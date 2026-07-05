@@ -1,5 +1,7 @@
 import os
 import logging
+import shutil
+import tempfile
 from abc import ABC
 from typing import Union, Optional, List
 
@@ -9,6 +11,7 @@ from app.downloaders.base import Downloader, DownloadQuality
 from app.downloaders.youtube_subtitle import YouTubeSubtitleFetcher
 from app.models.notes_model import AudioDownloadResult
 from app.models.transcriber_model import TranscriptResult
+from app.services.cookie_manager import CookieConfigManager
 from app.services.proxy_config_manager import ProxyConfigManager
 from app.utils.path_helper import get_data_dir
 from app.utils.url_parser import extract_video_id
@@ -25,10 +28,43 @@ def _apply_proxy(ydl_opts: dict) -> dict:
     return ydl_opts
 
 
+def _apply_youtube_challenge_support(ydl_opts: dict) -> dict:
+    node_path = shutil.which("node")
+    if node_path:
+        ydl_opts['js_runtimes'] = {'node': {'path': node_path}}
+        ydl_opts['remote_components'] = ['ejs:github']
+    return ydl_opts
+
+
 class YoutubeDownloader(Downloader, ABC):
     def __init__(self):
-
         super().__init__()
+        self._cookie_mgr = CookieConfigManager()
+        self._cookie = self._cookie_mgr.get('youtube')
+        self._cookiefile = self._write_netscape_cookie_file()
+
+    def _write_netscape_cookie_file(self) -> Optional[str]:
+        if not self._cookie:
+            logger.warning("YouTube cookie is not configured; downloads may fail when YouTube requires sign-in")
+            return None
+
+        lines = ["# Netscape HTTP Cookie File\n"]
+        for pair in self._cookie.replace("\n", "; ").split(";"):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            key, value = pair.split("=", 1)
+            if key:
+                lines.append(f".youtube.com\tTRUE\t/\tFALSE\t0\t{key}\t{value}\n")
+
+        if len(lines) == 1:
+            return None
+
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        tmp.writelines(lines)
+        tmp.close()
+        logger.info("Created YouTube Netscape cookie file for yt-dlp: %s (entries: %d)", tmp.name, len(lines) - 1)
+        return tmp.name
 
     def download(
         self,
@@ -56,6 +92,10 @@ class YoutubeDownloader(Downloader, ABC):
         if skip_download:
             ydl_opts['skip_download'] = True
 
+        if self._cookiefile:
+            ydl_opts['cookiefile'] = self._cookiefile
+
+        _apply_youtube_challenge_support(ydl_opts)
         _apply_proxy(ydl_opts)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=not skip_download)
@@ -102,6 +142,10 @@ class YoutubeDownloader(Downloader, ABC):
             'merge_output_format': 'mp4',  # 确保合并成 mp4
         }
 
+        if self._cookiefile:
+            ydl_opts['cookiefile'] = self._cookiefile
+
+        _apply_youtube_challenge_support(ydl_opts)
         _apply_proxy(ydl_opts)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
