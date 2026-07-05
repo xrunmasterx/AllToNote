@@ -118,7 +118,7 @@ class ModelService:
 
             models = ModelService.get_model_list(provider["id"], verbose=verbose)
             if ModelService._is_codex_provider(provider):
-                return {"models": {"data": [m.dict() for m in models.data]}}
+                return {"models": [m.dict() for m in models.data]}
 
             print(type(models))
             serializable_models = [m.dict() for m in models.data]

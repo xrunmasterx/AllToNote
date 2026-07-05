@@ -116,7 +116,7 @@ def test_codex_model_list_matches_openai_page_shape(monkeypatch):
     assert models.data[0].dict() == EXPECTED_CODEX_MODEL
 
 
-def test_codex_models_by_id_keeps_frontend_response_shape(monkeypatch):
+def test_codex_models_by_id_keeps_existing_endpoint_shape(monkeypatch):
     monkeypatch.setattr(
         "app.services.provider.ProviderService.get_provider_by_id",
         staticmethod(
@@ -135,6 +135,4 @@ def test_codex_models_by_id_keeps_frontend_response_shape(monkeypatch):
         staticmethod(lambda: [EXPECTED_CODEX_MODEL]),
     )
 
-    assert ModelService.get_all_models_by_id("codex_app_server") == {
-        "models": {"data": [EXPECTED_CODEX_MODEL]}
-    }
+    assert ModelService.get_all_models_by_id("codex_app_server") == {"models": [EXPECTED_CODEX_MODEL]}
