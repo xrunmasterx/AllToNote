@@ -28,7 +28,7 @@ class CodexAppServerGPT(UniversalGPT):
     def _chat_completion_create(self, messages: list):
         prompt = self._extract_prompt(messages)
         prompt = f"{prompt}\n\n{MARKDOWN_ONLY_INSTRUCTION}"
-        content = self._codex_client().generate_note(prompt)
+        content = self._codex_client().run_markdown_turn(prompt, self.model)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
