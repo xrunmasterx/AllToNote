@@ -1,12 +1,17 @@
 from pathlib import Path
 import sys
+import json
+
+from fastapi import BackgroundTasks
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.enmus.note_enums import DownloadQuality
 from app.gpt.codex_app_server_gpt import CodexAppServerGPT
+from app.routers.note import VideoRequest, generate_note
 from app.services.chat_service import chat
 from app.services.note import NoteGenerator
 
@@ -80,3 +85,38 @@ def test_note_generation_rejects_codex_images_before_download(monkeypatch):
     )
 
     assert result is None
+
+
+def test_generate_note_rejects_codex_video_understanding_before_generator_init(monkeypatch):
+    monkeypatch.setattr(
+        "app.routers.note.ProviderService.get_provider_by_id",
+        staticmethod(
+            lambda _id: {
+                "id": "codex_app_server",
+                "name": "Codex App Server",
+                "type": "codex_app_server",
+                "api_key": "",
+                "base_url": "codex-app-server://local",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "app.routers.note.NoteGenerator",
+        lambda: (_ for _ in ()).throw(AssertionError("NoteGenerator should not be constructed")),
+    )
+
+    response = generate_note(
+        VideoRequest(
+            video_url="https://www.bilibili.com/video/BV18NLx6fEAq/",
+            platform="bilibili",
+            quality=DownloadQuality.medium,
+            model_name="gpt-5.5",
+            provider_id="codex_app_server",
+            video_understanding=True,
+        ),
+        BackgroundTasks(),
+    )
+
+    payload = json.loads(response.body)
+    assert payload["code"] == 400
+    assert "text-only note generation" in payload["msg"]

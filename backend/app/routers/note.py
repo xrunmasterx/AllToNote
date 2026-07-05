@@ -23,6 +23,8 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 from app.enmus.task_status_enums import TaskStatus
+from app.services.codex_app_server import CODEX_PROVIDER_ID, CODEX_PROVIDER_TYPE
+from app.services.provider import ProviderService
 
 # from app.services.downloader import download_raw_audio
 # from app.services.whisperer import transcribe_audio
@@ -112,6 +114,19 @@ def _persist_prefetched_transcript(task_id: str, transcript: dict) -> None:
     logger.info(f"已写入客户端预取字幕缓存: {target} ({len(cleaned_segments)} 段)")
 
 
+def _codex_image_mode_error(provider_id: str, screenshot: bool, video_understanding: bool) -> str | None:
+    if not (screenshot or video_understanding):
+        return None
+
+    provider = ProviderService.get_provider_by_id(provider_id)
+    if provider and (provider.get("id") == CODEX_PROVIDER_ID or provider.get("type") == CODEX_PROVIDER_TYPE):
+        return (
+            "Codex app-server currently supports text-only note generation. "
+            "Disable screenshot and video understanding for this provider."
+        )
+    return None
+
+
 def run_note_task(task_id: str, video_url: str, platform: str, quality: DownloadQuality,
                   link: bool = False, screenshot: bool = False, model_name: str = None, provider_id: str = None,
                   _format: list = None, style: str = None, extras: str = None, video_understanding: bool = False,
@@ -180,6 +195,14 @@ async def upload(file: UploadFile = File(...)):
 @router.post("/generate_note")
 def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
     try:
+        codex_image_error = _codex_image_mode_error(
+            data.provider_id,
+            bool(data.screenshot),
+            bool(data.video_understanding),
+        )
+        if codex_image_error:
+            return R.error(msg=codex_image_error, code=400)
+
         # 就绪门禁：本地转写引擎（fast-whisper / mlx-whisper）必须等模型下载完才能跑视频，
         # 否则任务会卡在首次下载（慢 / OOM / 截断），用户只看到一个静默失败的任务。
         # 客户端已抓好字幕（prefetched_transcript）则不需要转写，跳过检查。
