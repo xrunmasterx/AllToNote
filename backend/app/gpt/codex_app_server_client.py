@@ -145,6 +145,8 @@ class CodexAppServerClient:
             self._send_request(process, "thread/start", thread_params)
             thread_response = self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
             thread_id = self._extract_thread_id(thread_response)
+            if not thread_id:
+                raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
 
             turn_params: dict[str, Any] = {
                 "input": [{"type": "text", "text": prompt, "text_elements": []}],
@@ -266,22 +268,20 @@ class CodexAppServerClient:
         return "Codex app-server turn failed"
 
     @staticmethod
-    def _extract_thread_id(response: dict[str, Any]) -> str:
+    def _extract_thread_id(response: dict[str, Any]) -> Optional[str]:
         result = response.get("result")
         if not isinstance(result, dict):
-            raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
+            return None
 
         thread = result.get("thread")
-        if isinstance(thread, dict):
-            thread_id = thread.get("id")
-            if isinstance(thread_id, str) and thread_id:
-                return thread_id
+        if not isinstance(thread, dict):
+            return None
 
-        thread_id = result.get("threadId") or result.get("thread_id") or result.get("id")
+        thread_id = thread.get("id")
         if isinstance(thread_id, str) and thread_id:
             return thread_id
 
-        raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
+        return None
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[str]) -> None:

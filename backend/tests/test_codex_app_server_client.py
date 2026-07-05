@@ -154,8 +154,12 @@ def test_extract_thread_id_reads_result_thread_id():
 
 
 def test_extract_thread_id_rejects_missing_thread_id():
-    with pytest.raises(CodexAppServerError, match="thread id"):
-        CodexAppServerClient._extract_thread_id({"result": {}})
+    assert CodexAppServerClient._extract_thread_id({"result": {}}) is None
+
+
+def test_extract_thread_id_rejects_legacy_thread_id_fields():
+    assert CodexAppServerClient._extract_thread_id({"result": {"threadId": "legacy"}}) is None
+    assert CodexAppServerClient._extract_thread_id({"result": {"id": "legacy"}}) is None
 
 
 def test_consume_next_message_rejects_server_request():
@@ -234,3 +238,26 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
     turn_start = fake_processes[0].stdin.messages[2]
     assert turn_start["method"] == "turn/start"
     assert turn_start["params"]["threadId"] == "thread-123"
+
+
+def test_run_markdown_turn_rejects_legacy_thread_start_response(monkeypatch):
+    stdout_messages = [
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"threadId": "legacy"}},
+    ]
+
+    def fake_popen(*args, **kwargs):
+        return _FakeProcess(stdout_messages)
+
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
+        lambda: None,
+    )
+    monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.Popen", fake_popen)
+
+    with pytest.raises(CodexAppServerError, match="thread id"):
+        CodexAppServerClient(codex_bin="codex", timeout_seconds=1).run_markdown_turn(
+            "make note",
+            "gpt-5",
+            cwd="E:\\VideoToNote",
+        )
