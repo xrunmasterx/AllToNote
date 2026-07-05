@@ -54,5 +54,13 @@
     "logo": "Ollama",
     "api_key": "",
     "base_url": "http://127.0.0.1:11434/v1"
+  },
+  {
+    "id": "codex_app_server",
+    "name": "Codex App Server",
+    "type": "codex_app_server",
+    "logo": "OpenAI",
+    "api_key": "",
+    "base_url": "codex_app_server://local"
   }
 ]

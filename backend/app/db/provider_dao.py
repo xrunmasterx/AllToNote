@@ -19,10 +19,6 @@ def get_builtin_providers_path():
 def seed_default_providers():
     db = next(get_db())
     try:
-        if db.query(Provider).count() > 0:
-            logger.info("Providers already exist, skipping seed.")
-            return
-
         json_path = get_builtin_providers_path()
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -31,7 +27,11 @@ def seed_default_providers():
             logger.error(f"Failed to read builtin_providers.json: {e}")
             return
 
+        existing_ids = {row[0] for row in db.query(Provider.id).all()}
+        inserted_count = 0
         for p in providers:
+            if p['id'] in existing_ids:
+                continue
             db.add(Provider(
                 id=p['id'],
                 name=p['name'],
@@ -41,8 +41,9 @@ def seed_default_providers():
                 type=p['type'],
                 enabled=p.get('enabled', 1)
             ))
+            inserted_count += 1
         db.commit()
-        logger.info("Default providers seeded successfully.")
+        logger.info(f"Default providers seeded successfully. inserted_count={inserted_count}")
     except Exception as e:
         logger.error(f"Failed to seed default providers: {e}")
     finally:
