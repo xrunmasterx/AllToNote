@@ -39,7 +39,7 @@ class CodexAppServerClient:
     def clean_markdown(text: str) -> str:
         cleaned = text.strip()
         lines = cleaned.splitlines()
-        if len(lines) >= 2 and lines[0].strip().lower() in ("```", "```markdown"):
+        if len(lines) >= 2 and lines[0].strip().lower() == "```markdown":
             closing_index = next(
                 (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "```"),
                 None,
@@ -132,6 +132,7 @@ class CodexAppServerClient:
                 },
             )
             self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
+            self._send_notification(process, "initialized")
 
             thread_params = {
                 "model": model,
@@ -180,6 +181,19 @@ class CodexAppServerClient:
 
         message = {"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params}
         self._next_id += 1
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+
+    @staticmethod
+    def _send_notification(
+        process: subprocess.Popen[str],
+        method: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if process.stdin is None:
+            raise CodexAppServerError("Codex app-server stdin is unavailable")
+
+        message = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()
 

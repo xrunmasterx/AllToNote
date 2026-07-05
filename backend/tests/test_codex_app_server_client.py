@@ -142,7 +142,7 @@ def test_clean_markdown_strips_markdown_fenced_code_block():
 def test_clean_markdown_strips_plain_fenced_code_block():
     text = "```\n# Title\n```\n"
 
-    assert CodexAppServerClient.clean_markdown(text) == "# Title"
+    assert CodexAppServerClient.clean_markdown(text) == text.strip()
 
 
 def test_clean_markdown_keeps_multiple_top_level_fenced_blocks():
@@ -305,9 +305,46 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
     )
 
     assert result == "# Note"
-    turn_start = fake_processes[0].stdin.messages[2]
+    turn_start = fake_processes[0].stdin.messages[3]
     assert turn_start["method"] == "turn/start"
     assert turn_start["params"]["threadId"] == "thread-123"
+
+
+def test_run_markdown_turn_sends_initialized_notification_after_initialize(monkeypatch):
+    stdout_messages = [
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"thread": {"id": "thread-123"}}},
+        {"jsonrpc": "2.0", "id": 3, "result": {}},
+        {"method": "item/agentMessage/delta", "params": {"delta": "# Note"}},
+        {"method": "turn/completed", "params": {"status": "completed"}},
+    ]
+    fake_processes = []
+
+    def fake_popen(*args, **kwargs):
+        process = _FakeProcess(stdout_messages)
+        fake_processes.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
+        lambda: None,
+    )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
+    monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.Popen", fake_popen)
+
+    CodexAppServerClient(codex_bin="codex", timeout_seconds=1).run_markdown_turn(
+        "make note",
+        "gpt-5",
+        cwd="E:\\VideoToNote",
+    )
+
+    messages = fake_processes[0].stdin.messages
+    assert [message["method"] for message in messages[:3]] == [
+        "initialize",
+        "initialized",
+        "thread/start",
+    ]
+    assert messages[1] == {"jsonrpc": "2.0", "method": "initialized", "params": {}}
 
 
 def test_run_markdown_turn_rejects_legacy_thread_start_response(monkeypatch):
