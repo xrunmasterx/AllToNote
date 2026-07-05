@@ -150,9 +150,8 @@ class CodexAppServerClient:
                 "input": [{"type": "text", "text": prompt, "text_elements": []}],
                 "approvalPolicy": "never",
                 "model": model,
+                "threadId": thread_id,
             }
-            if thread_id:
-                turn_params["threadId"] = thread_id
             self._send_request(process, "turn/start", turn_params)
             self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
 
@@ -213,6 +212,9 @@ class CodexAppServerClient:
             raise CodexAppServerError(str(message)) from message
 
         if "method" in message:
+            method = message.get("method")
+            if "id" in message:
+                raise CodexAppServerError(f"Unsupported Codex app-server request: {method}")
             self.handle_notification(message, state)
         return message
 
@@ -264,12 +266,22 @@ class CodexAppServerClient:
         return "Codex app-server turn failed"
 
     @staticmethod
-    def _extract_thread_id(response: dict[str, Any]) -> Optional[str]:
+    def _extract_thread_id(response: dict[str, Any]) -> str:
         result = response.get("result")
         if not isinstance(result, dict):
-            return None
+            raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
+
+        thread = result.get("thread")
+        if isinstance(thread, dict):
+            thread_id = thread.get("id")
+            if isinstance(thread_id, str) and thread_id:
+                return thread_id
+
         thread_id = result.get("threadId") or result.get("thread_id") or result.get("id")
-        return thread_id if isinstance(thread_id, str) else None
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+
+        raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[str]) -> None:
