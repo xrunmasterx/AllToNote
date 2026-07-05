@@ -14,11 +14,12 @@ export interface IResponse<T> {
 }
 
 export interface ICodexAppServerStatus {
-  available: boolean
+  codex_cli_available: boolean
+  codex_version?: string
   codex_bin?: string
-  version?: string
   codex_home?: string
   auth_available?: boolean
   default_model?: string
+  ready: boolean
   message?: string
 }

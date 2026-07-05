@@ -135,7 +135,8 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
       return status
     } catch (error) {
       const fallbackStatus = {
-        available: false,
+        codex_cli_available: false,
+        ready: false,
         message: getErrorMessage(error),
       }
       setCodexStatus(fallbackStatus)
@@ -199,7 +200,7 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
       try {
         setTesting(true)
         const status = await loadCodexStatus()
-        if (status.available && status.auth_available) {
+        if (status.ready) {
           toast.success('Codex App Server is available')
         } else {
           toast.error(status.message || 'Codex App Server is not ready')
@@ -346,9 +347,11 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
                   <span>Checking status...</span>
                 ) : (
                   <div className="flex flex-col gap-1">
-                    <span>CLI: {codexStatus?.available ? 'available' : 'unavailable'}</span>
+                    <span>
+                      CLI: {codexStatus?.codex_cli_available ? 'available' : 'unavailable'}
+                    </span>
                     <span>Auth: {codexStatus?.auth_available ? 'signed in' : 'not signed in'}</span>
-                    {codexStatus?.version && <span>Version: {codexStatus.version}</span>}
+                    {codexStatus?.codex_version && <span>Version: {codexStatus.codex_version}</span>}
                     <span>Default model: {codexStatus?.default_model || CODEX_DEFAULT_MODEL}</span>
                     {codexStatus?.message && <span>{codexStatus.message}</span>}
                   </div>
