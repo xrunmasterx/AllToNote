@@ -16,6 +16,16 @@ from app.services.codex_app_server import (
 )
 
 
+EXPECTED_CODEX_MODEL = {
+    "id": "gpt-5.5",
+    "object": "model",
+    "created": 0,
+    "owned_by": "codex_app_server",
+    "permission": [],
+    "root": "gpt-5.5",
+}
+
+
 def test_read_default_model_from_config(tmp_path: Path):
     codex_home = tmp_path / ".codex"
     codex_home.mkdir()
@@ -25,6 +35,16 @@ def test_read_default_model_from_config(tmp_path: Path):
 
 def test_missing_config_returns_none(tmp_path: Path):
     assert CodexAppServerStatusService.read_default_model(tmp_path / ".codex") is None
+
+
+def test_model_suggestions_include_complete_model_item(monkeypatch):
+    monkeypatch.setattr(
+        CodexAppServerStatusService,
+        "read_default_model",
+        staticmethod(lambda: "gpt-5.5"),
+    )
+
+    assert CodexAppServerStatusService.get_model_suggestions() == [EXPECTED_CODEX_MODEL]
 
 
 def test_status_ready_requires_cli_and_auth(monkeypatch, tmp_path: Path):
@@ -88,12 +108,12 @@ def test_codex_model_list_matches_openai_page_shape(monkeypatch):
     monkeypatch.setattr(
         CodexAppServerStatusService,
         "get_model_suggestions",
-        staticmethod(lambda: [{"id": "gpt-5.5", "object": "model"}]),
+        staticmethod(lambda: [EXPECTED_CODEX_MODEL]),
     )
 
     models = ModelService.get_model_list("codex_app_server")
 
-    assert models.data[0].dict()["id"] == "gpt-5.5"
+    assert models.data[0].dict() == EXPECTED_CODEX_MODEL
 
 
 def test_codex_models_by_id_keeps_frontend_response_shape(monkeypatch):
@@ -112,9 +132,9 @@ def test_codex_models_by_id_keeps_frontend_response_shape(monkeypatch):
     monkeypatch.setattr(
         CodexAppServerStatusService,
         "get_model_suggestions",
-        staticmethod(lambda: [{"id": "gpt-5.5", "object": "model"}]),
+        staticmethod(lambda: [EXPECTED_CODEX_MODEL]),
     )
 
     assert ModelService.get_all_models_by_id("codex_app_server") == {
-        "models": {"data": [{"id": "gpt-5.5", "object": "model"}]}
+        "models": {"data": [EXPECTED_CODEX_MODEL]}
     }

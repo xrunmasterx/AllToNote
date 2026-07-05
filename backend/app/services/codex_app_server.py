@@ -93,7 +93,16 @@ class CodexAppServerStatusService:
         default_model = CodexAppServerStatusService.read_default_model()
         if not default_model:
             return []
-        return [{"id": default_model, "object": "model"}]
+        return [
+            {
+                "id": default_model,
+                "object": "model",
+                "created": 0,
+                "owned_by": CODEX_PROVIDER_ID,
+                "permission": [],
+                "root": default_model,
+            }
+        ]
 
     @staticmethod
     def assert_ready() -> None:
