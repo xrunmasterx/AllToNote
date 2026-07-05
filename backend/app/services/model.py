@@ -16,6 +16,21 @@ from app.services.provider import ProviderService
 from app.utils.logger import get_logger
 
 logger=get_logger(__name__)
+
+
+class _ModelListItem:
+    def __init__(self, value: dict):
+        self._value = value
+
+    def dict(self) -> dict:
+        return dict(self._value)
+
+
+class _ModelListPage:
+    def __init__(self, models: list[dict]):
+        self.data = [_ModelListItem(model) for model in models]
+
+
 class ModelService:
 
     @staticmethod
@@ -42,7 +57,7 @@ class ModelService:
             models = CodexAppServerStatusService.get_model_suggestions()
             if verbose:
                 print(f"[{provider['name']}] 妯″瀷鍒楄〃: {models}")
-            return models
+            return _ModelListPage(models)
 
         try:
             config = ModelService._build_model_config(provider)
@@ -103,7 +118,7 @@ class ModelService:
 
             models = ModelService.get_model_list(provider["id"], verbose=verbose)
             if ModelService._is_codex_provider(provider):
-                return {"models": {"data": models}}
+                return {"models": {"data": [m.dict() for m in models.data]}}
 
             print(type(models))
             serializable_models = [m.dict() for m in models.data]

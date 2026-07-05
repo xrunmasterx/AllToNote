@@ -8,7 +8,7 @@ import tomllib
 
 CODEX_PROVIDER_ID = "codex_app_server"
 CODEX_PROVIDER_TYPE = "codex_app_server"
-CODEX_LOCAL_BASE_URL = "codex_app_server://local"
+CODEX_LOCAL_BASE_URL = "codex-app-server://local"
 
 
 @dataclass

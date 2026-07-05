@@ -61,6 +61,6 @@
     "type": "codex_app_server",
     "logo": "OpenAI",
     "api_key": "",
-    "base_url": "codex_app_server://local"
+    "base_url": "codex-app-server://local"
   }
 ]
