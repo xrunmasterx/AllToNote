@@ -89,6 +89,32 @@ def test_handle_turn_completed_failed_records_error_message():
     assert state.error == "model failed"
 
 
+def test_handle_turn_completed_interrupted_records_error_and_done():
+    state = CodexTurnState(text="# Partial note")
+
+    CodexAppServerClient.handle_notification(
+        {"method": "turn/completed", "params": {"status": "interrupted"}},
+        state,
+    )
+
+    assert state.done is True
+    assert state.error is not None
+    assert "interrupted" in state.error
+
+
+def test_handle_turn_completed_unknown_status_records_error_and_done():
+    state = CodexTurnState(text="# Partial note")
+
+    CodexAppServerClient.handle_notification(
+        {"method": "turn/completed", "params": {"status": "cancelled"}},
+        state,
+    )
+
+    assert state.done is True
+    assert state.error is not None
+    assert "cancelled" in state.error
+
+
 def test_handle_nested_turn_completed_failed_records_error_message():
     state = CodexTurnState()
 
@@ -114,6 +140,19 @@ def test_handle_error_notification_records_error_and_done():
 
     assert state.done is True
     assert state.error == "bad request"
+
+
+def test_handle_retryable_error_notification_does_not_mark_done_or_error():
+    state = CodexTurnState(text="# Partial note")
+
+    CodexAppServerClient.handle_notification(
+        {"method": "error", "params": {"message": "temporary failure", "willRetry": True}},
+        state,
+    )
+
+    assert state.done is False
+    assert state.error is None
+    assert state.text == "# Partial note"
 
 
 def test_handle_nested_error_notification_records_error_and_done():

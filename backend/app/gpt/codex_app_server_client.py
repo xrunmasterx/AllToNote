@@ -73,11 +73,21 @@ class CodexAppServerClient:
         if method == "turn/completed":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else params
             state.done = True
-            if turn.get("status") == "failed":
+            status = turn.get("status")
+            if status == "completed":
+                state.error = None
+            elif status == "failed":
                 state.error = CodexAppServerClient._extract_error_message(turn.get("error") or turn)
+            elif status == "interrupted":
+                state.error = "Codex app-server turn interrupted"
+            else:
+                status_name = status if isinstance(status, str) and status else "unknown"
+                state.error = f"Codex app-server turn completed with unsupported status: {status_name}"
             return
 
         if method == "error":
+            if params.get("willRetry") is True:
+                return
             state.done = True
             state.error = CodexAppServerClient._extract_error_message(params.get("error") or params)
 
