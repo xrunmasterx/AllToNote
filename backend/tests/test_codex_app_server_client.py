@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import queue
+import subprocess
 import sys
 import time
 
@@ -144,6 +145,12 @@ def test_clean_markdown_strips_plain_fenced_code_block():
     assert CodexAppServerClient.clean_markdown(text) == "# Title"
 
 
+def test_clean_markdown_keeps_multiple_top_level_fenced_blocks():
+    text = "```\na\n```\n\n# Note\n\n```\nb\n```"
+
+    assert CodexAppServerClient.clean_markdown(text) == text
+
+
 def test_extract_thread_id_reads_result_thread_id():
     assert (
         CodexAppServerClient._extract_thread_id(
@@ -188,6 +195,7 @@ class _RecordingStdin:
 
 class _FakeProcess:
     def __init__(self, stdout_messages):
+        self.pid = 1234
         self.stdin = _RecordingStdin()
         self.stdout = iter(json.dumps(message) + "\n" for message in stdout_messages)
         self.stderr = iter(())
@@ -205,6 +213,67 @@ class _FakeProcess:
 
     def kill(self):
         self._terminated = True
+
+
+class _FakeRunningProcess:
+    pid = 1234
+
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = []
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+def test_terminate_process_uses_taskkill_for_windows_process_tree(monkeypatch):
+    calls = []
+    process = _FakeRunningProcess()
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: True))
+    monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.run", fake_run)
+
+    CodexAppServerClient._terminate_process(process)
+
+    assert calls == [
+        (
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            {"check": True, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL},
+        )
+    ]
+    assert process.terminated is False
+    assert process.killed is False
+
+
+def test_terminate_process_falls_back_when_windows_taskkill_fails(monkeypatch):
+    process = _FakeRunningProcess()
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: True))
+    monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.run", fake_run)
+
+    CodexAppServerClient._terminate_process(process)
+
+    assert process.terminated is True
+    assert process.killed is False
+    assert process.wait_calls == [5]
 
 
 def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatch):
@@ -226,6 +295,7 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
         "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
         lambda: None,
     )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
     monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.Popen", fake_popen)
 
     result = CodexAppServerClient(codex_bin="codex", timeout_seconds=1).run_markdown_turn(
@@ -253,6 +323,7 @@ def test_run_markdown_turn_rejects_legacy_thread_start_response(monkeypatch):
         "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
         lambda: None,
     )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
     monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.Popen", fake_popen)
 
     with pytest.raises(CodexAppServerError, match="thread id"):

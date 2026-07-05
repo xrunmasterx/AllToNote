@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import queue
 import subprocess
@@ -37,12 +38,14 @@ class CodexAppServerClient:
     @staticmethod
     def clean_markdown(text: str) -> str:
         cleaned = text.strip()
-        if cleaned.startswith("```"):
-            first_line_end = cleaned.find("\n")
-            if first_line_end != -1:
-                fence_header = cleaned[:first_line_end].strip().lower()
-                if fence_header in ("```", "```markdown") and cleaned.endswith("```"):
-                    cleaned = cleaned[first_line_end + 1 : -3].strip()
+        lines = cleaned.splitlines()
+        if len(lines) >= 2 and lines[0].strip().lower() in ("```", "```markdown"):
+            closing_index = next(
+                (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "```"),
+                None,
+            )
+            if closing_index == len(lines) - 1:
+                cleaned = "\n".join(lines[1:-1]).strip()
 
         if not cleaned:
             raise CodexAppServerError("Codex app-server returned empty Markdown")
@@ -288,9 +291,25 @@ class CodexAppServerClient:
         if process.poll() is not None:
             return
 
+        if CodexAppServerClient._is_windows():
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except (OSError, subprocess.CalledProcessError):
+                pass
+
         process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+    @staticmethod
+    def _is_windows() -> bool:
+        return os.name == "nt"
