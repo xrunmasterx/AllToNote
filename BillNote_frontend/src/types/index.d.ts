@@ -9,6 +9,16 @@ export interface IProvider {
 }
 export interface IResponse<T> {
   code: number
-  data:T
+  data: T
   msg: string
+}
+
+export interface ICodexAppServerStatus {
+  available: boolean
+  codex_bin?: string
+  version?: string
+  codex_home?: string
+  auth_available?: boolean
+  default_model?: string
+  message?: string
 }

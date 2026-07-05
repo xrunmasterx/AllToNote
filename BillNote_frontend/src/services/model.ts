@@ -1,8 +1,11 @@
 import request from '@/utils/request.ts'
+import { ICodexAppServerStatus } from '@/types'
 
 // opts.silent: 让本次请求失败时不弹全局红 toast（调用方自行 catch 处理，
 // 比如 onboarding 撞名重试这种预期内失败）
-interface CallOpts { silent?: boolean }
+interface CallOpts {
+  silent?: boolean
+}
 const cfg = (o?: CallOpts) => (o?.silent ? { suppressToast: true } : undefined)
 
 export const getProviderList = async (opts?: CallOpts) => {
@@ -23,6 +26,10 @@ export const testConnection = async (data: any, opts?: CallOpts) => {
   return await request.post('/connect_test', data, cfg(opts))
 }
 
+export const getCodexAppServerStatus = async (): Promise<ICodexAppServerStatus> => {
+  return await request.get('/codex_app_server/status')
+}
+
 export const fetchModels = async (providerId: string) => {
   return await request.get('/model_list/' + providerId)
 }
@@ -31,10 +38,7 @@ export const fetchEnableModelById = async (id: string) => {
   return await request.get('/model_enable/' + id)
 }
 
-export async function addModel(
-  data: { provider_id: string; model_name: string },
-  opts?: CallOpts,
-) {
+export async function addModel(data: { provider_id: string; model_name: string }, opts?: CallOpts) {
   return request.post('/models', data, cfg(opts))
 }
 
