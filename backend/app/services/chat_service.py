@@ -3,6 +3,7 @@ from typing import Optional
 
 from app.gpt.gpt_factory import GPTFactory
 from app.models.model_config import ModelConfig
+from app.services.codex_app_server import CODEX_PROVIDER_ID, CODEX_PROVIDER_TYPE
 from app.services.provider import ProviderService
 from app.services.vector_store import VectorStoreManager
 from app.services.chat_tools import TOOLS, execute_tool
@@ -80,6 +81,12 @@ def chat(
     3. 如果 LLM 调用了工具，执行工具并将结果返回给 LLM
     4. 循环直到 LLM 给出最终回答
     """
+    provider = ProviderService.get_provider_by_id(provider_id)
+    if not provider:
+        raise ValueError(f"未找到模型供应商: {provider_id}")
+    if provider.get("id") == CODEX_PROVIDER_ID or provider.get("type") == CODEX_PROVIDER_TYPE:
+        raise ValueError("Codex app-server currently supports note generation only, not AI Q&A/RAG.")
+
     vector_store = VectorStoreManager()
 
     # 1. 检索初始上下文
@@ -97,10 +104,6 @@ def chat(
     messages.append({"role": "user", "content": question})
 
     # 3. 获取 LLM client
-    provider = ProviderService.get_provider_by_id(provider_id)
-    if not provider:
-        raise ValueError(f"未找到模型供应商: {provider_id}")
-
     config = ModelConfig(
         api_key=provider["api_key"],
         base_url=provider["base_url"],

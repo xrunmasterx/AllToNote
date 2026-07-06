@@ -16,7 +16,12 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useProviderStore } from '@/store/providerStore'
 import { useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
-import { testConnection, fetchModels, deleteModelById } from '@/services/model.ts'
+import {
+  getCodexAppServerStatus,
+  testConnection,
+  fetchModels,
+  deleteModelById,
+} from '@/services/model.ts'
 import {
   Select,
   SelectContent,
@@ -29,6 +34,11 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert.tsx'
 import { Tags } from 'lucide-react'
 import { X } from 'lucide-react'
 import { useModelStore } from '@/store/modelStore'
+import { ICodexAppServerStatus } from '@/types'
+
+const CODEX_APP_SERVER_PROVIDER_ID = 'codex_app_server'
+const CODEX_APP_SERVER_BASE_URL = 'codex-app-server://local'
+const CODEX_DEFAULT_MODEL = 'gpt-5.5'
 
 // ✅ Provider表单schema
 const ProviderSchema = z.object({
@@ -66,11 +76,13 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
   const [loading, setLoading] = useState(true)
   const [testing, setTesting] = useState(false)
   const [isBuiltIn, setIsBuiltIn] = useState(false)
-  const loadModelsById= useModelStore(state => state.loadModelsById)
+  const loadModelsById = useModelStore(state => state.loadModelsById)
   const [modelOptions, setModelOptions] = useState<IModel[]>([]) // ⚡新增，保存模型列表
-  const [models, setModels]= useState([])
+  const [models, setModels] = useState([])
   const [modelLoading, setModelLoading] = useState(false)
-  const randomColor = ()=>{
+  const [codexStatus, setCodexStatus] = useState<ICodexAppServerStatus | null>(null)
+  const [codexStatusLoading, setCodexStatusLoading] = useState(false)
+  const randomColor = () => {
     return '#' + Math.floor(Math.random() * 16777215).toString(16)
   }
 
@@ -96,15 +108,60 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
       modelName: '',
     },
   })
+  const providerType = providerForm.watch('type')
+  const isCodexProvider =
+    id === CODEX_APP_SERVER_PROVIDER_ID || providerType === CODEX_APP_SERVER_PROVIDER_ID
+  const isNameLocked = isBuiltIn || isCodexProvider
+
+  const getErrorMessage = (error: unknown) => {
+    if (typeof error === 'object' && error !== null && 'msg' in error) {
+      const msg = (error as { msg?: unknown }).msg
+      if (typeof msg === 'string') return msg
+    }
+    return 'Unknown error'
+  }
+
+  const refreshEnabledModels = async () => {
+    if (!id) return
+    const models = await loadModelsById(id)
+    if (models) setModels(models)
+  }
+
+  const loadCodexStatus = async () => {
+    try {
+      setCodexStatusLoading(true)
+      const status = await getCodexAppServerStatus()
+      setCodexStatus(status)
+      return status
+    } catch (error) {
+      const fallbackStatus = {
+        codex_cli_available: false,
+        ready: false,
+        message: getErrorMessage(error),
+      }
+      setCodexStatus(fallbackStatus)
+      return fallbackStatus
+    } finally {
+      setCodexStatusLoading(false)
+    }
+  }
 
   useEffect(() => {
-
     const load = async () => {
       if (isEditMode) {
-
         const data = await loadProviderById(id!)
-        providerForm.reset(data)
+        const providerIsCodex =
+          id === CODEX_APP_SERVER_PROVIDER_ID || data.type === CODEX_APP_SERVER_PROVIDER_ID
+        providerForm.reset({
+          ...data,
+          baseUrl: providerIsCodex ? CODEX_APP_SERVER_BASE_URL : data.baseUrl,
+        })
         setIsBuiltIn(data.type === 'built-in')
+        if (providerIsCodex) {
+          await loadCodexStatus()
+        } else {
+          setCodexStatus(null)
+        }
       } else {
         providerForm.reset({
           name: '',
@@ -114,17 +171,16 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
         })
         setIsBuiltIn(false)
       }
-      const models = await loadModelsById(id!)
-      if(models){
+      const models = id ? await loadModelsById(id) : []
+      if (models) {
         console.log('🔧 模型列表:', models)
         setModels(models)
-
       }
       setLoading(false)
     }
     load()
   }, [id])
-  const handelDelete=async (modelId)=>{
+  const handelDelete = async modelId => {
     if (!window.confirm('确定要删除这个模型吗？')) return
 
     try {
@@ -132,7 +188,6 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
       console.log('🔧 删除结果:', res)
 
       toast.success('删除成功')
-
     } catch (e) {
       toast.error('删除异常')
     }
@@ -140,24 +195,38 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
   // 测试连通性
   const handleTest = async () => {
     const values = providerForm.getValues()
+    const data = { data: { msg: 'Unknown error' } }
+    if (isCodexProvider) {
+      try {
+        setTesting(true)
+        const status = await loadCodexStatus()
+        if (status.ready) {
+          toast.success('Codex App Server is available')
+        } else {
+          toast.error(status.message || 'Codex App Server is not ready')
+        }
+      } finally {
+        setTesting(false)
+      }
+      return
+    }
     if (!values.apiKey || !values.baseUrl) {
       toast.error('请填写 API Key 和 Base URL')
       return
     }
     try {
-      if (!id){
+      if (!id) {
         toast.error('请先保存供应商信息')
         return
       }
       setTesting(true)
-     await testConnection({
-             id
-          })
+      await testConnection({
+        id,
+      })
 
-        toast.success('测试连通性成功 🎉')
-
+      toast.success('测试连通性成功 🎉')
     } catch (error) {
-
+      data.data.msg = getErrorMessage(error)
       toast.error(`连接失败: ${data.data.msg || '未知错误'}`)
       // toast.error('测试连通性异常')
     } finally {
@@ -195,12 +264,11 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
       await updateProvider({ ...values, id: id! })
       toast.success('更新供应商成功')
     } else {
-       id = await addNewProvider({ ...values })
+      id = await addNewProvider({ ...values })
 
       toast.success('新增供应商成功')
     }
     // 刷新页面
-
   }
 
   // 保存Model信息
@@ -234,25 +302,27 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               <FormItem className="flex items-center gap-4">
                 <FormLabel className="w-24 text-right">名称</FormLabel>
                 <FormControl>
-                  <Input {...field} disabled={isBuiltIn} className="flex-1" />
+                  <Input {...field} disabled={isNameLocked} className="flex-1" />
                 </FormControl>
                 <FormMessage />
               </FormItem>
             )}
           />
-          <FormField
-            control={providerForm.control}
-            name="apiKey"
-            render={({ field }) => (
-              <FormItem className="flex items-center gap-4">
-                <FormLabel className="w-24 text-right">API Key</FormLabel>
-                <FormControl>
-                  <Input {...field} className="flex-1" />
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+          {!isCodexProvider && (
+            <FormField
+              control={providerForm.control}
+              name="apiKey"
+              render={({ field }) => (
+                <FormItem className="flex items-center gap-4">
+                  <FormLabel className="w-24 text-right">API Key</FormLabel>
+                  <FormControl>
+                    <Input {...field} readOnly={isCodexProvider} className="flex-1" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
           <FormField
             control={providerForm.control}
             name="baseUrl"
@@ -260,7 +330,7 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               <FormItem className="flex items-center gap-4">
                 <FormLabel className="w-24 text-right">API地址</FormLabel>
                 <FormControl>
-                  <Input {...field} className="flex-1" />
+                  <Input {...field} readOnly={isCodexProvider} className="flex-1" />
                 </FormControl>
                 <Button type="button" onClick={handleTest} variant="ghost" disabled={testing}>
                   {testing ? '测试中...' : '测试连通性'}
@@ -269,6 +339,26 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
               </FormItem>
             )}
           />
+          {isCodexProvider && (
+            <Alert>
+              <AlertTitle>Codex App Server</AlertTitle>
+              <AlertDescription>
+                {codexStatusLoading ? (
+                  <span>Checking status...</span>
+                ) : (
+                  <div className="flex flex-col gap-1">
+                    <span>
+                      CLI: {codexStatus?.codex_cli_available ? 'available' : 'unavailable'}
+                    </span>
+                    <span>Auth: {codexStatus?.auth_available ? 'signed in' : 'not signed in'}</span>
+                    {codexStatus?.codex_version && <span>Version: {codexStatus.codex_version}</span>}
+                    <span>Default model: {codexStatus?.default_model || CODEX_DEFAULT_MODEL}</span>
+                    {codexStatus?.message && <span>{codexStatus.message}</span>}
+                  </div>
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
           <FormField
             control={providerForm.control}
             name="type"
@@ -298,7 +388,12 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
             <h2 className={'font-bold'}>注意!</h2>
             <span>请确保已经保存供应商信息,以及通过测试连通性.</span>
           </div>
-          <ModelSelector providerId={id!} />
+          <ModelSelector
+            providerId={id!}
+            manualOnly={isCodexProvider}
+            defaultModel={codexStatus?.default_model || CODEX_DEFAULT_MODEL}
+            onSaved={isCodexProvider ? refreshEnabledModels : undefined}
+          />
 
           {/*<datalist id="model-options">*/}
           {/*  {modelOptions.map(model => (*/}
@@ -308,21 +403,25 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
         </div>
         <div className="flex flex-col gap-2">
           <span className="font-bold">已启用模型</span>
-          <div className={'flex flex-wrap gap-2 rounded  p-2.5'}>
-            {
-              models && models.map(model => {
+          <div className={'flex flex-wrap gap-2 rounded p-2.5'}>
+            {models &&
+              models.map(model => {
                 return (
-                  <span key={model.id} className="inline-flex items-center gap-1 rounded-md bg-blue-100 px-2 py-0.5 text-sm text-blue-700">
+                  <span
+                    key={model.id}
+                    className="inline-flex items-center gap-1 rounded-md bg-blue-100 px-2 py-0.5 text-sm text-blue-700"
+                  >
                     {model.model_name}
-                    <button type="button" onClick={() => handelDelete(model.id)} className="hover:text-blue-900">
+                    <button
+                      type="button"
+                      onClick={() => handelDelete(model.id)}
+                      className="hover:text-blue-900"
+                    >
                       <X className="h-3 w-3" />
                     </button>
                   </span>
-
                 )
-              })
-            }
-
+              })}
           </div>
           {/*<ModelSelector providerId={id!} />*/}
 

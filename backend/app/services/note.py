@@ -21,6 +21,7 @@ from app.enmus.note_enums import DownloadQuality
 from app.exceptions.note import NoteError
 from app.exceptions.provider import ProviderError
 from app.gpt.base import GPT
+from app.gpt.codex_app_server_gpt import CodexAppServerGPT
 from app.gpt.gpt_factory import GPTFactory
 from app.models.audio_model import AudioDownloadResult
 from app.models.gpt_model import GPTSource
@@ -128,6 +129,7 @@ class NoteGenerator:
 
             downloader = self._get_downloader(platform)
             gpt = self._get_gpt(model_name, provider_id)
+            self._reject_unsupported_codex_options(gpt, screenshot, video_understanding)
 
             # 缓存文件路径
             audio_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_audio.json"
@@ -307,6 +309,18 @@ class NoteGenerator:
 
         logger.info(f"使用下载器：{downloader_cls.__class__}")
         return instance
+
+    @staticmethod
+    def _reject_unsupported_codex_options(
+        gpt: GPT,
+        screenshot: bool,
+        video_understanding: bool,
+    ) -> None:
+        if isinstance(gpt, CodexAppServerGPT) and (screenshot or video_understanding):
+            raise ValueError(
+                "Codex app-server currently supports text-only note generation. "
+                "Disable screenshot and video understanding for this provider."
+            )
 
     def _update_status(self, task_id: Optional[str], status: Union[str, TaskStatus], message: Optional[str] = None):
         """

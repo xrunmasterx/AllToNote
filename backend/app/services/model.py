@@ -7,10 +7,30 @@ from app.exceptions.provider import ProviderError
 from app.gpt.gpt_factory import GPTFactory
 from app.gpt.provider.OpenAI_compatible_provider import OpenAICompatibleProvider
 from app.models.model_config import ModelConfig
+from app.services.codex_app_server import (
+    CODEX_PROVIDER_ID,
+    CODEX_PROVIDER_TYPE,
+    CodexAppServerStatusService,
+)
 from app.services.provider import ProviderService
 from app.utils.logger import get_logger
 
 logger=get_logger(__name__)
+
+
+class _ModelListItem:
+    def __init__(self, value: dict):
+        self._value = value
+
+    def dict(self) -> dict:
+        return dict(self._value)
+
+
+class _ModelListPage:
+    def __init__(self, models: list[dict]):
+        self.data = [_ModelListItem(model) for model in models]
+
+
 class ModelService:
 
     @staticmethod
@@ -24,10 +44,20 @@ class ModelService:
         )
 
     @staticmethod
+    def _is_codex_provider(provider: dict) -> bool:
+        return provider.get("id") == CODEX_PROVIDER_ID or provider.get("type") == CODEX_PROVIDER_TYPE
+
+    @staticmethod
     def get_model_list(provider_id: int, verbose: bool = False):
         provider = ProviderService.get_provider_by_id(provider_id)
         if not provider:
             return []
+
+        if ModelService._is_codex_provider(provider):
+            models = CodexAppServerStatusService.get_model_suggestions()
+            if verbose:
+                print(f"[{provider['name']}] 妯″瀷鍒楄〃: {models}")
+            return _ModelListPage(models)
 
         try:
             config = ModelService._build_model_config(provider)
@@ -87,6 +117,9 @@ class ModelService:
             provider = ProviderService.get_provider_by_id(provider_id)
 
             models = ModelService.get_model_list(provider["id"], verbose=verbose)
+            if ModelService._is_codex_provider(provider):
+                return {"models": [m.dict() for m in models.data]}
+
             print(type(models))
             serializable_models = [m.dict() for m in models.data]
             model_list = {
@@ -114,6 +147,10 @@ class ModelService:
                 code=ProviderErrorEnum.NOT_FOUND.code,
                 message=ProviderErrorEnum.NOT_FOUND.message,
             )
+        if ModelService._is_codex_provider(provider):
+            CodexAppServerStatusService.assert_ready()
+            return True
+
         if not provider.get('api_key'):
             raise ProviderError(
                 code=ProviderErrorEnum.NOT_FOUND.code,
