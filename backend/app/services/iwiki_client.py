@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import math
+import os
+from pathlib import Path
 import re
+import shutil
+import subprocess
 from types import MappingProxyType
 from typing import cast
 
@@ -13,6 +17,8 @@ from typing import cast
 SUPPORTED_CLI_PROTOCOL = 1
 SUPPORTED_SCHEMA_VERSION = 2
 MAX_RESPONSE_DEPTH = 64
+MAX_PROCESS_DIAGNOSTIC_LENGTH = 4000
+READ_ONLY_COMMANDS = frozenset({"inspect", "validate", "query", "index"})
 
 
 class IWikiClientErrorCode(str, Enum):
@@ -327,3 +333,127 @@ def parse_inspect_result(envelope: IWikiEnvelope) -> IWikiInspectResult:
         paths=cast(Mapping[str, str], paths),
         index=cast(Mapping[str, str | None], index),
     )
+
+
+def _resolve_executable(path: Path) -> Path:
+    try:
+        resolved = path.expanduser().resolve()
+        if resolved.is_file():
+            return resolved
+    except (OSError, RuntimeError):
+        pass
+    raise IWikiClientError(
+        IWikiClientErrorCode.NOT_INSTALLED,
+        "iwiki executable is not available",
+    ) from None
+
+
+def discover_iwiki_bin() -> Path:
+    configured = os.environ.get("IWIKI_BIN")
+    if configured:
+        return _resolve_executable(Path(configured))
+
+    lookup_failed = False
+    try:
+        discovered = shutil.which("iwiki") or shutil.which("iwiki.exe")
+    except OSError:
+        lookup_failed = True
+        discovered = None
+    if lookup_failed or discovered is None:
+        raise IWikiClientError(
+            IWikiClientErrorCode.NOT_INSTALLED,
+            "iwiki executable was not found",
+        )
+    return _resolve_executable(Path(discovered))
+
+
+def _validate_transport_request(
+    command: str, args: list[str], timeout_seconds: float
+) -> None:
+    if type(command) is not str:
+        raise TypeError("command must be a string")
+    if command not in READ_ONLY_COMMANDS:
+        raise ValueError("command is not available through the read-only transport")
+    if type(args) is not list or not all(type(argument) is str for argument in args):
+        raise TypeError("args must be a list of strings")
+    if command == "index" and (not args or args[0] != "status"):
+        raise ValueError("only index status is available through the read-only transport")
+    if type(timeout_seconds) not in (int, float):
+        raise TypeError("timeout_seconds must be a number")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive and finite")
+
+
+def _safe_process_diagnostic(stderr: str) -> str:
+    truncated = stderr[-MAX_PROCESS_DIAGNOSTIC_LENGTH:]
+    sanitized = _safe_remote_details(truncated)
+    return cast(str, sanitized)
+
+
+class IWikiTransport:
+    def __init__(self, executable: Path):
+        if not isinstance(executable, Path):
+            raise TypeError("executable must be a Path")
+        self.executable = _resolve_executable(executable)
+
+    def run(
+        self, command: str, args: list[str], timeout_seconds: float
+    ) -> IWikiEnvelope:
+        _validate_transport_request(command, args, timeout_seconds)
+        process_args = (str(self.executable), command, *tuple(args))
+        process_failure: IWikiClientErrorCode | None = None
+        try:
+            result = subprocess.run(
+                process_args,
+                capture_output=True,
+                check=False,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=timeout_seconds,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            process_failure = IWikiClientErrorCode.TIMEOUT
+        except (OSError, UnicodeError):
+            process_failure = IWikiClientErrorCode.PROCESS_FAILED
+
+        if process_failure == IWikiClientErrorCode.TIMEOUT:
+            raise IWikiClientError(
+                IWikiClientErrorCode.TIMEOUT,
+                f"iwiki {command} timed out",
+            )
+        if process_failure == IWikiClientErrorCode.PROCESS_FAILED:
+            raise IWikiClientError(
+                IWikiClientErrorCode.PROCESS_FAILED,
+                f"cannot run iwiki {command}",
+            )
+
+        if (
+            type(result.returncode) is not int
+            or type(result.stdout) is not str
+            or type(result.stderr) is not str
+        ):
+            raise IWikiClientError(
+                IWikiClientErrorCode.PROCESS_FAILED,
+                f"iwiki {command} returned an invalid process result",
+            )
+
+        if result.returncode == 0:
+            return parse_envelope(result.stdout, command)
+
+        diagnostics = {
+            "exit_code": result.returncode,
+            "stderr": _safe_process_diagnostic(result.stderr),
+        }
+        try:
+            parse_envelope(result.stdout, command)
+        except IWikiClientError as error:
+            if error.code == IWikiClientErrorCode.REMOTE_ERROR:
+                error.details.update(diagnostics)
+                raise
+        raise IWikiClientError(
+            IWikiClientErrorCode.PROCESS_FAILED,
+            f"iwiki {command} process failed",
+            diagnostics,
+        ) from None
