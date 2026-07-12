@@ -1,0 +1,22 @@
+{
+  "cli_protocol_version": 1,
+  "ok": true,
+  "command": "inspect",
+  "data": {
+    "schema_version": 2,
+    "cli_protocol_version": 1,
+    "workspace_id": "llm-iwiki-main",
+    "name": "LLM Wiki",
+    "read_only": false,
+    "capabilities": ["inspect", "validate", "query_native", "plan_publish", "atomic_publish", "qmd_index"],
+    "paths": {
+      "raw_common": "raw/common",
+      "raw_personal": "raw/personal",
+      "wiki_common": "wiki/common",
+      "wiki_personal": "wiki/personal",
+      "cache": ".cache"
+    },
+    "index": {"state": "missing", "backend": "qmd"}
+  },
+  "error": null
+}

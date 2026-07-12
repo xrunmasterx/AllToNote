@@ -1,0 +1,21 @@
+{
+  "cli_protocol_version": 1,
+  "ok": true,
+  "command": "query",
+  "data": {
+    "scope": "common",
+    "query": "RHI",
+    "items": [
+      {
+        "path": "wiki/common/ue5/rhi/index.md",
+        "scope": "common",
+        "title": "RHI",
+        "score": 12,
+        "snippet": "RHI is the rendering hardware interface.",
+        "updated_at": "2026-07-12T00:00:00+00:00"
+      }
+    ],
+    "index_backend": "native"
+  },
+  "error": null
+}
