@@ -45,7 +45,7 @@ def test_real_iwiki_cli_contract():
     result = client.query(workspace, scope="common", text="RHI", limit=3)
     assert result["query"] == "RHI"
     assert result["scope"] == "common"
-    assert isinstance(result["index_backend"], str)
+    assert result["index_backend"] == "native"
     assert isinstance(result["items"], list)
     assert 1 <= len(result["items"]) <= 3
     for item in result["items"]:
