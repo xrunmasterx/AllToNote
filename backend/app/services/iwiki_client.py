@@ -179,6 +179,16 @@ def _raise_malformed(message: str) -> None:
     raise IWikiClientError(IWikiClientErrorCode.MALFORMED_RESPONSE, message)
 
 
+def _is_protocol_relative_path(value: object) -> bool:
+    if type(value) is not str or not value or "\x00" in value or "\\" in value:
+        return False
+    if value.startswith("/") or value.endswith("/"):
+        return False
+    if re.match(r"[A-Za-z]:", value):
+        return False
+    return all(component not in {"", ".", ".."} for component in value.split("/"))
+
+
 def parse_envelope(stdout: str, expected_command: str) -> IWikiEnvelope:
     payload = _load_single_json_object(stdout)
     required_fields = {"cli_protocol_version", "ok", "command", "data", "error"}
@@ -279,7 +289,8 @@ def parse_inspect_result(envelope: IWikiEnvelope) -> IWikiInspectResult:
     ):
         _raise_malformed("inspect capabilities are invalid")
     if not isinstance(paths, Mapping) or not all(
-        type(key) is str and type(value) is str for key, value in paths.items()
+        type(key) is str and _is_protocol_relative_path(value)
+        for key, value in paths.items()
     ):
         _raise_malformed("inspect paths are invalid")
     if not isinstance(index, Mapping) or set(index) != {
@@ -292,6 +303,8 @@ def parse_inspect_result(envelope: IWikiEnvelope) -> IWikiInspectResult:
         _raise_malformed("inspect index is invalid")
     if not all(type(index[field]) is str for field in ("state", "backend", "database_path")):
         _raise_malformed("inspect index is invalid")
+    if not _is_protocol_relative_path(index["database_path"]):
+        _raise_malformed("inspect paths are invalid")
     if not all(
         index[field] is None or type(index[field]) is str
         for field in ("last_success_at", "error")
@@ -449,9 +462,12 @@ class IWikiTransport:
         try:
             parse_envelope(result.stdout, command)
         except IWikiClientError as error:
-            if error.code == IWikiClientErrorCode.REMOTE_ERROR:
+            if error.code in {
+                IWikiClientErrorCode.REMOTE_ERROR,
+                IWikiClientErrorCode.INCOMPATIBLE_PROTOCOL,
+            }:
                 error.details.update(diagnostics)
-                raise
+                raise error from None
         raise IWikiClientError(
             IWikiClientErrorCode.PROCESS_FAILED,
             f"iwiki {command} process failed",

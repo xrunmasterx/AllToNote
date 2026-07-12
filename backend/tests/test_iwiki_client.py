@@ -456,6 +456,75 @@ def test_parse_inspect_rejects_invalid_index_status(index_status: object):
     assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
 
 
+@pytest.mark.parametrize(
+    "invalid_path",
+    [
+        "",
+        "wiki\\personal",
+        "wiki/personal\\draft",
+        "/wiki/personal",
+        "wiki/personal/",
+        "wiki//personal",
+        "wiki/./personal",
+        "wiki/../personal",
+        "C:/wiki/personal",
+        "C:wiki/personal",
+        "//server/share/wiki",
+        "\\\\server\\share\\wiki",
+        "\\\\?\\C:\\wiki",
+        "\\\\.\\PIPE\\iwiki",
+        "wiki/personal\x00secret",
+    ],
+)
+@pytest.mark.parametrize("field", ["relative_paths", "database_path"])
+def test_parse_inspect_rejects_noncanonical_protocol_relative_paths_without_leaking(
+    field: str, invalid_path: str
+):
+    private = r"C:\Users\private-user\secret-vault"
+    invalid_path = invalid_path.replace("secret", private)
+    overrides: dict[str, object]
+    if field == "relative_paths":
+        overrides = {"relative_paths": {"wiki_personal": invalid_path}}
+    else:
+        index_status = _success_payload()["data"]["index_status"]  # type: ignore[index]
+        assert isinstance(index_status, dict)
+        index_status["database_path"] = invalid_path
+        overrides = {"index_status": index_status}
+
+    with pytest.raises(IWikiClientError) as raised:
+        _parse_inspect_payload(**overrides)
+
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
+    assert raised.value.message == "inspect paths are invalid"
+    assert raised.value.details == {}
+    if invalid_path:
+        assert invalid_path not in str(raised.value)
+        assert invalid_path not in repr(raised.value.details)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "database_path"),
+    [
+        (".cache", ".cache/qmd/llm-iwiki.sqlite"),
+        ("wiki/.generated", "providers/native.sqlite"),
+    ],
+)
+def test_parse_inspect_accepts_canonical_protocol_relative_paths(
+    relative_path: str, database_path: str
+):
+    index_status = _success_payload()["data"]["index_status"]  # type: ignore[index]
+    assert isinstance(index_status, dict)
+    index_status["database_path"] = database_path
+
+    result = _parse_inspect_payload(
+        relative_paths={"provider_value": relative_path},
+        index_status=index_status,
+    )
+
+    assert result.paths == {"provider_value": relative_path}
+    assert result.index["database_path"] == database_path
+
+
 def test_parse_inspect_requires_matching_inner_protocol():
     with pytest.raises(IWikiClientError) as raised:
         _parse_inspect_payload(cli_protocol_version=2)
@@ -872,6 +941,37 @@ def test_nonzero_diagnostic_is_truncated_before_attachment(monkeypatch, tmp_path
 
     assert raised.value.code == IWikiClientErrorCode.REMOTE_ERROR
     assert raised.value.details["stderr"] == "a" * 4000
+
+
+def test_nonzero_incompatible_protocol_preserves_protocol_error_with_safe_diagnostics(
+    monkeypatch, tmp_path: Path
+):
+    binary = tmp_path / "iwiki.exe"
+    binary.write_bytes(b"")
+    private = r"C:\Users\private-user\secret-vault"
+    payload = _success_payload()
+    payload["cli_protocol_version"] = 2
+    monkeypatch.setattr(
+        "app.services.iwiki_client.subprocess.run",
+        lambda args, **kwargs: CompletedProcess(
+            args, 9, json.dumps(payload), f"cannot read {private}"
+        ),
+    )
+
+    with pytest.raises(IWikiClientError) as raised:
+        IWikiTransport(binary).run("inspect", [], 10)
+
+    assert raised.value.code == IWikiClientErrorCode.INCOMPATIBLE_PROTOCOL
+    assert raised.value.details == {
+        "expected": 1,
+        "actual": 2,
+        "exit_code": 9,
+        "stderr": "<redacted>",
+    }
+    assert private not in str(raised.value)
+    assert private not in repr(raised.value.details)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @pytest.mark.parametrize("stdout", ["not-json", json.dumps(_success_payload())])

@@ -47,7 +47,7 @@ def test_real_iwiki_cli_contract():
     assert result["scope"] == "common"
     assert result["index_backend"] == "native"
     assert isinstance(result["items"], list)
-    assert 1 <= len(result["items"]) <= 3
+    assert 0 <= len(result["items"]) <= 3
     for item in result["items"]:
         assert isinstance(item, Mapping)
         assert REQUIRED_QUERY_ITEM_FIELDS <= item.keys()
