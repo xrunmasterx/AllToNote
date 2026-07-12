@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections.abc import Mapping
 import json
 import sys
 
@@ -27,10 +28,30 @@ def _success_payload(**data_overrides: object) -> dict[str, object]:
         "cli_protocol_version": 1,
         "workspace_id": "llm-iwiki-main",
         "name": "LLM Wiki",
+        "description": "Personal and shared Markdown knowledge workspace.",
         "read_only": False,
         "capabilities": ["inspect", "validate", "query_native", "qmd_index"],
-        "paths": {"wiki_common": "wiki/common", "wiki_personal": "wiki/personal"},
-        "index": {"state": "missing", "backend": "qmd"},
+        "relative_paths": {
+            "cache": ".cache",
+            "raw_common": "raw/common",
+            "raw_personal": "raw/personal",
+            "wiki_common": "wiki/common",
+            "wiki_personal": "wiki/personal",
+        },
+        "index_status": {
+            "state": "missing",
+            "backend": "qmd",
+            "database_path": ".cache/qmd/llm-iwiki.sqlite",
+            "last_success_at": None,
+            "error": None,
+        },
+        "defaults": {
+            "encoding": "utf-8",
+            "link_style": "wikilink",
+            "publish_scope": "personal",
+            "visibility": "private",
+        },
+        "supported_schema_versions": [2],
     }
     data.update(data_overrides)
     return {
@@ -56,6 +77,46 @@ def test_parse_inspect_success_fixture():
     assert result.cli_protocol_version == 1
     assert result.capabilities >= {"inspect", "validate", "query_native", "qmd_index"}
     assert isinstance(result.capabilities, frozenset)
+    assert result.paths["wiki_personal"] == "wiki/personal"
+    assert result.index == {
+        "backend": "qmd",
+        "database_path": ".cache/qmd/llm-iwiki.sqlite",
+        "error": None,
+        "last_success_at": None,
+        "state": "missing",
+    }
+
+
+def test_parse_inspect_replays_provider_v1_wire_contract_without_aliases():
+    stdout = (FIXTURES / "inspect-success.json").read_text(encoding="utf-8")
+    envelope = parse_envelope(stdout, "inspect")
+    result = parse_inspect_result(envelope)
+    assert "relative_paths" in envelope.data
+    assert "index_status" in envelope.data
+    assert "paths" not in envelope.data
+    assert "index" not in envelope.data
+    assert result.paths == envelope.data["relative_paths"]
+    assert result.index == envelope.data["index_status"]
+
+
+def test_parse_inspect_rejects_obsolete_paths_and_index_aliases():
+    payload = _success_payload()
+    data = payload["data"]
+    data["paths"] = data.pop("relative_paths")  # type: ignore[union-attr]
+    data["index"] = data.pop("index_status")  # type: ignore[union-attr]
+    envelope = parse_envelope(json.dumps(payload), "inspect")
+    with pytest.raises(IWikiClientError) as raised:
+        parse_inspect_result(envelope)
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
+
+
+def test_parse_inspect_rejects_obsolete_aliases_even_with_current_wire_fields():
+    payload = _success_payload()
+    payload["data"]["paths"] = {"wiki_common": "wrong"}  # type: ignore[index]
+    envelope = parse_envelope(json.dumps(payload), "inspect")
+    with pytest.raises(IWikiClientError) as raised:
+        parse_inspect_result(envelope)
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
 
 
 @pytest.mark.parametrize("stdout", ["", "not-json", "{}", "[]", '{"cli_protocol_version": 2}'])
@@ -84,6 +145,34 @@ def test_parse_envelope_requires_one_strict_json_object(stdout: str):
     with pytest.raises(IWikiClientError) as raised:
         parse_envelope(stdout, "inspect")
     assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
+
+
+@pytest.mark.parametrize(
+    "number",
+    ["1e999", "-1e999", "[1, {\"nested\": 1e999}]"],
+)
+def test_parse_envelope_rejects_nonfinite_json_floats(number: str):
+    stdout = (
+        '{"cli_protocol_version":1,"ok":true,"command":"inspect",'
+        f'"data":{{"value":{number}}},"error":null}}'
+    )
+    with pytest.raises(IWikiClientError) as raised:
+        parse_envelope(stdout, "inspect")
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_parse_envelope_converts_decoder_recursion_to_safe_malformed_response():
+    private = r"C:\Users\private-user\secret-vault"
+    stdout = "[" * 2000 + json.dumps(private) + "]" * 2000
+    with pytest.raises(IWikiClientError) as raised:
+        parse_envelope(stdout, "inspect")
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
+    assert private not in str(raised.value)
+    assert private not in repr(raised.value.details)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -205,6 +294,70 @@ def test_remote_errors_redact_private_paths():
     }
 
 
+@pytest.mark.parametrize(
+    "private_path",
+    [
+        r"C:relative\secret",
+        r"C:\absolute\secret",
+        r"C:/absolute/secret",
+        r"\\server\share\secret",
+        r"\\?\C:\extended\secret",
+        r"\\.\PIPE\secret",
+        r"\rooted\secret",
+        "/home/private/secret",
+    ],
+)
+def test_remote_errors_redact_all_supported_private_path_forms(private_path: str):
+    payload = _success_payload()
+    payload.update(
+        ok=False,
+        data=None,
+        error={
+            "code": "invalid_workspace",
+            "message": f"cannot read {private_path}",
+            "details": {
+                "paths": [private_path],
+                private_path: "private key",
+            },
+        },
+    )
+    with pytest.raises(IWikiClientError) as raised:
+        parse_envelope(json.dumps(payload), "inspect")
+    assert raised.value.code == IWikiClientErrorCode.REMOTE_ERROR
+    assert private_path not in str(raised.value)
+    assert private_path not in repr(raised.value.details)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raised.value.details["remote_details"] == {
+        "paths": ["<redacted>"],
+        "<redacted>": "private key",
+    }
+
+
+def test_remote_detail_sanitizer_rejects_excessive_nesting_without_leaking():
+    private = r"C:\Users\private-user\secret-vault"
+    nested: object = private
+    for _ in range(80):
+        nested = {"next": nested}
+    payload = _success_payload()
+    payload.update(
+        ok=False,
+        data=None,
+        error={
+            "code": "invalid_workspace",
+            "message": f"cannot read {private}",
+            "details": {"nested": nested},
+        },
+    )
+    with pytest.raises(IWikiClientError) as raised:
+        parse_envelope(json.dumps(payload), "inspect")
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
+    assert private not in str(raised.value)
+    assert private not in repr(raised.value.details)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_remote_error_code_must_be_a_safe_identifier():
     private = r"C:\\Users\\private-user\\secret-vault"
     payload = _success_payload()
@@ -227,10 +380,13 @@ def test_remote_error_code_must_be_a_safe_identifier():
         ("cli_protocol_version", True),
         ("workspace_id", 1),
         ("name", 1),
+        ("description", 1),
         ("read_only", 0),
         ("capabilities", ["inspect", 1]),
-        ("paths", {"wiki_common": 1}),
-        ("index", []),
+        ("relative_paths", {"wiki_common": 1}),
+        ("index_status", []),
+        ("defaults", []),
+        ("supported_schema_versions", [True]),
     ],
 )
 def test_parse_inspect_rejects_invalid_required_field_types(field: str, value: object):
@@ -246,10 +402,13 @@ def test_parse_inspect_rejects_invalid_required_field_types(field: str, value: o
         "cli_protocol_version",
         "workspace_id",
         "name",
+        "description",
         "read_only",
         "capabilities",
-        "paths",
-        "index",
+        "relative_paths",
+        "index_status",
+        "defaults",
+        "supported_schema_versions",
     ],
 )
 def test_parse_inspect_requires_all_fields(missing: str):
@@ -262,16 +421,33 @@ def test_parse_inspect_requires_all_fields(missing: str):
 
 
 @pytest.mark.parametrize(
-    "index",
+    "index_status",
     [
-        {"state": 1, "backend": "qmd"},
-        {"state": "missing", "backend": 1},
-        {1: "missing", "backend": "qmd"},
+        {
+            "state": 1,
+            "backend": "qmd",
+            "database_path": ".cache/qmd.sqlite",
+            "last_success_at": None,
+            "error": None,
+        },
+        {
+            "state": "missing",
+            "backend": "qmd",
+            "database_path": ".cache/qmd.sqlite",
+            "last_success_at": 1,
+            "error": None,
+        },
+        {
+            "state": "missing",
+            "backend": "qmd",
+            "database_path": ".cache/qmd.sqlite",
+            "last_success_at": None,
+        },
     ],
 )
-def test_parse_inspect_rejects_non_string_index_entries(index: object):
+def test_parse_inspect_rejects_invalid_index_status(index_status: object):
     with pytest.raises(IWikiClientError) as raised:
-        _parse_inspect_payload(index=index)
+        _parse_inspect_payload(index_status=index_status)
     assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
 
 
@@ -314,8 +490,18 @@ def test_parse_inspect_rejects_older_schema():
 def test_parse_inspect_does_not_alias_mutable_envelope_data():
     capabilities = ["inspect"]
     paths = {"wiki_common": "wiki/common"}
-    index = {"state": "missing", "backend": "qmd"}
-    data = _success_payload(capabilities=capabilities, paths=paths, index=index)["data"]
+    index = {
+        "state": "missing",
+        "backend": "qmd",
+        "database_path": ".cache/qmd.sqlite",
+        "last_success_at": None,
+        "error": None,
+    }
+    data = _success_payload(
+        capabilities=capabilities,
+        relative_paths=paths,
+        index_status=index,
+    )["data"]
     envelope = IWikiEnvelope(1, "inspect", data)  # type: ignore[arg-type]
 
     result = parse_inspect_result(envelope)
@@ -325,4 +511,29 @@ def test_parse_inspect_does_not_alias_mutable_envelope_data():
 
     assert result.capabilities == frozenset({"inspect"})
     assert result.paths == {"wiki_common": "wiki/common"}
-    assert result.index == {"state": "missing", "backend": "qmd"}
+    assert result.index == {
+        "state": "missing",
+        "backend": "qmd",
+        "database_path": ".cache/qmd.sqlite",
+        "last_success_at": None,
+        "error": None,
+    }
+
+
+def test_protocol_models_are_deeply_immutable():
+    query = (FIXTURES / "query-success.json").read_text(encoding="utf-8")
+    envelope = parse_envelope(query, "query")
+    assert isinstance(envelope.data, Mapping)
+    assert isinstance(envelope.data["items"], tuple)
+    with pytest.raises(TypeError):
+        envelope.data["scope"] = "personal"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        envelope.data["items"][0]["path"] = "private.md"  # type: ignore[index]
+
+    result = _parse_inspect_payload()
+    assert isinstance(result.paths, Mapping)
+    assert isinstance(result.index, Mapping)
+    with pytest.raises(TypeError):
+        result.paths["wiki_common"] = "changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.index["state"] = "ready"  # type: ignore[index]
