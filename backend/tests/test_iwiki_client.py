@@ -8,12 +8,12 @@ import sys
 
 import pytest
 
-
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.services.iwiki_client import (
+    IWikiClient,
     IWikiTransport,
     IWikiClientError,
     IWikiClientErrorCode,
@@ -924,6 +924,339 @@ def test_stderr_is_diagnostic_only_and_is_not_parsed(monkeypatch, tmp_path: Path
 
     envelope = IWikiTransport(binary).run("inspect", [], 10)
     assert envelope.command == "inspect"
+
+
+class FakeTransport:
+    def __init__(self, responses: dict[str, object]):
+        self.responses = responses
+        self.calls: list[tuple[str, tuple[str, ...], float]] = []
+
+    def run(
+        self, command: str, args: list[str], timeout_seconds: float
+    ) -> IWikiEnvelope:
+        self.calls.append((command, tuple(args), timeout_seconds))
+        response = self.responses[command]
+        if isinstance(response, IWikiEnvelope):
+            return response
+        assert isinstance(response, Mapping)
+        return IWikiEnvelope(1, command, response)
+
+
+def _inspect_data(
+    capabilities: list[str], *, schema_version: int = 2, read_only: bool = False
+) -> dict[str, object]:
+    payload = _success_payload(
+        capabilities=capabilities,
+        schema_version=schema_version,
+        read_only=read_only,
+    )
+    data = payload["data"]
+    assert isinstance(data, dict)
+    return data
+
+
+def test_read_only_client_exposes_the_frozen_public_surface():
+    assert all(
+        callable(getattr(IWikiClient, method, None))
+        for method in ("discover", "inspect", "validate", "query", "index_status")
+    )
+
+
+def test_client_inspect_uses_exact_argv_timeout_and_typed_result(tmp_path: Path):
+    transport = FakeTransport({"inspect": _inspect_data(["inspect"])})
+    client = IWikiClient(transport)
+
+    result = client.inspect(tmp_path)
+
+    assert result.workspace_id == "llm-iwiki-main"
+    assert transport.calls == [
+        ("inspect", ("--workspace", str(tmp_path.resolve()), "--json"), 10)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "capability", "response", "expected_args", "timeout"),
+    [
+        (
+            "validate",
+            "validate",
+            {"valid": True, "errors": []},
+            None,
+            30,
+        ),
+        (
+            "query",
+            "query_native",
+            {"scope": "personal", "items": []},
+            ("--scope", "personal", "--text", "daily", "--limit", "5"),
+            30,
+        ),
+        (
+            "index",
+            "qmd_index",
+            {"state": "ready", "backend": "qmd"},
+            ("status",),
+            10,
+        ),
+    ],
+)
+def test_client_read_only_methods_negotiate_once_then_use_exact_argv(
+    tmp_path: Path,
+    method_name: str,
+    capability: str,
+    response: dict[str, object],
+    expected_args: tuple[str, ...] | None,
+    timeout: int,
+):
+    command = "index" if method_name == "index" else method_name
+    transport = FakeTransport(
+        {
+            "inspect": _inspect_data(["inspect", capability]),
+            command: response,
+        }
+    )
+    client = IWikiClient(transport)
+
+    if method_name == "query":
+        result = client.query(tmp_path, scope="personal", text="daily", limit=5)
+    elif method_name == "index":
+        result = client.index_status(tmp_path)
+    else:
+        result = client.validate(tmp_path)
+
+    workspace_args = ("--workspace", str(tmp_path.resolve()))
+    if expected_args is None:
+        target_args = workspace_args + ("--json",)
+    elif command == "index":
+        target_args = expected_args + workspace_args + ("--json",)
+    else:
+        target_args = workspace_args + expected_args + ("--json",)
+    assert isinstance(result, dict)
+    assert transport.calls == [
+        ("inspect", workspace_args + ("--json",), 10),
+        (command, target_args, timeout),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "capability"),
+    [
+        ("validate", "validate"),
+        ("query", "query_native"),
+        ("index_status", "qmd_index"),
+    ],
+)
+def test_missing_capability_stops_before_target_without_leaking_workspace(
+    tmp_path: Path, method_name: str, capability: str
+):
+    transport = FakeTransport({"inspect": _inspect_data(["inspect"])})
+    client = IWikiClient(transport)
+
+    with pytest.raises(IWikiClientError) as raised:
+        if method_name == "query":
+            client.query(tmp_path, scope="common", text="rhi")
+        else:
+            getattr(client, method_name)(tmp_path)
+
+    assert raised.value.code == IWikiClientErrorCode.MISSING_CAPABILITY
+    assert raised.value.details == {"capability": capability}
+    assert str(tmp_path) not in str(raised.value)
+    assert str(tmp_path) not in repr(raised.value.details)
+    assert [call[0] for call in transport.calls] == ["inspect"]
+
+
+def test_client_discover_uses_existing_executable_discovery(monkeypatch, tmp_path: Path):
+    binary = tmp_path / "iwiki.exe"
+    binary.write_bytes(b"")
+    monkeypatch.setenv("IWIKI_BIN", str(binary))
+
+    client = IWikiClient.discover()
+
+    assert isinstance(client.transport, IWikiTransport)
+    assert client.transport.executable == binary.resolve()
+
+
+@pytest.mark.parametrize("method_name", ["inspect", "validate", "query", "index_status"])
+@pytest.mark.parametrize("workspace", [None, "C:/private/wiki", 1, True])
+def test_client_methods_require_an_actual_path_before_transport(
+    method_name: str, workspace: object
+):
+    transport = FakeTransport({})
+    client = IWikiClient(transport)
+
+    with pytest.raises(TypeError):
+        if method_name == "query":
+            client.query(workspace, scope="common", text="x")  # type: ignore[arg-type]
+        else:
+            getattr(client, method_name)(workspace)
+
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("failing_method", ["expanduser", "resolve"])
+def test_workspace_resolution_failures_are_typed_generic_and_private(
+    monkeypatch, tmp_path: Path, failing_method: str
+):
+    private = r"C:\Users\private-user\secret-vault"
+
+    def fail(*args, **kwargs):
+        raise OSError(private)
+
+    monkeypatch.setattr(Path, failing_method, fail)
+    transport = FakeTransport({})
+    client = IWikiClient(transport)
+
+    with pytest.raises(IWikiClientError) as raised:
+        client.inspect(tmp_path)
+
+    assert raised.value.code == IWikiClientErrorCode.PROCESS_FAILED
+    assert raised.value.details == {}
+    assert private not in str(raised.value)
+    assert private not in repr(raised.value.details)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert transport.calls == []
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error_type"),
+    [
+        ({"scope": None, "text": "x", "limit": 20}, TypeError),
+        ({"scope": 1, "text": "x", "limit": 20}, TypeError),
+        ({"scope": True, "text": "x", "limit": 20}, TypeError),
+        ({"scope": _StringSubclass("common"), "text": "x", "limit": 20}, TypeError),
+        ({"scope": "raw", "text": "x", "limit": 20}, ValueError),
+        ({"scope": "common", "text": None, "limit": 20}, TypeError),
+        ({"scope": "common", "text": 1, "limit": 20}, TypeError),
+        ({"scope": "common", "text": True, "limit": 20}, TypeError),
+        ({"scope": "common", "text": _StringSubclass("x"), "limit": 20}, TypeError),
+        ({"scope": "common", "text": "", "limit": 20}, ValueError),
+        ({"scope": "common", "text": " \t\r\n", "limit": 20}, ValueError),
+        ({"scope": "common", "text": "x", "limit": True}, TypeError),
+        ({"scope": "common", "text": "x", "limit": 20.0}, TypeError),
+        ({"scope": "common", "text": "x", "limit": "20"}, TypeError),
+        ({"scope": "common", "text": "x", "limit": _IntSubclass(20)}, TypeError),
+        ({"scope": "common", "text": "x", "limit": 0}, ValueError),
+        ({"scope": "common", "text": "x", "limit": 101}, ValueError),
+    ],
+)
+def test_query_rejects_invalid_exact_type_parameters_before_inspection(
+    tmp_path: Path, kwargs: dict[str, object], error_type: type[Exception]
+):
+    transport = FakeTransport({})
+    client = IWikiClient(transport)
+
+    with pytest.raises(error_type):
+        client.query(tmp_path, **kwargs)  # type: ignore[arg-type]
+
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("scope", ["common", "personal", "combined"])
+def test_query_accepts_only_the_provider_scopes(tmp_path: Path, scope: str):
+    transport = FakeTransport(
+        {
+            "inspect": _inspect_data(["inspect", "query_native"]),
+            "query": {"scope": scope, "items": []},
+        }
+    )
+    client = IWikiClient(transport)
+
+    result = client.query(tmp_path, scope=scope, text=" x ", limit=1)
+
+    assert result["scope"] == scope
+    assert transport.calls[-1][1] == (
+        "--workspace",
+        str(tmp_path.resolve()),
+        "--scope",
+        scope,
+        "--text",
+        " x ",
+        "--limit",
+        "1",
+        "--json",
+    )
+
+
+def test_newer_read_only_schema_can_use_negotiated_read_methods(tmp_path: Path):
+    transport = FakeTransport(
+        {
+            "inspect": _inspect_data(
+                ["inspect", "validate"], schema_version=3, read_only=True
+            ),
+            "validate": {"valid": True},
+        }
+    )
+
+    result = IWikiClient(transport).validate(tmp_path)
+
+    assert result == {"valid": True}
+    assert [call[0] for call in transport.calls] == ["inspect", "validate"]
+
+
+def test_client_returns_deep_mutable_copies_without_aliasing_transport_data(
+    tmp_path: Path,
+):
+    query_envelope = IWikiEnvelope(
+        1,
+        "query",
+        {"items": [{"path": "wiki/personal/a.md", "tags": ["daily"]}]},
+    )
+    transport = FakeTransport(
+        {
+            "inspect": _inspect_data(["inspect", "query_native"]),
+            "query": query_envelope,
+        }
+    )
+    client = IWikiClient(transport)
+
+    first = client.query(tmp_path, scope="personal", text="daily")
+    first_items = first["items"]
+    assert isinstance(first_items, list)
+    assert isinstance(first_items[0], dict)
+    assert isinstance(first_items[0]["tags"], list)
+    first_items[0]["tags"].append("changed")
+    first_items.append({"path": "injected.md"})
+
+    second = client.query(tmp_path, scope="personal", text="daily")
+    assert second == {
+        "items": [{"path": "wiki/personal/a.md", "tags": ["daily"]}]
+    }
+    assert isinstance(query_envelope.data, Mapping)
+    frozen_items = query_envelope.data["items"]
+    assert isinstance(frozen_items, tuple)
+    assert frozen_items[0]["tags"] == ("daily",)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        IWikiEnvelope(1, "validate", {"items": []}),
+        IWikiEnvelope(1, "query", ["not", "an", "object"]),  # type: ignore[arg-type]
+    ],
+)
+def test_client_rejects_wrong_command_or_non_object_target_data(
+    tmp_path: Path, response: IWikiEnvelope
+):
+    transport = FakeTransport(
+        {
+            "inspect": _inspect_data(["inspect", "query_native"]),
+            "query": response,
+        }
+    )
+
+    with pytest.raises(IWikiClientError) as raised:
+        IWikiClient(transport).query(tmp_path, scope="common", text="x")
+
+    assert raised.value.code == IWikiClientErrorCode.MALFORMED_RESPONSE
 
 
 @pytest.mark.skipif(os.name == "nt", reason="portable temp executables require POSIX")

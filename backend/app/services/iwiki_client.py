@@ -457,3 +457,126 @@ class IWikiTransport:
             f"iwiki {command} process failed",
             diagnostics,
         ) from None
+
+
+class IWikiClient:
+    def __init__(self, transport: IWikiTransport):
+        self.transport = transport
+
+    @classmethod
+    def discover(cls) -> "IWikiClient":
+        return cls(IWikiTransport(discover_iwiki_bin()))
+
+    @staticmethod
+    def _workspace_path(workspace: Path) -> Path:
+        if not isinstance(workspace, Path):
+            raise TypeError("workspace must be a Path")
+        resolved: Path | None = None
+        try:
+            resolved = workspace.expanduser().resolve()
+        except (OSError, RuntimeError):
+            pass
+        if resolved is None:
+            raise IWikiClientError(
+                IWikiClientErrorCode.PROCESS_FAILED,
+                "cannot resolve iwiki workspace",
+            )
+        return resolved
+
+    def _inspect_resolved(self, workspace: Path) -> IWikiInspectResult:
+        envelope = self.transport.run(
+            "inspect",
+            ["--workspace", str(workspace), "--json"],
+            10,
+        )
+        return parse_inspect_result(envelope)
+
+    def inspect(self, workspace: Path) -> IWikiInspectResult:
+        return self._inspect_resolved(self._workspace_path(workspace))
+
+    def _require(self, workspace: Path, capability: str) -> None:
+        inspected = self._inspect_resolved(workspace)
+        if capability not in inspected.capabilities:
+            raise IWikiClientError(
+                IWikiClientErrorCode.MISSING_CAPABILITY,
+                f"iwiki capability is missing: {capability}",
+                {"capability": capability},
+            )
+
+    @staticmethod
+    def _data(envelope: IWikiEnvelope, expected_command: str) -> dict[str, object]:
+        if envelope.command != expected_command:
+            _raise_malformed("iwiki command does not match request")
+        if not isinstance(envelope.data, Mapping):
+            _raise_malformed("iwiki success response data must be an object")
+        return {
+            key: IWikiClient._thaw(value)
+            for key, value in envelope.data.items()
+        }
+
+    @staticmethod
+    def _thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {key: IWikiClient._thaw(item) for key, item in value.items()}
+        if type(value) is tuple:
+            return [IWikiClient._thaw(item) for item in value]
+        return value
+
+    def validate(self, workspace: Path) -> dict[str, object]:
+        resolved = self._workspace_path(workspace)
+        self._require(resolved, "validate")
+        envelope = self.transport.run(
+            "validate",
+            ["--workspace", str(resolved), "--json"],
+            30,
+        )
+        return self._data(envelope, "validate")
+
+    def query(
+        self,
+        workspace: Path,
+        *,
+        scope: str,
+        text: str,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        if type(scope) is not str:
+            raise TypeError("scope must be a string")
+        if scope not in {"common", "personal", "combined"}:
+            raise ValueError("scope must be common, personal, or combined")
+        if type(text) is not str:
+            raise TypeError("text must be a string")
+        if not text.strip():
+            raise ValueError("text must not be empty")
+        if type(limit) is not int:
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        resolved = self._workspace_path(workspace)
+        self._require(resolved, "query_native")
+        envelope = self.transport.run(
+            "query",
+            [
+                "--workspace",
+                str(resolved),
+                "--scope",
+                scope,
+                "--text",
+                text,
+                "--limit",
+                str(limit),
+                "--json",
+            ],
+            30,
+        )
+        return self._data(envelope, "query")
+
+    def index_status(self, workspace: Path) -> dict[str, object]:
+        resolved = self._workspace_path(workspace)
+        self._require(resolved, "qmd_index")
+        envelope = self.transport.run(
+            "index",
+            ["status", "--workspace", str(resolved), "--json"],
+            10,
+        )
+        return self._data(envelope, "index")
