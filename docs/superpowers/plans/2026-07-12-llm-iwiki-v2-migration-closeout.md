@@ -89,9 +89,10 @@ Create `docs/superpowers/reports/2026-07-12-v2-migration-closeout.md` with this 
 
 ## Commit Groups
 
-1. Runtime and contract tests.
-2. Architecture docs, agent rules, and command help.
-3. Canonical raw/wiki data migration and deletion of tracked generated artifacts.
+1. Baseline closeout report.
+2. Runtime and contract tests.
+3. Architecture docs, agent rules, and command help.
+4. Canonical raw/wiki data migration and deletion of tracked generated artifacts.
 
 ## Explicit Exclusions
 
@@ -119,6 +120,18 @@ if ($matches) { $matches; exit 1 }
 ```
 
 Expected: exit 0 with no output.
+
+- [ ] **Step 5: Commit the reviewed baseline report**
+
+Run:
+
+```powershell
+git add -- docs/superpowers/reports/2026-07-12-v2-migration-closeout.md
+git diff --cached --check
+git commit -m "docs: record v2 migration baseline"
+```
+
+Expected: one documentation-only commit containing exactly the closeout report. This gives Task 1 an independently reviewable commit and prevents its evidence from being mixed into later runtime or data commits.
 
 ## Task 2: Gate the Migrated Tree Against Data Loss and Leakage
 
@@ -387,7 +400,7 @@ Run:
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
 python tools/lint.py
-git diff --check HEAD~3..HEAD
+git diff --check HEAD~4..HEAD
 ```
 
 Expected: all tests pass, lint is clean under the documented policy, and diff check exits 0.
@@ -424,4 +437,4 @@ git rev-parse HEAD
 git log -3 --oneline
 ```
 
-Expected: three reviewable commits for runtime/tests, docs/rules, and canonical data. Use this exact final hash as the base when creating the Phase 1 worktree.
+Expected: four reviewable commits for the baseline report, runtime/tests, docs/rules, and canonical data. Use this exact final hash as the base when creating the Phase 1 worktree.
