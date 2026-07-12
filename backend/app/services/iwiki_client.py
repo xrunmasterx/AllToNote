@@ -415,7 +415,7 @@ class IWikiTransport:
             )
         except subprocess.TimeoutExpired:
             process_failure = IWikiClientErrorCode.TIMEOUT
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, ValueError):
             process_failure = IWikiClientErrorCode.PROCESS_FAILED
 
         if process_failure == IWikiClientErrorCode.TIMEOUT:

@@ -795,6 +795,31 @@ def test_transport_process_failures_are_typed_and_generic(
     assert raised.value.__context__ is None
 
 
+def test_transport_converts_nul_argument_valueerror_without_leaking_argv(
+    monkeypatch, tmp_path: Path
+):
+    binary = tmp_path / "iwiki.exe"
+    binary.write_bytes(b"")
+    private = r"C:\Users\private-user\secret-vault"
+    argument = private + "\x00suffix"
+    monkeypatch.setattr(
+        "app.services.iwiki_client.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError(f"embedded null byte in {args[0]!r}")
+        ),
+    )
+
+    with pytest.raises(IWikiClientError) as raised:
+        IWikiTransport(binary).run("inspect", ["--workspace", argument], 10)
+
+    assert raised.value.code == IWikiClientErrorCode.PROCESS_FAILED
+    assert private not in str(raised.value)
+    assert private not in repr(raised.value.details)
+    assert raised.value.details == {}
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def _remote_error_payload(command: str = "inspect") -> str:
     return json.dumps(
         {
