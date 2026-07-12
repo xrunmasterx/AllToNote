@@ -285,6 +285,27 @@ pnpm dev
 
 访问：`http://localhost:3015`
 
+### llm-iwiki development contract
+
+AllToNote talks to llm-iwiki only through the stable `iwiki` CLI protocol. It does
+not import llm-iwiki Python internals, expose an llm-iwiki HTTP API, or enable any
+llm-iwiki write operation. The current client surface is limited to `inspect`,
+`validate`, read-only `query`, and index `status`.
+
+1. Install a compatible CLI, for example:
+   `python -m pip install -e <llm-iwiki-worktree>`.
+2. Ensure `iwiki` is on `PATH`, or optionally set `IWIKI_BIN` to the absolute path
+   of the `iwiki` executable.
+3. Set `IWIKI_TEST_WORKSPACE` to a schema-v2 workspace when running the opt-in
+   cross-repository test.
+4. Run `cd backend && pytest tests/test_iwiki_contract_e2e.py -v`.
+
+If `IWIKI_TEST_WORKSPACE` is unset, the contract test skips without discovering or
+executing `iwiki`, so ordinary CI does not depend on a developer checkout. This
+consumer foundation was validated against llm-iwiki provider commit
+`2b6db8589fb592067856271313d7e232e87b7aa3`; that commit records the validated
+compatibility base, not a required local filesystem path.
+
 ## ⚙️ 依赖说明
 
 ### 🎬 FFmpeg
