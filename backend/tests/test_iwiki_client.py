@@ -469,6 +469,10 @@ def test_parse_inspect_rejects_invalid_index_status(index_status: object):
         "wiki/../personal",
         "C:/wiki/personal",
         "C:wiki/personal",
+        "wiki/C:/private",
+        "file:C:/private",
+        "https:private",
+        "wiki/http:private",
         "//server/share/wiki",
         "\\\\server\\share\\wiki",
         "\\\\?\\C:\\wiki",
@@ -507,6 +511,7 @@ def test_parse_inspect_rejects_noncanonical_protocol_relative_paths_without_leak
     [
         (".cache", ".cache/qmd/llm-iwiki.sqlite"),
         ("wiki/.generated", "providers/native.sqlite"),
+        ("知识库/个人", ".cache/索引.sqlite"),
     ],
 )
 def test_parse_inspect_accepts_canonical_protocol_relative_paths(

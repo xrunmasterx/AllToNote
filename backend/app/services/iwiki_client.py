@@ -180,11 +180,15 @@ def _raise_malformed(message: str) -> None:
 
 
 def _is_protocol_relative_path(value: object) -> bool:
-    if type(value) is not str or not value or "\x00" in value or "\\" in value:
+    if (
+        type(value) is not str
+        or not value
+        or "\x00" in value
+        or "\\" in value
+        or ":" in value
+    ):
         return False
     if value.startswith("/") or value.endswith("/"):
-        return False
-    if re.match(r"[A-Za-z]:", value):
         return False
     return all(component not in {"", ".", ".."} for component in value.split("/"))
 
