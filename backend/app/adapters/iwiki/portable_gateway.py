@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import OrderedDict
 from importlib import metadata, resources
 from pathlib import Path
 from threading import Lock
@@ -36,6 +37,11 @@ _RUNTIME_LOCK_KEYS = frozenset(
 )
 
 _TRUSTED_IWIKI_DISTRIBUTION = "llm-iwiki"
+_CONSUMED_TOMBSTONE_LIMIT = 128
+_CLAIM_ACQUIRED = 1
+_CLAIM_IN_PROGRESS = 2
+_CLAIM_CONSUMED = 3
+_CLAIM_UNKNOWN = 4
 _COMPATIBILITY_ERRORS = (
     AttributeError,
     ImportError,
@@ -194,18 +200,36 @@ def _open_locked_workspace(
 class IWikiPortableGateway:
     def __init__(self) -> None:
         self._prepared: dict[int, tuple[PreparedBundle, Path]] = {}
+        self._claimed: dict[int, PreparedBundle] = {}
+        self._consumed: OrderedDict[int, PreparedBundle] = OrderedDict()
         self._prepared_lock = Lock()
 
     def _claim_prepared(
         self,
         prepared: PreparedBundle,
-    ) -> tuple[PreparedBundle, Path] | None:
+    ) -> tuple[int, tuple[PreparedBundle, Path] | None]:
+        prepared_id = id(prepared)
         with self._prepared_lock:
-            binding = self._prepared.get(id(prepared))
-            if binding is None or binding[0] is not prepared:
-                return None
-            del self._prepared[id(prepared)]
-            return binding
+            binding = self._prepared.get(prepared_id)
+            if binding is not None and binding[0] is prepared:
+                del self._prepared[prepared_id]
+                self._claimed[prepared_id] = prepared
+                return _CLAIM_ACQUIRED, binding
+            if self._claimed.get(prepared_id) is prepared:
+                return _CLAIM_IN_PROGRESS, None
+            if self._consumed.get(prepared_id) is prepared:
+                self._consumed.move_to_end(prepared_id)
+                return _CLAIM_CONSUMED, None
+            return _CLAIM_UNKNOWN, None
+
+    def _finish_prepared(self, prepared: PreparedBundle) -> None:
+        prepared_id = id(prepared)
+        with self._prepared_lock:
+            claimed = self._claimed.pop(prepared_id)
+            assert claimed is prepared
+            self._consumed[prepared_id] = prepared
+            if len(self._consumed) > _CONSUMED_TOMBSTONE_LIMIT:
+                self._consumed.popitem(last=False)
 
     @staticmethod
     def _close_prepared(prepared: PreparedBundle) -> None:
@@ -264,36 +288,40 @@ class IWikiPortableGateway:
     def commit_prepared(self, prepared: PreparedBundle) -> CommitResult:
         if not isinstance(prepared, PreparedBundle):
             raise _prepared_bundle_invalid()
-        binding = self._claim_prepared(prepared)
-        if binding is None:
+        claim_state, binding = self._claim_prepared(prepared)
+        if claim_state != _CLAIM_ACQUIRED or binding is None:
             raise _prepared_bundle_invalid()
         try:
             _open_locked_workspace(binding[1])
             try:
-                return commit_prepared_bundle(prepared)
+                result = commit_prepared_bundle(prepared)
             except IWikiError as error:
                 if error.code is ErrorCode.INVALID_ARGUMENT:
                     raise _prepared_bundle_invalid() from None
                 raise _map_iwiki_error(error) from None
             except _COMPATIBILITY_ERRORS:
                 raise _contract_incompatible() from None
-        finally:
+        except BaseException:
+            try:
+                self._close_prepared(prepared)
+            except Exception:
+                pass
+            raise
+        else:
             self._close_prepared(prepared)
+            return result
+        finally:
+            self._finish_prepared(prepared)
 
     def discard_prepared(self, prepared: PreparedBundle) -> None:
         if not isinstance(prepared, PreparedBundle):
             raise _prepared_bundle_invalid()
-        binding = self._claim_prepared(prepared)
-        if binding is not None:
-            self._close_prepared(prepared)
+        claim_state, _ = self._claim_prepared(prepared)
+        if claim_state == _CLAIM_CONSUMED:
             return
-
+        if claim_state != _CLAIM_ACQUIRED:
+            raise _prepared_bundle_invalid()
         try:
-            prepared.__enter__()
-        except IWikiError as error:
-            if error.code is ErrorCode.INVALID_ARGUMENT:
-                return
-            raise _map_iwiki_error(error) from None
-        except _COMPATIBILITY_ERRORS:
-            raise _contract_incompatible() from None
-        raise _prepared_bundle_invalid()
+            self._close_prepared(prepared)
+        finally:
+            self._finish_prepared(prepared)

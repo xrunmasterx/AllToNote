@@ -30,6 +30,58 @@ MANIFEST_SHA256 = (
 )
 
 
+class _InstrumentedPreparedBundle:
+    def __init__(
+        self,
+        *,
+        close_error: Exception | None = None,
+        close_entered: threading.Event | None = None,
+        release_close: threading.Event | None = None,
+    ) -> None:
+        self.enter_calls = 0
+        self.close_calls = 0
+        self.close_error = close_error
+        self.close_entered = close_entered
+        self.release_close = release_close
+
+    def __enter__(self) -> _InstrumentedPreparedBundle:
+        self.enter_calls += 1
+        return self
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_entered is not None:
+            self.close_entered.set()
+        if self.release_close is not None:
+            assert self.release_close.wait(timeout=3)
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _prepare_instrumented_bundle(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prepared: _InstrumentedPreparedBundle,
+) -> _InstrumentedPreparedBundle:
+    monkeypatch.setattr(
+        gateway_module,
+        "PreparedBundle",
+        _InstrumentedPreparedBundle,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "prepare_bundle_commit",
+        lambda *_args, **_kwargs: prepared,
+    )
+    return gateway.prepare_candidate(
+        workspace_root,
+        STAGING_RELATIVE_PATH,
+        expected_bundle_id=BUNDLE_ID,
+        expected_manifest_sha256=MANIFEST_SHA256,
+    )
+
+
 @pytest.fixture
 def workspace_root(tmp_path: Path) -> Path:
     root = tmp_path / "workspace"
@@ -660,6 +712,166 @@ def test_discard_loses_to_an_atomic_commit_claim(
         prepared.__enter__()
 
 
+def test_discard_does_not_touch_handle_claimed_by_commit(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_instrumented_bundle(
+        gateway,
+        workspace_root,
+        monkeypatch,
+        _InstrumentedPreparedBundle(),
+    )
+    sdk_entered = threading.Event()
+    release_sdk = threading.Event()
+    sdk_calls = 0
+    winner_errors: list[BaseException] = []
+
+    def commit_once(_prepared: object) -> CommitResult:
+        nonlocal sdk_calls
+        sdk_calls += 1
+        sdk_entered.set()
+        assert release_sdk.wait(timeout=3)
+        return CommitResult(
+            bundle_id=BUNDLE_ID,
+            manifest_sha256=MANIFEST_SHA256,
+            commit_sha256="sha256:" + "1" * 64,
+            relative_path=f"raw/personal/bundles/{BUNDLE_ID}",
+            idempotent=False,
+        )
+
+    def commit_in_thread() -> None:
+        try:
+            gateway.commit_prepared(prepared)
+        except BaseException as error:
+            winner_errors.append(error)
+
+    monkeypatch.setattr(gateway_module, "commit_prepared_bundle", commit_once)
+    winner = threading.Thread(target=commit_in_thread)
+    winner.start()
+    assert sdk_entered.wait(timeout=3)
+
+    try:
+        with pytest.raises(DomainError) as caught:
+            gateway.discard_prepared(prepared)
+
+        assert caught.value.code == "portable_prepared_bundle_invalid"
+        assert prepared.enter_calls == 0
+        assert prepared.close_calls == 0
+        assert sdk_calls == 1
+    finally:
+        release_sdk.set()
+        winner.join(timeout=3)
+
+    assert not winner.is_alive()
+    assert winner_errors == []
+    assert prepared.enter_calls == 0
+    assert prepared.close_calls == 1
+
+
+def test_claimed_discard_rejects_other_discard_and_commit_without_native_calls(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    prepared = _prepare_instrumented_bundle(
+        gateway,
+        workspace_root,
+        monkeypatch,
+        _InstrumentedPreparedBundle(
+            close_entered=close_entered,
+            release_close=release_close,
+        ),
+    )
+    sdk_calls = 0
+    winner_errors: list[BaseException] = []
+
+    def unexpected_commit(_prepared: object) -> CommitResult:
+        nonlocal sdk_calls
+        sdk_calls += 1
+        raise AssertionError("claimed discard reached commit SDK")
+
+    def discard_in_thread() -> None:
+        try:
+            gateway.discard_prepared(prepared)
+        except BaseException as error:
+            winner_errors.append(error)
+
+    monkeypatch.setattr(
+        gateway_module,
+        "commit_prepared_bundle",
+        unexpected_commit,
+    )
+    winner = threading.Thread(target=discard_in_thread)
+    winner.start()
+    assert close_entered.wait(timeout=3)
+
+    try:
+        with pytest.raises(DomainError) as discard_error:
+            gateway.discard_prepared(prepared)
+        with pytest.raises(DomainError) as commit_error:
+            gateway.commit_prepared(prepared)
+
+        assert discard_error.value.code == "portable_prepared_bundle_invalid"
+        assert commit_error.value.code == "portable_prepared_bundle_invalid"
+        assert prepared.enter_calls == 0
+        assert prepared.close_calls == 1
+        assert sdk_calls == 0
+    finally:
+        release_close.set()
+        winner.join(timeout=3)
+
+    assert not winner.is_alive()
+    assert winner_errors == []
+    assert prepared.enter_calls == 0
+    assert prepared.close_calls == 1
+
+
+def test_consumed_tombstones_are_bounded_and_never_probe_evicted_handles(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tombstone_limit = 128
+    prepared_handles = [
+        _InstrumentedPreparedBundle()
+        for _ in range(tombstone_limit + 1)
+    ]
+    prepared_iterator = iter(prepared_handles)
+    monkeypatch.setattr(
+        gateway_module,
+        "PreparedBundle",
+        _InstrumentedPreparedBundle,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "prepare_bundle_commit",
+        lambda *_args, **_kwargs: next(prepared_iterator),
+    )
+
+    for _ in prepared_handles:
+        prepared = gateway.prepare_candidate(
+            workspace_root,
+            STAGING_RELATIVE_PATH,
+            expected_bundle_id=BUNDLE_ID,
+            expected_manifest_sha256=MANIFEST_SHA256,
+        )
+        gateway.discard_prepared(prepared)
+
+    gateway.discard_prepared(prepared_handles[-1])
+    with pytest.raises(DomainError) as caught:
+        gateway.discard_prepared(prepared_handles[0])
+
+    assert caught.value.code == "portable_prepared_bundle_invalid"
+    assert prepared_handles[-1].enter_calls == 0
+    assert prepared_handles[-1].close_calls == 1
+    assert prepared_handles[0].enter_calls == 0
+    assert prepared_handles[0].close_calls == 1
+
+
 def test_sdk_commit_failure_closes_claimed_handle(
     gateway: IWikiPortableGateway,
     workspace_root: Path,
@@ -683,6 +895,107 @@ def test_sdk_commit_failure_closes_claimed_handle(
     assert caught.value.code == "iwiki_runtime_retryable"
     with pytest.raises(IWikiError):
         prepared.__enter__()
+
+
+def test_runtime_primary_is_not_masked_by_close_failure(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_instrumented_bundle(
+        gateway,
+        workspace_root,
+        monkeypatch,
+        _InstrumentedPreparedBundle(
+            close_error=OSError("secret C:/private/close")
+        ),
+    )
+
+    def fail_open(_workspace_root: Path) -> object:
+        raise RuntimeError("primary runtime failure")
+
+    monkeypatch.setattr(gateway_module, "_open_locked_workspace", fail_open)
+
+    with pytest.raises(RuntimeError, match="primary runtime failure"):
+        gateway.commit_prepared(prepared)
+
+    assert prepared.close_calls == 1
+
+
+def test_mapped_iwiki_primary_is_not_masked_by_close_failure(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_instrumented_bundle(
+        gateway,
+        workspace_root,
+        monkeypatch,
+        _InstrumentedPreparedBundle(
+            close_error=OSError("secret C:/private/close")
+        ),
+    )
+
+    def fail_commit(_prepared: object) -> CommitResult:
+        raise IWikiError(ErrorCode.RETRYABLE_RUNTIME, "primary iwiki failure")
+
+    monkeypatch.setattr(gateway_module, "commit_prepared_bundle", fail_commit)
+
+    with pytest.raises(DomainError) as caught:
+        gateway.commit_prepared(prepared)
+
+    assert caught.value.code == "iwiki_runtime_retryable"
+    assert caught.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert prepared.close_calls == 1
+
+
+def test_fatal_primary_is_not_masked_by_close_failure(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_instrumented_bundle(
+        gateway,
+        workspace_root,
+        monkeypatch,
+        _InstrumentedPreparedBundle(
+            close_error=OSError("secret C:/private/close")
+        ),
+    )
+
+    def fail_open(_workspace_root: Path) -> object:
+        raise KeyboardInterrupt("primary fatal failure")
+
+    monkeypatch.setattr(gateway_module, "_open_locked_workspace", fail_open)
+
+    with pytest.raises(KeyboardInterrupt, match="primary fatal failure"):
+        gateway.commit_prepared(prepared)
+
+    assert prepared.close_calls == 1
+
+
+def test_discard_reports_sanitized_close_failure_without_primary_error(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_instrumented_bundle(
+        gateway,
+        workspace_root,
+        monkeypatch,
+        _InstrumentedPreparedBundle(
+            close_error=OSError("secret C:/private/close")
+        ),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        gateway.discard_prepared(prepared)
+
+    assert caught.value.code == "portable_contract_incompatible"
+    assert "C:/private" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+    assert prepared.close_calls == 1
 
 
 def test_commit_prepared_rejects_handle_from_another_gateway(
