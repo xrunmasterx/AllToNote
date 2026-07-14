@@ -60,7 +60,9 @@ class _ExternalOperationStore(Protocol):
     def get_external_operation(self, operation_id: str) -> ExternalOperation: ...
 
     def reconcile_external_operations_after_process_loss(
-        self, job_id: str
+        self,
+        job_id: str,
+        authority: ExecutionAuthority,
     ) -> tuple[ExternalOperation, ...]: ...
 
 
@@ -129,7 +131,9 @@ class ExternalOperationGuard:
     def reconcile_after_process_loss(
         self, job_id: str
     ) -> tuple[ExternalOperation, ...]:
-        return self._store.reconcile_external_operations_after_process_loss(job_id)
+        return self._store.reconcile_external_operations_after_process_loss(
+            job_id, self._authority
+        )
 
 
 __all__ = ["ExternalOperation", "ExternalOperationGuard", "ExternalOutcome"]

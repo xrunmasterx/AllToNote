@@ -787,6 +787,42 @@ class SqliteJobRepository:
         summary_json: str,
     ) -> ExternalOperation:
         with self._transaction(immediate=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT operation_id, outcome FROM external_operations
+                WHERE job_id = ? AND step_id = ? AND provider = ?
+                  AND request_hash = ?
+                ORDER BY rowid DESC
+                """,
+                (job_id, step_id, provider, request_hash),
+            ).fetchall()
+            by_outcome = {
+                outcome: tuple(
+                    row["operation_id"]
+                    for row in rows
+                    if row["outcome"] == outcome.value
+                )
+                for outcome in ExternalOutcome
+            }
+            if by_outcome[ExternalOutcome.UNKNOWN]:
+                raise DomainError(
+                    "external_outcome_unknown",
+                    ErrorCategory.CONFLICT,
+                    "Unknown external outcome requires explicit confirmation",
+                )
+            if by_outcome[ExternalOutcome.STARTED]:
+                raise DomainError(
+                    "external_operation_in_progress",
+                    ErrorCategory.CONFLICT,
+                    "An external operation for this request is already in progress",
+                )
+            for reusable_outcome in (
+                ExternalOutcome.SUCCEEDED,
+                ExternalOutcome.PREPARED,
+            ):
+                reusable = by_outcome[reusable_outcome]
+                if reusable:
+                    return self._get_external_operation(connection, reusable[0])
             operation_id = new_typed_id("op")
             now = utc_now_millis()
             connection.execute(
@@ -819,9 +855,24 @@ class SqliteJobRepository:
     ) -> ExternalOperation:
         with self._transaction(immediate=True) as connection:
             operation = self._get_external_operation(connection, operation_id)
-            if operation.outcome is ExternalOutcome.UNKNOWN:
+            unknown = connection.execute(
+                """
+                SELECT 1 FROM external_operations
+                WHERE job_id = ? AND step_id = ? AND provider = ?
+                  AND request_hash = ? AND outcome = ?
+                LIMIT 1
+                """,
+                (
+                    operation.job_id,
+                    operation.step_id,
+                    operation.provider,
+                    operation.request_hash,
+                    ExternalOutcome.UNKNOWN.value,
+                ),
+            ).fetchone()
+            if unknown is not None:
                 raise DomainError(
-                    "external_operation_unknown",
+                    "external_outcome_unknown",
                     ErrorCategory.CONFLICT,
                     "Unknown external outcome requires explicit confirmation",
                 )
@@ -909,15 +960,26 @@ class SqliteJobRepository:
             return self._get_external_operation(connection, operation_id)
 
     def reconcile_external_operations_after_process_loss(
-        self, job_id: str
+        self,
+        job_id: str,
+        authority: ExecutionAuthority,
     ) -> tuple[ExternalOperation, ...]:
         with self._transaction(immediate=True) as connection:
+            self._assert_scheduler_authority(connection, authority)
             rows = connection.execute(
                 """
-                SELECT operation_id FROM external_operations
-                WHERE job_id = ? AND outcome = ? ORDER BY operation_id
+                SELECT operations.operation_id
+                FROM external_operations AS operations
+                JOIN attempts ON attempts.attempt_id = operations.attempt_id
+                WHERE operations.job_id = ? AND operations.outcome = ?
+                  AND attempts.fencing_token < ?
+                ORDER BY operations.operation_id
                 """,
-                (job_id, ExternalOutcome.STARTED.value),
+                (
+                    job_id,
+                    ExternalOutcome.STARTED.value,
+                    authority.fencing_token,
+                ),
             ).fetchall()
             operation_ids = tuple(row["operation_id"] for row in rows)
             if operation_ids:
@@ -987,6 +1049,12 @@ class SqliteJobRepository:
     def transition_job(self, job_id: str, state: JobState) -> Job:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
+            if state in (JobState.SUCCEEDED, JobState.CANCELLED):
+                raise DomainError(
+                    "job_terminal_transition_guarded",
+                    ErrorCategory.CONFLICT,
+                    "Job success and cancellation require their guarded paths",
+                )
             next_state = transition_job(job.state, state)
             if next_state in TERMINAL_JOB_STATES:
                 self._ensure_attempts_settled(connection, job_id)
@@ -1055,6 +1123,9 @@ class SqliteJobRepository:
                 )
             self._assert_execution_authority(
                 connection, job_id, attempt_id, authority
+            )
+            self._ensure_no_other_unsettled_attempts(
+                connection, job_id, attempt_id
             )
             yield connection
             now = utc_now_millis()
@@ -1288,6 +1359,32 @@ class SqliteJobRepository:
             "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
             (next_state.value, now, job_id),
         )
+
+    @staticmethod
+    def _ensure_no_other_unsettled_attempts(
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> None:
+        unsettled = connection.execute(
+            """
+            SELECT 1 FROM attempts
+            WHERE job_id = ? AND attempt_id != ? AND state IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                job_id,
+                attempt_id,
+                AttemptState.PENDING.value,
+                AttemptState.RUNNING.value,
+            ),
+        ).fetchone()
+        if unsettled is not None:
+            raise DomainError(
+                "attempt_not_settled",
+                ErrorCategory.CONFLICT,
+                "All other Attempts must settle before portable commit",
+            )
 
     @staticmethod
     def _ensure_attempts_settled(
