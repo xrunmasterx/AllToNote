@@ -5,9 +5,10 @@ import json
 import os
 import shutil
 from collections.abc import Iterator, Mapping
+from ctypes import wintypes
 from dataclasses import replace
 from pathlib import Path
-from ctypes import wintypes
+from typing import get_type_hints
 
 import pytest
 from iwiki.workspace import open_workspace
@@ -26,6 +27,7 @@ from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable import bundle_assembler as assembler_module
 from app.core.portable.bundle_assembler import (
     BundleAssembler,
+    CandidateBundle,
     DisplayAssetInput,
     ReceiptProvenance,
     StepAttemptSummary,
@@ -188,6 +190,7 @@ def _bundle_input(workspace_root: Path) -> VideoBundleInput:
             source_id=SOURCE_ID,
             source_revision_id=REVISION_ID,
             connector_id="youtube",
+            connector_version="1.0.0",
             platform="youtube",
             canonical_identity_scheme="youtube-video",
             stable_video_identity="portable101",
@@ -270,6 +273,13 @@ def _candidate_path(workspace_root: Path) -> Path:
         / f"{JOB_ID}.nonce"
         / "bundle.partial"
     )
+
+
+def test_candidate_bundle_public_type_hints_resolve() -> None:
+    getter = CandidateBundle.absolute_path.fget
+
+    assert getter is not None
+    assert get_type_hints(getter)["return"] is Path
 
 
 def test_assembled_candidate_passes_real_semantic_validation(
@@ -366,8 +376,12 @@ def test_candidate_has_exact_canonical_manifest_receipt_and_payload_inventory(
         "source_kind": "video",
         "source_id": SOURCE_ID,
         "source_revision_id": REVISION_ID,
-        "connector": {"id": "youtube"},
+        "connector": {"id": "youtube", "version": "1.0.0"},
         "platform": "youtube",
+        "capability": {
+            "id": "alltonote.video-source-bundle",
+            "version": "1.0.0",
+        },
         "stable_video_identity": "portable101",
         "canonical_uri": "https://www.youtube.com/watch?v=portable101",
         "title": "Portable Bundle Contract",
@@ -1114,7 +1128,7 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
     assert not _candidate_path(workspace_root).exists()
 
 
-def test_assembler_rejects_forbidden_receipt_field_before_writing(
+def test_assembler_rejects_nested_nonempty_source_extensions_before_writing(
     workspace_root: Path,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
@@ -1134,7 +1148,7 @@ def test_assembler_rejects_forbidden_receipt_field_before_writing(
 
 
 @pytest.mark.parametrize(
-    "forbidden_key",
+    "extension_key",
     (
         "APIKey",
         "api-key",
@@ -1148,11 +1162,13 @@ def test_assembler_rejects_forbidden_receipt_field_before_writing(
         "X-API-Key",
         "X-Auth-Token",
         "aws_secret_access_key",
+        "refresh_token",
+        "monkey",
     ),
 )
-def test_assembler_canonicalizes_forbidden_provenance_keys(
+def test_assembler_rejects_all_nonempty_source_extensions(
     workspace_root: Path,
-    forbidden_key: str,
+    extension_key: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
     secret = "secret-value-must-not-leak"
@@ -1160,7 +1176,7 @@ def test_assembler_canonicalizes_forbidden_provenance_keys(
         bundle_input,
         source=replace(
             bundle_input.source,
-            extensions={"safe_container": {forbidden_key: secret}},
+            extensions={"safe_container": {extension_key: secret}},
         ),
     )
 
@@ -1173,50 +1189,33 @@ def test_assembler_canonicalizes_forbidden_provenance_keys(
     assert not _candidate_path(workspace_root).exists()
 
 
-def test_provenance_key_matching_does_not_reject_unrelated_monkey_field(
-    workspace_root: Path,
-) -> None:
-    bundle_input = _bundle_input(workspace_root)
-    valid = replace(
-        bundle_input,
-        source=replace(
-            bundle_input.source,
-            extensions={"monkey": "banana"},
-        ),
-    )
-
-    candidate = BundleAssembler().assemble(valid)
-
-    assert IWikiPortableGateway().validate_candidate(
-        workspace_root,
-        candidate.staging_relative_path,
-    ).valid
-
-
 @pytest.mark.parametrize(
-    "unsafe_text",
+    "warning",
     (
         "diagnostic /home/alice/private.log failed",
         r"diagnostic C:\Users\alice\private.log failed",
         r"diagnostic \\server\share\private.log failed",
+        "Authorization: Bearer TOPSECRET",
+        "Authorization guidance is documented.",
     ),
 )
-def test_assembler_rejects_embedded_absolute_paths_without_leaking_them(
+def test_assembler_rejects_all_nonempty_warnings_without_leaking_values(
     workspace_root: Path,
-    unsafe_text: str,
+    warning: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
     invalid = replace(
         bundle_input,
-        receipt=replace(bundle_input.receipt, warnings=(unsafe_text,)),
+        receipt=replace(bundle_input.receipt, warnings=(warning,)),
     )
 
     with pytest.raises(DomainError) as raised:
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_sensitive_data"
-    assert unsafe_text not in str(raised.value)
-    assert unsafe_text not in repr(raised.value)
+    assert warning not in str(raised.value)
+    assert warning not in repr(raised.value)
+    assert not _candidate_path(workspace_root).exists()
 
 
 @pytest.mark.parametrize(
@@ -1237,6 +1236,7 @@ def test_assembler_rejects_embedded_absolute_paths_without_leaking_them(
         "https://example.com/video?X-Goog-Signature=secret",
         "https://example.com/video?oauth_token=secret",
         "https://example.com/video?auth_token=secret",
+        "https://example.com/video#access_token=secret",
     ),
 )
 def test_source_urls_reject_local_credentials_and_signed_queries(
@@ -1252,6 +1252,25 @@ def test_source_urls_reject_local_credentials_and_signed_queries(
     assert raised.value.code == "video_bundle_sensitive_data"
     assert secret not in str(raised.value)
     assert secret not in repr(raised.value)
+
+
+def test_source_urls_allow_ordinary_fragment(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    safe_url = "https://example.com/video#chapter-2"
+    valid_source = replace(
+        bundle_input.source,
+        canonical_uri=safe_url,
+        source_link=safe_url,
+    )
+
+    candidate = BundleAssembler().assemble(replace(bundle_input, source=valid_source))
+
+    assert IWikiPortableGateway().validate_candidate(
+        workspace_root,
+        candidate.staging_relative_path,
+    ).valid
 
 
 @pytest.mark.parametrize(

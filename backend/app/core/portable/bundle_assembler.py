@@ -6,7 +6,7 @@ import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import TypeVar
 from urllib.parse import parse_qsl, urlsplit
@@ -41,41 +41,6 @@ _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
 _EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
 _EXECUTOR_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,127}\Z")
-_FORBIDDEN_FIELD_NAMES = frozenset(
-    {
-        "api_key",
-        "access_token",
-        "auth_token",
-        "authorization",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "client_secret",
-        "cookie",
-        "credential",
-        "credentials",
-        "full_prompt",
-        "password",
-        "pid",
-        "process_id",
-        "provider_raw",
-        "provider_raw_request",
-        "provider_raw_response",
-        "provider_request_id",
-        "secret",
-        "secret_value",
-        "secret_access_key",
-        "session_token",
-        "lease",
-        "lease_id",
-        "fence",
-        "fencing",
-        "fencing_token",
-    }
-)
-_FORBIDDEN_CANONICAL_FIELD_NAMES = frozenset(
-    re.sub(r"[^a-z0-9]", "", name.casefold()) for name in _FORBIDDEN_FIELD_NAMES
-)
-_FIELD_NAME_WRAPPER_TOKENS = frozenset({"header", "headers", "http", "x"})
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
         "accesskey",
@@ -212,11 +177,6 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
         for key, item in value.items():
             if type(key) is not str:
                 raise _error("video_bundle_input_invalid", f"{field_name} has a non-text key")
-            if _is_forbidden_field_name(key):
-                raise _error(
-                    "video_bundle_sensitive_data",
-                    "Portable bundle content contains forbidden provenance data",
-                )
             _validate_safe_value(item, f"{field_name}.{key}")
         return
     if isinstance(value, (list, tuple)):
@@ -224,16 +184,6 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
             _validate_safe_value(item, f"{field_name}[{index}]")
         return
     raise _error("video_bundle_input_invalid", f"{field_name} is not JSON-safe")
-
-
-def _is_forbidden_field_name(key: str) -> bool:
-    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
-    tokens = re.findall(r"[a-z0-9]+", separated.casefold())
-    candidates = {"".join(tokens)}
-    while tokens and tokens[0] in _FIELD_NAME_WRAPPER_TOKENS:
-        tokens = tokens[1:]
-        candidates.add("".join(tokens))
-    return bool(candidates & _FORBIDDEN_CANONICAL_FIELD_NAMES)
 
 
 def _portable_path(value: str, *, allow_control: bool = False) -> str:
@@ -279,6 +229,7 @@ def _require_safe_url(value: str, field_name: str) -> None:
     try:
         parsed = urlsplit(value)
         query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+        fragment = parse_qsl(parsed.fragment, keep_blank_values=True, strict_parsing=False)
     except (UnicodeError, ValueError):
         raise _error("video_bundle_sensitive_data", f"{field_name} is not a safe URL") from None
     if (
@@ -286,7 +237,7 @@ def _require_safe_url(value: str, field_name: str) -> None:
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or any(_is_sensitive_url_query_key(key) for key, _ in query)
+        or any(_is_sensitive_url_query_key(key) for key, _ in (*query, *fragment))
     ):
         raise _error("video_bundle_sensitive_data", f"{field_name} is not a safe URL")
 
@@ -355,6 +306,7 @@ class VideoSourceMetadata:
     source_id: str
     source_revision_id: str
     connector_id: str
+    connector_version: str
     platform: str
     canonical_identity_scheme: str
     stable_video_identity: str
@@ -379,6 +331,7 @@ class VideoSourceMetadata:
         _require_id(self.source_revision_id, "rev", "source_revision_id")
         for field_name in (
             "connector_id",
+            "connector_version",
             "platform",
             "canonical_identity_scheme",
             "stable_video_identity",
@@ -615,6 +568,11 @@ class BundleAssembler:
     def assemble(self, bundle_input: VideoBundleInput) -> CandidateBundle:
         if not isinstance(bundle_input, VideoBundleInput):
             raise _error("video_bundle_input_invalid", "Bundle input is invalid")
+        if bundle_input.source.extensions or bundle_input.receipt.warnings:
+            raise _error(
+                "video_bundle_sensitive_data",
+                "Portable bundle open-content fields must be empty",
+            )
         self._validate_timestamps(bundle_input)
         payloads = self._build_payloads(bundle_input)
         self._validate_input_bindings(bundle_input, payloads)
@@ -711,8 +669,15 @@ class BundleAssembler:
             "source_kind": "video",
             "source_id": source.source_id,
             "source_revision_id": source.source_revision_id,
-            "connector": {"id": source.connector_id},
+            "connector": {
+                "id": source.connector_id,
+                "version": source.connector_version,
+            },
             "platform": source.platform,
+            "capability": {
+                "id": bundle_input.receipt.capability_id,
+                "version": bundle_input.receipt.capability_version,
+            },
             "stable_video_identity": source.stable_video_identity,
             "canonical_uri": source.canonical_uri,
             "title": source.title,
