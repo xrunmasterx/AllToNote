@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -7,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from app.core.domain.ids import new_typed_id, utc_now_millis
-from app.core.domain.video import JobState
+from app.core.domain.video import JobState, QualityOverall, VideoProduceResult
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import (
     Attempt,
@@ -25,6 +26,7 @@ from app.core.jobs.state_machine import (
     transition_attempt,
     transition_job,
 )
+from app.core.ports.jobs import JobCompletion, SourceIdentityBinding
 
 
 _SCHEMA_VERSION = 1
@@ -326,6 +328,17 @@ class SqliteJobRepository:
                 else None
             )
             return job, attempt, challenge
+
+    def get_job_result(self, job_id: str) -> VideoProduceResult | None:
+        with self._transaction(immediate=False) as connection:
+            row = connection.execute(
+                "SELECT result_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                self._get_job(connection, job_id)
+            if row["result_json"] is None:
+                return None
+            return self._decode_video_result(row["result_json"])
 
     def create_attempt(self, job_id: str, step_id: str) -> Attempt:
         with self._transaction(immediate=True) as connection:
@@ -1168,71 +1181,241 @@ class SqliteJobRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            job = self._get_job(connection, job_id)
-            if job.state is not JobState.RUNNING:
-                raise DomainError(
-                    "commit_guard_not_running",
-                    ErrorCategory.CONFLICT,
-                    "Commit guard requires a running Job",
-                )
-            if job.cancellation_requested:
-                raise DomainError(
-                    "commit_guard_cancelled",
-                    ErrorCategory.CANCELLED,
-                    "Cancellation won before portable commit",
-                )
-            self._assert_execution_authority(
+            self._assert_commit_guard(
                 connection, job_id, attempt_id, authority
             )
-            self._ensure_no_other_unsettled_attempts(
-                connection, job_id, attempt_id
-            )
             yield connection
-            now = utc_now_millis()
-            attempt_updated = connection.execute(
-                """
-                UPDATE attempts SET state = ?, updated_at = ?
-                WHERE attempt_id = ? AND state = ? AND fencing_token = ?
-                """,
-                (
-                    AttemptState.SUCCEEDED.value,
-                    now,
-                    attempt_id,
-                    AttemptState.RUNNING.value,
-                    authority.fencing_token,
-                ),
+            self._finish_commit_guard(
+                connection, job_id, attempt_id, authority
             )
-            if attempt_updated.rowcount != 1:
-                raise DomainError(
-                    "commit_guard_conflict",
-                    ErrorCategory.CONFLICT,
-                    "Attempt authority changed before success",
-                )
-            self._ensure_attempts_settled(connection, job_id)
-            updated = connection.execute(
-                """
-                UPDATE jobs SET state = ?, updated_at = ?
-                WHERE job_id = ? AND state = ? AND cancellation_requested = 0
-                """,
-                (
-                    JobState.SUCCEEDED.value,
-                    now,
-                    job_id,
-                    JobState.RUNNING.value,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise DomainError(
-                    "commit_guard_conflict",
-                    ErrorCategory.CONFLICT,
-                    "Portable commit authority changed before success",
-                )
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    def commit_video_result_atomic(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+        commit: Callable[[], JobCompletion],
+    ) -> JobCompletion:
+        with self._transaction(immediate=True) as connection:
+            self._assert_commit_guard(
+                connection, job_id, attempt_id, authority
+            )
+            completion = commit()
+            self._validate_completion(job_id, completion)
+            binding = completion.source_identity
+            existing = connection.execute(
+                """
+                SELECT * FROM source_identities
+                WHERE connector_id = ? AND canonical_identity = ?
+                """,
+                (binding.connector_id, binding.canonical_identity),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO source_identities (
+                        connector_id, canonical_identity, source_id,
+                        owning_bundle_id, manifest_sha256, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        binding.connector_id,
+                        binding.canonical_identity,
+                        binding.source_id,
+                        binding.owning_bundle_id,
+                        binding.manifest_sha256,
+                        utc_now_millis(),
+                    ),
+                )
+            elif any(
+                existing[field] != getattr(binding, field)
+                for field in (
+                    "source_id",
+                    "owning_bundle_id",
+                    "manifest_sha256",
+                )
+            ):
+                raise DomainError(
+                    "source_identity_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Canonical source identity is bound to another committed Bundle",
+                )
+            connection.execute(
+                "UPDATE jobs SET result_json = ? WHERE job_id = ?",
+                (self._encode_video_result(completion.result), job_id),
+            )
+            self._finish_commit_guard(
+                connection, job_id, attempt_id, authority
+            )
+            return completion
+
+    def _assert_commit_guard(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> None:
+        job = self._get_job(connection, job_id)
+        if job.state is not JobState.RUNNING:
+            raise DomainError(
+                "commit_guard_not_running",
+                ErrorCategory.CONFLICT,
+                "Commit guard requires a running Job",
+            )
+        if job.cancellation_requested:
+            raise DomainError(
+                "commit_guard_cancelled",
+                ErrorCategory.CANCELLED,
+                "Cancellation won before portable commit",
+            )
+        self._assert_execution_authority(
+            connection, job_id, attempt_id, authority
+        )
+        self._ensure_no_other_unsettled_attempts(
+            connection, job_id, attempt_id
+        )
+
+    def _finish_commit_guard(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> None:
+        now = utc_now_millis()
+        attempt_updated = connection.execute(
+            """
+            UPDATE attempts SET state = ?, updated_at = ?
+            WHERE attempt_id = ? AND state = ? AND fencing_token = ?
+            """,
+            (
+                AttemptState.SUCCEEDED.value,
+                now,
+                attempt_id,
+                AttemptState.RUNNING.value,
+                authority.fencing_token,
+            ),
+        )
+        if attempt_updated.rowcount != 1:
+            raise DomainError(
+                "commit_guard_conflict",
+                ErrorCategory.CONFLICT,
+                "Attempt authority changed before success",
+            )
+        self._ensure_attempts_settled(connection, job_id)
+        updated = connection.execute(
+            """
+            UPDATE jobs SET state = ?, updated_at = ?
+            WHERE job_id = ? AND state = ? AND cancellation_requested = 0
+            """,
+            (
+                JobState.SUCCEEDED.value,
+                now,
+                job_id,
+                JobState.RUNNING.value,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise DomainError(
+                "commit_guard_conflict",
+                ErrorCategory.CONFLICT,
+                "Portable commit authority changed before success",
+            )
+
+    @staticmethod
+    def _validate_completion(job_id: str, completion: JobCompletion) -> None:
+        if not isinstance(completion, JobCompletion):
+            raise DomainError(
+                "job_completion_invalid",
+                ErrorCategory.INTERNAL,
+                "Commit callback returned an invalid completion",
+            )
+        result = completion.result
+        binding = completion.source_identity
+        if (
+            result.job_id != job_id
+            or result.source_id != binding.source_id
+            or result.bundle_id != binding.owning_bundle_id
+            or result.manifest_sha256 != binding.manifest_sha256
+        ):
+            raise DomainError(
+                "job_completion_invalid",
+                ErrorCategory.INTERNAL,
+                "Completion result and source identity binding do not match",
+            )
+
+    @staticmethod
+    def _encode_video_result(result: VideoProduceResult) -> str:
+        return json.dumps(
+            {
+                "job_id": result.job_id,
+                "run_id": result.run_id,
+                "bundle_id": result.bundle_id,
+                "manifest_sha256": result.manifest_sha256,
+                "commit_sha256": result.commit_sha256,
+                "workspace_relative_bundle_path": result.workspace_relative_bundle_path,
+                "source_id": result.source_id,
+                "source_revision_id": result.source_revision_id,
+                "primary_draft_artifact_id": result.primary_draft_artifact_id,
+                "transcript_artifact_id": result.transcript_artifact_id,
+                "evidence_set_artifact_id": result.evidence_set_artifact_id,
+                "quality_report_artifact_id": result.quality_report_artifact_id,
+                "display_asset_ids": list(result.display_asset_ids),
+                "quality_overall": result.quality_overall.value,
+                "publish_eligible": result.publish_eligible,
+                "usage": dict(result.usage),
+                "warnings": list(result.warnings),
+                "idempotent": result.idempotent,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    @staticmethod
+    def _decode_video_result(payload: str) -> VideoProduceResult:
+        try:
+            value = json.loads(payload)
+            return VideoProduceResult(
+                job_id=value["job_id"],
+                run_id=value["run_id"],
+                bundle_id=value["bundle_id"],
+                manifest_sha256=value["manifest_sha256"],
+                commit_sha256=value["commit_sha256"],
+                workspace_relative_bundle_path=value[
+                    "workspace_relative_bundle_path"
+                ],
+                source_id=value["source_id"],
+                source_revision_id=value["source_revision_id"],
+                primary_draft_artifact_id=value[
+                    "primary_draft_artifact_id"
+                ],
+                transcript_artifact_id=value["transcript_artifact_id"],
+                evidence_set_artifact_id=value["evidence_set_artifact_id"],
+                quality_report_artifact_id=value[
+                    "quality_report_artifact_id"
+                ],
+                display_asset_ids=tuple(value["display_asset_ids"]),
+                quality_overall=QualityOverall(value["quality_overall"]),
+                publish_eligible=value["publish_eligible"],
+                usage=value["usage"],
+                warnings=tuple(value["warnings"]),
+                idempotent=value["idempotent"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DomainError(
+                "job_result_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job result is invalid",
+            ) from error
 
     def _get_job(self, connection: sqlite3.Connection, job_id: str) -> Job:
         row = connection.execute(

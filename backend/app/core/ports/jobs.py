@@ -1,8 +1,11 @@
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
-from app.core.domain.video import JobState
+from app.core.domain.video import JobState, VideoProduceResult
 from app.core.jobs.model import (
     Attempt,
+    AttemptState,
     Challenge,
     CheckpointMetadata,
     CheckpointRecord,
@@ -10,6 +13,21 @@ from app.core.jobs.model import (
     JobEvent,
 )
 from app.core.jobs.resource_lease import ExecutionAuthority
+
+
+@dataclass(frozen=True)
+class SourceIdentityBinding:
+    connector_id: str
+    canonical_identity: str
+    source_id: str
+    owning_bundle_id: str
+    manifest_sha256: str
+
+
+@dataclass(frozen=True)
+class JobCompletion:
+    result: VideoProduceResult
+    source_identity: SourceIdentityBinding
 
 
 class JobRepositoryPort(Protocol):
@@ -27,6 +45,16 @@ class JobRepositoryPort(Protocol):
     def get_job_details(
         self, job_id: str
     ) -> tuple[Job, Attempt | None, Challenge | None]: ...
+
+    def get_job_result(self, job_id: str) -> VideoProduceResult | None: ...
+
+    def commit_video_result_atomic(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+        commit: Callable[[], JobCompletion],
+    ) -> JobCompletion: ...
 
     def cancel_job(self, job_id: str) -> Job: ...
 
@@ -47,6 +75,34 @@ class JobRepositoryPort(Protocol):
         confirmed_unknown_operation_ids: tuple[str, ...],
         client_request_id: str,
     ) -> Job: ...
+
+
+class VideoExecutionRepositoryPort(JobRepositoryPort, Protocol):
+    """Narrow execution surface used by the sequential video recipe."""
+
+    def transition_job(self, job_id: str, state: JobState) -> Job: ...
+
+    def create_attempt(self, job_id: str, step_id: str) -> Attempt: ...
+
+    def acquire_scheduler_lease(
+        self, owner_id: str, *, ttl_seconds: int
+    ) -> ExecutionAuthority: ...
+
+    def start_attempt(
+        self, attempt_id: str, authority: ExecutionAuthority
+    ) -> Attempt: ...
+
+    def transition_attempt(
+        self,
+        attempt_id: str,
+        state: AttemptState,
+        *,
+        authority: ExecutionAuthority | None = None,
+    ) -> Attempt: ...
+
+    def latest_checkpoint(
+        self, job_id: str, step_id: str
+    ) -> CheckpointMetadata | None: ...
 
 
 class AttemptMetadataRepositoryPort(Protocol):

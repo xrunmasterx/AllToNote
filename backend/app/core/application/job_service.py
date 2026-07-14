@@ -201,7 +201,7 @@ class JobService:
                 else None
             ),
             retry_of_job_id=job.retry_of_job_id,
-            result=None,
+            result=self._repository.get_job_result(job_id),
             error=None,
         )
 

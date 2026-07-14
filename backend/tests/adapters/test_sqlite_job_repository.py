@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
-from app.core.domain.video import JobState
+from app.core.domain.video import (
+    JobState,
+    QualityOverall,
+    VideoProduceResult,
+)
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.model import AttemptState
@@ -18,6 +22,7 @@ from app.core.jobs.state_machine import (
     transition_attempt,
     transition_job,
 )
+from app.core.ports.jobs import JobCompletion, SourceIdentityBinding
 
 
 HASH_A = "sha256:" + "a" * 64
@@ -117,6 +122,38 @@ EXTRA_SCHEMA_OBJECTS = (
         "CREATE VIEW unexpected_view AS SELECT job_id, state FROM jobs",
     ),
 )
+
+
+def _video_completion(job_id: str, *, source_id: str = "src_test") -> JobCompletion:
+    return JobCompletion(
+        result=VideoProduceResult(
+            job_id=job_id,
+            run_id="run_test",
+            bundle_id="bnd_test",
+            manifest_sha256=HASH_A,
+            commit_sha256=HASH_B,
+            workspace_relative_bundle_path="raw/personal/bundles/bnd_test",
+            source_id=source_id,
+            source_revision_id="rev_test",
+            primary_draft_artifact_id="art_draft",
+            transcript_artifact_id="art_transcript",
+            evidence_set_artifact_id="art_evidence",
+            quality_report_artifact_id="art_quality",
+            display_asset_ids=(),
+            quality_overall=QualityOverall.PASS,
+            publish_eligible=True,
+            usage={"input_tokens": 3, "output_tokens": 2},
+            warnings=(),
+            idempotent=False,
+        ),
+        source_identity=SourceIdentityBinding(
+            connector_id="fixture",
+            canonical_identity="fixture://course",
+            source_id=source_id,
+            owning_bundle_id="bnd_test",
+            manifest_sha256=HASH_A,
+        ),
+    )
 
 
 @pytest.fixture
@@ -792,6 +829,107 @@ def test_commit_guard_rolls_back_when_guarded_work_fails(
             raise RuntimeError("portable commit failed")
 
     assert repo.get_job(job.job_id).state is JobState.RUNNING
+
+
+def test_commit_video_result_atomic_persists_result_identity_and_success(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.create_attempt(job.job_id, "commit")
+    attempt = repo.start_attempt(attempt.attempt_id, authority)
+    completion = _video_completion(job.job_id)
+
+    returned = repo.commit_video_result_atomic(
+        job.job_id,
+        attempt.attempt_id,
+        authority,
+        lambda: completion,
+    )
+
+    assert returned == completion
+    assert repo.get_job(job.job_id).state is JobState.SUCCEEDED
+    assert repo.get_job_result(job.job_id) == completion.result
+    with repo._connect() as connection:
+        identity = connection.execute(
+            "SELECT * FROM source_identities WHERE connector_id = 'fixture'"
+        ).fetchone()
+    assert identity is not None
+    assert identity["source_id"] == completion.source_identity.source_id
+    assert identity["owning_bundle_id"] == completion.result.bundle_id
+
+
+def test_commit_video_result_atomic_rolls_back_when_callback_fails(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.create_attempt(job.job_id, "commit")
+    attempt = repo.start_attempt(attempt.attempt_id, authority)
+
+    def fail_commit() -> JobCompletion:
+        raise RuntimeError("portable commit failed")
+
+    with pytest.raises(RuntimeError, match="portable commit failed"):
+        repo.commit_video_result_atomic(
+            job.job_id,
+            attempt.attempt_id,
+            authority,
+            fail_commit,
+        )
+
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
+    assert repo.get_job_result(job.job_id) is None
+
+
+def test_commit_video_result_atomic_rolls_back_on_source_identity_conflict(
+    repo: SqliteJobRepository,
+) -> None:
+    first = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(first.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    first_attempt = repo.create_attempt(first.job_id, "commit")
+    first_attempt = repo.start_attempt(first_attempt.attempt_id, authority)
+    repo.commit_video_result_atomic(
+        first.job_id,
+        first_attempt.attempt_id,
+        authority,
+        lambda: _video_completion(first.job_id),
+    )
+
+    second = repo.create_job(
+        request_hash=HASH_B,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(second.job_id, JobState.RUNNING)
+    second_attempt = repo.create_attempt(second.job_id, "commit")
+    second_attempt = repo.start_attempt(second_attempt.attempt_id, authority)
+
+    with pytest.raises(DomainError, match="source_identity_conflict"):
+        repo.commit_video_result_atomic(
+            second.job_id,
+            second_attempt.attempt_id,
+            authority,
+            lambda: _video_completion(second.job_id, source_id="src_other"),
+        )
+
+    assert repo.get_job(second.job_id).state is JobState.RUNNING
+    assert repo.get_job_result(second.job_id) is None
 
 
 def _create_needs_input_attempt(repo: SqliteJobRepository):

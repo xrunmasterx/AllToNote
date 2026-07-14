@@ -454,7 +454,6 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         TranscriptPort,
         KnowledgeModelPort,
         ScreenshotPort,
-        PortableWorkspacePort,
         CredentialBrokerPort,
     )
 
@@ -463,6 +462,18 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         not {name for name in port.__dict__ if not name.startswith("_")}
         for port in marker_ports
     )
+    assert {
+        name
+        for name in PortableWorkspacePort.__dict__
+        if not name.startswith("_")
+    } == {
+        "inspect",
+        "candidate_location",
+        "validate_candidate",
+        "prepare_candidate",
+        "commit_prepared",
+        "discard_prepared",
+    }
     assert getattr(JobRepositoryPort, "_is_protocol", False)
     assert {
         name for name in JobRepositoryPort.__dict__ if not name.startswith("_")
@@ -471,6 +482,8 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         "create_job",
         "create_retry_job_atomic",
         "get_job_details",
+        "get_job_result",
+        "commit_video_result_atomic",
         "respond_challenge_atomic",
     }
     event_argument, event_return = get_args(EventSink)
