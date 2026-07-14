@@ -11,7 +11,7 @@ import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.domain.video import JobState, RetryJobRequest
-from app.core.errors import DomainError, ErrorCategory
+from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.model import AttemptState
 
 
@@ -161,6 +161,28 @@ def test_submit_hashes_sorted_compact_utf8_canonical_request(
     snapshot = service.submit(request)
 
     assert repo.get_job(snapshot.job_id).request_hash == expected_hash
+    assert repo.get_job_request(snapshot.job_id) == expected_json
+
+
+def test_get_restores_persisted_failure_detail(
+    repo: SqliteJobRepository,
+    tmp_path: Path,
+) -> None:
+    service = _new_service(repo)
+    submitted = service.submit(_request(tmp_path))
+    repo.transition_job(submitted.job_id, JobState.RUNNING)
+    error = ErrorDetail(
+        "preflight_failed",
+        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+        "Preflight failed",
+        {"check": "workspace"},
+    )
+    repo.fail_job_atomic(submitted.job_id, error)
+
+    snapshot = _new_service(repo).get(submitted.job_id)
+
+    assert snapshot.state is JobState.FAILED
+    assert snapshot.error == error
 
 
 def test_submit_hash_excludes_principal_and_client_request_id(
@@ -259,6 +281,12 @@ def test_secret_named_field_never_enters_hash_database_or_error(
         "xapikey",
         "authtoken",
         "setcookie",
+        "X-Auth-Token",
+        "clientSecret",
+        "aws_secret_access_key",
+        "apiToken",
+        "privateKey",
+        "bearerToken",
     ),
 )
 def test_secret_field_alias_is_rejected_by_submit_and_respond(
@@ -293,6 +321,17 @@ def test_secret_field_alias_is_rejected_by_submit_and_respond(
     assert tuple(challenge_row) == ("pending", None)
     assert secret.encode("utf-8") not in repo.database_path.read_bytes()
     assert service.get(job.job_id).challenge_id == challenge.challenge_id
+
+
+def test_non_secret_identifier_containing_key_text_is_not_rejected(
+    repo: SqliteJobRepository,
+    tmp_path: Path,
+) -> None:
+    service = _new_service(repo)
+
+    snapshot = service.submit(_request(tmp_path, payload={"monkey": "banana"}))
+
+    assert snapshot.state is JobState.QUEUED
 
 
 @pytest.mark.parametrize(

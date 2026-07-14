@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.video import (
     JobState,
     QualityOverall,
-    VideoProduceResult,
 )
-from app.core.errors import DomainError, ErrorCategory
+from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.model import AttemptState
 from app.core.jobs.state_machine import (
@@ -22,11 +24,26 @@ from app.core.jobs.state_machine import (
     transition_attempt,
     transition_job,
 )
-from app.core.ports.jobs import JobCompletion, SourceIdentityBinding
+from app.core.ports.jobs import (
+    PortableCommitReceipt,
+    SourceIdentityBinding,
+    VideoResultPlan,
+)
 
 
 HASH_A = "sha256:" + "a" * 64
 HASH_B = "sha256:" + "b" * 64
+RUN_ID = new_typed_id("run", now_ms=1, randomness=b"\x01" * 10)
+BUNDLE_ID = new_typed_id("bnd", now_ms=1, randomness=b"\x02" * 10)
+NEXT_BUNDLE_ID = new_typed_id("bnd", now_ms=1, randomness=b"\x03" * 10)
+SOURCE_ID = new_typed_id("src", now_ms=1, randomness=b"\x04" * 10)
+OTHER_SOURCE_ID = new_typed_id("src", now_ms=1, randomness=b"\x05" * 10)
+REVISION_ID = new_typed_id("rev", now_ms=1, randomness=b"\x06" * 10)
+PRIMARY_DRAFT_ID = new_typed_id("art", now_ms=1, randomness=b"\x07" * 10)
+TRANSCRIPT_ID = new_typed_id("art", now_ms=1, randomness=b"\x08" * 10)
+EVIDENCE_SET_ID = new_typed_id("art", now_ms=1, randomness=b"\x09" * 10)
+QUALITY_REPORT_ID = new_typed_id("art", now_ms=1, randomness=b"\x0a" * 10)
+DISPLAY_ASSET_ID = new_typed_id("art", now_ms=1, randomness=b"\x0b" * 10)
 EXPECTED_TABLES = {
     "attempts",
     "challenges",
@@ -124,36 +141,44 @@ EXTRA_SCHEMA_OBJECTS = (
 )
 
 
-def _video_completion(job_id: str, *, source_id: str = "src_test") -> JobCompletion:
-    return JobCompletion(
-        result=VideoProduceResult(
-            job_id=job_id,
-            run_id="run_test",
-            bundle_id="bnd_test",
-            manifest_sha256=HASH_A,
-            commit_sha256=HASH_B,
-            workspace_relative_bundle_path="raw/personal/bundles/bnd_test",
-            source_id=source_id,
-            source_revision_id="rev_test",
-            primary_draft_artifact_id="art_draft",
-            transcript_artifact_id="art_transcript",
-            evidence_set_artifact_id="art_evidence",
-            quality_report_artifact_id="art_quality",
-            display_asset_ids=(),
-            quality_overall=QualityOverall.PASS,
-            publish_eligible=True,
-            usage={"input_tokens": 3, "output_tokens": 2},
-            warnings=(),
-            idempotent=False,
-        ),
-        source_identity=SourceIdentityBinding(
-            connector_id="fixture",
-            canonical_identity="fixture://course",
-            source_id=source_id,
-            owning_bundle_id="bnd_test",
-            manifest_sha256=HASH_A,
-        ),
+def _video_commit_inputs(
+    job_id: str,
+    *,
+    source_id: str = SOURCE_ID,
+    bundle_id: str = BUNDLE_ID,
+) -> tuple[VideoResultPlan, SourceIdentityBinding, PortableCommitReceipt]:
+    plan = VideoResultPlan(
+        job_id=job_id,
+        run_id=RUN_ID,
+        bundle_id=bundle_id,
+        manifest_sha256=HASH_A,
+        source_id=source_id,
+        source_revision_id=REVISION_ID,
+        primary_draft_artifact_id=PRIMARY_DRAFT_ID,
+        transcript_artifact_id=TRANSCRIPT_ID,
+        evidence_set_artifact_id=EVIDENCE_SET_ID,
+        quality_report_artifact_id=QUALITY_REPORT_ID,
+        display_asset_ids=(),
+        quality_overall=QualityOverall.PASS,
+        publish_eligible=True,
+        usage={"input_tokens": 3, "output_tokens": 2},
+        warnings=(),
     )
+    binding = SourceIdentityBinding(
+        connector_id="fixture",
+        canonical_identity="fixture://course",
+        source_id=source_id,
+        owning_bundle_id=bundle_id,
+        manifest_sha256=HASH_A,
+    )
+    receipt = PortableCommitReceipt(
+        bundle_id=bundle_id,
+        manifest_sha256=HASH_A,
+        commit_sha256=HASH_B,
+        workspace_relative_bundle_path=f"raw/personal/bundles/{bundle_id}",
+        idempotent=False,
+    )
+    return plan, binding, receipt
 
 
 @pytest.fixture
@@ -843,25 +868,29 @@ def test_commit_video_result_atomic_persists_result_identity_and_success(
     authority = _authority(repo)
     attempt = repo.create_attempt(job.job_id, "commit")
     attempt = repo.start_attempt(attempt.attempt_id, authority)
-    completion = _video_completion(job.job_id)
+    plan, binding, receipt = _video_commit_inputs(job.job_id)
 
     returned = repo.commit_video_result_atomic(
         job.job_id,
         attempt.attempt_id,
         authority,
-        lambda: completion,
+        result_plan=plan,
+        source_identity=binding,
+        commit=lambda: receipt,
     )
 
-    assert returned == completion
+    assert returned.result.job_id == plan.job_id
+    assert returned.result.commit_sha256 == receipt.commit_sha256
+    assert returned.source_identity == binding
     assert repo.get_job(job.job_id).state is JobState.SUCCEEDED
-    assert repo.get_job_result(job.job_id) == completion.result
+    assert repo.get_job_result(job.job_id) == returned.result
     with repo._connect() as connection:
         identity = connection.execute(
             "SELECT * FROM source_identities WHERE connector_id = 'fixture'"
         ).fetchone()
     assert identity is not None
-    assert identity["source_id"] == completion.source_identity.source_id
-    assert identity["owning_bundle_id"] == completion.result.bundle_id
+    assert identity["source_id"] == binding.source_id
+    assert identity["owning_bundle_id"] == plan.bundle_id
 
 
 def test_commit_video_result_atomic_rolls_back_when_callback_fails(
@@ -877,7 +906,9 @@ def test_commit_video_result_atomic_rolls_back_when_callback_fails(
     attempt = repo.create_attempt(job.job_id, "commit")
     attempt = repo.start_attempt(attempt.attempt_id, authority)
 
-    def fail_commit() -> JobCompletion:
+    plan, binding, _ = _video_commit_inputs(job.job_id)
+
+    def fail_commit() -> PortableCommitReceipt:
         raise RuntimeError("portable commit failed")
 
     with pytest.raises(RuntimeError, match="portable commit failed"):
@@ -885,7 +916,9 @@ def test_commit_video_result_atomic_rolls_back_when_callback_fails(
             job.job_id,
             attempt.attempt_id,
             authority,
-            fail_commit,
+            result_plan=plan,
+            source_identity=binding,
+            commit=fail_commit,
         )
 
     assert repo.get_job(job.job_id).state is JobState.RUNNING
@@ -904,11 +937,14 @@ def test_commit_video_result_atomic_rolls_back_on_source_identity_conflict(
     authority = _authority(repo)
     first_attempt = repo.create_attempt(first.job_id, "commit")
     first_attempt = repo.start_attempt(first_attempt.attempt_id, authority)
+    first_plan, first_binding, first_receipt = _video_commit_inputs(first.job_id)
     repo.commit_video_result_atomic(
         first.job_id,
         first_attempt.attempt_id,
         authority,
-        lambda: _video_completion(first.job_id),
+        result_plan=first_plan,
+        source_identity=first_binding,
+        commit=lambda: first_receipt,
     )
 
     second = repo.create_job(
@@ -920,16 +956,456 @@ def test_commit_video_result_atomic_rolls_back_on_source_identity_conflict(
     second_attempt = repo.create_attempt(second.job_id, "commit")
     second_attempt = repo.start_attempt(second_attempt.attempt_id, authority)
 
+    plan, binding, receipt = _video_commit_inputs(
+        second.job_id,
+        source_id=OTHER_SOURCE_ID,
+        bundle_id=NEXT_BUNDLE_ID,
+    )
+    callback_calls = 0
+
+    def commit() -> PortableCommitReceipt:
+        nonlocal callback_calls
+        callback_calls += 1
+        return receipt
+
     with pytest.raises(DomainError, match="source_identity_conflict"):
         repo.commit_video_result_atomic(
             second.job_id,
             second_attempt.attempt_id,
             authority,
-            lambda: _video_completion(second.job_id, source_id="src_other"),
+            result_plan=plan,
+            source_identity=binding,
+            commit=commit,
         )
 
+    assert callback_calls == 0
     assert repo.get_job(second.job_id).state is JobState.RUNNING
     assert repo.get_job_result(second.job_id) is None
+
+
+def test_commit_video_result_atomic_advances_same_source_binding(
+    repo: SqliteJobRepository,
+) -> None:
+    first = repo.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    repo.transition_job(first.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    first_attempt = repo.start_attempt(
+        repo.create_attempt(first.job_id, "commit").attempt_id, authority
+    )
+    plan, binding, receipt = _video_commit_inputs(first.job_id)
+    repo.commit_video_result_atomic(
+        first.job_id,
+        first_attempt.attempt_id,
+        authority,
+        result_plan=plan,
+        source_identity=binding,
+        commit=lambda: receipt,
+    )
+
+    second = repo.create_job(
+        request_hash=HASH_B, principal="local", client_request_id=None
+    )
+    repo.transition_job(second.job_id, JobState.RUNNING)
+    second_attempt = repo.start_attempt(
+        repo.create_attempt(second.job_id, "commit").attempt_id, authority
+    )
+    next_plan, next_binding, next_receipt = _video_commit_inputs(
+        second.job_id, bundle_id=NEXT_BUNDLE_ID
+    )
+
+    repo.commit_video_result_atomic(
+        second.job_id,
+        second_attempt.attempt_id,
+        authority,
+        result_plan=next_plan,
+        source_identity=next_binding,
+        commit=lambda: next_receipt,
+    )
+
+    assert repo.get_job(second.job_id).state is JobState.SUCCEEDED
+    assert repo.get_job_result(second.job_id) is not None
+
+
+@pytest.mark.parametrize("failure", ("mismatch", "noncanonical"))
+def test_commit_video_result_atomic_rejects_plan_before_callback(
+    repo: SqliteJobRepository,
+    failure: str,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "commit").attempt_id, authority
+    )
+    plan, binding, receipt = _video_commit_inputs(job.job_id)
+    if failure == "mismatch":
+        binding = SourceIdentityBinding(
+            connector_id=binding.connector_id,
+            canonical_identity=binding.canonical_identity,
+            source_id="src_mismatch",
+            owning_bundle_id=binding.owning_bundle_id,
+            manifest_sha256=binding.manifest_sha256,
+        )
+    else:
+        plan = VideoResultPlan(
+            **{
+                **plan.__dict__,
+                "usage": {"input_tokens": object()},
+            }
+        )
+    callback_calls = 0
+
+    def commit() -> PortableCommitReceipt:
+        nonlocal callback_calls
+        callback_calls += 1
+        return receipt
+
+    with pytest.raises(DomainError, match="job_result_plan_invalid"):
+        repo.commit_video_result_atomic(
+            job.job_id,
+            attempt.attempt_id,
+            authority,
+            result_plan=plan,
+            source_identity=binding,
+            commit=commit,
+        )
+
+    assert callback_calls == 0
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "job_id",
+        "run_id",
+        "bundle_id",
+        "source_id",
+        "revision_id",
+        "primary_draft_id",
+        "transcript_id",
+        "evidence_set_id",
+        "quality_report_id",
+        "manifest_digest",
+        "display_asset_prefix",
+        "duplicate_display_asset",
+        "usage_bool",
+        "quality_type",
+        "publish_eligible_type",
+        "warning_type",
+        "binding_connector",
+        "binding_canonical_identity",
+    ),
+)
+def test_commit_video_result_atomic_rejects_malformed_semantics_before_callback(
+    repo: SqliteJobRepository,
+    malformation: str,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "commit").attempt_id, authority
+    )
+    plan, binding, receipt = _video_commit_inputs(job.job_id)
+    wrong_uuid = "00000000-0000-4000-8000-000000000000"
+    if malformation == "job_id":
+        plan = replace(plan, job_id=f"job_{wrong_uuid}")
+    elif malformation == "run_id":
+        plan = replace(plan, run_id=f"run_{wrong_uuid}")
+    elif malformation == "bundle_id":
+        malformed = f"bnd_{wrong_uuid}"
+        plan = replace(plan, bundle_id=malformed)
+        binding = replace(binding, owning_bundle_id=malformed)
+        receipt = replace(receipt, bundle_id=malformed)
+    elif malformation == "source_id":
+        malformed = f"src_{wrong_uuid}"
+        plan = replace(plan, source_id=malformed)
+        binding = replace(binding, source_id=malformed)
+    elif malformation == "revision_id":
+        plan = replace(plan, source_revision_id=f"rev_{wrong_uuid}")
+    elif malformation in {
+        "primary_draft_id",
+        "transcript_id",
+        "evidence_set_id",
+        "quality_report_id",
+    }:
+        field_by_case = {
+            "primary_draft_id": "primary_draft_artifact_id",
+            "transcript_id": "transcript_artifact_id",
+            "evidence_set_id": "evidence_set_artifact_id",
+            "quality_report_id": "quality_report_artifact_id",
+        }
+        plan = replace(plan, **{field_by_case[malformation]: f"art_{wrong_uuid}"})
+    elif malformation == "manifest_digest":
+        malformed = "sha256:" + "A" * 64
+        plan = replace(plan, manifest_sha256=malformed)
+        binding = replace(binding, manifest_sha256=malformed)
+        receipt = replace(receipt, manifest_sha256=malformed)
+    elif malformation == "display_asset_prefix":
+        plan = replace(plan, display_asset_ids=(REVISION_ID,))
+    elif malformation == "duplicate_display_asset":
+        plan = replace(
+            plan, display_asset_ids=(DISPLAY_ASSET_ID, DISPLAY_ASSET_ID)
+        )
+    elif malformation == "usage_bool":
+        plan = replace(plan, usage={"input_tokens": True})
+    elif malformation == "quality_type":
+        plan = replace(plan, quality_overall="pass")  # type: ignore[arg-type]
+    elif malformation == "publish_eligible_type":
+        plan = replace(plan, publish_eligible=1)  # type: ignore[arg-type]
+    elif malformation == "warning_type":
+        plan = replace(plan, warnings=(1,))  # type: ignore[arg-type]
+    elif malformation == "binding_connector":
+        binding = replace(binding, connector_id="")
+    else:
+        binding = replace(binding, canonical_identity=1)  # type: ignore[arg-type]
+    callback_calls = 0
+
+    def commit() -> PortableCommitReceipt:
+        nonlocal callback_calls
+        callback_calls += 1
+        return receipt
+
+    with pytest.raises(DomainError, match="job_result_plan_invalid"):
+        repo.commit_video_result_atomic(
+            job.job_id,
+            attempt.attempt_id,
+            authority,
+            result_plan=plan,
+            source_identity=binding,
+            commit=commit,
+        )
+
+    assert callback_calls == 0
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
+    assert repo.get_job_result(job.job_id) is None
+
+
+def test_job_request_round_trips_and_direct_repository_call_defaults_none(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "request-store"
+    writer = SqliteJobRepository.open(machine_root)
+    request_json = '{"input":"fixture://course"}'
+    persisted = writer.create_job(
+        request_hash=sha256_digest(request_json),
+        request_json=request_json,
+        principal="local",
+        client_request_id="persisted",
+    )
+    direct = writer.create_job(
+        request_hash=HASH_B,
+        principal="local",
+        client_request_id="direct",
+    )
+
+    reader = SqliteJobRepository.open(machine_root)
+
+    assert reader.get_job_request(persisted.job_id) == '{"input":"fixture://course"}'
+    assert reader.get_job_request(direct.job_id) is None
+
+
+def test_repository_rejects_noncanonical_or_secret_request_json(
+    repo: SqliteJobRepository,
+) -> None:
+    for request_json in (
+        '{"b":2, "a":1}',
+        '{"api_key":"never-persist"}',
+    ):
+        with pytest.raises(DomainError, match="job_request_json_invalid"):
+            repo.create_job(
+                request_hash=sha256_digest(request_json),
+                request_json=request_json,
+                principal="local",
+                client_request_id=None,
+            )
+
+    assert b"never-persist" not in repo.database_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "secret_field",
+    (
+        "X-Auth-Token",
+        "clientSecret",
+        "aws_secret_access_key",
+        "apiToken",
+        "privateKey",
+        "bearerToken",
+    ),
+)
+def test_repository_rejects_secret_aliases_from_request_and_error_without_leak(
+    repo: SqliteJobRepository,
+    secret_field: str,
+) -> None:
+    secret = f"never-persist-{secret_field}"
+    request_json = json.dumps(
+        {secret_field: secret},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(DomainError) as request_error:
+        repo.create_job(
+            request_hash=sha256_digest(request_json),
+            request_json=request_json,
+            principal="local",
+            client_request_id=None,
+        )
+
+    job = repo.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    with pytest.raises(DomainError) as failure_error:
+        repo.fail_job_atomic(
+            job.job_id,
+            ErrorDetail(
+                "unsafe_error",
+                ErrorCategory.INTERNAL,
+                "Unsafe detail rejected",
+                {secret_field: secret},
+            ),
+        )
+
+    assert request_error.value.code == "job_request_json_invalid"
+    assert failure_error.value.code == "job_error_invalid"
+    for caught in (request_error, failure_error):
+        assert secret_field not in str(caught.value)
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+    assert secret.encode() not in repo.database_path.read_bytes()
+
+
+def test_repository_allows_monkey_identifier_in_request_and_error(
+    repo: SqliteJobRepository,
+) -> None:
+    request_json = '{"monkey":"banana"}'
+    job = repo.create_job(
+        request_hash=sha256_digest(request_json),
+        request_json=request_json,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    error = ErrorDetail(
+        "monkey_error",
+        ErrorCategory.INTERNAL,
+        "Monkey remained safe",
+        {"monkey": "banana"},
+    )
+
+    repo.fail_job_atomic(job.job_id, error)
+
+    assert repo.get_job_request(job.job_id) == request_json
+    assert repo.get_job_error(job.job_id) == error
+
+
+def test_failed_error_round_trips_after_repository_reopen(tmp_path: Path) -> None:
+    machine_root = tmp_path / "error-store"
+    writer = SqliteJobRepository.open(machine_root)
+    job = writer.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    writer.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(writer)
+    attempt = writer.start_attempt(
+        writer.create_attempt(job.job_id, "preflight").attempt_id, authority
+    )
+    error = ErrorDetail(
+        "preflight_workspace_failed",
+        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+        "Workspace preflight failed",
+        {"check": "portable_contract"},
+    )
+
+    failed = writer.fail_job_atomic(
+        job.job_id,
+        error,
+        attempt_id=attempt.attempt_id,
+        authority=authority,
+    )
+    reader = SqliteJobRepository.open(machine_root)
+
+    assert failed.state is JobState.FAILED
+    assert reader.get_job_error(job.job_id) == error
+
+
+def test_atomic_failure_rejects_secret_details_without_mutation(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    secret = "never-persist-error-secret"
+
+    with pytest.raises(DomainError, match="job_error_invalid"):
+        repo.fail_job_atomic(
+            job.job_id,
+            ErrorDetail(
+                "unsafe_error",
+                ErrorCategory.INTERNAL,
+                "Unsafe detail rejected",
+                {"api_key": secret},
+            ),
+        )
+
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
+    assert secret.encode() not in repo.database_path.read_bytes()
+
+
+def test_take_over_running_attempt_requires_new_expired_lease_fence(
+    tmp_path: Path,
+) -> None:
+    now_ms = 1_000
+    repo = SqliteJobRepository.open(
+        tmp_path / "takeover-store", clock=lambda: now_ms
+    )
+    job = repo.create_job(
+        request_hash=HASH_A, principal="local", client_request_id=None
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    old_authority = repo.acquire_scheduler_lease("old-owner", ttl_seconds=1)
+    old_attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "commit").attempt_id, old_authority
+    )
+
+    with pytest.raises(DomainError, match="scheduler_busy"):
+        repo.acquire_scheduler_lease("new-owner", ttl_seconds=1)
+    with pytest.raises(DomainError, match="attempt_takeover_not_fenced"):
+        repo.take_over_running_attempt(
+            job.job_id, old_attempt.attempt_id, old_authority
+        )
+
+    now_ms = 2_001
+    new_authority = repo.acquire_scheduler_lease("new-owner", ttl_seconds=1)
+    replacement = repo.take_over_running_attempt(
+        job.job_id, old_attempt.attempt_id, new_authority
+    )
+
+    assert replacement.attempt_id != old_attempt.attempt_id
+    assert replacement.step_id == old_attempt.step_id
+    assert replacement.state is AttemptState.RUNNING
+    assert replacement.fencing_token == new_authority.fencing_token
+    with repo._connect() as connection:
+        old_state = connection.execute(
+            "SELECT state FROM attempts WHERE attempt_id = ?",
+            (old_attempt.attempt_id,),
+        ).fetchone()[0]
+    assert old_state == AttemptState.INTERRUPTED.value
+    with pytest.raises(DomainError, match="attempt_fenced"):
+        repo.transition_attempt(
+            replacement.attempt_id,
+            AttemptState.SUCCEEDED,
+            authority=old_authority,
+        )
 
 
 def _create_needs_input_attempt(repo: SqliteJobRepository):

@@ -1,8 +1,14 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from types import MappingProxyType
+from typing import Mapping, Protocol
 
-from app.core.domain.video import JobState, VideoProduceResult
+from app.core.domain.video import (
+    JobState,
+    QualityOverall,
+    VideoProduceResult,
+)
+from app.core.errors import ErrorDetail
 from app.core.jobs.model import (
     Attempt,
     AttemptState,
@@ -25,6 +31,39 @@ class SourceIdentityBinding:
 
 
 @dataclass(frozen=True)
+class VideoResultPlan:
+    job_id: str
+    run_id: str
+    bundle_id: str
+    manifest_sha256: str
+    source_id: str
+    source_revision_id: str
+    primary_draft_artifact_id: str
+    transcript_artifact_id: str
+    evidence_set_artifact_id: str
+    quality_report_artifact_id: str
+    display_asset_ids: tuple[str, ...]
+    quality_overall: QualityOverall
+    publish_eligible: bool
+    usage: Mapping[str, int | float | str]
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "display_asset_ids", tuple(self.display_asset_ids))
+        object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+
+
+@dataclass(frozen=True)
+class PortableCommitReceipt:
+    bundle_id: str
+    manifest_sha256: str
+    commit_sha256: str
+    workspace_relative_bundle_path: str
+    idempotent: bool
+
+
+@dataclass(frozen=True)
 class JobCompletion:
     result: VideoProduceResult
     source_identity: SourceIdentityBinding
@@ -37,6 +76,7 @@ class JobRepositoryPort(Protocol):
         self,
         *,
         request_hash: str,
+        request_json: str | None = None,
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None = None,
@@ -48,13 +88,29 @@ class JobRepositoryPort(Protocol):
 
     def get_job_result(self, job_id: str) -> VideoProduceResult | None: ...
 
+    def get_job_request(self, job_id: str) -> str | None: ...
+
+    def get_job_error(self, job_id: str) -> ErrorDetail | None: ...
+
     def commit_video_result_atomic(
         self,
         job_id: str,
         attempt_id: str,
         authority: ExecutionAuthority,
-        commit: Callable[[], JobCompletion],
+        *,
+        result_plan: VideoResultPlan,
+        source_identity: SourceIdentityBinding,
+        commit: Callable[[], PortableCommitReceipt],
     ) -> JobCompletion: ...
+
+    def fail_job_atomic(
+        self,
+        job_id: str,
+        error: ErrorDetail,
+        *,
+        attempt_id: str | None = None,
+        authority: ExecutionAuthority | None = None,
+    ) -> Job: ...
 
     def cancel_job(self, job_id: str) -> Job: ...
 
@@ -88,6 +144,14 @@ class VideoExecutionRepositoryPort(JobRepositoryPort, Protocol):
         self, owner_id: str, *, ttl_seconds: int
     ) -> ExecutionAuthority: ...
 
+    def heartbeat_scheduler_lease(
+        self, authority: ExecutionAuthority, *, ttl_seconds: int
+    ) -> ExecutionAuthority: ...
+
+    def release_scheduler_lease(
+        self, authority: ExecutionAuthority
+    ) -> bool: ...
+
     def start_attempt(
         self, attempt_id: str, authority: ExecutionAuthority
     ) -> Attempt: ...
@@ -103,6 +167,13 @@ class VideoExecutionRepositoryPort(JobRepositoryPort, Protocol):
     def latest_checkpoint(
         self, job_id: str, step_id: str
     ) -> CheckpointMetadata | None: ...
+
+    def take_over_running_attempt(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> Attempt: ...
 
 
 class AttemptMetadataRepositoryPort(Protocol):

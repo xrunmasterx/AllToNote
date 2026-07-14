@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
 from app.core.domain.ids import new_typed_id
 from app.core.domain.video import JobSnapshot, JobState, VideoProduceRequest
 from app.core.errors import DomainError, ErrorCategory
+from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
 RUNTIME_VERSION = "0.1.0"
@@ -70,7 +72,7 @@ def main(
 
     correlation_id = new_typed_id("corr")
     try:
-        active_runtime = runtime or _default_runtime()
+        active_runtime = runtime or _default_runtime(args.workspace.resolve())
         request = VideoProduceRequest(
             request_schema_version=1,
             workspace_root=args.workspace.resolve(),
@@ -83,6 +85,22 @@ def main(
     except DomainError as error:
         _print_json(_error_envelope(correlation_id, error))
         return _EXIT_CODES[error.category]
+    except KeyboardInterrupt:
+        error = DomainError(
+            "interrupted",
+            ErrorCategory.CANCELLED,
+            "Command was interrupted",
+        )
+        _print_json(_error_envelope(correlation_id, error))
+        return 130
+    except Exception:
+        error = DomainError(
+            "internal_error",
+            ErrorCategory.INTERNAL,
+            "AllToNote could not complete the command",
+        )
+        _print_json(_error_envelope(correlation_id, error))
+        return _EXIT_CODES[ErrorCategory.INTERNAL]
 
     if snapshot.state is JobState.FAILED and snapshot.error is not None:
         _print_json(
@@ -92,16 +110,35 @@ def main(
                 "command": "produce video",
                 "correlation_id": correlation_id,
                 "data": {"job_id": snapshot.job_id, "state": snapshot.state.value},
-                "error": {
-                    "code": snapshot.error.code,
-                    "category": snapshot.error.category.value,
-                    "message": snapshot.error.message,
-                    "details": dict(snapshot.error.details),
-                },
+                "error": _error_payload(
+                    snapshot.error.code,
+                    snapshot.error.category,
+                    snapshot.error.message,
+                    snapshot.error.details,
+                ),
                 "warnings": [],
             }
         )
         return _EXIT_CODES[snapshot.error.category]
+
+    if snapshot.state is JobState.CANCELLED:
+        _print_json(
+            {
+                "alltonote_cli_protocol_version": 1,
+                "ok": False,
+                "command": "produce video",
+                "correlation_id": correlation_id,
+                "data": {"job_id": snapshot.job_id, "state": snapshot.state.value},
+                "error": _error_payload(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job was cancelled",
+                    {},
+                ),
+                "warnings": [],
+            }
+        )
+        return _EXIT_CODES[ErrorCategory.CANCELLED]
 
     result = snapshot.result
     data: dict[str, object] = {
@@ -142,14 +179,71 @@ def _error_envelope(correlation_id: str, error: DomainError) -> dict[str, object
         "ok": False,
         "command": "produce video",
         "correlation_id": correlation_id,
-        "error": {
-            "code": error.code,
-            "category": error.category.value,
-            "message": error.message,
-            "details": dict(error.details),
-        },
+        "error": _error_payload(
+            error.code,
+            error.category,
+            error.message,
+            error.details,
+        ),
         "warnings": [],
     }
+
+
+_OMIT = object()
+
+
+def _error_payload(
+    code: str,
+    category: ErrorCategory,
+    message: str,
+    details: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "code": code,
+        "category": category.value,
+        "message": message,
+        "details": _safe_error_details(details),
+    }
+
+
+def _safe_error_details(details: Mapping[str, object]) -> dict[str, object]:
+    try:
+        projected = _project_mapping(details)
+        json.dumps(projected, ensure_ascii=False, allow_nan=False)
+        return projected
+    except Exception:
+        return {}
+
+
+def _project_mapping(value: Mapping[object, object]) -> dict[str, object]:
+    projected: dict[str, object] = {}
+    for key, item in value.items():
+        if type(key) is not str:
+            continue
+        if is_sensitive_identifier(key):
+            projected[key] = "[REDACTED]"
+            continue
+        safe_item = _project_value(item)
+        if safe_item is not _OMIT:
+            projected[key] = safe_item
+    return projected
+
+
+def _project_value(value: object) -> object:
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        return value if math.isfinite(value) else _OMIT
+    if isinstance(value, Mapping):
+        return _project_mapping(value)
+    if isinstance(value, (list, tuple)):
+        projected = []
+        for item in value:
+            safe_item = _project_value(item)
+            if safe_item is not _OMIT:
+                projected.append(safe_item)
+        return projected
+    return _OMIT
 
 
 def _print_json(envelope: dict[str, object]) -> None:
@@ -163,10 +257,10 @@ def _print_json(envelope: dict[str, object]) -> None:
     )
 
 
-def _default_runtime() -> _VideoRuntime:
-    from app.runtime import create_fake_runtime
+def _default_runtime(workspace_root: Path) -> _VideoRuntime:
+    from app.runtime import create_fake_runtime_for_workspace
 
-    return create_fake_runtime(Path.home() / ".alltonote" / "runtime")
+    return create_fake_runtime_for_workspace(workspace_root)
 
 
 def entrypoint() -> None:

@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from uuid import RFC_4122, UUID
 
-from app.core.domain.ids import new_typed_id, utc_now_millis
+from app.core.domain.ids import new_typed_id, sha256_digest, utc_now_millis
 from app.core.domain.video import JobState, QualityOverall, VideoProduceResult
-from app.core.errors import DomainError, ErrorCategory
+from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.model import (
     Attempt,
     AttemptState,
@@ -26,16 +27,24 @@ from app.core.jobs.state_machine import (
     transition_attempt,
     transition_job,
 )
-from app.core.ports.jobs import JobCompletion, SourceIdentityBinding
+from app.core.ports.jobs import (
+    JobCompletion,
+    PortableCommitReceipt,
+    SourceIdentityBinding,
+    VideoResultPlan,
+)
+from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
 _SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5_000
+_RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE jobs (
         job_id TEXT PRIMARY KEY,
         request_hash TEXT NOT NULL,
+        request_json TEXT,
         principal TEXT NOT NULL,
         client_request_id TEXT,
         state TEXT NOT NULL,
@@ -273,14 +282,17 @@ class SqliteJobRepository:
         self,
         *,
         request_hash: str,
+        request_json: str | None = None,
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None = None,
     ) -> Job:
+        self._validate_request_json(request_hash, request_json)
         with self._transaction(immediate=True) as connection:
             return self._create_job(
                 connection,
                 request_hash=request_hash,
+                request_json=request_json,
                 principal=principal,
                 client_request_id=client_request_id,
                 retry_of_job_id=retry_of_job_id,
@@ -339,6 +351,13 @@ class SqliteJobRepository:
             if row["result_json"] is None:
                 return None
             return self._decode_video_result(row["result_json"])
+
+    def get_job_request(self, job_id: str) -> str | None:
+        return self._get_nullable_job_json(job_id, "request_json")
+
+    def get_job_error(self, job_id: str) -> ErrorDetail | None:
+        payload = self._get_nullable_job_json(job_id, "error_json")
+        return self._decode_error(payload) if payload is not None else None
 
     def create_attempt(self, job_id: str, step_id: str) -> Attempt:
         with self._transaction(immediate=True) as connection:
@@ -494,6 +513,55 @@ class SqliteJobRepository:
                 ),
             )
             return self._get_attempt(connection, attempt_id)
+
+    def take_over_running_attempt(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> Attempt:
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            attempt = self._get_attempt(connection, attempt_id)
+            self._assert_scheduler_authority(connection, authority)
+            if (
+                job.state is not JobState.RUNNING
+                or attempt.job_id != job_id
+                or attempt.state is not AttemptState.RUNNING
+            ):
+                raise DomainError(
+                    "attempt_takeover_invalid",
+                    ErrorCategory.CONFLICT,
+                    "Takeover requires a running Attempt from the running Job",
+                )
+            if authority.fencing_token <= attempt.fencing_token:
+                raise DomainError(
+                    "attempt_takeover_not_fenced",
+                    ErrorCategory.CONFLICT,
+                    "Takeover requires a newer scheduler fencing token",
+                )
+            now = utc_now_millis()
+            connection.execute(
+                "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
+                (AttemptState.INTERRUPTED.value, now, attempt_id),
+            )
+            replacement = self._create_attempt(
+                connection, job_id, attempt.step_id
+            )
+            connection.execute(
+                """
+                UPDATE attempts SET state = ?, fencing_token = ?, updated_at = ?
+                WHERE attempt_id = ? AND state = ?
+                """,
+                (
+                    AttemptState.RUNNING.value,
+                    authority.fencing_token,
+                    now,
+                    replacement.attempt_id,
+                    AttemptState.PENDING.value,
+                ),
+            )
+            return self._get_attempt(connection, replacement.attempt_id)
 
     def cancel_job(self, job_id: str) -> Job:
         with self._transaction(immediate=True) as connection:
@@ -705,9 +773,14 @@ class SqliteJobRepository:
                     ErrorCategory.CONFLICT,
                     "Retry must confirm exactly every unknown operation",
                 )
+            request_json = connection.execute(
+                "SELECT request_json FROM jobs WHERE job_id = ?",
+                (original_job_id,),
+            ).fetchone()[0]
             return self._create_job(
                 connection,
                 request_hash=original.request_hash,
+                request_json=request_json,
                 principal=original.principal,
                 client_request_id=client_request_id,
                 retry_of_job_id=original.job_id,
@@ -1200,60 +1273,110 @@ class SqliteJobRepository:
         job_id: str,
         attempt_id: str,
         authority: ExecutionAuthority,
-        commit: Callable[[], JobCompletion],
+        *,
+        result_plan: VideoResultPlan,
+        source_identity: SourceIdentityBinding,
+        commit: Callable[[], PortableCommitReceipt],
     ) -> JobCompletion:
         with self._transaction(immediate=True) as connection:
             self._assert_commit_guard(
                 connection, job_id, attempt_id, authority
             )
-            completion = commit()
-            self._validate_completion(job_id, completion)
-            binding = completion.source_identity
+            self._validate_result_plan(result_plan)
+            self._validate_result_plan_binding(
+                job_id, result_plan, source_identity
+            )
             existing = connection.execute(
                 """
                 SELECT * FROM source_identities
                 WHERE connector_id = ? AND canonical_identity = ?
                 """,
-                (binding.connector_id, binding.canonical_identity),
+                (
+                    source_identity.connector_id,
+                    source_identity.canonical_identity,
+                ),
             ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO source_identities (
-                        connector_id, canonical_identity, source_id,
-                        owning_bundle_id, manifest_sha256, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        binding.connector_id,
-                        binding.canonical_identity,
-                        binding.source_id,
-                        binding.owning_bundle_id,
-                        binding.manifest_sha256,
-                        utc_now_millis(),
-                    ),
-                )
-            elif any(
-                existing[field] != getattr(binding, field)
-                for field in (
-                    "source_id",
-                    "owning_bundle_id",
-                    "manifest_sha256",
-                )
+            if (
+                existing is not None
+                and existing["source_id"] != source_identity.source_id
             ):
                 raise DomainError(
                     "source_identity_conflict",
                     ErrorCategory.CONFLICT,
-                    "Canonical source identity is bound to another committed Bundle",
+                    "Canonical source identity is bound to another Source",
                 )
+            receipt = commit()
+            result = self._result_from_plan_receipt(result_plan, receipt)
+            connection.execute(
+                """
+                INSERT INTO source_identities (
+                    connector_id, canonical_identity, source_id,
+                    owning_bundle_id, manifest_sha256, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connector_id, canonical_identity) DO UPDATE SET
+                    owning_bundle_id = excluded.owning_bundle_id,
+                    manifest_sha256 = excluded.manifest_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source_identity.connector_id,
+                    source_identity.canonical_identity,
+                    source_identity.source_id,
+                    source_identity.owning_bundle_id,
+                    source_identity.manifest_sha256,
+                    utc_now_millis(),
+                ),
+            )
             connection.execute(
                 "UPDATE jobs SET result_json = ? WHERE job_id = ?",
-                (self._encode_video_result(completion.result), job_id),
+                (self._encode_video_result(result), job_id),
             )
             self._finish_commit_guard(
                 connection, job_id, attempt_id, authority
             )
-            return completion
+            return JobCompletion(result=result, source_identity=source_identity)
+
+    def fail_job_atomic(
+        self,
+        job_id: str,
+        error: ErrorDetail,
+        *,
+        attempt_id: str | None = None,
+        authority: ExecutionAuthority | None = None,
+    ) -> Job:
+        if (attempt_id is None) != (authority is None):
+            raise DomainError(
+                "failure_authority_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Failure Attempt and execution authority must be provided together",
+            )
+        error_json = self._encode_error(error)
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "job_failure_not_running",
+                    ErrorCategory.CONFLICT,
+                    "Atomic failure requires a running Job",
+                )
+            now = utc_now_millis()
+            if attempt_id is not None and authority is not None:
+                self._assert_execution_authority(
+                    connection, job_id, attempt_id, authority
+                )
+                connection.execute(
+                    "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
+                    (AttemptState.FAILED.value, now, attempt_id),
+                )
+            self._ensure_attempts_settled(connection, job_id)
+            connection.execute(
+                """
+                UPDATE jobs SET state = ?, error_json = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (JobState.FAILED.value, error_json, now, job_id),
+            )
+            return self._get_job(connection, job_id)
 
     def _assert_commit_guard(
         self,
@@ -1329,27 +1452,145 @@ class SqliteJobRepository:
                 "Portable commit authority changed before success",
             )
 
-    @staticmethod
-    def _validate_completion(job_id: str, completion: JobCompletion) -> None:
-        if not isinstance(completion, JobCompletion):
+    @classmethod
+    def _validate_result_plan(cls, plan: VideoResultPlan) -> None:
+        if not isinstance(plan, VideoResultPlan):
             raise DomainError(
-                "job_completion_invalid",
+                "job_result_plan_invalid",
                 ErrorCategory.INTERNAL,
-                "Commit callback returned an invalid completion",
+                "Video result plan has an invalid type",
             )
-        result = completion.result
-        binding = completion.source_identity
         if (
-            result.job_id != job_id
-            or result.source_id != binding.source_id
-            or result.bundle_id != binding.owning_bundle_id
-            or result.manifest_sha256 != binding.manifest_sha256
+            not cls._is_typed_uuid7(plan.job_id, "job")
+            or not cls._is_typed_uuid7(plan.run_id, "run")
+            or not cls._is_typed_uuid7(plan.bundle_id, "bnd")
+            or not cls._is_sha256_digest(plan.manifest_sha256)
+            or not cls._is_typed_uuid7(plan.source_id, "src")
+            or not cls._is_typed_uuid7(plan.source_revision_id, "rev")
+            or any(
+                not cls._is_typed_uuid7(value, "art")
+                for value in (
+                    plan.primary_draft_artifact_id,
+                    plan.transcript_artifact_id,
+                    plan.evidence_set_artifact_id,
+                    plan.quality_report_artifact_id,
+                    *plan.display_asset_ids,
+                )
+            )
+            or len(plan.display_asset_ids) != len(set(plan.display_asset_ids))
+            or type(plan.quality_overall) is not QualityOverall
+            or type(plan.publish_eligible) is not bool
+            or any(
+                type(value) is not str or not value.strip()
+                for value in plan.warnings
+            )
+            or frozenset(plan.usage) - _RESULT_USAGE_FIELDS
+            or any(
+                type(value) is not int or value < 0
+                for value in plan.usage.values()
+            )
         ):
             raise DomainError(
-                "job_completion_invalid",
+                "job_result_plan_invalid",
                 ErrorCategory.INTERNAL,
-                "Completion result and source identity binding do not match",
+                "Video result plan contains invalid fields",
             )
+
+    @staticmethod
+    def _is_typed_uuid7(value: object, prefix: str) -> bool:
+        if type(value) is not str or not value.startswith(f"{prefix}_"):
+            return False
+        suffix = value[len(prefix) + 1 :]
+        try:
+            parsed = UUID(suffix)
+        except (AttributeError, ValueError):
+            return False
+        return (
+            parsed.version == 7
+            and parsed.variant == RFC_4122
+            and str(parsed) == suffix
+        )
+
+    @staticmethod
+    def _is_sha256_digest(value: object) -> bool:
+        return (
+            type(value) is str
+            and value.startswith("sha256:")
+            and len(value) == 71
+            and all(character in "0123456789abcdef" for character in value[7:])
+        )
+
+    @classmethod
+    def _validate_result_plan_binding(
+        cls,
+        job_id: str,
+        plan: VideoResultPlan,
+        binding: SourceIdentityBinding,
+    ) -> None:
+        if (
+            not isinstance(binding, SourceIdentityBinding)
+            or any(
+                type(value) is not str or not value.strip()
+                for value in (
+                    binding.connector_id,
+                    binding.canonical_identity,
+                )
+            )
+            or not cls._is_typed_uuid7(binding.source_id, "src")
+            or not cls._is_typed_uuid7(binding.owning_bundle_id, "bnd")
+            or not cls._is_sha256_digest(binding.manifest_sha256)
+            or plan.job_id != job_id
+            or plan.source_id != binding.source_id
+            or plan.bundle_id != binding.owning_bundle_id
+            or plan.manifest_sha256 != binding.manifest_sha256
+        ):
+            raise DomainError(
+                "job_result_plan_invalid",
+                ErrorCategory.INTERNAL,
+                "Video result plan and source binding do not match",
+            )
+
+    @classmethod
+    def _result_from_plan_receipt(
+        cls,
+        plan: VideoResultPlan,
+        receipt: PortableCommitReceipt,
+    ) -> VideoProduceResult:
+        if not isinstance(receipt, PortableCommitReceipt) or (
+            receipt.bundle_id != plan.bundle_id
+            or receipt.manifest_sha256 != plan.manifest_sha256
+            or not cls._is_sha256_digest(receipt.commit_sha256)
+            or type(receipt.workspace_relative_bundle_path) is not str
+            or not receipt.workspace_relative_bundle_path
+            or type(receipt.idempotent) is not bool
+        ):
+            raise DomainError(
+                "portable_commit_receipt_invalid",
+                ErrorCategory.INTERNAL,
+                "Portable commit receipt does not match the result plan",
+            )
+        result = VideoProduceResult(
+            job_id=plan.job_id,
+            run_id=plan.run_id,
+            bundle_id=plan.bundle_id,
+            manifest_sha256=plan.manifest_sha256,
+            commit_sha256=receipt.commit_sha256,
+            workspace_relative_bundle_path=receipt.workspace_relative_bundle_path,
+            source_id=plan.source_id,
+            source_revision_id=plan.source_revision_id,
+            primary_draft_artifact_id=plan.primary_draft_artifact_id,
+            transcript_artifact_id=plan.transcript_artifact_id,
+            evidence_set_artifact_id=plan.evidence_set_artifact_id,
+            quality_report_artifact_id=plan.quality_report_artifact_id,
+            display_asset_ids=plan.display_asset_ids,
+            quality_overall=plan.quality_overall,
+            publish_eligible=plan.publish_eligible,
+            usage=plan.usage,
+            warnings=plan.warnings,
+            idempotent=receipt.idempotent,
+        )
+        cls._encode_video_result(result)
+        return result
 
     @staticmethod
     def _encode_video_result(result: VideoProduceResult) -> str:
@@ -1417,6 +1658,132 @@ class SqliteJobRepository:
                 "Stored Job result is invalid",
             ) from error
 
+    def _get_nullable_job_json(self, job_id: str, column: str) -> str | None:
+        assert column in {"request_json", "error_json"}
+        with self._transaction(immediate=False) as connection:
+            row = connection.execute(
+                f"SELECT {column} FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                self._get_job(connection, job_id)
+            return row[column]
+
+    @classmethod
+    def _validate_request_json(
+        cls, request_hash: str, request_json: str | None
+    ) -> None:
+        if request_json is None:
+            return
+        try:
+            value = json.loads(
+                request_json,
+                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            )
+            cls._assert_safe_json_fields(value)
+            canonical = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise DomainError(
+                "job_request_json_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Stored Job request must be safe canonical JSON",
+            ) from None
+        if (
+            not isinstance(value, dict)
+            or canonical != request_json
+            or sha256_digest(request_json) != request_hash
+        ):
+            raise DomainError(
+                "job_request_json_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Stored Job request must match its canonical hash",
+            )
+
+    @classmethod
+    def _assert_safe_json_fields(cls, value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if is_sensitive_identifier(key):
+                    raise ValueError
+                cls._assert_safe_json_fields(item)
+        elif isinstance(value, list):
+            for item in value:
+                cls._assert_safe_json_fields(item)
+
+    @classmethod
+    def _safe_error_json_value(cls, value: object) -> object:
+        if value is None or type(value) in (bool, int, float, str):
+            return value
+        if isinstance(value, Mapping):
+            normalized: dict[str, object] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise TypeError
+                if is_sensitive_identifier(key):
+                    raise TypeError
+                normalized[key] = cls._safe_error_json_value(item)
+            return normalized
+        if isinstance(value, tuple):
+            return [cls._safe_error_json_value(item) for item in value]
+        raise TypeError
+
+    @classmethod
+    def _encode_error(cls, error: ErrorDetail) -> str:
+        if (
+            not isinstance(error, ErrorDetail)
+            or type(error.code) is not str
+            or not error.code
+            or not isinstance(error.category, ErrorCategory)
+            or type(error.message) is not str
+            or not error.message
+        ):
+            raise DomainError(
+                "job_error_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job failure requires a structured error",
+            )
+        try:
+            return json.dumps(
+                {
+                    "code": error.code,
+                    "category": error.category.value,
+                    "message": error.message,
+                    "details": cls._safe_error_json_value(error.details),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            raise DomainError(
+                "job_error_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job error cannot be serialized canonically",
+            ) from None
+
+    @staticmethod
+    def _decode_error(payload: str) -> ErrorDetail:
+        try:
+            value = json.loads(payload)
+            return ErrorDetail(
+                code=value["code"],
+                category=ErrorCategory(value["category"]),
+                message=value["message"],
+                details=value["details"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DomainError(
+                "job_error_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job error is invalid",
+            ) from error
+
     def _get_job(self, connection: sqlite3.Connection, job_id: str) -> Job:
         row = connection.execute(
             "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
@@ -1434,6 +1801,7 @@ class SqliteJobRepository:
         connection: sqlite3.Connection,
         *,
         request_hash: str,
+        request_json: str | None,
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None,
@@ -1463,14 +1831,16 @@ class SqliteJobRepository:
         connection.execute(
             """
             INSERT INTO jobs (
-                job_id, request_hash, principal, client_request_id, state,
+                job_id, request_hash, request_json, principal,
+                client_request_id, state,
                 cancellation_requested, retry_of_job_id, result_json,
                 error_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
             """,
             (
                 job_id,
                 request_hash,
+                request_json,
                 principal,
                 client_request_id,
                 JobState.QUEUED.value,

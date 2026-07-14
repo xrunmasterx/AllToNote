@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import StrEnum
@@ -11,71 +10,17 @@ from pathlib import Path
 from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.ports.jobs import JobRepositoryPort
+from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
 _IDEMPOTENCY_FIELDS = frozenset({"principal", "client_request_id"})
-_SECRET_FIELD_NAMES = frozenset(
-    {
-        "accesstoken",
-        "apikey",
-        "authtoken",
-        "authorization",
-        "cookie",
-        "password",
-        "refreshtoken",
-        "secret",
-        "setcookie",
-        "token",
-        "xapikey",
-    }
-)
-_SECRET_IDENTIFIER_TOKENS = frozenset(
-    {
-        "authorization",
-        "bearer",
-        "cookie",
-        "passwd",
-        "password",
-        "secret",
-        "token",
-    }
-)
-_SECRET_KEY_QUALIFIERS = frozenset(
-    {"access", "api", "client", "encryption", "private", "signing"}
-)
-_IDENTIFIER_SEGMENT_PATTERN = re.compile(r"[A-Za-z0-9]+")
-_IDENTIFIER_TOKEN_PATTERN = re.compile(
-    r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+"
-)
-
-
-def _identifier_tokens(identifier: str) -> tuple[str, ...]:
-    return tuple(
-        token.group(0).casefold()
-        for segment in _IDENTIFIER_SEGMENT_PATTERN.finditer(identifier)
-        for token in _IDENTIFIER_TOKEN_PATTERN.finditer(segment.group(0))
-    )
-
-
-def _is_secret_identifier(identifier: str) -> bool:
-    normalized = "".join(
-        character for character in identifier.casefold() if character.isalnum()
-    )
-    if normalized in _SECRET_FIELD_NAMES:
-        return True
-    tokens = frozenset(_identifier_tokens(identifier))
-    return bool(tokens & _SECRET_IDENTIFIER_TOKENS) or (
-        "key" in tokens and bool(tokens & _SECRET_KEY_QUALIFIERS)
-    )
-
-
 def _canonical_value(value: object, *, excluded_fields: frozenset[str]) -> object:
     if value is None or type(value) in (bool, int, float, str):
         return value
     if isinstance(value, StrEnum):
         enum_type = type(value)
         if any(
-            _is_secret_identifier(identifier)
+            is_sensitive_identifier(identifier)
             for identifier in (enum_type.__name__, enum_type.__qualname__, value.name)
         ):
             raise TypeError
@@ -90,7 +35,7 @@ def _canonical_value(value: object, *, excluded_fields: frozenset[str]) -> objec
         for field in fields(value):
             if field.name in excluded_fields:
                 continue
-            if _is_secret_identifier(field.name):
+            if is_sensitive_identifier(field.name):
                 raise TypeError
             normalized[field.name] = _canonical_value(
                 getattr(value, field.name), excluded_fields=frozenset()
@@ -102,7 +47,7 @@ def _canonical_value(value: object, *, excluded_fields: frozenset[str]) -> objec
             if type(key) is not str:
                 raise TypeError
             if key not in excluded_fields:
-                if _is_secret_identifier(key):
+                if is_sensitive_identifier(key):
                     raise TypeError
                 normalized[key] = _canonical_value(
                     item, excluded_fields=frozenset()
@@ -179,6 +124,7 @@ class JobService:
         )
         job = self._repository.create_job(
             request_hash=_sha256_json(request_json),
+            request_json=request_json,
             principal=principal,
             client_request_id=client_request_id,
         )
@@ -202,7 +148,7 @@ class JobService:
             ),
             retry_of_job_id=job.retry_of_job_id,
             result=self._repository.get_job_result(job_id),
-            error=None,
+            error=self._repository.get_job_error(job_id),
         )
 
     def cancel(self, job_id: str) -> JobSnapshot:

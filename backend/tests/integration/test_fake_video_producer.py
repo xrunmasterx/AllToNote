@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import json
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,30 +16,26 @@ from iwiki.workspace import open_workspace
 from app.core.domain.video import (
     JobState,
     QualityOverall,
+    ScreenshotPolicy,
     VideoProduceRequest,
+)
+from app.core.application.video_service import (
+    VideoPreflightCapabilities,
+    _CandidateCheckpoint,
 )
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
-PREFLIGHT_FAILURE_CASES = (
-    "request_schema",
-    "workspace_contract",
-    "recipe_version",
-    "runtime_version",
-    "video_feature_pack",
-    "job_store",
-    "work_directory",
-    "disk_space",
-    "source_capability",
-    "transcript_capability",
-    "model_capability",
-    "screenshot_capability",
-    "screenshot_model_incompatibility",
-    "ffmpeg_loadability",
-    "model_loadability",
-    "transcriber_loadability",
-    "effective_config",
-    "credential_reference",
+PREFLIGHT_CAPABILITY_FAILURES = (
+    ("video_feature_pack", "video_feature_pack_unavailable"),
+    ("source_capability", "source_capability_unavailable"),
+    ("transcript_capability", "transcript_capability_unavailable"),
+    ("model_capability", "model_capability_unavailable"),
+    ("ffmpeg_loadable", "ffmpeg_unavailable"),
+    ("model_loadable", "model_unavailable"),
+    ("transcriber_loadable", "transcriber_unavailable"),
+    ("effective_config_valid", "effective_config_invalid"),
+    ("credential_references_resolvable", "credential_reference_unavailable"),
 )
 CHECKPOINT_STEPS = (
     "preflight",
@@ -166,20 +166,25 @@ def test_quality_fail_still_commits_and_returns_success(
     _validate_committed_bundle(workspace_root, snapshot.result.bundle_id)
 
 
-@pytest.mark.parametrize("failure", PREFLIGHT_FAILURE_CASES)
+@pytest.mark.parametrize(("field_name", "error_code"), PREFLIGHT_CAPABILITY_FAILURES)
 def test_preflight_failure_starts_no_external_work(
     runtime_factory: Callable[..., tuple[object, object]],
-    failure: str,
+    field_name: str,
+    error_code: str,
     workspace_root: Path,
 ) -> None:
-    runtime, calls = runtime_factory(preflight_failure=failure)
+    runtime, calls = runtime_factory(
+        capabilities=replace(
+            VideoPreflightCapabilities(), **{field_name: False}
+        )
+    )
 
     submitted = runtime.submit_video(valid_request(workspace_root))
     snapshot = runtime.wait_job(submitted.job_id)
 
     assert snapshot.state is JobState.FAILED
     assert snapshot.error is not None
-    assert snapshot.error.code == f"preflight_{failure}_failed"
+    assert snapshot.error.code == error_code
     assert calls.download == 0
     assert calls.transcribe == 0
     assert calls.model == 0
@@ -187,6 +192,64 @@ def test_preflight_failure_starts_no_external_work(
     assert calls.commit == 0
     staging = workspace_root / "raw" / "personal" / ".staging"
     assert tuple(staging.iterdir()) == ()
+
+
+def test_screenshot_capability_is_checked_only_when_requested(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory(
+        capabilities=replace(
+            VideoPreflightCapabilities(), screenshot_capability=False
+        )
+    )
+    request = replace(
+        valid_request(workspace_root, client_request_id="screenshots-required"),
+        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
+
+    snapshot = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert snapshot.state is JobState.FAILED
+    assert snapshot.error is not None
+    assert snapshot.error.code == "screenshot_capability_unavailable"
+    assert calls.download == calls.transcribe == calls.model == calls.ffmpeg == 0
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_state"),
+    (
+        (ScreenshotPolicy.ON_DEMAND, JobState.FAILED),
+        (ScreenshotPolicy.OFF, JobState.SUCCEEDED),
+    ),
+)
+def test_screenshot_model_compatibility_is_typed_and_policy_scoped(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+    policy: ScreenshotPolicy,
+    expected_state: JobState,
+) -> None:
+    runtime, calls = runtime_factory(
+        capabilities=replace(
+            VideoPreflightCapabilities(), screenshot_model_compatible=False
+        )
+    )
+    request = replace(
+        valid_request(workspace_root, client_request_id=f"compat-{policy.value}"),
+        screenshot_policy=policy,
+    )
+
+    snapshot = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert snapshot.state is expected_state
+    if policy is ScreenshotPolicy.ON_DEMAND:
+        assert snapshot.error is not None
+        assert snapshot.error.code == "screenshot_model_incompatible"
+        assert calls.download == calls.transcribe == calls.model == calls.ffmpeg == 0
+    else:
+        assert snapshot.error is None
+        assert calls.download == calls.transcribe == calls.model == 1
+        assert calls.ffmpeg == 0
 
 
 def test_crash_after_rename_reconciles_without_new_model_work(
@@ -217,3 +280,338 @@ def test_crash_after_rename_reconciles_without_new_model_work(
     assert calls.model == 1
     assert calls.commit == 1
     _validate_committed_bundle(workspace_root, recovered.result.bundle_id)
+
+
+def _read_call_log(path: Path) -> tuple[str, ...]:
+    return tuple(
+        json.loads(line)["operation"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_crash_after_rename_recovers_after_runtime_reopen_and_new_fence(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "durable-machine"
+    call_log = tmp_path / "external-calls.ndjson"
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        crash_after_commit_once=True,
+        owner_id="process-a",
+        clock=lambda: 1_000,
+    )
+    submitted = first.submit_video(
+        valid_request(workspace_root, client_request_id="restart-after-rename")
+    )
+
+    with pytest.raises(RuntimeError, match="injected crash after portable rename"):
+        first.wait_job(submitted.job_id)
+
+    del first
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        owner_id="process-b",
+        clock=lambda: 302_000,
+    )
+    recovered = reopened.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    assert recovered.result is not None
+    assert recovered.result.idempotent is True
+    operations = _read_call_log(call_log)
+    assert operations.count("download") == 1
+    assert operations.count("transcribe") == 1
+    assert operations.count("model") == 1
+    assert operations.count("portable_commit") == 1
+    with reopened.job_repository._connect() as connection:
+        commit_attempts = connection.execute(
+            """
+            SELECT state FROM attempts
+            WHERE job_id = ? AND step_id = 'commit'
+            ORDER BY rowid
+            """,
+            (submitted.job_id,),
+        ).fetchall()
+        assembly_attempts = connection.execute(
+            """
+            SELECT COUNT(*) FROM attempts
+            WHERE job_id = ? AND step_id = 'assemble_candidate_bundle'
+            """,
+            (submitted.job_id,),
+        ).fetchone()[0]
+    assert tuple(row["state"] for row in commit_attempts) == (
+        "interrupted",
+        "succeeded",
+    )
+    assert assembly_attempts == 1
+
+
+def test_restart_after_draft_failure_reuses_transcript_checkpoint(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "transcript-replay-machine"
+    call_log = tmp_path / "transcript-replay-calls.ndjson"
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        crash_operation_once="model",
+        owner_id="process-a",
+        clock=lambda: 1_000,
+    )
+    submitted = first.submit_video(
+        valid_request(workspace_root, client_request_id="transcript-replay")
+    )
+
+    with pytest.raises(RuntimeError, match="injected model crash"):
+        first.wait_job(submitted.job_id)
+
+    del first
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        owner_id="process-b",
+        clock=lambda: 302_000,
+    )
+    recovered = reopened.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    operations = _read_call_log(call_log)
+    assert operations.count("download") == 1
+    assert operations.count("transcribe") == 1
+    assert operations.count("model") == 2
+
+
+def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "draft-replay-machine"
+    call_log = tmp_path / "draft-replay-calls.ndjson"
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        crash_operation_once="screenshots",
+        owner_id="process-a",
+        clock=lambda: 1_000,
+    )
+    request = valid_request(workspace_root, client_request_id="draft-replay")
+    submitted = first.submit_video(request)
+
+    with pytest.raises(RuntimeError, match="injected screenshots crash"):
+        first.wait_job(submitted.job_id)
+
+    del first
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        owner_id="process-b",
+        clock=lambda: 302_000,
+    )
+    recovered = reopened.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    operations = _read_call_log(call_log)
+    assert operations.count("download") == 1
+    assert operations.count("transcribe") == 1
+    assert operations.count("model") == 1
+
+
+def test_unsupported_recipe_version_fails_preflight_without_external_work(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+    request = VideoProduceRequest(
+        request_schema_version=1,
+        workspace_root=workspace_root,
+        input_value="fixture://course",
+        client_request_id="unsupported-recipe",
+        recipe_version=999,
+    )
+
+    snapshot = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert snapshot.state is JobState.FAILED
+    assert snapshot.error is not None
+    assert snapshot.error.code == "recipe_version_unsupported"
+    assert calls.download == calls.transcribe == calls.model == calls.ffmpeg == 0
+
+
+def test_second_canonical_source_conflicts_before_new_bundle_commit(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+
+    first = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="same-source-first")
+        ).job_id
+    )
+    second = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="same-source-second")
+        ).job_id
+    )
+
+    assert first.state is JobState.SUCCEEDED
+    assert second.state is JobState.FAILED
+    assert first.result is not None
+    assert second.result is None
+    assert second.error is not None
+    assert second.error.code == "source_identity_conflict"
+    committed = tuple((workspace_root / "raw" / "personal" / "bundles").iterdir())
+    assert [item.name for item in committed] == [first.result.bundle_id]
+    assert calls.commit == 1
+
+
+def test_long_external_step_renews_scheduler_lease_cooperatively(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    now_ms = [1_000]
+
+    def long_model_step(heartbeat: Callable[[], None]) -> None:
+        now_ms[0] += 200_000
+        heartbeat()
+        now_ms[0] += 200_000
+
+    calls = runtime_module.FakeCallCounts()
+    runtime = runtime_module.create_fake_runtime(
+        tmp_path / "heartbeat-machine",
+        calls=calls,
+        clock=lambda: now_ms[0],
+        operation_hooks={"model": long_model_step},
+    )
+
+    snapshot = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="long-model")
+        ).job_id
+    )
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert calls.download == calls.transcribe == calls.model == 1
+    assert calls.commit == 1
+
+
+def test_takeover_of_running_generate_draft_leaves_no_running_replacement(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "takeover-machine"
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        owner_id="process-a",
+        clock=lambda: 1_000,
+    )
+    submitted = first.submit_video(
+        valid_request(workspace_root, client_request_id="takeover-model")
+    )
+    repository = first.job_repository
+    repository.transition_job(submitted.job_id, JobState.RUNNING)
+    old_authority = repository.acquire_scheduler_lease("process-a", ttl_seconds=300)
+    abandoned = repository.start_attempt(
+        repository.create_attempt(submitted.job_id, "generate_draft").attempt_id,
+        old_authority,
+    )
+
+    del first
+    calls = runtime_module.FakeCallCounts()
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        calls=calls,
+        owner_id="process-b",
+        clock=lambda: 302_000,
+    )
+    recovered = reopened.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    with reopened.job_repository._connect() as connection:
+        attempts = connection.execute(
+            "SELECT attempt_id, state FROM attempts WHERE job_id = ?",
+            (submitted.job_id,),
+        ).fetchall()
+    states = {row["attempt_id"]: row["state"] for row in attempts}
+    assert states[abandoned.attempt_id] == "interrupted"
+    assert "running" not in states.values()
+    assert calls.model == 1
+
+
+def test_concurrent_waits_on_one_runtime_execute_job_once(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    model_entered = threading.Event()
+    release_model = threading.Event()
+
+    def block_model(heartbeat: Callable[[], None]) -> None:
+        heartbeat()
+        model_entered.set()
+        assert release_model.wait(timeout=5)
+
+    runtime, calls = runtime_factory(operation_hooks={"model": block_model})
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="concurrent-wait")
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runtime.wait_job, submitted.job_id)
+        assert model_entered.wait(timeout=5)
+        second = executor.submit(runtime.wait_job, submitted.job_id)
+        release_model.set()
+        snapshots = (first.result(timeout=10), second.result(timeout=10))
+
+    assert all(item.state is JobState.SUCCEEDED for item in snapshots)
+    assert calls.download == calls.transcribe == calls.model == 1
+    assert calls.commit == 1
+
+
+def test_candidate_checkpoint_decode_rejects_malformed_control_payloads(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, _ = runtime_factory()
+    snapshot = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="strict-candidate")
+        ).job_id
+    )
+    assert snapshot.state is JobState.SUCCEEDED
+    metadata = runtime.job_repository.latest_checkpoint(
+        snapshot.job_id, "assemble_candidate_bundle"
+    )
+    assert metadata is not None
+    payload_path = (
+        Path(runtime.job_repository.database_path).parent.parent
+        / "attempts"
+        / metadata.relative_path
+    )
+    original = json.loads(payload_path.read_text(encoding="utf-8"))
+
+    invalid_payloads: list[dict[str, object]] = []
+    for key, value in (
+        ("extra", "not-allowed"),
+        ("publish_eligible", 1),
+        ("display_asset_ids", "art_not-a-list"),
+        ("warnings", [1]),
+        ("usage", {"input_tokens": 1, "cost_micros": 1}),
+        ("bundle_id", "bnd_invalid"),
+        ("manifest_sha256", "sha256:" + "A" * 64),
+        ("staging_relative_path", "../outside"),
+    ):
+        mutated = dict(original)
+        mutated[key] = value
+        invalid_payloads.append(mutated)
+
+    for invalid in invalid_payloads:
+        with pytest.raises(Exception, match="candidate_checkpoint_invalid"):
+            _CandidateCheckpoint.decode(json.dumps(invalid).encode("utf-8"))

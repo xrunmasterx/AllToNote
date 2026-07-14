@@ -1,22 +1,42 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Protocol, TypeVar
 from uuid import UUID
 
 from app.core.application.job_service import JobService
+from app.core.application.video_checkpoints import (
+    CandidateCheckpoint as _CandidateCheckpoint,
+    decode_acquired as _decode_acquired,
+    decode_draft as _decode_draft,
+    decode_preflight as _decode_preflight,
+    decode_revision as _decode_revision,
+    decode_screenshots as _decode_screenshots,
+    decode_source as _decode_source,
+    decode_transcript as _decode_transcript,
+    decode_validation as _decode_validation,
+    encode_acquired as _encode_acquired,
+    encode_draft as _encode_draft,
+    encode_screenshots as _encode_screenshots,
+    encode_source as _encode_source,
+    encode_transcript as _encode_transcript,
+    encode_validation as _encode_validation,
+)
 from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.video import (
     GeneratedVideoDraft,
     JobSnapshot,
     JobState,
-    QualityOverall,
+    ScreenshotPolicy,
     TranscriptDocument,
     VideoProduceRequest,
-    VideoProduceResult,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata, CheckpointRecord
@@ -35,8 +55,9 @@ from app.core.portable.evidence import build_evidence_set
 from app.core.portable.quality import evaluate_video_draft
 from app.core.ports.jobs import (
     AttemptStoragePort,
-    JobCompletion,
+    PortableCommitReceipt,
     SourceIdentityBinding,
+    VideoResultPlan,
     VideoExecutionRepositoryPort,
 )
 from app.core.ports.portable import PortableCommitResultPort, PortableWorkspacePort
@@ -76,10 +97,74 @@ CHECKPOINT_STEPS = (
     "quality_and_portable_validation",
 )
 _T = TypeVar("_T")
+_REQUEST_KEYS = frozenset(
+    {
+        "request_schema_version",
+        "workspace_root",
+        "input_value",
+        "recipe_id",
+        "recipe_version",
+        "provider_profile",
+        "model_override",
+        "transcriber_profile",
+        "output_language",
+        "quality_preset",
+        "style",
+        "screenshot_policy",
+        "provided_transcript",
+    }
+)
+
+
+@dataclass(frozen=True)
+class VideoPreflightCapabilities:
+    runtime_version: str = RUNTIME_VERSION
+    video_feature_pack: bool = True
+    source_capability: bool = True
+    transcript_capability: bool = True
+    model_capability: bool = True
+    screenshot_capability: bool = True
+    screenshot_model_compatible: bool = True
+    ffmpeg_loadable: bool = True
+    model_loadable: bool = True
+    transcriber_loadable: bool = True
+    effective_config_valid: bool = True
+    credential_references_resolvable: bool = True
+    required_free_bytes: int = 1
+
+
+def _checkpoint_error() -> DomainError:
+    return DomainError(
+        "checkpoint_content_invalid",
+        ErrorCategory.INTERNAL,
+        "Checkpoint content is invalid",
+    )
+
+
+def _decode_object(payload: bytes, *, keys: frozenset[str]) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, ValueError, RecursionError):
+        raise _checkpoint_error() from None
+    if type(value) is not dict or frozenset(value) != keys:
+        raise _checkpoint_error()
+    return value
+
+
+def _encode_object(value: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        dict(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 class VideoRecipeOperations(Protocol):
-    def preflight(self, request: VideoProduceRequest) -> None: ...
+    def preflight_capabilities(
+        self, request: VideoProduceRequest
+    ) -> VideoPreflightCapabilities: ...
 
     def resolve_source(
         self,
@@ -89,7 +174,13 @@ class VideoRecipeOperations(Protocol):
         source_revision_id: str,
     ) -> VideoSourceMetadata: ...
 
-    def acquire(self, source: VideoSourceMetadata, *, external: bool) -> object: ...
+    def acquire(
+        self,
+        source: VideoSourceMetadata,
+        *,
+        external: bool,
+        heartbeat: Callable[[], None],
+    ) -> object: ...
 
     def transcribe(
         self,
@@ -97,6 +188,7 @@ class VideoRecipeOperations(Protocol):
         acquired: object,
         *,
         external: bool,
+        heartbeat: Callable[[], None],
     ) -> TranscriptDocument: ...
 
     def generate_draft(
@@ -106,6 +198,7 @@ class VideoRecipeOperations(Protocol):
         evidence_ids: dict[str, str],
         *,
         external: bool,
+        heartbeat: Callable[[], None],
     ) -> GeneratedVideoDraft: ...
 
     def screenshots(
@@ -114,89 +207,10 @@ class VideoRecipeOperations(Protocol):
         draft: GeneratedVideoDraft,
         *,
         external: bool,
+        heartbeat: Callable[[], None],
     ) -> tuple[DisplayAssetInput, ...]: ...
 
     def after_portable_commit(self, result: PortableCommitResultPort) -> None: ...
-
-
-@dataclass(frozen=True)
-class _CandidateCheckpoint:
-    staging_relative_path: str
-    bundle_id: str
-    manifest_sha256: str
-    run_id: str
-    source_id: str
-    source_revision_id: str
-    primary_draft_artifact_id: str
-    transcript_artifact_id: str
-    evidence_set_artifact_id: str
-    quality_report_artifact_id: str
-    display_asset_ids: tuple[str, ...]
-    quality_overall: QualityOverall
-    publish_eligible: bool
-    usage: Mapping[str, int]
-    warnings: tuple[str, ...]
-
-    def encode(self) -> bytes:
-        return json.dumps(
-            {
-                "step": "assemble_candidate_bundle",
-                "staging_relative_path": self.staging_relative_path,
-                "bundle_id": self.bundle_id,
-                "manifest_sha256": self.manifest_sha256,
-                "run_id": self.run_id,
-                "source_id": self.source_id,
-                "source_revision_id": self.source_revision_id,
-                "primary_draft_artifact_id": self.primary_draft_artifact_id,
-                "transcript_artifact_id": self.transcript_artifact_id,
-                "evidence_set_artifact_id": self.evidence_set_artifact_id,
-                "quality_report_artifact_id": self.quality_report_artifact_id,
-                "display_asset_ids": list(self.display_asset_ids),
-                "quality_overall": self.quality_overall.value,
-                "publish_eligible": self.publish_eligible,
-                "usage": dict(self.usage),
-                "warnings": list(self.warnings),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-    @classmethod
-    def decode(cls, payload: bytes) -> _CandidateCheckpoint:
-        try:
-            value = json.loads(payload)
-            if type(value) is not dict or value.get("step") != "assemble_candidate_bundle":
-                raise TypeError
-            usage = value["usage"]
-            if type(usage) is not dict or any(
-                type(key) is not str or type(item) is not int or item < 0
-                for key, item in usage.items()
-            ):
-                raise TypeError
-            return cls(
-                staging_relative_path=value["staging_relative_path"],
-                bundle_id=value["bundle_id"],
-                manifest_sha256=value["manifest_sha256"],
-                run_id=value["run_id"],
-                source_id=value["source_id"],
-                source_revision_id=value["source_revision_id"],
-                primary_draft_artifact_id=value["primary_draft_artifact_id"],
-                transcript_artifact_id=value["transcript_artifact_id"],
-                evidence_set_artifact_id=value["evidence_set_artifact_id"],
-                quality_report_artifact_id=value["quality_report_artifact_id"],
-                display_asset_ids=tuple(value["display_asset_ids"]),
-                quality_overall=QualityOverall(value["quality_overall"]),
-                publish_eligible=value["publish_eligible"],
-                usage=usage,
-                warnings=tuple(value["warnings"]),
-            )
-        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
-            raise DomainError(
-                "candidate_checkpoint_invalid",
-                ErrorCategory.INTERNAL,
-                "Candidate checkpoint is invalid",
-            ) from None
 
 
 class VideoService:
@@ -209,6 +223,8 @@ class VideoService:
         *,
         checkpoint_reader: Callable[[CheckpointMetadata], bytes],
         owner_id: str,
+        work_root: Path,
+        local_instance_id: str,
     ) -> None:
         self._repository = repository
         self._job_service = JobService(repository)
@@ -217,8 +233,9 @@ class VideoService:
         self._operations = operations
         self._checkpoint_reader = checkpoint_reader
         self._owner_id = owner_id
-        self._requests: dict[str, VideoProduceRequest] = {}
-        self._errors: dict[str, ErrorDetail] = {}
+        self._work_root = work_root
+        self._local_instance_id = local_instance_id
+        self._execution_lock = threading.Lock()
 
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
         if not isinstance(request, VideoProduceRequest):
@@ -228,13 +245,16 @@ class VideoService:
                 "Video production requires a versioned request",
             )
         snapshot = self._job_service.submit(request)
-        self._requests[snapshot.job_id] = request
         return snapshot
 
     def get_job(self, job_id: str) -> JobSnapshot:
         return self._snapshot(job_id)
 
     def wait_job(self, job_id: str) -> JobSnapshot:
+        with self._execution_lock:
+            return self._wait_job_locked(job_id)
+
+    def _wait_job_locked(self, job_id: str) -> JobSnapshot:
         snapshot = self._snapshot(job_id)
         if snapshot.state in {
             JobState.SUCCEEDED,
@@ -242,13 +262,7 @@ class VideoService:
             JobState.CANCELLED,
         }:
             return snapshot
-        request = self._requests.get(job_id)
-        if request is None:
-            raise DomainError(
-                "job_request_unavailable",
-                ErrorCategory.INTERNAL,
-                "Submitted request is unavailable for execution",
-            )
+        request = self._load_request(job_id)
         if snapshot.state is JobState.QUEUED:
             self._repository.transition_job(job_id, JobState.RUNNING)
         authority = self._repository.acquire_scheduler_lease(
@@ -256,18 +270,40 @@ class VideoService:
         )
         _, active_attempt, _ = self._repository.get_job_details(job_id)
         try:
+            if (
+                active_attempt is not None
+                and active_attempt.state is AttemptState.RUNNING
+                and active_attempt.fencing_token != authority.fencing_token
+            ):
+                active_attempt = self._repository.take_over_running_attempt(
+                    job_id, active_attempt.attempt_id, authority
+                )
             if active_attempt is not None and active_attempt.step_id == "commit":
                 return self._reconcile_commit(request, active_attempt, authority)
-            return self._execute(job_id, request, authority)
+            return self._execute(
+                job_id,
+                request,
+                authority,
+                resumed_attempt=active_attempt,
+            )
         except DomainError as error:
             self._fail_job(job_id, active_attempt, authority, error)
             return self._snapshot(job_id)
+        finally:
+            try:
+                self._repository.release_scheduler_lease(authority)
+            except Exception:
+                # The lease has a bounded TTL; cleanup must not replace the Job result
+                # or the primary execution error.
+                pass
 
     def _execute(
         self,
         job_id: str,
         request: VideoProduceRequest,
         authority: ExecutionAuthority,
+        *,
+        resumed_attempt: Attempt | None,
     ) -> JobSnapshot:
         request_hash = self._request_hash(request)
         self._checkpointed(
@@ -276,6 +312,12 @@ class VideoService:
             request_hash,
             authority,
             lambda: self._preflight(request),
+            encode=lambda value: _encode_object(
+                {"step": "preflight", "policy_hash": value}
+            ),
+            decode=_decode_preflight,
+            reuse=False,
+            resumed_attempt=resumed_attempt,
         )
         ids = self._ids(job_id)
         source = self._checkpointed(
@@ -288,20 +330,42 @@ class VideoService:
                 source_id=ids["source"],
                 source_revision_id=ids["revision"],
             ),
+            encode=_encode_source,
+            decode=_decode_source,
+            resumed_attempt=resumed_attempt,
         )
         acquired = self._checkpointed(
             job_id,
             "acquire",
             request_hash,
             authority,
-            lambda: self._operations.acquire(source, external=True),
+            lambda: self._invoke_external(
+                authority,
+                lambda heartbeat: self._operations.acquire(
+                    source, external=True, heartbeat=heartbeat
+                ),
+            ),
+            encode=_encode_acquired,
+            decode=_decode_acquired,
+            resumed_attempt=resumed_attempt,
         )
         transcript = self._checkpointed(
             job_id,
             "normalize_transcript",
             request_hash,
             authority,
-            lambda: self._operations.transcribe(request, acquired, external=True),
+            lambda: self._invoke_external(
+                authority,
+                lambda heartbeat: self._operations.transcribe(
+                    request,
+                    acquired,
+                    external=True,
+                    heartbeat=heartbeat,
+                ),
+            ),
+            encode=_encode_transcript,
+            decode=_decode_transcript,
+            resumed_attempt=resumed_attempt,
         )
         self._checkpointed(
             job_id,
@@ -309,6 +373,11 @@ class VideoService:
             request_hash,
             authority,
             lambda: source.source_revision_id,
+            encode=lambda value: _encode_object(
+                {"step": "create_source_revision", "revision_id": value}
+            ),
+            decode=_decode_revision,
+            resumed_attempt=resumed_attempt,
         )
         bundle_input = self._build_input(
             request,
@@ -317,6 +386,7 @@ class VideoService:
             transcript=transcript,
             authority=authority,
             request_hash=request_hash,
+            resumed_attempt=resumed_attempt,
         )
         checkpoint = self._checkpointed(
             job_id,
@@ -325,6 +395,8 @@ class VideoService:
             authority,
             lambda: self._assemble(bundle_input),
             encode=lambda value: value.encode(),
+            decode=_CandidateCheckpoint.decode,
+            resumed_attempt=resumed_attempt,
         )
         self._checkpointed(
             job_id,
@@ -332,6 +404,9 @@ class VideoService:
             request_hash,
             authority,
             lambda: self._validate_candidate(request, checkpoint),
+            encode=_encode_validation,
+            decode=lambda payload: _decode_validation(payload, checkpoint),
+            resumed_attempt=resumed_attempt,
         )
         commit_attempt = self._repository.create_attempt(job_id, "commit")
         commit_attempt = self._repository.start_attempt(
@@ -359,6 +434,7 @@ class VideoService:
         transcript: TranscriptDocument,
         authority: ExecutionAuthority,
         request_hash: str,
+        resumed_attempt: Attempt | None,
     ) -> VideoBundleInput:
         ids = self._ids(job_id)
         transcript_payload = build_transcript(
@@ -383,16 +459,37 @@ class VideoService:
             "generate_draft",
             request_hash,
             authority,
-            lambda: self._operations.generate_draft(
-                request, transcript, evidence_ids, external=True
+            lambda: self._invoke_external(
+                authority,
+                lambda heartbeat: self._operations.generate_draft(
+                    request,
+                    transcript,
+                    evidence_ids,
+                    external=True,
+                    heartbeat=heartbeat,
+                ),
             ),
+            encode=_encode_draft,
+            decode=_decode_draft,
+            resumed_attempt=resumed_attempt,
         )
         screenshots = self._checkpointed(
             job_id,
             "optional_screenshots",
             request_hash,
             authority,
-            lambda: self._operations.screenshots(request, draft, external=True),
+            lambda: self._invoke_external(
+                authority,
+                lambda heartbeat: self._operations.screenshots(
+                    request,
+                    draft,
+                    external=True,
+                    heartbeat=heartbeat,
+                ),
+            ),
+            encode=_encode_screenshots,
+            decode=_decode_screenshots,
+            resumed_attempt=resumed_attempt,
         )
         quality = evaluate_video_draft(
             draft,
@@ -406,7 +503,7 @@ class VideoService:
             created_at=created,
             location=self._portable.candidate_location(
                 request.workspace_root,
-                local_instance_id="task11",
+                local_instance_id=self._local_instance_id,
                 nonce=job_id.removeprefix("job_").replace("-", ""),
             ),
             source=source,
@@ -474,6 +571,8 @@ class VideoService:
             manifest_sha256=candidate.manifest_sha256,
             run_id=bundle_input.receipt.run_id,
             source_id=bundle_input.source.source_id,
+            connector_id=bundle_input.source.connector_id,
+            canonical_identity=self._canonical_source_identity(bundle_input.source),
             source_revision_id=bundle_input.source.source_revision_id,
             primary_draft_artifact_id=ids.primary_draft,
             transcript_artifact_id=ids.transcript,
@@ -507,45 +606,52 @@ class VideoService:
         )
         callback_entered = False
 
-        def commit() -> JobCompletion:
+        result_plan = VideoResultPlan(
+            job_id=attempt.job_id,
+            run_id=checkpoint.run_id,
+            bundle_id=checkpoint.bundle_id,
+            manifest_sha256=checkpoint.manifest_sha256,
+            source_id=checkpoint.source_id,
+            source_revision_id=checkpoint.source_revision_id,
+            primary_draft_artifact_id=checkpoint.primary_draft_artifact_id,
+            transcript_artifact_id=checkpoint.transcript_artifact_id,
+            evidence_set_artifact_id=checkpoint.evidence_set_artifact_id,
+            quality_report_artifact_id=checkpoint.quality_report_artifact_id,
+            display_asset_ids=checkpoint.display_asset_ids,
+            quality_overall=checkpoint.quality_overall,
+            publish_eligible=checkpoint.publish_eligible,
+            usage=checkpoint.usage,
+            warnings=checkpoint.warnings,
+        )
+        source_identity = SourceIdentityBinding(
+            connector_id=checkpoint.connector_id,
+            canonical_identity=checkpoint.canonical_identity,
+            source_id=checkpoint.source_id,
+            owning_bundle_id=checkpoint.bundle_id,
+            manifest_sha256=checkpoint.manifest_sha256,
+        )
+
+        def commit() -> PortableCommitReceipt:
             nonlocal callback_entered
             callback_entered = True
             committed = self._portable.commit_prepared(prepared)
             self._operations.after_portable_commit(committed)
-            result = VideoProduceResult(
-                job_id=attempt.job_id,
-                run_id=checkpoint.run_id,
+            return PortableCommitReceipt(
                 bundle_id=committed.bundle_id,
                 manifest_sha256=committed.manifest_sha256,
                 commit_sha256=committed.commit_sha256,
                 workspace_relative_bundle_path=committed.relative_path,
-                source_id=checkpoint.source_id,
-                source_revision_id=checkpoint.source_revision_id,
-                primary_draft_artifact_id=checkpoint.primary_draft_artifact_id,
-                transcript_artifact_id=checkpoint.transcript_artifact_id,
-                evidence_set_artifact_id=checkpoint.evidence_set_artifact_id,
-                quality_report_artifact_id=checkpoint.quality_report_artifact_id,
-                display_asset_ids=checkpoint.display_asset_ids,
-                quality_overall=checkpoint.quality_overall,
-                publish_eligible=checkpoint.publish_eligible,
-                usage=checkpoint.usage,
-                warnings=checkpoint.warnings,
                 idempotent=committed.idempotent,
-            )
-            return JobCompletion(
-                result=result,
-                source_identity=SourceIdentityBinding(
-                    connector_id="fixture",
-                    canonical_identity=request.input_value,
-                    source_id=result.source_id,
-                    owning_bundle_id=result.bundle_id,
-                    manifest_sha256=result.manifest_sha256,
-                ),
             )
 
         try:
             self._repository.commit_video_result_atomic(
-                attempt.job_id, attempt.attempt_id, authority, commit
+                attempt.job_id,
+                attempt.attempt_id,
+                authority,
+                result_plan=result_plan,
+                source_identity=source_identity,
+                commit=commit,
             )
         except BaseException:
             if not callback_entered:
@@ -571,9 +677,119 @@ class VideoService:
             )
         return _CandidateCheckpoint.decode(self._checkpoint_reader(metadata))
 
-    def _preflight(self, request: VideoProduceRequest) -> None:
-        self._operations.preflight(request)
+    def _load_request(self, job_id: str) -> VideoProduceRequest:
+        job, _, _ = self._repository.get_job_details(job_id)
+        payload = self._repository.get_job_request(job_id)
+        try:
+            value = json.loads(payload) if payload is not None else None
+            if type(value) is not dict or frozenset(value) != _REQUEST_KEYS:
+                raise TypeError
+            provided = value["provided_transcript"]
+            transcript = (
+                None
+                if provided is None
+                else _decode_transcript(
+                    _encode_object(
+                        {"step": "normalize_transcript", **provided}
+                    )
+                )
+            )
+            return VideoProduceRequest(
+                request_schema_version=value["request_schema_version"],
+                workspace_root=Path(value["workspace_root"]),
+                input_value=value["input_value"],
+                recipe_id=value["recipe_id"],
+                recipe_version=value["recipe_version"],
+                provider_profile=value["provider_profile"],
+                model_override=value["model_override"],
+                transcriber_profile=value["transcriber_profile"],
+                output_language=value["output_language"],
+                quality_preset=value["quality_preset"],
+                style=value["style"],
+                screenshot_policy=ScreenshotPolicy(value["screenshot_policy"]),
+                client_request_id=job.client_request_id,
+                principal=job.principal,
+                provided_transcript=transcript,
+            )
+        except (DomainError, KeyError, TypeError, ValueError, UnicodeError):
+            raise DomainError(
+                "job_request_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored video request is invalid",
+            ) from None
+
+    @staticmethod
+    def _canonical_source_identity(source: VideoSourceMetadata) -> str:
+        return f"{source.canonical_identity_scheme}:{source.stable_video_identity}"
+
+    def _preflight(self, request: VideoProduceRequest) -> str:
+        capabilities = self._operations.preflight_capabilities(request)
+        if not isinstance(capabilities, VideoPreflightCapabilities):
+            raise DomainError(
+                "preflight_capabilities_invalid",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Video preflight capabilities are invalid",
+            )
+        checks = (
+            (request.request_schema_version == 1, "request_schema_unsupported"),
+            (
+                request.recipe_id == "alltonote.video-course-note"
+                and request.recipe_version == 1,
+                "recipe_version_unsupported",
+            ),
+            (capabilities.runtime_version == RUNTIME_VERSION, "runtime_version_unsupported"),
+            (capabilities.video_feature_pack, "video_feature_pack_unavailable"),
+            (capabilities.source_capability, "source_capability_unavailable"),
+            (capabilities.transcript_capability, "transcript_capability_unavailable"),
+            (capabilities.model_capability, "model_capability_unavailable"),
+            (
+                request.screenshot_policy is ScreenshotPolicy.OFF
+                or capabilities.screenshot_capability,
+                "screenshot_capability_unavailable",
+            ),
+            (
+                request.screenshot_policy is ScreenshotPolicy.OFF
+                or capabilities.screenshot_model_compatible,
+                "screenshot_model_incompatible",
+            ),
+            (capabilities.ffmpeg_loadable, "ffmpeg_unavailable"),
+            (capabilities.model_loadable, "model_unavailable"),
+            (capabilities.transcriber_loadable, "transcriber_unavailable"),
+            (capabilities.effective_config_valid, "effective_config_invalid"),
+            (
+                capabilities.credential_references_resolvable,
+                "credential_reference_unavailable",
+            ),
+        )
+        for valid, code in checks:
+            if not valid:
+                raise DomainError(
+                    code,
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Video preflight check failed",
+                )
         self._portable.inspect(request.workspace_root)
+        if not self._work_root.is_dir() or not os.access(self._work_root, os.W_OK):
+            raise DomainError(
+                "work_directory_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Video work directory is unavailable",
+            )
+        try:
+            free_bytes = shutil.disk_usage(request.workspace_root).free
+        except OSError:
+            raise DomainError(
+                "disk_space_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Workspace disk space is unavailable",
+            ) from None
+        if free_bytes < capabilities.required_free_bytes:
+            raise DomainError(
+                "disk_space_insufficient",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Workspace has insufficient free disk space",
+            )
+        return self._preflight_policy_hash(request)
 
     def _validate_candidate(
         self,
@@ -604,11 +820,48 @@ class VideoService:
         action: Callable[[], _T],
         *,
         encode: Callable[[_T], bytes] | None = None,
+        decode: Callable[[bytes], _T] | None = None,
+        reuse: bool = True,
+        resumed_attempt: Attempt | None = None,
     ) -> _T:
-        attempt = self._repository.create_attempt(job_id, step_id)
-        attempt = self._repository.start_attempt(attempt.attempt_id, authority)
+        self._heartbeat(authority)
+        existing = self._repository.latest_checkpoint(job_id, step_id)
+        if reuse and existing is not None and self._attempt_storage.validate_checkpoint(
+            existing,
+            expected_schema_id=CHECKPOINT_SCHEMA,
+            expected_input_hash=input_hash,
+        ):
+            try:
+                payload = self._checkpoint_reader(existing)
+                if decode is not None:
+                    value = decode(payload)
+                else:
+                    marker = _decode_object(
+                        payload, keys=frozenset({"state", "step"})
+                    )
+                    if marker != {"state": "succeeded", "step": step_id}:
+                        raise _checkpoint_error()
+                    value = None  # type: ignore[assignment]
+            except (DomainError, OSError, RuntimeError, TypeError, ValueError):
+                pass
+            else:
+                if self._is_resumed_step(resumed_attempt, job_id, step_id):
+                    self._repository.transition_attempt(
+                        resumed_attempt.attempt_id,
+                        AttemptState.SUCCEEDED,
+                        authority=authority,
+                    )
+                self._heartbeat(authority)
+                return value
+        if self._is_resumed_step(resumed_attempt, job_id, step_id):
+            attempt = resumed_attempt
+        else:
+            attempt = self._repository.create_attempt(job_id, step_id)
+            attempt = self._repository.start_attempt(attempt.attempt_id, authority)
         try:
+            self._heartbeat(authority)
             value = action()
+            self._heartbeat(authority)
             payload = (
                 encode(value)
                 if encode is not None
@@ -640,6 +893,33 @@ class VideoService:
         )
         return value
 
+    @staticmethod
+    def _is_resumed_step(
+        attempt: Attempt | None,
+        job_id: str,
+        step_id: str,
+    ) -> bool:
+        return (
+            attempt is not None
+            and attempt.job_id == job_id
+            and attempt.step_id == step_id
+            and attempt.state is AttemptState.RUNNING
+        )
+
+    def _heartbeat(self, authority: ExecutionAuthority) -> None:
+        self._repository.heartbeat_scheduler_lease(authority, ttl_seconds=300)
+
+    def _invoke_external(
+        self,
+        authority: ExecutionAuthority,
+        action: Callable[[Callable[[], None]], _T],
+    ) -> _T:
+        heartbeat = lambda: self._heartbeat(authority)
+        heartbeat()
+        value = action(heartbeat)
+        heartbeat()
+        return value
+
     def _fail_job(
         self,
         job_id: str,
@@ -649,31 +929,26 @@ class VideoService:
     ) -> None:
         current_job, current_attempt, _ = self._repository.get_job_details(job_id)
         attempt = current_attempt or active_attempt
-        if attempt is not None and attempt.state is AttemptState.RUNNING:
-            self._repository.transition_attempt(
-                attempt.attempt_id, AttemptState.FAILED, authority=authority
-            )
-        if current_job.state is JobState.RUNNING:
-            self._repository.transition_job(job_id, JobState.FAILED)
-        self._errors[job_id] = ErrorDetail(
-            error.code, error.category, error.message, error.details
+        if current_job.state is not JobState.RUNNING:
+            return
+        running_attempt = (
+            attempt
+            if attempt is not None
+            and attempt.state is AttemptState.RUNNING
+            and attempt.fencing_token == authority.fencing_token
+            else None
+        )
+        self._repository.fail_job_atomic(
+            job_id,
+            ErrorDetail(error.code, error.category, error.message, error.details),
+            attempt_id=(
+                running_attempt.attempt_id if running_attempt is not None else None
+            ),
+            authority=authority if running_attempt is not None else None,
         )
 
     def _snapshot(self, job_id: str) -> JobSnapshot:
-        snapshot = self._job_service.get(job_id)
-        error = self._errors.get(job_id)
-        if error is None:
-            return snapshot
-        return JobSnapshot(
-            job_id=snapshot.job_id,
-            state=snapshot.state,
-            cancellation_requested=snapshot.cancellation_requested,
-            active_attempt_id=snapshot.active_attempt_id,
-            challenge_id=snapshot.challenge_id,
-            retry_of_job_id=snapshot.retry_of_job_id,
-            result=snapshot.result,
-            error=error,
-        )
+        return self._job_service.get(job_id)
 
     @staticmethod
     def _request_hash(request: VideoProduceRequest) -> str:

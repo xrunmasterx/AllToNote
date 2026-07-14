@@ -27,7 +27,13 @@ from app.core.domain.video import (
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.ports.credentials import CredentialBrokerPort
 from app.core.ports.events import EventSink
-from app.core.ports.jobs import AttemptStoragePort, JobRepositoryPort
+from app.core.ports.jobs import (
+    AttemptStoragePort,
+    JobRepositoryPort,
+    PortableCommitReceipt,
+    SourceIdentityBinding,
+    VideoResultPlan,
+)
 from app.core.ports.model import KnowledgeModelPort
 from app.core.ports.portable import PortableWorkspacePort
 from app.core.ports.screenshot import ScreenshotPort
@@ -479,11 +485,14 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         name for name in JobRepositoryPort.__dict__ if not name.startswith("_")
     } == {
         "cancel_job",
+        "commit_video_result_atomic",
         "create_job",
         "create_retry_job_atomic",
+        "fail_job_atomic",
         "get_job_details",
+        "get_job_error",
+        "get_job_request",
         "get_job_result",
-        "commit_video_result_atomic",
         "respond_challenge_atomic",
     }
     event_argument, event_return = get_args(EventSink)
@@ -491,9 +500,71 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     assert event_return is type(None)
 
 
+def test_video_result_commit_contracts_are_frozen_snapshots() -> None:
+    display_ids = ["art_display"]
+    usage = {"input_tokens": 3}
+    warnings = ["warning"]
+    plan = VideoResultPlan(
+        job_id="job_test",
+        run_id="run_test",
+        bundle_id="bnd_test",
+        manifest_sha256="sha256:" + "a" * 64,
+        source_id="src_test",
+        source_revision_id="rev_test",
+        primary_draft_artifact_id="art_draft",
+        transcript_artifact_id="art_transcript",
+        evidence_set_artifact_id="art_evidence",
+        quality_report_artifact_id="art_quality",
+        display_asset_ids=display_ids,
+        quality_overall=QualityOverall.PASS,
+        publish_eligible=True,
+        usage=usage,
+        warnings=warnings,
+    )
+    binding = SourceIdentityBinding(
+        "fixture", "fixture://course", "src_test", "bnd_test", "sha256:" + "a" * 64
+    )
+    receipt = PortableCommitReceipt(
+        "bnd_test",
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+        "raw/personal/bundles/bnd_test",
+        False,
+    )
+
+    display_ids.append("changed")
+    usage["input_tokens"] = 99
+    warnings.append("changed")
+
+    assert plan.display_asset_ids == ("art_display",)
+    assert dict(plan.usage) == {"input_tokens": 3}
+    assert plan.warnings == ("warning",)
+    assert isinstance(plan.usage, MappingProxyType)
+    with pytest.raises(FrozenInstanceError):
+        binding.source_id = "changed"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        receipt.idempotent = True  # type: ignore[misc]
+
+
 def test_task6_checkpoint_and_event_ports_have_exact_frozen_methods() -> None:
     jobs_ports = importlib.import_module("app.core.ports.jobs")
     metadata_port = jobs_ports.AttemptMetadataRepositoryPort
+    execution_port = jobs_ports.VideoExecutionRepositoryPort
+
+    assert getattr(execution_port, "_is_protocol", False)
+    assert {
+        name for name in execution_port.__dict__ if not name.startswith("_")
+    } == {
+        "acquire_scheduler_lease",
+        "create_attempt",
+        "latest_checkpoint",
+        "heartbeat_scheduler_lease",
+        "release_scheduler_lease",
+        "start_attempt",
+        "take_over_running_attempt",
+        "transition_attempt",
+        "transition_job",
+    }
 
     assert getattr(metadata_port, "_is_protocol", False)
     assert {
