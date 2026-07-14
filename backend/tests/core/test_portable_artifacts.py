@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -119,6 +120,29 @@ def test_ndjson_rejects_ambiguous_byte_and_text_iterables(records: object) -> No
         encode_ndjson(records)  # type: ignore[arg-type]
 
 
+def test_ndjson_sanitizes_generator_io_failures() -> None:
+    def records():
+        raise OSError("secret C:/private/records.jsonl")
+        yield None
+
+    with pytest.raises(DomainError) as caught:
+        encode_ndjson(records())
+
+    assert caught.value.code == "portable_json_invalid"
+    assert "C:/private" not in str(caught.value)
+
+
+def test_canonical_json_sanitizes_circular_values() -> None:
+    circular: list[object] = []
+    circular.append(circular)
+
+    with pytest.raises(DomainError) as caught:
+        encode_json(circular)
+
+    assert caught.value.code == "portable_json_invalid"
+    assert caught.value.__cause__ is None
+
+
 @pytest.mark.parametrize(
     "value",
     (
@@ -174,6 +198,14 @@ def test_transcript_rejects_empty_duplicate_and_out_of_order_segments(
 ) -> None:
     with pytest.raises(DomainError, match=code):
         build_transcript(REVISION_ID, "zh-CN", segments)
+
+
+def test_transcript_sanitizes_invalid_segment_collections() -> None:
+    with pytest.raises(DomainError) as caught:
+        build_transcript(REVISION_ID, "zh-CN", None)  # type: ignore[arg-type]
+
+    assert caught.value.code == "transcript_invalid"
+    assert caught.value.__cause__ is None
 
 
 def test_evidence_set_exactly_maps_segments_to_verifiable_records() -> None:
@@ -256,6 +288,32 @@ def test_evidence_set_rejects_transcript_artifact_hash_mismatch() -> None:
     assert caught.value.code == "evidence_target_hash_mismatch"
 
 
+@pytest.mark.parametrize("bad_input", ("reference", "mapping"))
+def test_evidence_set_sanitizes_invalid_boundary_inputs(bad_input: str) -> None:
+    transcript = TranscriptDocument("zh-CN", SEGMENTS)
+    reference = PortableArtifactRef(
+        BUNDLE_ID,
+        TRANSCRIPT_ARTIFACT_ID,
+        sha256_digest(build_transcript(REVISION_ID, "zh-CN", SEGMENTS)),
+    )
+    mapping = {
+        "seg_000001": EVIDENCE_IDS[0],
+        "seg_000002": EVIDENCE_IDS[1],
+    }
+
+    with pytest.raises(DomainError) as caught:
+        build_evidence_set(
+            BUNDLE_ID,
+            REVISION_ID,
+            None if bad_input == "reference" else reference,  # type: ignore[arg-type]
+            transcript,
+            None if bad_input == "mapping" else mapping,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.code == "evidence_input_invalid"
+    assert caught.value.__cause__ is None
+
+
 def test_segment_citations_are_rewritten_to_trusted_evidence_ids() -> None:
     result = rewrite_segment_citations(
         "结论[^seg_000001]",
@@ -293,6 +351,76 @@ def test_citation_rewrite_ignores_escaped_and_indented_code_literals() -> None:
     assert result == source
 
 
+def test_escaped_backtick_does_not_hide_active_html() -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(
+            "\\`<script>alert(1)</script>`",
+            bundle_relative_path="drafts/note.md",
+        )
+
+
+def test_escaped_backtick_does_not_hide_visible_segment_citation() -> None:
+    result = rewrite_segment_citations(
+        "\\`claim[^seg_000001]`",
+        {"seg_000001": EVIDENCE_IDS[0]},
+    )
+
+    assert result == f"\\`claim[^{EVIDENCE_IDS[0]}]`"
+
+
+def test_segment_citation_escape_uses_backslash_parity() -> None:
+    source = "\\[^seg_000001] \\\\[^seg_000001]"
+
+    result = rewrite_segment_citations(
+        source,
+        {"seg_000001": EVIDENCE_IDS[0]},
+    )
+
+    assert result == f"\\[^seg_000001] \\\\[^{EVIDENCE_IDS[0]}]"
+
+
+def test_multiline_code_span_is_literal_for_safety_and_citations() -> None:
+    source = "before `code\n<script>[^seg_000001]</script>\nend` after"
+
+    validate_markdown_safety(source, bundle_relative_path="drafts/note.md")
+    assert rewrite_segment_citations(
+        source,
+        {"seg_000001": EVIDENCE_IDS[0]},
+    ) == source
+
+
+def test_fence_with_trailing_text_does_not_close_code_block() -> None:
+    source = "```text\n```not-close\n<script>[^seg_000001]</script>\n"
+
+    validate_markdown_safety(source, bundle_relative_path="drafts/note.md")
+    assert rewrite_segment_citations(
+        source,
+        {"seg_000001": EVIDENCE_IDS[0]},
+    ) == source
+
+
+def test_mermaid_fence_is_rejected_as_active_content() -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(
+            "```mermaid\ngraph TD; A-->B\n```\n",
+            bundle_relative_path="drafts/note.md",
+        )
+
+
+def test_markdown_scan_scales_linearly_on_unclosed_link_markers() -> None:
+    durations: list[float] = []
+    for size in (4_000, 8_000, 16_000):
+        started = time.perf_counter()
+        validate_markdown_safety(
+            "[" * size,
+            bundle_relative_path="drafts/note.md",
+        )
+        durations.append(time.perf_counter() - started)
+
+    assert durations[-1] < 1.0
+    assert durations[-1] < max(0.2, durations[0] * 6)
+
+
 @pytest.mark.parametrize(
     "markdown",
     (
@@ -309,6 +437,17 @@ def test_citation_rewrite_rejects_unknown_or_malformed_segment_labels(
         rewrite_segment_citations(markdown, {"seg_000001": EVIDENCE_IDS[0]})
 
     assert caught.value.code == "draft_segment_citation_invalid"
+
+
+def test_citation_rewrite_sanitizes_invalid_mapping_inputs() -> None:
+    with pytest.raises(DomainError) as caught:
+        rewrite_segment_citations(
+            "claim[^seg_000001]",
+            None,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.code == "draft_segment_citation_invalid"
+    assert caught.value.__cause__ is None
 
 
 @pytest.mark.parametrize(
@@ -352,6 +491,74 @@ def test_markdown_safety_rejects_active_content_and_unsafe_links(
     assert "secret.txt" not in str(caught.value)
 
 
+def test_backslash_does_not_escape_a_closing_backtick_inside_code() -> None:
+    markdown = r"`literal\`<script>alert(1)</script>`"
+
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "<video src='../assets/movie.mp4'></video>",
+        "<audio src='../assets/audio.mp3'></audio>",
+        "<source src='../assets/movie.mp4'>",
+        "<track src='../assets/captions.vtt'>",
+        "<canvas>active surface</canvas>",
+        "<img srcset='../assets/a.webp 1x, ../assets/b.webp 2x'>",
+        "![remote](https://example.com/frame.webp)",
+        "<img src='https://example.com/frame.webp'>",
+    ),
+)
+def test_markdown_safety_rejects_active_media_and_external_images(
+    markdown: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "[source](https://example.com/watch?v=1)",
+        "![frame](../assets/frame.webp)",
+        "<img src='../assets/frame.webp' alt='frame'>",
+    ),
+)
+def test_markdown_safety_allows_http_links_and_bundle_relative_images(
+    markdown: str,
+) -> None:
+    validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "[x](%252e%252e%252fsecret.txt)",
+        "[x](%25252e%25252e%25252fsecret.txt)",
+    ),
+)
+def test_markdown_safety_rejects_multiply_encoded_traversal(markdown: str) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+@pytest.mark.parametrize(
+    "base_path",
+    (
+        "C:/drafts/note.md",
+        "/drafts/note.md",
+        "drafts/../note.md",
+    ),
+)
+def test_markdown_safety_rejects_absolute_or_noncanonical_base_paths(
+    base_path: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety("safe", bundle_relative_path=base_path)
+
+
 def test_markdown_safety_accepts_bundle_relative_obsidian_anchor_and_https_links() -> None:
     markdown = (
         "![frame](../assets/frame.webp)\n"
@@ -370,6 +577,17 @@ def test_markdown_safety_treats_indented_code_as_literal_text() -> None:
     )
 
 
+def test_markdown_safety_sanitizes_malformed_ipv6_urls() -> None:
+    with pytest.raises(DomainError) as caught:
+        validate_markdown_safety(
+            "[source](http://[::1)",
+            bundle_relative_path="drafts/note.md",
+        )
+
+    assert caught.value.code == "draft_markdown_unsafe"
+    assert caught.value.__cause__ is None
+
+
 def test_quality_passes_and_report_binds_exact_final_draft_bytes() -> None:
     outcome = _evaluate(_draft(_good_markdown()))
     report = json.loads(outcome.report.payload)
@@ -382,7 +600,98 @@ def test_quality_passes_and_report_binds_exact_final_draft_bytes() -> None:
     assert report["subject"]["sha256"] == sha256_digest(outcome.final_draft)
     assert report["overall"] == "pass"
     assert report["method"] == {"kind": "deterministic"}
+    assert report["profile"] == {"id": "alltonote.video-course-note", "version": 1}
     assert report["evidence_ids"] == list(EVIDENCE_IDS)
+
+
+def test_quality_report_uses_the_video_course_note_profile() -> None:
+    report = json.loads(_evaluate(_draft(_good_markdown())).report.payload)
+
+    assert report["profile"] == {"id": "alltonote.video-course-note", "version": 1}
+
+
+@pytest.mark.parametrize("bad_input", ("draft", "evidence", "bundle_id", "artifact_id"))
+def test_quality_sanitizes_invalid_boundary_inputs(bad_input: str) -> None:
+    kwargs: dict[str, object] = {
+        "draft": _draft(_good_markdown()),
+        "evidence_set": _evidence_set(),
+        "draft_bundle_id": BUNDLE_ID,
+        "draft_artifact_id": DRAFT_ARTIFACT_ID,
+    }
+    if bad_input in {"draft", "evidence"}:
+        kwargs["draft" if bad_input == "draft" else "evidence_set"] = object()
+    else:
+        kwargs["draft_bundle_id" if bad_input == "bundle_id" else "draft_artifact_id"] = (
+            "C:/private/draft.md"
+        )
+
+    with pytest.raises(DomainError) as caught:
+        evaluate_video_draft(**kwargs)  # type: ignore[arg-type]
+
+    assert caught.value.code == "quality_input_invalid"
+    assert caught.value.category is ErrorCategory.INVALID_REQUEST
+    assert "C:/private" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+def test_quality_does_not_require_an_h2_when_all_citations_are_valid() -> None:
+    markdown = (
+        "# Note\n\n"
+        f"Summary[^{EVIDENCE_IDS[0]}][^{EVIDENCE_IDS[1]}]\n\n"
+        f"[^{EVIDENCE_IDS[0]}]: Segment 1\n"
+        f"[^{EVIDENCE_IDS[1]}]: Segment 2\n"
+    )
+
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.PASS
+    assert outcome.publish_eligible is True
+
+
+def test_setext_h2_requires_evidence_when_its_body_is_substantive() -> None:
+    markdown = (
+        "# Note\n\n"
+        "Unsupported\n"
+        "-----------\n"
+        "Substantive text without evidence.\n\n"
+        f"## Supported\nSummary[^{EVIDENCE_IDS[0]}][^{EVIDENCE_IDS[1]}]\n\n"
+        f"[^{EVIDENCE_IDS[0]}]: Segment 1\n"
+        f"[^{EVIDENCE_IDS[1]}]: Segment 2\n"
+    )
+
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.FAIL
+    assert "h2_evidence" in {
+        check.check_id
+        for check in outcome.report.checks
+        if check.status == "fail"
+    }
+
+
+@pytest.mark.parametrize(
+    "literal_block",
+    (
+        "```text\nNot a section\n-------------\n[^ev_fake]: fake\n```\n",
+        "    Not a section\n    -------------\n    [^ev_fake]: fake\n",
+        "``Not a section\n-------------\n[^ev_fake]: fake``\n",
+    ),
+)
+def test_setext_headings_and_footnotes_inside_code_are_ignored(
+    literal_block: str,
+) -> None:
+    markdown = (
+        "# Note\n\n"
+        + literal_block
+        + f"Summary[^{EVIDENCE_IDS[0]}][^{EVIDENCE_IDS[1]}]\n\n"
+        + f"[^{EVIDENCE_IDS[0]}]: Segment 1\n"
+        + f"[^{EVIDENCE_IDS[1]}]: Segment 2\n"
+    )
+
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.PASS
+    assert outcome.publish_eligible is True
 
 
 def test_each_substantive_h2_requires_final_evidence_and_matching_definition() -> None:
@@ -461,6 +770,60 @@ def test_quality_rejects_evidence_locator_or_excerpt_hash_mismatch() -> None:
 
     assert outcome.overall is QualityOverall.FAIL
     assert outcome.publish_eligible is False
+    assert "evidence_integrity" in {
+        check.check_id
+        for check in outcome.report.checks
+        if check.status == "fail"
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("header_schema", True),
+        ("record_count", 2.0),
+        ("record_schema", True),
+        ("start_ms", False),
+        ("end_ms", 2530.0),
+    ),
+)
+def test_quality_rejects_non_integer_evidence_schema_and_locator_values(
+    field: str,
+    value: object,
+) -> None:
+    evidence_set = _evidence_set()
+    records = [json.loads(line) for line in evidence_set.payload.splitlines()]
+    if field == "header_schema":
+        records[0]["evidence_set_schema_version"] = value
+    elif field == "record_count":
+        records[0]["record_count"] = value
+    elif field == "record_schema":
+        records[1]["evidence_ref_schema_version"] = value
+    else:
+        records[1]["locator"][field] = value
+    corrupted = replace(evidence_set, payload=encode_ndjson(records))
+
+    outcome = _evaluate(_draft(_good_markdown()), evidence_set=corrupted)
+
+    assert outcome.overall is QualityOverall.FAIL
+    assert "evidence_integrity" in {
+        check.check_id
+        for check in outcome.report.checks
+        if check.status == "fail"
+    }
+
+
+def test_quality_rejects_noncanonical_evidence_ndjson() -> None:
+    evidence_set = _evidence_set()
+    records = [json.loads(line) for line in evidence_set.payload.splitlines()]
+    noncanonical = b"".join(
+        json.dumps(record, ensure_ascii=False).encode() + b"\n" for record in records
+    )
+    corrupted = replace(evidence_set, payload=noncanonical)
+
+    outcome = _evaluate(_draft(_good_markdown()), evidence_set=corrupted)
+
+    assert outcome.overall is QualityOverall.FAIL
     assert "evidence_integrity" in {
         check.check_id
         for check in outcome.report.checks
@@ -597,6 +960,32 @@ def test_repair_execution_failure_is_sanitized_and_distinct_from_quality() -> No
     assert "C:/private" not in outcome.execution_error.message
     assert outcome.publish_eligible is False
     assert outcome.repair_attempts == 1
+
+
+def test_invalid_repair_return_is_sanitized() -> None:
+    def invalid_repair(_draft_value: GeneratedVideoDraft):
+        return "C:/private/draft.md"
+
+    outcome = _evaluate(
+        _draft("# Note\n\n## Missing\nNo evidence.\n"),
+        repair=invalid_repair,
+    )
+
+    assert outcome.execution_error is not None
+    assert outcome.execution_error.code == "quality_repair_failed"
+    assert "C:/private" not in outcome.execution_error.message
+
+
+@pytest.mark.parametrize("fatal", (MemoryError, KeyboardInterrupt, SystemExit))
+def test_repair_does_not_swallow_fatal_exceptions(fatal: type[BaseException]) -> None:
+    def fail_repair(_draft_value: GeneratedVideoDraft) -> GeneratedVideoDraft:
+        raise fatal()
+
+    with pytest.raises(fatal):
+        _evaluate(
+            _draft("# Note\n\n## Missing\nNo evidence.\n"),
+            repair=fail_repair,
+        )
 
 
 def test_builders_snapshot_mutable_inputs_and_return_frozen_results() -> None:

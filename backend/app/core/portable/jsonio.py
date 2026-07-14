@@ -36,8 +36,8 @@ def _validate_json_value(value: object) -> None:
 
 
 def encode_json(value: object) -> bytes:
-    _validate_json_value(value)
     try:
+        _validate_json_value(value)
         encoded = json.dumps(
             value,
             ensure_ascii=False,
@@ -45,7 +45,11 @@ def encode_json(value: object) -> bytes:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    except (TypeError, UnicodeError, ValueError):
+    except DomainError:
+        raise
+    except MemoryError:
+        raise
+    except (RecursionError, TypeError, UnicodeError, ValueError):
         raise _json_invalid() from None
     return encoded + b"\n"
 
@@ -55,7 +59,11 @@ def encode_ndjson(records: Iterable[object]) -> bytes:
         raise _json_invalid()
     try:
         return b"".join(encode_json(record) for record in records)
-    except TypeError:
+    except DomainError:
+        raise
+    except MemoryError:
+        raise
+    except (OSError, RecursionError, TypeError):
         raise _json_invalid() from None
 
 

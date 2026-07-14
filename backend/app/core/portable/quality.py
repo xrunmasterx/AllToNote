@@ -10,7 +10,7 @@ from app.core.domain.video import GeneratedVideoDraft, QualityOverall
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import EvidenceSet
-from app.core.portable.jsonio import encode_json, encode_utf8_lf
+from app.core.portable.jsonio import encode_json, encode_ndjson, encode_utf8_lf
 from app.core.portable.markdown_safety import (
     _analyze_markdown,
     validate_markdown_safety,
@@ -33,6 +33,14 @@ _EVIDENCE_RECORD_FIELDS = {
 _REPAIRABLE_CHECKS = frozenset(
     {"citation_integrity", "h2_evidence", "draft_placeholders"}
 )
+
+
+def _quality_input_invalid() -> DomainError:
+    return DomainError(
+        "quality_input_invalid",
+        ErrorCategory.INVALID_REQUEST,
+        "Quality evaluation input is invalid",
+    )
 
 
 @dataclass(frozen=True)
@@ -99,14 +107,17 @@ def _load_evidence_records(evidence_set: EvidenceSet) -> list[object] | None:
         lines = text.splitlines()
         if not lines:
             return None
-        return [
+        records = [
             json.loads(
                 line,
                 parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
             )
             for line in lines
         ]
-    except (UnicodeError, ValueError):
+        if encode_ndjson(records) != payload:
+            return None
+        return records
+    except (DomainError, UnicodeError, ValueError):
         return None
 
 
@@ -128,6 +139,11 @@ def _evidence_is_valid(evidence_set: EvidenceSet) -> bool:
     if transcript_digest != evidence_set.target_artifact_ref.sha256:
         return False
     header = records[0]
+    if (
+        type(header.get("evidence_set_schema_version")) is not int
+        or type(header.get("record_count")) is not int
+    ):
+        return False
     if header != {
         "record_type": "evidence_set_header",
         "evidence_set_schema_version": 1,
@@ -149,6 +165,14 @@ def _evidence_is_valid(evidence_set: EvidenceSet) -> bool:
         expected_ids,
     ):
         if not isinstance(record, dict) or set(record) != _EVIDENCE_RECORD_FIELDS:
+            return False
+        locator = record.get("locator")
+        if (
+            type(record.get("evidence_ref_schema_version")) is not int
+            or not isinstance(locator, dict)
+            or type(locator.get("start_ms")) is not int
+            or type(locator.get("end_ms")) is not int
+        ):
             return False
         if (
             record["evidence_ref_schema_version"] != 1
@@ -193,7 +217,7 @@ def _citation_checks(
         and len(mapped_draft_citations) == len(draft.cited_segment_ids)
         and citations == mapped_draft_citations
     )
-    h2_valid = bool(analysis.substantive_h2_citations) and all(
+    h2_valid = all(
         bool(section_citations)
         and set(section_citations) <= known_evidence
         and set(section_citations) <= citations
@@ -292,7 +316,7 @@ def _make_report(
                 "artifact_id": subject.artifact_id,
                 "sha256": subject.sha256,
             },
-            "profile": {"id": "video-note-default", "version": 1},
+            "profile": {"id": "alltonote.video-course-note", "version": 1},
             "overall": overall.value,
             "checks": check_documents,
             "method": {"kind": "deterministic"},
@@ -318,6 +342,20 @@ def evaluate_video_draft(
     draft_artifact_id: str,
     repair: Callable[[GeneratedVideoDraft], GeneratedVideoDraft] | None = None,
 ) -> QualityOutcome:
+    if not isinstance(draft, GeneratedVideoDraft) or not isinstance(
+        evidence_set,
+        EvidenceSet,
+    ):
+        raise _quality_input_invalid()
+    try:
+        PortableArtifactRef(
+            draft_bundle_id,
+            draft_artifact_id,
+            "sha256:" + "0" * 64,
+        )
+    except DomainError:
+        raise _quality_input_invalid() from None
+
     assessment = _assess(draft, evidence_set)
     repair_attempts = 0
     execution_error: ErrorDetail | None = None
@@ -335,6 +373,8 @@ def evaluate_video_draft(
                 raise TypeError("repair returned an invalid draft")
             final_draft = repaired
             assessment = _assess(repaired, evidence_set)
+        except MemoryError:
+            raise
         except Exception:
             execution_error = ErrorDetail(
                 code="quality_repair_failed",

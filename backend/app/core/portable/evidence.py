@@ -15,15 +15,13 @@ from app.core.portable.artifacts import (
     require_revision_id,
 )
 from app.core.portable.jsonio import encode_ndjson
+from app.core.portable.markdown_safety import _backslash_escaped, _scan_markdown
 
 
 _EVIDENCE_ID = re.compile(
     r"ev_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
-_VALID_SEGMENT_CITATION = re.compile(r"(?<!\\)\[\^(seg_[0-9]{6,})\]")
-_ANY_SEGMENT_CITATION = re.compile(r"(?<!\\)\[\^(seg_[^\]\r\n]*)\]")
-_SEGMENT_CITATION_PREFIX = re.compile(r"(?<!\\)\[\^seg_")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_SEGMENT_ID = re.compile(r"seg_[0-9]{6,}\Z")
 
 
 @dataclass(frozen=True)
@@ -64,6 +62,11 @@ def build_evidence_set(
 ) -> EvidenceSet:
     require_bundle_id(bundle_id)
     require_revision_id(source_revision_id)
+    if not isinstance(transcript_artifact_ref, PortableArtifactRef):
+        raise _evidence_error(
+            "evidence_input_invalid",
+            "Evidence input is invalid",
+        )
     if not isinstance(transcript, TranscriptDocument):
         raise _evidence_error(
             "evidence_transcript_invalid",
@@ -73,7 +76,15 @@ def build_evidence_set(
         language=transcript.language,
         segments=transcript.segments,
     )
-    citation_map = dict(evidence_ids_by_segment)
+    try:
+        citation_map = dict(evidence_ids_by_segment)
+    except MemoryError:
+        raise
+    except (TypeError, ValueError):
+        raise _evidence_error(
+            "evidence_input_invalid",
+            "Evidence input is invalid",
+        ) from None
     segment_ids = {segment.segment_id for segment in document.segments}
     if set(citation_map) != segment_ids:
         raise _evidence_error(
@@ -149,55 +160,6 @@ def build_evidence_set(
     )
 
 
-def _rewrite_visible_text(text: str, citation_map: Mapping[str, str]) -> str:
-    for match in _ANY_SEGMENT_CITATION.finditer(text):
-        if _VALID_SEGMENT_CITATION.fullmatch(match.group(0)) is None:
-            raise _evidence_error(
-                "draft_segment_citation_invalid",
-                "Draft contains an invalid transcript citation",
-            )
-
-    def replace(match: re.Match[str]) -> str:
-        evidence_id = citation_map.get(match.group(1))
-        if evidence_id is None:
-            raise _evidence_error(
-                "draft_segment_citation_invalid",
-                "Draft references an unknown transcript segment",
-            )
-        return f"[^{evidence_id}]"
-
-    rewritten = _VALID_SEGMENT_CITATION.sub(replace, text)
-    if _SEGMENT_CITATION_PREFIX.search(rewritten) is not None:
-        raise _evidence_error(
-            "draft_segment_citation_invalid",
-            "Draft contains a malformed transcript citation",
-        )
-    return rewritten
-
-
-def _rewrite_inline_code(line: str, citation_map: Mapping[str, str]) -> str:
-    output: list[str] = []
-    cursor = 0
-    while cursor < len(line):
-        marker = line.find("`", cursor)
-        if marker < 0:
-            output.append(_rewrite_visible_text(line[cursor:], citation_map))
-            break
-        run_end = marker
-        while run_end < len(line) and line[run_end] == "`":
-            run_end += 1
-        marker_text = line[marker:run_end]
-        closing = line.find(marker_text, run_end)
-        if closing < 0:
-            output.append(_rewrite_visible_text(line[cursor:], citation_map))
-            break
-        output.append(_rewrite_visible_text(line[cursor:marker], citation_map))
-        closing_end = closing + len(marker_text)
-        output.append(line[marker:closing_end])
-        cursor = closing_end
-    return "".join(output)
-
-
 def rewrite_segment_citations(
     markdown: str,
     evidence_ids_by_segment: Mapping[str, str],
@@ -207,7 +169,15 @@ def rewrite_segment_citations(
             "draft_segment_citation_invalid",
             "Draft markdown must be text",
         )
-    citation_map = dict(evidence_ids_by_segment)
+    try:
+        citation_map = dict(evidence_ids_by_segment)
+    except MemoryError:
+        raise
+    except (TypeError, ValueError):
+        raise _evidence_error(
+            "draft_segment_citation_invalid",
+            "Evidence citation mapping is invalid",
+        ) from None
     if any(
         not isinstance(value, str) or _EVIDENCE_ID.fullmatch(value) is None
         for value in citation_map.values()
@@ -217,25 +187,45 @@ def rewrite_segment_citations(
             "Evidence citation mapping is invalid",
         )
 
+    scan = _scan_markdown(markdown)
     output: list[str] = []
-    fence_marker: str | None = None
-    for line in markdown.splitlines(keepends=True):
-        fence = _FENCE.match(line)
-        if fence_marker is not None:
-            output.append(line)
-            if fence is not None and fence.group(1)[0] == fence_marker[0] and len(
-                fence.group(1)
-            ) >= len(fence_marker):
-                fence_marker = None
+    copied_until = 0
+    cursor = 0
+    prefix = "[^seg_"
+    while cursor < len(markdown):
+        if (
+            scan.visible_mask[cursor]
+            and markdown.startswith(prefix, cursor)
+            and not _backslash_escaped(markdown, cursor)
+        ):
+            closing = cursor + len(prefix)
+            while closing < len(markdown) and markdown[closing] not in "]\r\n":
+                closing += 1
+            if closing >= len(markdown) or markdown[closing] != "]":
+                raise _evidence_error(
+                    "draft_segment_citation_invalid",
+                    "Draft contains a malformed transcript citation",
+                )
+            segment_id = markdown[cursor + 2 : closing]
+            if (
+                _SEGMENT_ID.fullmatch(segment_id) is None
+                or not all(scan.visible_mask[cursor : closing + 1])
+            ):
+                raise _evidence_error(
+                    "draft_segment_citation_invalid",
+                    "Draft contains an invalid transcript citation",
+                )
+            evidence_id = citation_map.get(segment_id)
+            if evidence_id is None:
+                raise _evidence_error(
+                    "draft_segment_citation_invalid",
+                    "Draft references an unknown transcript segment",
+                )
+            output.append(markdown[copied_until:cursor])
+            output.append(f"[^{evidence_id}]")
+            copied_until = closing + 1
+            cursor = closing + 1
             continue
-        if fence is not None:
-            fence_marker = fence.group(1)
-            output.append(line)
-            continue
-        if line.startswith(("    ", "\t")):
-            output.append(line)
-            continue
-        output.append(_rewrite_inline_code(line, citation_map))
-    if not markdown:
-        return ""
+        cursor += 1
+    output.append(markdown[copied_until:])
     return "".join(output)
