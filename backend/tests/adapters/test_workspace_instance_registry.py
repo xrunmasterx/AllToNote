@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 import app.adapters.jobs.workspace_instance_registry as registry_module
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
+from app.core.errors import DomainError
 
 
 WORKSPACE_IDENTITY = "workspace-lineage-1"
@@ -51,6 +53,39 @@ def _write_registry(local_app_data: Path, payload: object) -> None:
     _registry_path(local_app_data).write_text(
         json.dumps(payload), encoding="utf-8"
     )
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        command = [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ]
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"directory junction creation unavailable: {result.stderr}")
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink creation unavailable: {error}")
+
+
+def _remove_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink()
 
 
 @pytest.fixture
@@ -146,6 +181,63 @@ def test_registry_and_machine_state_are_never_written_inside_portable_workspace(
     assert instance.machine_root.resolve(strict=False).parent == machine_parent
     assert not instance.machine_root.is_relative_to(workspace_root)
     assert not _registry_path(local_app_data).is_relative_to(workspace_root)
+
+
+@pytest.mark.parametrize("escape_component", ("AllToNote", "workspaces"))
+def test_registry_rejects_physical_root_escape_before_writing_artifacts(
+    workspace_root: Path,
+    tmp_path: Path,
+    escape_component: str,
+) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    local_app_data.mkdir()
+    escaped_target = tmp_path / "escaped-target"
+    escaped_target.mkdir()
+    if escape_component == "AllToNote":
+        link = local_app_data / "AllToNote"
+    else:
+        app_root = local_app_data / "AllToNote"
+        app_root.mkdir()
+        link = app_root / "workspaces"
+    _create_directory_link(link, escaped_target)
+
+    try:
+        registry = WorkspaceInstanceRegistry(
+            local_app_data, inspect_workspace=_inspect_workspace
+        )
+        with pytest.raises(DomainError, match="workspace_instance_root_unsafe"):
+            registry.resolve(workspace_root)
+
+        for artifact_name in (
+            "workspace-instances.json",
+            "workspace-instances.json.lock",
+            "jobs.sqlite",
+        ):
+            assert list(tmp_path.rglob(artifact_name)) == []
+    finally:
+        _remove_directory_link(link)
+
+
+def test_constructor_supplied_local_root_redirection_is_trusted(
+    workspace_root: Path,
+    tmp_path: Path,
+) -> None:
+    trusted_physical_root = tmp_path / "trusted-physical-root"
+    trusted_physical_root.mkdir()
+    supplied_root = tmp_path / "redirected-local-root"
+    _create_directory_link(supplied_root, trusted_physical_root)
+
+    try:
+        instance = WorkspaceInstanceRegistry(
+            supplied_root, inspect_workspace=_inspect_workspace
+        ).resolve(workspace_root)
+
+        assert (
+            trusted_physical_root / "AllToNote" / "workspace-instances.json"
+        ).is_file()
+        assert instance.machine_root.is_relative_to(trusted_physical_root)
+    finally:
+        _remove_directory_link(supplied_root)
 
 
 def test_same_root_is_stable_across_processes(

@@ -7,7 +7,7 @@ import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.domain.video import JobState
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import AttemptState
 from app.core.jobs.state_machine import (
     LEGAL_ATTEMPT_TRANSITIONS,
@@ -32,11 +32,170 @@ EXPECTED_TABLES = {
     "source_identities",
     "steps",
 }
+OLD_EXECUTION_CHAIN_TABLES = (
+    """
+    CREATE TABLE attempts (
+        attempt_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id, step_id) REFERENCES steps(job_id, step_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE challenges (
+        challenge_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+        attempt_id TEXT REFERENCES attempts(attempt_id),
+        state TEXT NOT NULL,
+        prompt_json TEXT NOT NULL,
+        response_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE external_operations (
+        operation_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+        step_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+        provider TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        operation_idempotency_key TEXT,
+        provider_request_id TEXT,
+        outcome TEXT NOT NULL,
+        summary_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE checkpoints (
+        checkpoint_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+        step_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+        relative_path TEXT NOT NULL,
+        schema_id TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        output_hash TEXT NOT NULL,
+        byte_length INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+)
 
 
 @pytest.fixture
 def repo(tmp_path: Path) -> SqliteJobRepository:
     yield SqliteJobRepository.open(tmp_path / "machine-root")
+
+
+def _database_path(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    machine_root = tmp_path / name
+    machine_root.mkdir()
+    return machine_root, machine_root / "jobs.sqlite"
+
+
+def _assert_schema_invalid(machine_root: Path) -> None:
+    with pytest.raises(DomainError, match="job_store_schema_invalid") as caught:
+        SqliteJobRepository.open(machine_root)
+    assert caught.value.code == "job_store_schema_invalid"
+    assert caught.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
+
+
+def test_current_schema_reopens_and_preserves_writer_data(tmp_path: Path) -> None:
+    machine_root = tmp_path / "machine-root"
+    writer = SqliteJobRepository.open(machine_root)
+    job = writer.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="reopen-current",
+    )
+
+    reopened = SqliteJobRepository.open(machine_root)
+
+    assert reopened.get_job(job.job_id) == job
+
+
+def test_version_one_empty_shell_is_rejected(tmp_path: Path) -> None:
+    machine_root, database_path = _database_path(tmp_path, "empty-shell")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA user_version = 1")
+
+    _assert_schema_invalid(machine_root)
+
+
+def test_version_one_missing_table_is_rejected(tmp_path: Path) -> None:
+    machine_root = tmp_path / "missing-table"
+    SqliteJobRepository.open(machine_root)
+    with sqlite3.connect(machine_root / "jobs.sqlite") as connection:
+        connection.execute("DROP TABLE source_identities")
+
+    _assert_schema_invalid(machine_root)
+
+
+def test_version_one_old_execution_chain_shape_is_rejected(tmp_path: Path) -> None:
+    machine_root = tmp_path / "old-head"
+    SqliteJobRepository.open(machine_root)
+    with sqlite3.connect(machine_root / "jobs.sqlite") as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for table in (
+            "challenges",
+            "external_operations",
+            "checkpoints",
+            "attempts",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        for statement in OLD_EXECUTION_CHAIN_TABLES:
+            connection.execute(statement)
+
+    _assert_schema_invalid(machine_root)
+
+
+def test_version_one_extra_application_table_is_rejected(tmp_path: Path) -> None:
+    machine_root = tmp_path / "extra-table"
+    SqliteJobRepository.open(machine_root)
+    with sqlite3.connect(machine_root / "jobs.sqlite") as connection:
+        connection.execute("CREATE TABLE unexpected (value TEXT)")
+
+    _assert_schema_invalid(machine_root)
+
+
+def test_version_zero_with_application_table_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "partial-v0")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE unexpected (value TEXT)")
+
+    _assert_schema_invalid(machine_root)
+
+    with sqlite3.connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert version == 0
+    assert tables == {"unexpected"}
+
+
+def test_corrupt_database_is_rejected_without_overwrite(tmp_path: Path) -> None:
+    machine_root, database_path = _database_path(tmp_path, "corrupt")
+    corrupt_bytes = b"not-a-sqlite-database\x00keep-these-bytes"
+    database_path.write_bytes(corrupt_bytes)
+
+    _assert_schema_invalid(machine_root)
+
+    assert database_path.read_bytes() == corrupt_bytes
 
 
 def test_open_creates_version_one_database_with_exact_schema_and_pragmas(

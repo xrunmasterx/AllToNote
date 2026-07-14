@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from filelock import FileLock
 
+from app.core.errors import DomainError, ErrorCategory
+
 
 _REGISTRY_VERSION = 1
 _REGISTRY_KEYS = frozenset({"version", "instances"})
@@ -35,7 +37,14 @@ class WorkspaceInstanceRegistry:
         *,
         inspect_workspace: Callable[[Path], str],
     ) -> None:
-        self._app_root = (Path(local_app_data) / "AllToNote").resolve(strict=False)
+        try:
+            trusted_local_root = Path(local_app_data).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            self._raise_root_unsafe(error)
+        if not trusted_local_root.is_dir():
+            self._raise_root_unsafe()
+        self._trusted_local_root = trusted_local_root
+        self._app_root = trusted_local_root / "AllToNote"
         self._registry_path = self._app_root / "workspace-instances.json"
         self._lock_path = self._app_root / "workspace-instances.json.lock"
         self._inspect_workspace = inspect_workspace
@@ -53,7 +62,12 @@ class WorkspaceInstanceRegistry:
             raise ValueError("workspace_identity_invalid")
 
         normalized_root = Path(os.path.normcase(os.path.normpath(str(canonical))))
-        self._app_root.mkdir(parents=True, exist_ok=True)
+        self._app_root = self._ensure_contained_directory(self._app_root)
+        machine_parent = self._ensure_contained_directory(
+            self._app_root / "workspaces"
+        )
+        self._registry_path = self._app_root / "workspace-instances.json"
+        self._lock_path = self._app_root / "workspace-instances.json.lock"
         with FileLock(self._lock_path):
             registry = self._read_registry()
             instance = self._find_instance(
@@ -65,6 +79,9 @@ class WorkspaceInstanceRegistry:
                     "workspace_identity": workspace_identity,
                     "canonical_root": str(normalized_root),
                 }
+                resolved_instance = self._to_workspace_instance(
+                    instance, machine_parent
+                )
                 registry["instances"].append(instance)
                 registry["instances"].sort(
                     key=lambda item: (
@@ -73,8 +90,40 @@ class WorkspaceInstanceRegistry:
                     )
                 )
                 self._write_registry(registry)
+            else:
+                resolved_instance = self._to_workspace_instance(
+                    instance, machine_parent
+                )
 
-        return self._to_workspace_instance(instance)
+        return resolved_instance
+
+    def _ensure_contained_directory(self, path: Path) -> Path:
+        try:
+            before = path.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as error:
+            self._raise_root_unsafe(error)
+        if not before.is_relative_to(self._trusted_local_root):
+            self._raise_root_unsafe()
+
+        try:
+            path.mkdir(exist_ok=True)
+            after = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            self._raise_root_unsafe(error)
+        if (
+            not after.is_dir()
+            or not after.is_relative_to(self._trusted_local_root)
+        ):
+            self._raise_root_unsafe()
+        return after
+
+    @staticmethod
+    def _raise_root_unsafe(error: BaseException | None = None) -> None:
+        raise DomainError(
+            "workspace_instance_root_unsafe",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "Workspace instance root is outside the trusted local root",
+        ) from error
 
     def _read_registry(self) -> dict[str, object]:
         try:
@@ -168,16 +217,21 @@ class WorkspaceInstanceRegistry:
                 temporary_path.unlink(missing_ok=True)
 
     def _to_workspace_instance(
-        self, instance: dict[str, str]
+        self,
+        instance: dict[str, str],
+        machine_parent: Path,
     ) -> WorkspaceInstance:
         instance_id = instance["instance_id"]
         try:
-            machine_parent = (self._app_root / "workspaces").resolve(strict=False)
             machine_root = (machine_parent / instance_id).resolve(strict=False)
         except (OSError, RuntimeError, ValueError) as error:
-            raise ValueError("workspace_instance_registry_invalid") from error
-        if machine_root.parent != machine_parent or machine_root.name != instance_id:
-            raise ValueError("workspace_instance_registry_invalid")
+            self._raise_root_unsafe(error)
+        if (
+            machine_root.parent != machine_parent
+            or machine_root.name != instance_id
+            or not machine_root.is_relative_to(self._trusted_local_root)
+        ):
+            self._raise_root_unsafe()
         return WorkspaceInstance(
             instance_id=instance_id,
             workspace_identity=instance["workspace_identity"],

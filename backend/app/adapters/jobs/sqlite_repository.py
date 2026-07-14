@@ -140,6 +140,35 @@ _SCHEMA_STATEMENTS = (
 )
 
 
+def _normalize_schema_sql(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def _application_schema(connection: sqlite3.Connection) -> dict[str, str]:
+    rows = connection.execute(
+        """
+        SELECT name, sql FROM sqlite_master
+        WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
+        """
+    ).fetchall()
+    return {row[0]: _normalize_schema_sql(row[1]) for row in rows}
+
+
+def _expected_schema() -> dict[str, str]:
+    with sqlite3.connect(":memory:") as connection:
+        for statement in _SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        return _application_schema(connection)
+
+
+def _raise_schema_invalid(error: BaseException | None = None) -> None:
+    raise DomainError(
+        "job_store_schema_invalid",
+        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+        "JobStore schema does not match version 1",
+    ) from error
+
+
 class SqliteJobRepository:
     def __init__(self, machine_root: Path) -> None:
         self.machine_root = machine_root
@@ -150,7 +179,12 @@ class SqliteJobRepository:
         resolved_root = Path(machine_root).resolve()
         resolved_root.mkdir(parents=True, exist_ok=True)
         repository = cls(resolved_root)
-        repository._initialize_schema()
+        try:
+            repository._initialize_schema()
+        except DomainError:
+            raise
+        except sqlite3.DatabaseError as error:
+            _raise_schema_invalid(error)
         return repository
 
     def _connect(self) -> sqlite3.Connection:
@@ -159,10 +193,14 @@ class SqliteJobRepository:
             timeout=_BUSY_TIMEOUT_MS / 1_000,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA journal_mode = WAL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
@@ -187,10 +225,16 @@ class SqliteJobRepository:
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
                     "JobStore schema version is not supported",
                 )
+            actual_schema = _application_schema(connection)
             if version == 0:
+                if actual_schema:
+                    _raise_schema_invalid()
                 for statement in _SCHEMA_STATEMENTS:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
+            if actual_schema != _expected_schema():
+                _raise_schema_invalid()
 
     def create_job(
         self,
