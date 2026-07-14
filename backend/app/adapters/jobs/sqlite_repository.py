@@ -844,17 +844,44 @@ class SqliteJobRepository:
                 )
             prepared = by_outcome[ExternalOutcome.PREPARED]
             if prepared:
-                connection.execute(
+                operation = self._get_external_operation(connection, prepared[0])
+                if operation.attempt_id == attempt_id:
+                    return operation
+                previous_attempt = self._get_attempt(
+                    connection, operation.attempt_id
+                )
+                if previous_attempt.fencing_token == authority.fencing_token:
+                    raise DomainError(
+                        "external_operation_in_progress",
+                        ErrorCategory.CONFLICT,
+                        "Prepared external operation belongs to another live Attempt",
+                    )
+                if previous_attempt.fencing_token > authority.fencing_token:
+                    raise DomainError(
+                        "attempt_fenced",
+                        ErrorCategory.CONFLICT,
+                        "Prepared external operation has newer execution authority",
+                    )
+                updated = connection.execute(
                     """
-                    UPDATE external_operations SET attempt_id = ?
-                    WHERE operation_id = ? AND outcome = ?
+                    UPDATE external_operations
+                    SET attempt_id = ?, updated_at = ?
+                    WHERE operation_id = ? AND attempt_id = ? AND outcome = ?
                     """,
                     (
                         attempt_id,
+                        utc_now_millis(),
                         prepared[0],
+                        operation.attempt_id,
                         ExternalOutcome.PREPARED.value,
                     ),
                 )
+                if updated.rowcount != 1:
+                    raise DomainError(
+                        "external_operation_in_progress",
+                        ErrorCategory.CONFLICT,
+                        "Prepared external operation changed before reassignment",
+                    )
                 return self._get_external_operation(connection, prepared[0])
             operation_id = new_typed_id("op")
             now = utc_now_millis()

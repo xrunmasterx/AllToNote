@@ -464,6 +464,86 @@ def test_prepared_binding_rebinds_same_operation_to_current_fenced_attempt(
     assert guard.start(replay.operation_id).outcome is ExternalOutcome.STARTED
 
 
+def test_prepared_binding_cannot_move_between_attempts_with_same_token(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, ExternalOutcome, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, first_attempt, authority = _running_attempt(repository)
+    second_attempt = repository.create_attempt(job.job_id, first_attempt.step_id)
+    second_attempt = repository.start_attempt(second_attempt.attempt_id, authority)
+    guard = ExternalOperationGuard(repository, authority)
+    request_hash = sha256_digest(b"same token concurrent attempts")
+    prepared = guard.prepare(
+        job_id=job.job_id,
+        step_id=first_attempt.step_id,
+        attempt_id=first_attempt.attempt_id,
+        provider="paid-provider",
+        request_hash=request_hash,
+        summary_json="{}",
+    )
+
+    with pytest.raises(DomainError, match="external_operation_in_progress"):
+        guard.prepare(
+            job_id=job.job_id,
+            step_id=second_attempt.step_id,
+            attempt_id=second_attempt.attempt_id,
+            provider="paid-provider",
+            request_hash=request_hash,
+            summary_json="{}",
+        )
+
+    assert guard.get(prepared.operation_id) == prepared
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == 1
+    started = guard.start(prepared.operation_id)
+    assert started.outcome is ExternalOutcome.STARTED
+    assert started.attempt_id == first_attempt.attempt_id
+
+
+def test_prepared_binding_with_future_attempt_token_fails_closed(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, _, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, existing_attempt, authority = _running_attempt(repository)
+    current_attempt = repository.create_attempt(job.job_id, existing_attempt.step_id)
+    current_attempt = repository.start_attempt(current_attempt.attempt_id, authority)
+    guard = ExternalOperationGuard(repository, authority)
+    request_hash = sha256_digest(b"future attempt token")
+    prepared = guard.prepare(
+        job_id=job.job_id,
+        step_id=existing_attempt.step_id,
+        attempt_id=existing_attempt.attempt_id,
+        provider="paid-provider",
+        request_hash=request_hash,
+        summary_json="{}",
+    )
+    with repository._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE attempts SET fencing_token = ? WHERE attempt_id = ?",
+            (authority.fencing_token + 1, existing_attempt.attempt_id),
+        )
+
+    with pytest.raises(DomainError, match="attempt_fenced"):
+        guard.prepare(
+            job_id=job.job_id,
+            step_id=current_attempt.step_id,
+            attempt_id=current_attempt.attempt_id,
+            provider="paid-provider",
+            request_hash=request_hash,
+            summary_json="{}",
+        )
+
+    assert guard.get(prepared.operation_id).attempt_id == existing_attempt.attempt_id
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == 1
+
+
 @pytest.mark.parametrize("existing_outcome", (None, "prepared", "failed"))
 def test_prepare_rejects_stale_authority_before_reuse_or_insert(
     tmp_path: Path,
