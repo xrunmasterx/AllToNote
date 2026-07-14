@@ -1,7 +1,6 @@
 import importlib.util
 import pathlib
 import threading
-import time
 import unittest
 
 
@@ -12,30 +11,61 @@ if spec is None or spec.loader is None:
     raise ImportError("task_serial_executor module spec not found")
 task_serial_executor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(task_serial_executor)
-SerialTaskExecutor = task_serial_executor.SerialTaskExecutor
+ConcurrentTaskExecutor = task_serial_executor.ConcurrentTaskExecutor
 
 
-class TestTaskSerialExecutor(unittest.TestCase):
-    def test_executor_runs_tasks_one_by_one(self):
-        executor = SerialTaskExecutor()
+class TestConcurrentTaskExecutor(unittest.TestCase):
+    def test_executor_runs_two_tasks_concurrently(self):
+        executor = ConcurrentTaskExecutor(max_workers=2)
         state_lock = threading.Lock()
-        state = {"active": 0, "peak_active": 0}
+        both_active = threading.Event()
+        release_tasks = threading.Event()
+        active = 0
+        results = []
+        errors = []
 
-        def critical_work():
+        def concurrent_work(call_id):
+            nonlocal active
             with state_lock:
-                state["active"] += 1
-                state["peak_active"] = max(state["peak_active"], state["active"])
-            time.sleep(0.05)
-            with state_lock:
-                state["active"] -= 1
+                active += 1
+                if active == 2:
+                    both_active.set()
+            try:
+                if not release_tasks.wait(timeout=1):
+                    raise TimeoutError("test did not release concurrent tasks")
+                return call_id
+            finally:
+                with state_lock:
+                    active -= 1
 
-        threads = [threading.Thread(target=lambda: executor.run(critical_work)) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        def run_task(call_id):
+            try:
+                result = executor.run(concurrent_work, call_id)
+                with state_lock:
+                    results.append(result)
+            except Exception as exc:
+                with state_lock:
+                    errors.append(exc)
 
-        self.assertEqual(state["peak_active"], 1)
+        threads = [threading.Thread(target=run_task, args=(call_id,)) for call_id in (1, 2)]
+        try:
+            for thread in threads:
+                thread.start()
+
+            self.assertTrue(both_active.wait(timeout=1), "two tasks were not active concurrently")
+            release_tasks.set()
+            for thread in threads:
+                thread.join(timeout=1)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertCountEqual(results, [1, 2])
+        finally:
+            release_tasks.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(timeout=1)
+            executor.shutdown()
 
 
 if __name__ == "__main__":
