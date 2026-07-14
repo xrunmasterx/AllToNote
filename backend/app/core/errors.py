@@ -17,22 +17,34 @@ class ErrorCategory(StrEnum):
     INTERNAL = "internal"
 
 
+_IMMUTABLE_DETAIL_SCALAR_TYPES = (type(None), bool, int, float, str, bytes)
+
+
+def _freeze_mapping(value: Mapping[object, object]) -> Mapping[str, object]:
+    frozen: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError("Error detail mapping keys must be strings")
+        frozen[key] = _freeze_value(item)
+    return MappingProxyType(frozen)
+
+
 def _freeze_value(value: object) -> object:
+    if isinstance(value, _IMMUTABLE_DETAIL_SCALAR_TYPES):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {key: _freeze_value(item) for key, item in value.items()}
-        )
+        return _freeze_mapping(value)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze_value(item) for item in value)
-    return value
+    raise TypeError("Error detail value type is not supported")
 
 
 def immutable_details(details: Mapping[str, object] | None) -> Mapping[str, object]:
-    return MappingProxyType(
-        {key: _freeze_value(value) for key, value in (details or {}).items()}
-    )
+    return _freeze_mapping(details or {})
 
 
 @dataclass(frozen=True)

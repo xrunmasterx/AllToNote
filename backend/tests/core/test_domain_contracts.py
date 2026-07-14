@@ -232,6 +232,56 @@ def test_error_details_reject_nested_internal_mutation(error_type: type) -> None
         nested_set.add("changed")
 
 
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_snapshot_bytearrays_as_immutable_bytes(error_type: type) -> None:
+    payload = bytearray(b"secret")
+    error = error_type(
+        code="binary_details",
+        category=ErrorCategory.INTERNAL,
+        message="Binary details",
+        details={"payload": payload},
+    )
+
+    payload[:] = b"changed"
+
+    frozen_payload = error.details["payload"]
+    assert frozen_payload == b"secret"
+    assert isinstance(frozen_payload, bytes)
+    with pytest.raises(TypeError):
+        frozen_payload[0] = 0
+
+
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_reject_unknown_leaf_without_disclosing_it(error_type: type) -> None:
+    class MutableSecret:
+        def __repr__(self) -> str:
+            return "MutableSecret(super-secret-value)"
+
+    with pytest.raises(TypeError) as exc_info:
+        error_type(
+            code="unsupported_details",
+            category=ErrorCategory.INTERNAL,
+            message="Unsupported details",
+            details={"payload": MutableSecret()},
+        )
+
+    assert str(exc_info.value) == "Error detail value type is not supported"
+    assert "super-secret-value" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_reject_non_string_nested_mapping_keys(error_type: type) -> None:
+    with pytest.raises(TypeError) as exc_info:
+        error_type(
+            code="invalid_details_key",
+            category=ErrorCategory.INTERNAL,
+            message="Invalid details key",
+            details={"nested": {1: "value"}},
+        )
+
+    assert str(exc_info.value) == "Error detail mapping keys must be strings"
+
+
 def test_transcript_rejects_invalid_half_open_range() -> None:
     with pytest.raises(DomainError, match="transcript_segment_invalid"):
         TranscriptSegment("seg_000001", 100, 100, "text")
