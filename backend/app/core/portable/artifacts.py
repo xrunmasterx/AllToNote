@@ -64,17 +64,16 @@ def build_transcript(
 ) -> bytes:
     require_revision_id(source_revision_id)
     try:
-        document = TranscriptDocument(language=language, segments=tuple(segments))
-    except DomainError:
-        raise
+        segment_snapshot = tuple(segments)
     except MemoryError:
         raise
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+    except Exception:
         raise DomainError(
             "transcript_invalid",
             ErrorCategory.INVALID_REQUEST,
             "Transcript input is invalid",
         ) from None
+    document = TranscriptDocument(language=language, segments=segment_snapshot)
     records: list[dict[str, object]] = [
         {
             "record_type": "transcript_header",

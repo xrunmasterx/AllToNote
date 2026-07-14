@@ -146,6 +146,43 @@ def test_ndjson_does_not_swallow_generator_memory_error() -> None:
         encode_ndjson(records())
 
 
+def _raise_caller_domain_error() -> None:
+    raise DomainError(
+        "caller_secret",
+        ErrorCategory.INVALID_REQUEST,
+        "secret C:/private/input.jsonl",
+        {"path": "C:/private/input.jsonl"},
+    ) from RuntimeError("secret C:/private/cause")
+
+
+def _assert_sanitized_boundary_error(error: DomainError, code: str) -> None:
+    assert error.code == code
+    assert "C:/private" not in str(error)
+    assert "C:/private" not in repr(error)
+    assert "C:/private" not in repr(error.details)
+    assert error.details == {}
+    assert error.__cause__ is None
+
+
+def test_ndjson_sanitizes_domain_errors_from_the_caller_iterator() -> None:
+    def records():
+        _raise_caller_domain_error()
+        yield None
+
+    with pytest.raises(DomainError) as caught:
+        encode_ndjson(records())
+
+    _assert_sanitized_boundary_error(caught.value, "portable_json_invalid")
+
+
+def test_ndjson_preserves_trusted_json_validation_errors() -> None:
+    with pytest.raises(DomainError) as caught:
+        encode_ndjson(({"value": object()},))
+
+    assert caught.value.code == "portable_json_invalid"
+    assert caught.value.message == "Portable JSON value is invalid"
+
+
 def test_canonical_json_sanitizes_circular_values() -> None:
     circular: list[object] = []
     circular.append(circular)
@@ -245,6 +282,17 @@ def test_transcript_does_not_swallow_segment_iterator_memory_error() -> None:
 
     with pytest.raises(MemoryError):
         build_transcript(REVISION_ID, "zh-CN", segments())
+
+
+def test_transcript_sanitizes_domain_errors_from_the_caller_iterator() -> None:
+    def segments() -> Iterator[TranscriptSegment]:
+        _raise_caller_domain_error()
+        yield SEGMENTS[0]
+
+    with pytest.raises(DomainError) as caught:
+        build_transcript(REVISION_ID, "zh-CN", segments())
+
+    _assert_sanitized_boundary_error(caught.value, "transcript_invalid")
 
 
 def test_evidence_set_exactly_maps_segments_to_verifiable_records() -> None:
@@ -367,6 +415,18 @@ class _FailingMapping(Mapping[str, str]):
         return 1
 
 
+class _DomainErrorMapping(Mapping[str, str]):
+    def __getitem__(self, key: str) -> str:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        _raise_caller_domain_error()
+        yield "seg_000001"
+
+    def __len__(self) -> int:
+        return 1
+
+
 @pytest.mark.parametrize("failure", (RuntimeError, OSError))
 @pytest.mark.parametrize("operation", ("build", "rewrite"))
 def test_evidence_mapping_failures_are_sanitized(
@@ -418,6 +478,40 @@ def test_evidence_mapping_memory_error_is_not_swallowed(operation: str) -> None:
             )
         else:
             rewrite_segment_citations("claim[^seg_000001]", mapping)
+
+
+@pytest.mark.parametrize(
+    ("operation", "code"),
+    (
+        ("build", "evidence_input_invalid"),
+        ("rewrite", "draft_segment_citation_invalid"),
+    ),
+)
+def test_evidence_sanitizes_domain_errors_from_caller_mappings(
+    operation: str,
+    code: str,
+) -> None:
+    mapping = _DomainErrorMapping()
+
+    with pytest.raises(DomainError) as caught:
+        if operation == "build":
+            transcript = TranscriptDocument("zh-CN", SEGMENTS)
+            reference = PortableArtifactRef(
+                BUNDLE_ID,
+                TRANSCRIPT_ARTIFACT_ID,
+                sha256_digest(build_transcript(REVISION_ID, "zh-CN", SEGMENTS)),
+            )
+            build_evidence_set(
+                BUNDLE_ID,
+                REVISION_ID,
+                reference,
+                transcript,
+                mapping,
+            )
+        else:
+            rewrite_segment_citations("claim[^seg_000001]", mapping)
+
+    _assert_sanitized_boundary_error(caught.value, code)
 
 
 def test_segment_citations_are_rewritten_to_trusted_evidence_ids() -> None:
@@ -573,6 +667,33 @@ def test_balanced_destination_scan_scales_linearly(shape: str) -> None:
 
     assert durations[-1] < 1.0
     assert durations[-1] < max(0.2, durations[0] * 6)
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "[\n\n![x][id]\n[id]: https://tracker.example/frame.webp\n",
+        "[\n\n[safe](/etc/passwd)\n",
+    ),
+)
+def test_unmatched_bracket_does_not_hide_later_unsafe_destinations(
+    markdown: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+def test_many_unmatched_brackets_remain_linear_and_do_not_hide_remote_images() -> None:
+    markdown = (
+        "[" * 64_000
+        + "\n\n![x][id]\n[id]: https://tracker.example/frame.webp\n"
+    )
+    started = time.perf_counter()
+
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+    assert time.perf_counter() - started < 1.0
 
 
 @pytest.mark.parametrize(
@@ -776,6 +897,40 @@ def test_markdown_safety_rejects_windows_device_names_in_any_base_segment(
     ),
 )
 def test_markdown_safety_allows_portable_non_device_base_names(base_path: str) -> None:
+    validate_markdown_safety("safe", bundle_relative_path=base_path)
+
+
+@pytest.mark.parametrize(
+    "base_path",
+    (
+        "drafts/note:part.md",
+        "drafts/folder./note.md",
+        "drafts/folder /note.md",
+        "drafts/CON/note.md",
+        "drafts/CON:/note.md",
+        "drafts/NUL::$DATA/note.md",
+        "drafts/prn.backup/note.md",
+    ),
+)
+def test_markdown_safety_enforces_public_portable_component_rules(
+    base_path: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety("safe", bundle_relative_path=base_path)
+
+
+@pytest.mark.parametrize(
+    "base_path",
+    (
+        "drafts/conifer/note.md",
+        "drafts/console.txt",
+        "drafts/COM10.txt",
+        "drafts/lpt-notes/note.md",
+    ),
+)
+def test_markdown_safety_keeps_normal_portable_component_names(
+    base_path: str,
+) -> None:
     validate_markdown_safety("safe", bundle_relative_path=base_path)
 
 

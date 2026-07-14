@@ -58,13 +58,23 @@ def encode_ndjson(records: Iterable[object]) -> bytes:
     if isinstance(records, (bytes, bytearray, str)):
         raise _json_invalid()
     try:
-        return b"".join(encode_json(record) for record in records)
-    except DomainError:
-        raise
+        iterator = iter(records)
     except MemoryError:
         raise
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except Exception:
         raise _json_invalid() from None
+    encoded: list[bytes] = []
+    while True:
+        try:
+            record = next(iterator)
+        except StopIteration:
+            break
+        except MemoryError:
+            raise
+        except Exception:
+            raise _json_invalid() from None
+        encoded.append(encode_json(record))
+    return b"".join(encoded)
 
 
 def encode_utf8_lf(text: str) -> bytes:

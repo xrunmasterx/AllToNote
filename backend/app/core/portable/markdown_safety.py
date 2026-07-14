@@ -33,9 +33,10 @@ _HTML_IMAGE_SOURCE = re.compile(
 _AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*)>")
 _ENCODED_PATH_CONTROL = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[/\\]")
-_WINDOWS_DEVICE = re.compile(
-    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)",
-    re.IGNORECASE,
+_WINDOWS_DEVICE_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
 )
 _FOOTNOTE = re.compile(r"\[\^(ev_[0-9a-f-]+)\]")
 _FOOTNOTE_DEFINITION = re.compile(r"^ {0,3}\[\^(ev_[0-9a-f-]+)\]:")
@@ -186,18 +187,19 @@ def _reference_label(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
-def _closing_bracket(markdown: str, opening: int) -> int | None:
-    depth = 1
-    cursor = opening + 1
-    while cursor < len(markdown):
-        if markdown[cursor] == "[" and not _backslash_escaped(markdown, cursor):
-            depth += 1
-        elif markdown[cursor] == "]" and not _backslash_escaped(markdown, cursor):
-            depth -= 1
-            if depth == 0:
-                return cursor
-        cursor += 1
-    return None
+def _bracket_matches(markdown: str) -> dict[int, int]:
+    stack: list[int] = []
+    matches: dict[int, int] = {}
+    for index, character in enumerate(markdown):
+        if character not in "[]":
+            continue
+        if _backslash_escaped(markdown, index):
+            continue
+        if character == "[":
+            stack.append(index)
+        elif character == "]" and stack:
+            matches[stack.pop()] = index
+    return matches
 
 
 def _destination_after(markdown: str, start: int) -> tuple[str, int] | None:
@@ -232,6 +234,7 @@ def _destination_after(markdown: str, start: int) -> tuple[str, int] | None:
 
 
 def _iter_markdown_destinations(markdown: str):
+    bracket_matches = _bracket_matches(markdown)
     definitions: dict[str, str] = {}
     references: list[tuple[str, bool]] = []
     destinations: list[tuple[str, bool]] = []
@@ -251,19 +254,19 @@ def _iter_markdown_destinations(markdown: str):
             and not _backslash_escaped(markdown, cursor - 1)
         )
         if cursor + 1 < len(markdown) and markdown[cursor + 1] == "[":
-            closing = cursor + 2
-            while closing + 1 < len(markdown) and markdown[closing : closing + 2] != "]]":
-                closing += 1
-            if closing + 1 >= len(markdown):
-                break
+            closing = bracket_matches.get(cursor + 1)
+            if closing is None or bracket_matches.get(cursor) != closing + 1:
+                cursor += 1
+                continue
             destinations.append(
                 (markdown[cursor + 2 : closing].split("|", 1)[0], is_image)
             )
             cursor = closing + 2
             continue
-        closing = _closing_bracket(markdown, cursor)
+        closing = bracket_matches.get(cursor)
         if closing is None:
-            break
+            cursor += 1
+            continue
         label = markdown[cursor + 1 : closing]
         after = closing + 1
         is_definition = (
@@ -297,7 +300,7 @@ def _iter_markdown_destinations(markdown: str):
             continue
         reference_label = label
         if after < len(markdown) and markdown[after] == "[":
-            reference_closing = _closing_bracket(markdown, after)
+            reference_closing = bracket_matches.get(after)
             if reference_closing is not None:
                 explicit_label = markdown[after + 1 : reference_closing]
                 reference_label = explicit_label or label
@@ -380,6 +383,7 @@ def _is_portable_bundle_path(value: str) -> bool:
         return False
     if (
         not decoded
+        or ":" in decoded
         or "\\" in decoded
         or decoded.startswith("/")
         or _WINDOWS_DRIVE.match(decoded) is not None
@@ -387,7 +391,13 @@ def _is_portable_bundle_path(value: str) -> bool:
         or posixpath.normpath(decoded).startswith("../")
     ):
         return False
-    return not any(_WINDOWS_DEVICE.match(segment) for segment in decoded.split("/"))
+    for segment in decoded.split("/"):
+        if (
+            segment.endswith((".", " "))
+            or segment.split(".", 1)[0].casefold() in _WINDOWS_DEVICE_STEMS
+        ):
+            return False
+    return True
 
 
 def validate_markdown_safety(
