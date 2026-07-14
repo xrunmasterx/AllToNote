@@ -52,6 +52,8 @@ _SCHEMA_STATEMENTS = (
         fencing_token INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        UNIQUE(job_id, attempt_id),
+        UNIQUE(job_id, step_id, attempt_id),
         FOREIGN KEY(job_id, step_id) REFERENCES steps(job_id, step_id) ON DELETE CASCADE
     )
     """,
@@ -70,12 +72,13 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE challenges (
         challenge_id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-        attempt_id TEXT REFERENCES attempts(attempt_id),
+        attempt_id TEXT,
         state TEXT NOT NULL,
         prompt_json TEXT NOT NULL,
         response_json TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id, attempt_id) REFERENCES attempts(job_id, attempt_id)
     )
     """,
     """
@@ -83,7 +86,7 @@ _SCHEMA_STATEMENTS = (
         operation_id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
         step_id TEXT NOT NULL,
-        attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+        attempt_id TEXT NOT NULL,
         provider TEXT NOT NULL,
         request_hash TEXT NOT NULL,
         operation_idempotency_key TEXT,
@@ -91,7 +94,9 @@ _SCHEMA_STATEMENTS = (
         outcome TEXT NOT NULL,
         summary_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id, step_id, attempt_id)
+            REFERENCES attempts(job_id, step_id, attempt_id)
     )
     """,
     """
@@ -99,14 +104,16 @@ _SCHEMA_STATEMENTS = (
         checkpoint_id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
         step_id TEXT NOT NULL,
-        attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+        attempt_id TEXT NOT NULL,
         relative_path TEXT NOT NULL,
         schema_id TEXT NOT NULL,
         input_hash TEXT NOT NULL,
         output_hash TEXT NOT NULL,
         byte_length INTEGER NOT NULL,
         metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(job_id, step_id, attempt_id)
+            REFERENCES attempts(job_id, step_id, attempt_id)
     )
     """,
     """
@@ -238,7 +245,13 @@ class SqliteJobRepository:
 
     def create_attempt(self, job_id: str, step_id: str) -> Attempt:
         with self._transaction(immediate=True) as connection:
-            self._get_job(connection, job_id)
+            job = self._get_job(connection, job_id)
+            if job.state in TERMINAL_JOB_STATES:
+                raise DomainError(
+                    "job_terminal",
+                    ErrorCategory.CONFLICT,
+                    "Terminal Job cannot create an Attempt",
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO steps (job_id, step_id, step_name, ordinal)

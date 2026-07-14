@@ -11,7 +11,11 @@ from app.core.errors import DomainError
 from app.core.jobs.model import AttemptState
 from app.core.jobs.state_machine import (
     LEGAL_ATTEMPT_TRANSITIONS,
+    LEGAL_JOB_TRANSITIONS,
+    TERMINAL_ATTEMPT_STATES,
+    TERMINAL_JOB_STATES,
     transition_attempt,
+    transition_job,
 )
 
 
@@ -94,6 +98,166 @@ def test_json_columns_are_utf8_text_and_schema_has_no_secret_columns(
     )
 
 
+def _insert_challenge(
+    connection: sqlite3.Connection,
+    *,
+    challenge_id: str,
+    job_id: str,
+    attempt_id: str | None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO challenges (
+            challenge_id, job_id, attempt_id, state, prompt_json,
+            response_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'pending', '{}', NULL, 'created', 'updated')
+        """,
+        (challenge_id, job_id, attempt_id),
+    )
+
+
+def _insert_execution_record(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    record_id: str,
+    job_id: str,
+    step_id: str,
+    attempt_id: str,
+) -> None:
+    if table == "external_operations":
+        connection.execute(
+            """
+            INSERT INTO external_operations (
+                operation_id, job_id, step_id, attempt_id, provider,
+                request_hash, operation_idempotency_key, provider_request_id,
+                outcome, summary_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'provider', ?, NULL, NULL, 'started', '{}',
+                      'created', 'updated')
+            """,
+            (record_id, job_id, step_id, attempt_id, HASH_A),
+        )
+        return
+    if table == "checkpoints":
+        connection.execute(
+            """
+            INSERT INTO checkpoints (
+                checkpoint_id, job_id, step_id, attempt_id, relative_path,
+                schema_id, input_hash, output_hash, byte_length, metadata_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, 'checkpoint.bin', 'schema.v1', ?, ?, 1, '{}',
+                      'created')
+            """,
+            (record_id, job_id, step_id, attempt_id, HASH_A, HASH_B),
+        )
+        return
+    raise AssertionError(f"unsupported test table: {table}")
+
+
+def test_execution_chain_foreign_keys_accept_valid_writer_shapes(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    attempt = repo.create_attempt(job.job_id, "resolve")
+
+    with repo._transaction(immediate=True) as connection:
+        _insert_challenge(
+            connection,
+            challenge_id="challenge-with-attempt",
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+        )
+        _insert_challenge(
+            connection,
+            challenge_id="challenge-without-attempt",
+            job_id=job.job_id,
+            attempt_id=None,
+        )
+        _insert_execution_record(
+            connection,
+            table="external_operations",
+            record_id="operation-valid",
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+        )
+        _insert_execution_record(
+            connection,
+            table="checkpoints",
+            record_id="checkpoint-valid",
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+        )
+
+
+def test_challenge_foreign_key_rejects_cross_job_attempt(
+    repo: SqliteJobRepository,
+) -> None:
+    first_job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    second_job = repo.create_job(
+        request_hash=HASH_B,
+        principal="local",
+        client_request_id=None,
+    )
+    attempt = repo.create_attempt(first_job.job_id, "resolve")
+
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        with repo._transaction(immediate=True) as connection:
+            _insert_challenge(
+                connection,
+                challenge_id="challenge-cross-job",
+                job_id=second_job.job_id,
+                attempt_id=attempt.attempt_id,
+            )
+
+
+@pytest.mark.parametrize("table", ("external_operations", "checkpoints"))
+@pytest.mark.parametrize("invalid_shape", ("cross_job", "cross_step", "missing_step"))
+def test_execution_record_foreign_keys_reject_invalid_ownership_shapes(
+    repo: SqliteJobRepository,
+    table: str,
+    invalid_shape: str,
+) -> None:
+    first_job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    second_job = repo.create_job(
+        request_hash=HASH_B,
+        principal="local",
+        client_request_id=None,
+    )
+    attempt = repo.create_attempt(first_job.job_id, "resolve")
+    repo.create_attempt(first_job.job_id, "draft")
+    invalid_values = {
+        "cross_job": (second_job.job_id, attempt.step_id),
+        "cross_step": (first_job.job_id, "draft"),
+        "missing_step": (first_job.job_id, "missing"),
+    }
+    invalid_job_id, invalid_step_id = invalid_values[invalid_shape]
+
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        with repo._transaction(immediate=True) as connection:
+            _insert_execution_record(
+                connection,
+                table=table,
+                record_id=f"{table}-{invalid_shape}",
+                job_id=invalid_job_id,
+                step_id=invalid_step_id,
+                attempt_id=attempt.attempt_id,
+            )
+
+
 def test_idempotency_replay_returns_existing_job(repo: SqliteJobRepository) -> None:
     first = repo.create_job(
         request_hash=HASH_A,
@@ -159,92 +323,97 @@ def test_same_client_request_id_is_scoped_by_principal(
     assert first.job_id != second.job_id
 
 
-LEGAL_JOB_TRANSITIONS = (
-    (JobState.QUEUED, JobState.RUNNING),
-    (JobState.QUEUED, JobState.CANCELLED),
-    (JobState.RUNNING, JobState.WAITING_FOR_INPUT),
-    (JobState.RUNNING, JobState.SUCCEEDED),
-    (JobState.RUNNING, JobState.FAILED),
-    (JobState.RUNNING, JobState.CANCELLED),
-    (JobState.WAITING_FOR_INPUT, JobState.QUEUED),
-    (JobState.WAITING_FOR_INPUT, JobState.FAILED),
-    (JobState.WAITING_FOR_INPUT, JobState.CANCELLED),
+@pytest.mark.parametrize(
+    "terminal_state",
+    (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED),
 )
-
-
-@pytest.mark.parametrize(("start", "end"), LEGAL_JOB_TRANSITIONS)
-def test_job_state_machine_accepts_only_frozen_edges(
+def test_create_attempt_rejects_terminal_job_without_inserting_rows(
     repo: SqliteJobRepository,
-    start: JobState,
-    end: JobState,
+    terminal_state: JobState,
 ) -> None:
     job = repo.create_job(
         request_hash=HASH_A,
         principal="local",
         client_request_id=None,
     )
-    if start is JobState.RUNNING:
+    if terminal_state is JobState.CANCELLED:
+        repo.transition_job(job.job_id, terminal_state)
+    else:
         repo.transition_job(job.job_id, JobState.RUNNING)
-    elif start is JobState.WAITING_FOR_INPUT:
-        repo.transition_job(job.job_id, JobState.RUNNING)
-        repo.transition_job(job.job_id, JobState.WAITING_FOR_INPUT)
+        repo.transition_job(job.job_id, terminal_state)
 
-    assert repo.transition_job(job.job_id, end).state is end
+    with pytest.raises(DomainError, match="job_terminal"):
+        repo.create_attempt(job.job_id, "must-not-exist")
+
+    with repo._connect() as connection:
+        step_count = connection.execute(
+            "SELECT COUNT(*) FROM steps WHERE job_id = ?", (job.job_id,)
+        ).fetchone()[0]
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM attempts WHERE job_id = ?", (job.job_id,)
+        ).fetchone()[0]
+    assert step_count == 0
+    assert attempt_count == 0
 
 
 @pytest.mark.parametrize(
-    "end",
-    (JobState.WAITING_FOR_INPUT, JobState.FAILED, JobState.SUCCEEDED),
+    "nonterminal_state",
+    (JobState.QUEUED, JobState.RUNNING, JobState.WAITING_FOR_INPUT),
 )
-def test_queued_job_rejects_edges_not_in_frozen_graph(
+def test_create_attempt_allows_every_nonterminal_job_state(
     repo: SqliteJobRepository,
-    end: JobState,
+    nonterminal_state: JobState,
 ) -> None:
     job = repo.create_job(
         request_hash=HASH_A,
         principal="local",
         client_request_id=None,
     )
-
-    with pytest.raises(DomainError, match="job_transition_invalid"):
-        repo.transition_job(job.job_id, end)
-
-
-def test_terminal_job_cannot_return_to_running(repo: SqliteJobRepository) -> None:
-    job = repo.create_job(
-        request_hash="sha256:" + "0" * 64,
-        principal="local",
-        client_request_id=None,
-    )
-    repo.transition_job(job.job_id, JobState.RUNNING)
-    repo.transition_job(job.job_id, JobState.FAILED)
-
-    with pytest.raises(DomainError, match="job_terminal"):
+    if nonterminal_state is not JobState.QUEUED:
         repo.transition_job(job.job_id, JobState.RUNNING)
+    if nonterminal_state is JobState.WAITING_FOR_INPUT:
+        repo.transition_job(job.job_id, JobState.WAITING_FOR_INPUT)
+
+    attempt = repo.create_attempt(job.job_id, "allowed")
+
+    assert attempt.job_id == job.job_id
+    assert attempt.state is AttemptState.PENDING
 
 
-@pytest.mark.parametrize(("start", "end"), LEGAL_ATTEMPT_TRANSITIONS)
-def test_attempt_state_machine_accepts_only_legal_edges(
+@pytest.mark.parametrize(
+    ("start", "end"),
+    tuple((start, end) for start in JobState for end in JobState),
+)
+def test_job_state_machine_complete_transition_matrix(
+    start: JobState,
+    end: JobState,
+) -> None:
+    if (start, end) in LEGAL_JOB_TRANSITIONS:
+        assert transition_job(start, end) is end
+    elif start in TERMINAL_JOB_STATES:
+        with pytest.raises(DomainError, match="job_terminal"):
+            transition_job(start, end)
+    else:
+        with pytest.raises(DomainError, match="job_transition_invalid"):
+            transition_job(start, end)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    tuple((start, end) for start in AttemptState for end in AttemptState),
+)
+def test_attempt_state_machine_complete_transition_matrix(
     start: AttemptState,
     end: AttemptState,
 ) -> None:
-    assert transition_attempt(start, end) is end
-
-
-def test_terminal_attempt_cannot_return_to_running(
-    repo: SqliteJobRepository,
-) -> None:
-    job = repo.create_job(
-        request_hash=HASH_A,
-        principal="local",
-        client_request_id=None,
-    )
-    attempt = repo.create_attempt(job.job_id, "resolve")
-    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
-    repo.transition_attempt(attempt.attempt_id, AttemptState.FAILED)
-
-    with pytest.raises(DomainError, match="attempt_terminal"):
-        repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
+    if (start, end) in LEGAL_ATTEMPT_TRANSITIONS:
+        assert transition_attempt(start, end) is end
+    elif start in TERMINAL_ATTEMPT_STATES:
+        with pytest.raises(DomainError, match="attempt_terminal"):
+            transition_attempt(start, end)
+    else:
+        with pytest.raises(DomainError, match="attempt_transition_invalid"):
+            transition_attempt(start, end)
 
 
 @pytest.mark.parametrize("attempt_state", (AttemptState.PENDING, AttemptState.RUNNING))

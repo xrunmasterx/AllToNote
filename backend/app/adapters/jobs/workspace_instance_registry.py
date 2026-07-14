@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +13,11 @@ from filelock import FileLock
 
 
 _REGISTRY_VERSION = 1
+_REGISTRY_KEYS = frozenset({"version", "instances"})
+_ENTRY_KEYS = frozenset(
+    {"instance_id", "workspace_identity", "canonical_root"}
+)
+_INSTANCE_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 
 @dataclass(frozen=True)
@@ -29,7 +35,7 @@ class WorkspaceInstanceRegistry:
         *,
         inspect_workspace: Callable[[Path], str],
     ) -> None:
-        self._app_root = Path(local_app_data) / "AllToNote"
+        self._app_root = (Path(local_app_data) / "AllToNote").resolve(strict=False)
         self._registry_path = self._app_root / "workspace-instances.json"
         self._lock_path = self._app_root / "workspace-instances.json.lock"
         self._inspect_workspace = inspect_workspace
@@ -71,17 +77,51 @@ class WorkspaceInstanceRegistry:
         return self._to_workspace_instance(instance)
 
     def _read_registry(self) -> dict[str, object]:
-        if not self._registry_path.exists():
+        try:
+            with self._registry_path.open("r", encoding="utf-8") as registry_file:
+                registry = json.load(registry_file)
+        except FileNotFoundError:
             return {"version": _REGISTRY_VERSION, "instances": []}
-        with self._registry_path.open("r", encoding="utf-8") as registry_file:
-            registry = json.load(registry_file)
+        except (OSError, UnicodeError, ValueError, RecursionError) as error:
+            raise ValueError("workspace_instance_registry_invalid") from error
+        self._validate_registry(registry)
+        return registry
+
+    @staticmethod
+    def _validate_registry(registry: object) -> None:
         if (
-            not isinstance(registry, dict)
-            or registry.get("version") != _REGISTRY_VERSION
-            or not isinstance(registry.get("instances"), list)
+            type(registry) is not dict
+            or frozenset(registry) != _REGISTRY_KEYS
+            or type(registry["version"]) is not int
+            or registry["version"] != _REGISTRY_VERSION
+            or type(registry["instances"]) is not list
         ):
             raise ValueError("workspace_instance_registry_invalid")
-        return registry
+
+        registry_keys: set[tuple[str, str]] = set()
+        instance_ids: set[str] = set()
+        for entry in registry["instances"]:
+            if type(entry) is not dict or frozenset(entry) != _ENTRY_KEYS:
+                raise ValueError("workspace_instance_registry_invalid")
+            values = tuple(entry[key] for key in _ENTRY_KEYS)
+            if any(type(value) is not str or not value for value in values):
+                raise ValueError("workspace_instance_registry_invalid")
+
+            instance_id = entry["instance_id"]
+            workspace_identity = entry["workspace_identity"]
+            canonical_root = entry["canonical_root"]
+            normalized_root = os.path.normcase(os.path.normpath(canonical_root))
+            registry_key = (workspace_identity, canonical_root)
+            if (
+                _INSTANCE_ID_PATTERN.fullmatch(instance_id) is None
+                or not Path(canonical_root).is_absolute()
+                or canonical_root != normalized_root
+                or registry_key in registry_keys
+                or instance_id in instance_ids
+            ):
+                raise ValueError("workspace_instance_registry_invalid")
+            registry_keys.add(registry_key)
+            instance_ids.add(instance_id)
 
     @staticmethod
     def _find_instance(
@@ -131,9 +171,16 @@ class WorkspaceInstanceRegistry:
         self, instance: dict[str, str]
     ) -> WorkspaceInstance:
         instance_id = instance["instance_id"]
+        try:
+            machine_parent = (self._app_root / "workspaces").resolve(strict=False)
+            machine_root = (machine_parent / instance_id).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError("workspace_instance_registry_invalid") from error
+        if machine_root.parent != machine_parent or machine_root.name != instance_id:
+            raise ValueError("workspace_instance_registry_invalid")
         return WorkspaceInstance(
             instance_id=instance_id,
             workspace_identity=instance["workspace_identity"],
             canonical_root=Path(instance["canonical_root"]),
-            machine_root=self._app_root / "workspaces" / instance_id,
+            machine_root=machine_root,
         )
