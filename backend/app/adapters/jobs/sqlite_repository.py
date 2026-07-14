@@ -144,17 +144,20 @@ def _normalize_schema_sql(sql: str) -> str:
     return " ".join(sql.split())
 
 
-def _application_schema(connection: sqlite3.Connection) -> dict[str, str]:
+def _application_schema(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
     rows = connection.execute(
         """
-        SELECT name, sql FROM sqlite_master
-        WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
+        SELECT type, name, sql FROM sqlite_master
+        WHERE type IN ('table', 'index', 'trigger', 'view')
+          AND name NOT GLOB 'sqlite_*'
         """
     ).fetchall()
-    return {row[0]: _normalize_schema_sql(row[1]) for row in rows}
+    return {(row[0], row[1]): _normalize_schema_sql(row[2]) for row in rows}
 
 
-def _expected_schema() -> dict[str, str]:
+def _expected_schema() -> dict[tuple[str, str], str]:
     with sqlite3.connect(":memory:") as connection:
         for statement in _SCHEMA_STATEMENTS:
             connection.execute(statement)

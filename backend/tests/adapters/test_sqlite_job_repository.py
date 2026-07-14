@@ -89,6 +89,33 @@ OLD_EXECUTION_CHAIN_TABLES = (
     )
     """,
 )
+EXTRA_SCHEMA_OBJECTS = (
+    (
+        "index",
+        "unexpected_index",
+        "CREATE INDEX unexpected_index ON jobs(state)",
+    ),
+    (
+        "index",
+        "unexpected_unique_index",
+        "CREATE UNIQUE INDEX unexpected_unique_index ON jobs(job_id)",
+    ),
+    (
+        "trigger",
+        "unexpected_trigger",
+        """
+        CREATE TRIGGER unexpected_trigger AFTER UPDATE ON jobs
+        BEGIN
+            SELECT 1;
+        END
+        """,
+    ),
+    (
+        "view",
+        "unexpected_view",
+        "CREATE VIEW unexpected_view AS SELECT job_id, state FROM jobs",
+    ),
+)
 
 
 @pytest.fixture
@@ -165,6 +192,43 @@ def test_version_one_extra_application_table_is_rejected(tmp_path: Path) -> None
         connection.execute("CREATE TABLE unexpected (value TEXT)")
 
     _assert_schema_invalid(machine_root)
+
+
+@pytest.mark.parametrize(
+    ("object_type", "object_name", "statement"),
+    EXTRA_SCHEMA_OBJECTS,
+)
+def test_version_one_extra_schema_object_is_rejected_without_mutation(
+    tmp_path: Path,
+    object_type: str,
+    object_name: str,
+    statement: str,
+) -> None:
+    machine_root = tmp_path / object_name
+    writer = SqliteJobRepository.open(machine_root)
+    job = writer.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=object_name,
+    )
+    with sqlite3.connect(writer.database_path) as connection:
+        before = connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job.job_id,)
+        ).fetchone()
+        connection.execute(statement)
+
+    _assert_schema_invalid(machine_root)
+
+    with sqlite3.connect(writer.database_path) as connection:
+        schema_object = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type, object_name),
+        ).fetchone()
+        after = connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job.job_id,)
+        ).fetchone()
+    assert schema_object is not None
+    assert after == before
 
 
 def test_version_zero_with_application_table_is_rejected_without_mutation(
