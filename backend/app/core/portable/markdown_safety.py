@@ -37,6 +37,11 @@ _WINDOWS_DEVICE_STEMS = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
     | {f"lpt{index}" for index in range(1, 10)}
+    | {
+        f"{prefix}{suffix}"
+        for prefix in ("com", "lpt")
+        for suffix in ("¹", "²", "³")
+    }
 )
 _FOOTNOTE = re.compile(r"\[\^(ev_[0-9a-f-]+)\]")
 _FOOTNOTE_DEFINITION = re.compile(r"^ {0,3}\[\^(ev_[0-9a-f-]+)\]:")

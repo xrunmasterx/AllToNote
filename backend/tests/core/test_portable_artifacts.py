@@ -934,6 +934,40 @@ def test_markdown_safety_keeps_normal_portable_component_names(
     validate_markdown_safety("safe", bundle_relative_path=base_path)
 
 
+@pytest.mark.parametrize(
+    "device_name",
+    tuple(
+        name
+        for prefix in ("COM", "LPT")
+        for suffix in ("¹", "²", "³")
+        for name in (f"{prefix}{suffix}", f"{prefix}{suffix}.txt")
+    ),
+)
+def test_markdown_safety_rejects_superscript_windows_device_aliases(
+    device_name: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(
+            "safe",
+            bundle_relative_path=f"drafts/{device_name}/note.md",
+        )
+
+
+@pytest.mark.parametrize(
+    "base_path",
+    (
+        "drafts/COM¹-notes/note.md",
+        "drafts/LPT²backup/note.md",
+        "drafts/xCOM³/note.md",
+        "drafts/COM⁴/note.md",
+    ),
+)
+def test_markdown_safety_allows_similar_superscript_component_names(
+    base_path: str,
+) -> None:
+    validate_markdown_safety("safe", bundle_relative_path=base_path)
+
+
 def test_markdown_safety_accepts_bundle_relative_obsidian_anchor_and_https_links() -> None:
     markdown = (
         "![frame](../assets/frame.webp)\n"
