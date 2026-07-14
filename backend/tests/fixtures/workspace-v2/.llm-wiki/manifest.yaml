@@ -1,0 +1,15 @@
+schema_version: 2
+workspace_id: 018f0000-0000-7000-8000-000000000010
+name: Task 8 fixture
+paths:
+  raw_common: raw/common
+  raw_personal: raw/personal
+  wiki_common: wiki/common
+  wiki_personal: wiki/personal
+  cache: .cache
+defaults:
+  publish_scope: personal
+  visibility: private
+  encoding: utf-8
+  link_style: relative
+description: Portable gateway contract fixture
