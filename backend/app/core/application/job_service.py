@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import StrEnum
@@ -25,17 +26,56 @@ _SECRET_FIELD_NAMES = frozenset(
         "token",
     }
 )
+_SECRET_IDENTIFIER_TOKENS = frozenset(
+    {
+        "authorization",
+        "bearer",
+        "cookie",
+        "passwd",
+        "password",
+        "secret",
+        "token",
+    }
+)
+_SECRET_KEY_QUALIFIERS = frozenset(
+    {"access", "api", "client", "encryption", "private", "signing"}
+)
+_IDENTIFIER_SEGMENT_PATTERN = re.compile(r"[A-Za-z0-9]+")
+_IDENTIFIER_TOKEN_PATTERN = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+"
+)
 
 
-def _is_secret_field(field_name: str) -> bool:
-    normalized = "".join(character for character in field_name.casefold() if character.isalnum())
-    return normalized in _SECRET_FIELD_NAMES
+def _identifier_tokens(identifier: str) -> tuple[str, ...]:
+    return tuple(
+        token.group(0).casefold()
+        for segment in _IDENTIFIER_SEGMENT_PATTERN.finditer(identifier)
+        for token in _IDENTIFIER_TOKEN_PATTERN.finditer(segment.group(0))
+    )
+
+
+def _is_secret_identifier(identifier: str) -> bool:
+    normalized = "".join(
+        character for character in identifier.casefold() if character.isalnum()
+    )
+    if normalized in _SECRET_FIELD_NAMES:
+        return True
+    tokens = frozenset(_identifier_tokens(identifier))
+    return bool(tokens & _SECRET_IDENTIFIER_TOKENS) or (
+        "key" in tokens and bool(tokens & _SECRET_KEY_QUALIFIERS)
+    )
 
 
 def _canonical_value(value: object, *, excluded_fields: frozenset[str]) -> object:
     if value is None or type(value) in (bool, int, float, str):
         return value
     if isinstance(value, StrEnum):
+        enum_type = type(value)
+        if any(
+            _is_secret_identifier(identifier)
+            for identifier in (enum_type.__name__, enum_type.__qualname__, value.name)
+        ):
+            raise TypeError
         return value.value
     if isinstance(value, Path):
         return str(value)
@@ -47,7 +87,7 @@ def _canonical_value(value: object, *, excluded_fields: frozenset[str]) -> objec
         for field in fields(value):
             if field.name in excluded_fields:
                 continue
-            if _is_secret_field(field.name):
+            if _is_secret_identifier(field.name):
                 raise TypeError
             normalized[field.name] = _canonical_value(
                 getattr(value, field.name), excluded_fields=frozenset()
@@ -59,7 +99,7 @@ def _canonical_value(value: object, *, excluded_fields: frozenset[str]) -> objec
             if type(key) is not str:
                 raise TypeError
             if key not in excluded_fields:
-                if _is_secret_field(key):
+                if _is_secret_identifier(key):
                     raise TypeError
                 normalized[key] = _canonical_value(
                     item, excluded_fields=frozenset()

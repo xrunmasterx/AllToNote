@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,22 @@ class _SecretLike:
 
     def __repr__(self) -> str:
         return f"_SecretLike({self.value})"
+
+
+class _SecretToken(StrEnum):
+    VALUE = "synthetic-secret-token"
+
+
+class _ApiKey(StrEnum):
+    VALUE = "synthetic-api-key"
+
+
+class _CredentialKind(StrEnum):
+    API_KEY = "synthetic-member-secret"
+
+
+class _SafeMode(StrEnum):
+    STANDARD = "standard"
 
 
 @pytest.fixture
@@ -219,6 +236,89 @@ def test_secret_named_field_never_enters_hash_database_or_error(
     assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
     assert secret.encode("utf-8") not in repo.database_path.read_bytes()
+
+
+@pytest.mark.parametrize("secret_field", ("X-API-Key", "auth_token", "set-cookie"))
+def test_secret_field_alias_is_rejected_by_submit_and_respond(
+    repo: SqliteJobRepository,
+    tmp_path: Path,
+    secret_field: str,
+) -> None:
+    service = _new_service(repo)
+    secret = "secret-alias-value-never-store"
+
+    with pytest.raises(DomainError) as submit_error:
+        service.submit(_request(tmp_path, payload={secret_field: secret}))
+
+    job, _, challenge = _waiting_job(repo)
+    with pytest.raises(DomainError) as respond_error:
+        service.respond(job.job_id, challenge.challenge_id, {secret_field: secret})
+
+    for caught in (submit_error, respond_error):
+        assert caught.value.code == "request_canonicalization_invalid"
+        assert caught.value.category is ErrorCategory.INVALID_REQUEST
+        assert caught.value.details == {}
+        assert secret_field not in str(caught.value)
+        assert secret_field not in repr(caught.value)
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+    assert secret.encode("utf-8") not in repo.database_path.read_bytes()
+    assert service.get(job.job_id).challenge_id == challenge.challenge_id
+
+
+@pytest.mark.parametrize(
+    "secret_member",
+    (_SecretToken.VALUE, _ApiKey.VALUE, _CredentialKind.API_KEY),
+)
+def test_secret_like_strenum_is_rejected_by_submit_and_respond(
+    repo: SqliteJobRepository,
+    tmp_path: Path,
+    secret_member: StrEnum,
+) -> None:
+    service = _new_service(repo)
+    secret = str(secret_member)
+
+    with pytest.raises(DomainError) as submit_error:
+        service.submit(_request(tmp_path, payload={"credential": secret_member}))
+
+    job, _, challenge = _waiting_job(repo)
+    with pytest.raises(DomainError) as respond_error:
+        service.respond(
+            job.job_id,
+            challenge.challenge_id,
+            {"credential": secret_member},
+        )
+
+    for caught in (submit_error, respond_error):
+        assert caught.value.code == "request_canonicalization_invalid"
+        assert caught.value.category is ErrorCategory.INVALID_REQUEST
+        assert caught.value.details == {}
+        assert type(secret_member).__name__ not in str(caught.value)
+        assert type(secret_member).__qualname__ not in repr(caught.value)
+        assert secret_member.name not in str(caught.value)
+        assert secret not in repr(caught.value)
+    assert secret.encode("utf-8") not in repo.database_path.read_bytes()
+    assert service.get(job.job_id).challenge_id == challenge.challenge_id
+
+
+def test_non_secret_custom_strenum_remains_canonicalizable(
+    repo: SqliteJobRepository,
+    tmp_path: Path,
+) -> None:
+    service = _new_service(repo)
+
+    submitted = service.submit(
+        _request(tmp_path, payload={"processing_mode": _SafeMode.STANDARD})
+    )
+    job, _, challenge = _waiting_job(repo)
+    resumed = service.respond(
+        job.job_id,
+        challenge.challenge_id,
+        {"processing_mode": _SafeMode.STANDARD},
+    )
+
+    assert submitted.state is JobState.QUEUED
+    assert resumed.state is JobState.QUEUED
 
 
 def test_get_projects_pending_challenge_and_response_attempt(
