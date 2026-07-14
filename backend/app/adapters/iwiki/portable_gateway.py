@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from importlib import metadata, resources
 from pathlib import Path
+from threading import Lock
 
 from iwiki.errors import ErrorCode, IWikiError
 from iwiki.portable import (
@@ -31,6 +33,18 @@ _RUNTIME_LOCK_KEYS = frozenset(
         "schema_sha256",
         "source_commit",
     }
+)
+
+_TRUSTED_IWIKI_DISTRIBUTION = "llm-iwiki"
+_COMPATIBILITY_ERRORS = (
+    AttributeError,
+    ImportError,
+    KeyError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    UnicodeError,
+    ValueError,
 )
 
 
@@ -107,6 +121,12 @@ def _prepared_bundle_invalid() -> DomainError:
     )
 
 
+def _canonical_distribution_name(name: str) -> str:
+    if not name.isascii():
+        return ""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _load_runtime_lock() -> dict[str, object]:
     try:
         payload = json.loads(
@@ -114,34 +134,36 @@ def _load_runtime_lock() -> dict[str, object]:
             .joinpath("runtime-lock.json")
             .read_text(encoding="utf-8")
         )
-    except (OSError, UnicodeError, ValueError):
-        raise _contract_incompatible() from None
+        if type(payload) is not dict or frozenset(payload) != _RUNTIME_LOCK_KEYS:
+            raise _contract_incompatible()
 
-    if type(payload) is not dict or frozenset(payload) != _RUNTIME_LOCK_KEYS:
-        raise _contract_incompatible()
+        package_spec = payload["iwiki_package"]
+        api_version = payload["portable_api_version"]
+        string_fields = (
+            payload["portable_contract_id"],
+            payload["schema_set_id"],
+            payload["schema_sha256"],
+            payload["source_commit"],
+        )
+        if (
+            type(package_spec) is not str
+            or package_spec.count("==") != 1
+            or type(api_version) is not int
+            or any(
+                type(value) is not str or not value for value in string_fields
+            )
+        ):
+            raise _contract_incompatible()
 
-    package_spec = payload["iwiki_package"]
-    api_version = payload["portable_api_version"]
-    string_fields = (
-        payload["portable_contract_id"],
-        payload["schema_set_id"],
-        payload["schema_sha256"],
-        payload["source_commit"],
-    )
-    if (
-        type(package_spec) is not str
-        or package_spec.count("==") != 1
-        or type(api_version) is not int
-        or any(type(value) is not str or not value for value in string_fields)
-    ):
-        raise _contract_incompatible()
-
-    package_name, expected_version = package_spec.split("==", 1)
-    if not package_name or not expected_version:
-        raise _contract_incompatible()
-    try:
-        installed_version = metadata.version(package_name)
-    except (metadata.PackageNotFoundError, ValueError):
+        package_name, expected_version = package_spec.split("==", 1)
+        if (
+            _canonical_distribution_name(package_name)
+            != _TRUSTED_IWIKI_DISTRIBUTION
+            or not expected_version
+        ):
+            raise _contract_incompatible()
+        installed_version = metadata.version(_TRUSTED_IWIKI_DISTRIBUTION)
+    except _COMPATIBILITY_ERRORS:
         raise _contract_incompatible() from None
     if installed_version != expected_version:
         raise _contract_incompatible()
@@ -155,22 +177,44 @@ def _open_locked_workspace(
     try:
         workspace = open_workspace(workspace_root, writable=True)
         info = inspect_portable_contract(workspace)
+        if (
+            info.iwiki_sdk_api_version != runtime_lock["portable_api_version"]
+            or info.contract_id != runtime_lock["portable_contract_id"]
+            or info.schema_set_id != runtime_lock["schema_set_id"]
+            or info.schema_set_sha256 != runtime_lock["schema_sha256"]
+        ):
+            raise _contract_incompatible()
     except IWikiError as error:
         raise _map_iwiki_error(error) from None
-
-    if (
-        info.iwiki_sdk_api_version != runtime_lock["portable_api_version"]
-        or info.contract_id != runtime_lock["portable_contract_id"]
-        or info.schema_set_id != runtime_lock["schema_set_id"]
-        or info.schema_set_sha256 != runtime_lock["schema_sha256"]
-    ):
-        raise _contract_incompatible()
+    except _COMPATIBILITY_ERRORS:
+        raise _contract_incompatible() from None
     return workspace, info
 
 
 class IWikiPortableGateway:
     def __init__(self) -> None:
         self._prepared: dict[int, tuple[PreparedBundle, Path]] = {}
+        self._prepared_lock = Lock()
+
+    def _claim_prepared(
+        self,
+        prepared: PreparedBundle,
+    ) -> tuple[PreparedBundle, Path] | None:
+        with self._prepared_lock:
+            binding = self._prepared.get(id(prepared))
+            if binding is None or binding[0] is not prepared:
+                return None
+            del self._prepared[id(prepared)]
+            return binding
+
+    @staticmethod
+    def _close_prepared(prepared: PreparedBundle) -> None:
+        try:
+            prepared.close()
+        except IWikiError as error:
+            raise _map_iwiki_error(error) from None
+        except _COMPATIBILITY_ERRORS:
+            raise _contract_incompatible() from None
 
     def inspect(self, workspace_root: Path) -> PortableContractInfo:
         _, info = _open_locked_workspace(workspace_root)
@@ -190,6 +234,8 @@ class IWikiPortableGateway:
             )
         except IWikiError as error:
             raise _map_iwiki_error(error) from None
+        except _COMPATIBILITY_ERRORS:
+            raise _contract_incompatible() from None
 
     def prepare_candidate(
         self,
@@ -209,19 +255,45 @@ class IWikiPortableGateway:
             )
         except IWikiError as error:
             raise _map_iwiki_error(error) from None
-        self._prepared[id(prepared)] = (prepared, workspace.root)
+        except _COMPATIBILITY_ERRORS:
+            raise _contract_incompatible() from None
+        with self._prepared_lock:
+            self._prepared[id(prepared)] = (prepared, workspace.root)
         return prepared
 
     def commit_prepared(self, prepared: PreparedBundle) -> CommitResult:
-        binding = self._prepared.get(id(prepared))
-        if binding is None or binding[0] is not prepared:
+        if not isinstance(prepared, PreparedBundle):
             raise _prepared_bundle_invalid()
-        _open_locked_workspace(binding[1])
+        binding = self._claim_prepared(prepared)
+        if binding is None:
+            raise _prepared_bundle_invalid()
         try:
-            return commit_prepared_bundle(prepared)
+            _open_locked_workspace(binding[1])
+            try:
+                return commit_prepared_bundle(prepared)
+            except IWikiError as error:
+                if error.code is ErrorCode.INVALID_ARGUMENT:
+                    raise _prepared_bundle_invalid() from None
+                raise _map_iwiki_error(error) from None
+            except _COMPATIBILITY_ERRORS:
+                raise _contract_incompatible() from None
+        finally:
+            self._close_prepared(prepared)
+
+    def discard_prepared(self, prepared: PreparedBundle) -> None:
+        if not isinstance(prepared, PreparedBundle):
+            raise _prepared_bundle_invalid()
+        binding = self._claim_prepared(prepared)
+        if binding is not None:
+            self._close_prepared(prepared)
+            return
+
+        try:
+            prepared.__enter__()
         except IWikiError as error:
             if error.code is ErrorCode.INVALID_ARGUMENT:
-                raise _prepared_bundle_invalid() from None
+                return
             raise _map_iwiki_error(error) from None
-        finally:
-            self._prepared.pop(id(prepared), None)
+        except _COMPATIBILITY_ERRORS:
+            raise _contract_incompatible() from None
+        raise _prepared_bundle_invalid()
