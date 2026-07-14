@@ -282,6 +282,57 @@ def test_error_details_reject_non_string_nested_mapping_keys(error_type: type) -
     assert str(exc_info.value) == "Error detail mapping keys must be strings"
 
 
+class _MutableSecretStr(str):
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.metadata = {"state": "original"}
+        return instance
+
+    def __repr__(self) -> str:
+        return "MutableSecretStr(super-secret-value)"
+
+
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_reject_mutable_scalar_subclasses(error_type: type) -> None:
+    payload = _MutableSecretStr("public-value")
+    try:
+        error = error_type(
+            code="invalid_scalar_subclass",
+            category=ErrorCategory.INTERNAL,
+            message="Invalid scalar subclass",
+            details={"payload": payload},
+        )
+    except TypeError as exc:
+        assert str(exc) == "Error detail value type is not supported"
+        assert "super-secret-value" not in str(exc)
+    else:
+        assert error.details["payload"] is payload
+        payload.metadata["state"] = "changed"
+        assert error.details["payload"].metadata["state"] == "changed"
+        pytest.fail("Mutable scalar subclass was accepted by reference")
+
+
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_reject_string_subclass_mapping_keys(error_type: type) -> None:
+    key = _MutableSecretStr("public-key")
+    try:
+        error = error_type(
+            code="invalid_key_subclass",
+            category=ErrorCategory.INTERNAL,
+            message="Invalid key subclass",
+            details={key: "value"},
+        )
+    except TypeError as exc:
+        assert str(exc) == "Error detail mapping keys must be strings"
+        assert "super-secret-value" not in str(exc)
+    else:
+        stored_key = next(iter(error.details))
+        assert stored_key is key
+        key.metadata["state"] = "changed"
+        assert stored_key.metadata["state"] == "changed"
+        pytest.fail("String subclass mapping key was accepted by reference")
+
+
 def test_transcript_rejects_invalid_half_open_range() -> None:
     with pytest.raises(DomainError, match="transcript_segment_invalid"):
         TranscriptSegment("seg_000001", 100, 100, "text")

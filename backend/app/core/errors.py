@@ -17,20 +17,20 @@ class ErrorCategory(StrEnum):
     INTERNAL = "internal"
 
 
-_IMMUTABLE_DETAIL_SCALAR_TYPES = (type(None), bool, int, float, str, bytes)
+_IMMUTABLE_DETAIL_SCALAR_TYPES = frozenset({bool, int, float, str, bytes})
 
 
 def _freeze_mapping(value: Mapping[object, object]) -> Mapping[str, object]:
     frozen: dict[str, object] = {}
     for key, item in value.items():
-        if not isinstance(key, str):
+        if type(key) is not str:
             raise TypeError("Error detail mapping keys must be strings")
         frozen[key] = _freeze_value(item)
     return MappingProxyType(frozen)
 
 
 def _freeze_value(value: object) -> object:
-    if isinstance(value, _IMMUTABLE_DETAIL_SCALAR_TYPES):
+    if value is None or type(value) in _IMMUTABLE_DETAIL_SCALAR_TYPES:
         return value
     if isinstance(value, bytearray):
         return bytes(value)
