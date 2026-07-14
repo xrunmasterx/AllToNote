@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import pickle
 import shutil
 import sys
+from importlib import metadata, resources
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from app.core.errors import DomainError, ErrorCategory
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
+RUNTIME_LOCK_PATH = Path(__file__).parents[2] / "app" / "runtime-lock.json"
 STAGING_RELATIVE_PATH = (
     "raw/personal/.staging/fixture/job.nonce/bundle.partial"
 )
@@ -45,14 +48,61 @@ def gateway() -> IWikiPortableGateway:
     return IWikiPortableGateway()
 
 
+def _runtime_lock() -> dict[str, object]:
+    return json.loads(RUNTIME_LOCK_PATH.read_text(encoding="utf-8"))
+
+
+def _patch_packaged_runtime_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    **changes: object,
+) -> None:
+    lock = _runtime_lock()
+    lock.update(changes)
+    package_root = tmp_path / "app-package"
+    package_root.mkdir()
+    (package_root / "runtime-lock.json").write_text(
+        json.dumps(lock),
+        encoding="utf-8",
+    )
+    original_files = resources.files
+
+    def patched_files(package: str) -> object:
+        if package == "app":
+            return package_root
+        return original_files(package)
+
+    monkeypatch.setattr(resources, "files", patched_files)
+
+
 def _imported_module_names(tree: ast.AST) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            names.add(node.module)
+            if node.module == "iwiki":
+                names.update(
+                    f"iwiki.{alias.name}" for alias in node.names
+                )
+            else:
+                names.add(node.module)
     return names
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("import iwiki", {"iwiki"}),
+        ("from iwiki import portable", {"iwiki.portable"}),
+        ("from iwiki import _private", {"iwiki._private"}),
+    ),
+)
+def test_import_scanner_resolves_root_iwiki_imports(
+    source: str,
+    expected: set[str],
+) -> None:
+    assert _imported_module_names(ast.parse(source)) == expected
 
 
 def test_gateway_inspects_the_pinned_contract(
@@ -64,7 +114,7 @@ def test_gateway_inspects_the_pinned_contract(
     assert info.iwiki_sdk_api_version == 1
     assert info.contract_id == "iwiki-portable-contract-v1"
     assert info.schema_set_id == "2026-07-portable-v1"
-    assert info.schema_set_sha256 == gateway_module.EXPECTED_SCHEMA_SHA256
+    assert info.schema_set_sha256 == _runtime_lock()["schema_sha256"]
 
 
 def test_gateway_opens_workspace_as_writable(
@@ -91,12 +141,34 @@ def test_gateway_rejects_wrong_schema_fingerprint(
     gateway: IWikiPortableGateway,
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(
-        gateway_module,
-        "EXPECTED_SCHEMA_SHA256",
-        "sha256:" + "0" * 64,
+    _patch_packaged_runtime_lock(
+        monkeypatch,
+        tmp_path,
+        schema_sha256="sha256:" + "0" * 64,
     )
+
+    with pytest.raises(DomainError) as caught:
+        gateway.inspect(workspace_root)
+
+    assert caught.value.code == "portable_contract_incompatible"
+    assert caught.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
+
+
+def test_gateway_rejects_installed_iwiki_version_not_matching_runtime_lock(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_version = metadata.version
+
+    def mismatched_version(distribution_name: str) -> str:
+        if distribution_name == "llm-iwiki":
+            return "999.0.0"
+        return installed_version(distribution_name)
+
+    monkeypatch.setattr(metadata, "version", mismatched_version)
 
     with pytest.raises(DomainError) as caught:
         gateway.inspect(workspace_root)
@@ -110,7 +182,11 @@ def test_gateway_imports_only_public_iwiki_sdk() -> None:
         inspect.getsource(sys.modules[IWikiPortableGateway.__module__])
     )
     imports = _imported_module_names(tree)
-    iwiki_imports = {name for name in imports if name.startswith("iwiki.")}
+    iwiki_imports = {
+        name
+        for name in imports
+        if name == "iwiki" or name.startswith("iwiki.")
+    }
 
     assert iwiki_imports <= {
         "iwiki.errors",
@@ -129,6 +205,49 @@ def test_gateway_validates_candidate_with_the_real_pinned_sdk(
     assert report.bundle_id == BUNDLE_ID
     assert report.manifest_sha256 == MANIFEST_SHA256
     assert report.issues == ()
+
+
+def test_validate_candidate_fails_closed_when_runtime_lock_drifts(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_packaged_runtime_lock(
+        monkeypatch,
+        tmp_path,
+        schema_sha256="sha256:" + "0" * 64,
+    )
+
+    with pytest.raises(DomainError) as caught:
+        gateway.validate_candidate(workspace_root, STAGING_RELATIVE_PATH)
+
+    assert caught.value.code == "portable_contract_incompatible"
+    assert caught.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
+
+
+def test_prepare_candidate_fails_closed_when_runtime_lock_drifts(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_packaged_runtime_lock(
+        monkeypatch,
+        tmp_path,
+        schema_sha256="sha256:" + "0" * 64,
+    )
+
+    with pytest.raises(DomainError) as caught:
+        gateway.prepare_candidate(
+            workspace_root,
+            STAGING_RELATIVE_PATH,
+            expected_bundle_id=BUNDLE_ID,
+            expected_manifest_sha256=MANIFEST_SHA256,
+        )
+
+    assert caught.value.code == "portable_contract_incompatible"
+    assert caught.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
 
 
 def test_gateway_preserves_prepared_bundle_as_opaque_sdk_handle(
@@ -173,6 +292,93 @@ def test_gateway_commits_prepared_bundle_with_the_real_pinned_sdk(
     assert final.is_dir()
     assert (final / "commit.json").is_file()
     assert not (workspace_root / STAGING_RELATIVE_PATH).exists()
+
+
+def test_commit_prepared_fails_closed_when_runtime_lock_drifts(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    prepared = gateway.prepare_candidate(
+        workspace_root,
+        STAGING_RELATIVE_PATH,
+        expected_bundle_id=BUNDLE_ID,
+        expected_manifest_sha256=MANIFEST_SHA256,
+    )
+    _patch_packaged_runtime_lock(
+        monkeypatch,
+        tmp_path,
+        schema_sha256="sha256:" + "0" * 64,
+    )
+
+    try:
+        with pytest.raises(DomainError) as caught:
+            gateway.commit_prepared(prepared)
+
+        assert caught.value.code == "portable_contract_incompatible"
+        assert caught.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
+    finally:
+        prepared.close()
+
+
+def test_commit_prepared_rejects_handle_from_another_gateway(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+) -> None:
+    prepared = gateway.prepare_candidate(
+        workspace_root,
+        STAGING_RELATIVE_PATH,
+        expected_bundle_id=BUNDLE_ID,
+        expected_manifest_sha256=MANIFEST_SHA256,
+    )
+
+    try:
+        with pytest.raises(DomainError) as caught:
+            IWikiPortableGateway().commit_prepared(prepared)
+
+        assert caught.value.code == "portable_prepared_bundle_invalid"
+        assert caught.value.category is ErrorCategory.INVALID_REQUEST
+    finally:
+        prepared.close()
+
+
+def test_commit_prepared_rejects_consumed_handle(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+) -> None:
+    prepared = gateway.prepare_candidate(
+        workspace_root,
+        STAGING_RELATIVE_PATH,
+        expected_bundle_id=BUNDLE_ID,
+        expected_manifest_sha256=MANIFEST_SHA256,
+    )
+    gateway.commit_prepared(prepared)
+
+    with pytest.raises(DomainError) as caught:
+        gateway.commit_prepared(prepared)
+
+    assert caught.value.code == "portable_prepared_bundle_invalid"
+    assert caught.value.category is ErrorCategory.INVALID_REQUEST
+
+
+def test_commit_prepared_rejects_closed_handle(
+    gateway: IWikiPortableGateway,
+    workspace_root: Path,
+) -> None:
+    prepared = gateway.prepare_candidate(
+        workspace_root,
+        STAGING_RELATIVE_PATH,
+        expected_bundle_id=BUNDLE_ID,
+        expected_manifest_sha256=MANIFEST_SHA256,
+    )
+    prepared.close()
+
+    with pytest.raises(DomainError) as caught:
+        gateway.commit_prepared(prepared)
+
+    assert caught.value.code == "portable_prepared_bundle_invalid"
+    assert caught.value.category is ErrorCategory.INVALID_REQUEST
 
 
 @pytest.mark.parametrize(
