@@ -1237,6 +1237,8 @@ def test_assembler_rejects_all_nonempty_warnings_without_leaking_values(
         "https://example.com/video?oauth_token=secret",
         "https://example.com/video?auth_token=secret",
         "https://example.com/video#access_token=secret",
+        "https://example.com/video#chapter-2?access_token=secret",
+        "https://example.com/video#/callback?access_token=secret",
     ),
 )
 def test_source_urls_reject_local_credentials_and_signed_queries(
@@ -1254,11 +1256,18 @@ def test_source_urls_reject_local_credentials_and_signed_queries(
     assert secret not in repr(raised.value)
 
 
-def test_source_urls_allow_ordinary_fragment(
+@pytest.mark.parametrize(
+    "safe_url",
+    (
+        "https://example.com/video#chapter-2",
+        "https://example.com/video#/callback?chapter=2",
+    ),
+)
+def test_source_urls_allow_ordinary_fragments(
     workspace_root: Path,
+    safe_url: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
-    safe_url = "https://example.com/video#chapter-2"
     valid_source = replace(
         bundle_input.source,
         canonical_uri=safe_url,

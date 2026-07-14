@@ -39,7 +39,7 @@ _TYPED_ID = re.compile(
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
-_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
+_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/#A-Za-z0-9._-])/(?!/)[^\s]+")
 _EXECUTOR_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,127}\Z")
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
@@ -230,6 +230,12 @@ def _require_safe_url(value: str, field_name: str) -> None:
         parsed = urlsplit(value)
         query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
         fragment = parse_qsl(parsed.fragment, keep_blank_values=True, strict_parsing=False)
+        _, separator, fragment_tail = parsed.fragment.partition("?")
+        fragment_tail_query = (
+            parse_qsl(fragment_tail, keep_blank_values=True, strict_parsing=False)
+            if separator
+            else ()
+        )
     except (UnicodeError, ValueError):
         raise _error("video_bundle_sensitive_data", f"{field_name} is not a safe URL") from None
     if (
@@ -237,7 +243,10 @@ def _require_safe_url(value: str, field_name: str) -> None:
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or any(_is_sensitive_url_query_key(key) for key, _ in (*query, *fragment))
+        or any(
+            _is_sensitive_url_query_key(key)
+            for key, _ in (*query, *fragment, *fragment_tail_query)
+        )
     ):
         raise _error("video_bundle_sensitive_data", f"{field_name} is not a safe URL")
 
