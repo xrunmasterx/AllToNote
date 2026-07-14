@@ -454,7 +454,6 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         ScreenshotPort,
         PortableWorkspacePort,
         CredentialBrokerPort,
-        JobRepositoryPort,
         AttemptStoragePort,
     )
 
@@ -463,6 +462,16 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         not {name for name in port.__dict__ if not name.startswith("_")}
         for port in marker_ports
     )
+    assert getattr(JobRepositoryPort, "_is_protocol", False)
+    assert {
+        name for name in JobRepositoryPort.__dict__ if not name.startswith("_")
+    } == {
+        "cancel_job",
+        "create_job",
+        "create_retry_job_atomic",
+        "get_job_details",
+        "respond_challenge_atomic",
+    }
     event_argument, event_return = get_args(EventSink)
     assert event_argument[0].__forward_arg__ == "JobEvent"
     assert event_return is type(None)

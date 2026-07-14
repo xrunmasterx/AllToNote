@@ -17,6 +17,11 @@ class AttemptState(StrEnum):
     SKIPPED = "skipped"
 
 
+class ChallengeState(StrEnum):
+    PENDING = "pending"
+    CONSUMED = "consumed"
+
+
 @dataclass(frozen=True)
 class Job:
     job_id: str
@@ -39,4 +44,25 @@ class Attempt:
     updated_at: str
 
 
-__all__ = ["Attempt", "AttemptState", "Job", "JobState"]
+@dataclass(frozen=True)
+class Challenge:
+    challenge_id: str
+    job_id: str
+    attempt_id: str
+    state: ChallengeState
+    prompt_json: str
+    response_json: str | None
+    response_hash: str | None
+    response_attempt_id: str | None
+    created_at: str
+    updated_at: str
+
+
+__all__ = [
+    "Attempt",
+    "AttemptState",
+    "Challenge",
+    "ChallengeState",
+    "Job",
+    "JobState",
+]

@@ -8,7 +8,13 @@ from pathlib import Path
 from app.core.domain.ids import new_typed_id, utc_now_millis
 from app.core.domain.video import JobState
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import Attempt, AttemptState, Job
+from app.core.jobs.model import (
+    Attempt,
+    AttemptState,
+    Challenge,
+    ChallengeState,
+    Job,
+)
 from app.core.jobs.state_machine import (
     TERMINAL_JOB_STATES,
     transition_attempt,
@@ -76,9 +82,13 @@ _SCHEMA_STATEMENTS = (
         state TEXT NOT NULL,
         prompt_json TEXT NOT NULL,
         response_json TEXT,
+        response_hash TEXT,
+        response_attempt_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        FOREIGN KEY(job_id, attempt_id) REFERENCES attempts(job_id, attempt_id)
+        FOREIGN KEY(job_id, attempt_id) REFERENCES attempts(job_id, attempt_id),
+        FOREIGN KEY(job_id, response_attempt_id)
+            REFERENCES attempts(job_id, attempt_id)
     )
     """,
     """
@@ -245,50 +255,59 @@ class SqliteJobRepository:
         request_hash: str,
         principal: str,
         client_request_id: str | None,
+        retry_of_job_id: str | None = None,
     ) -> Job:
         with self._transaction(immediate=True) as connection:
-            if client_request_id is not None:
-                existing = connection.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE principal = ? AND client_request_id = ?
-                    """,
-                    (principal, client_request_id),
-                ).fetchone()
-                if existing is not None:
-                    if existing["request_hash"] != request_hash:
-                        raise DomainError(
-                            "idempotency_conflict",
-                            ErrorCategory.CONFLICT,
-                            "Idempotency key is already bound to another request",
-                        )
-                    return self._job_from_row(existing)
-
-            now = utc_now_millis()
-            job_id = new_typed_id("job")
-            connection.execute(
-                """
-                INSERT INTO jobs (
-                    job_id, request_hash, principal, client_request_id, state,
-                    retry_of_job_id, result_json, error_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-                """,
-                (
-                    job_id,
-                    request_hash,
-                    principal,
-                    client_request_id,
-                    JobState.QUEUED.value,
-                    None,
-                    now,
-                    now,
-                ),
+            return self._create_job(
+                connection,
+                request_hash=request_hash,
+                principal=principal,
+                client_request_id=client_request_id,
+                retry_of_job_id=retry_of_job_id,
             )
-            return self._get_job(connection, job_id)
 
     def get_job(self, job_id: str) -> Job:
         with self._transaction(immediate=False) as connection:
             return self._get_job(connection, job_id)
+
+    def get_job_details(
+        self, job_id: str
+    ) -> tuple[Job, Attempt | None, Challenge | None]:
+        with self._transaction(immediate=False) as connection:
+            job = self._get_job(connection, job_id)
+            attempt_row = connection.execute(
+                """
+                SELECT * FROM attempts
+                WHERE job_id = ? AND state IN (?, ?)
+                ORDER BY created_at DESC, attempt_id DESC
+                LIMIT 1
+                """,
+                (
+                    job_id,
+                    AttemptState.PENDING.value,
+                    AttemptState.RUNNING.value,
+                ),
+            ).fetchone()
+            challenge_row = connection.execute(
+                """
+                SELECT * FROM challenges
+                WHERE job_id = ? AND state = ?
+                ORDER BY created_at DESC, challenge_id DESC
+                LIMIT 1
+                """,
+                (job_id, ChallengeState.PENDING.value),
+            ).fetchone()
+            attempt = (
+                self._attempt_from_row(attempt_row)
+                if attempt_row is not None
+                else None
+            )
+            challenge = (
+                self._challenge_from_row(challenge_row)
+                if challenge_row is not None
+                else None
+            )
+            return job, attempt, challenge
 
     def create_attempt(self, job_id: str, step_id: str) -> Attempt:
         with self._transaction(immediate=True) as connection:
@@ -299,56 +318,213 @@ class SqliteJobRepository:
                     ErrorCategory.CONFLICT,
                     "Terminal Job cannot create an Attempt",
                 )
+            return self._create_attempt(connection, job_id, step_id)
+
+    def cancel_job(self, job_id: str) -> Job:
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            if job.state in TERMINAL_JOB_STATES:
+                return job
+            next_state = transition_job(job.state, JobState.CANCELLED)
+            self._ensure_attempts_settled(connection, job_id)
             connection.execute(
-                """
-                INSERT OR IGNORE INTO steps (job_id, step_id, step_name, ordinal)
-                VALUES (?, ?, ?, 0)
-                """,
-                (job_id, step_id, step_id),
+                "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
+                (next_state.value, utc_now_millis(), job_id),
             )
+            return self._get_job(connection, job_id)
+
+    def create_challenge(
+        self,
+        job_id: str,
+        attempt_id: str,
+        prompt_json: str,
+    ) -> Challenge:
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "challenge_job_not_running",
+                    ErrorCategory.CONFLICT,
+                    "Challenge creation requires a running Job",
+                )
+            attempt = self._get_attempt(connection, attempt_id)
+            if attempt.job_id != job_id or attempt.state is not AttemptState.NEEDS_INPUT:
+                raise DomainError(
+                    "challenge_attempt_invalid",
+                    ErrorCategory.CONFLICT,
+                    "Challenge requires a needs-input Attempt from the same Job",
+                )
+            pending = connection.execute(
+                """
+                SELECT 1 FROM challenges
+                WHERE job_id = ? AND state = ?
+                LIMIT 1
+                """,
+                (job_id, ChallengeState.PENDING.value),
+            ).fetchone()
+            if pending is not None:
+                raise DomainError(
+                    "challenge_pending_exists",
+                    ErrorCategory.CONFLICT,
+                    "Job already has a pending Challenge",
+                )
+            challenge_id = new_typed_id("chl")
             now = utc_now_millis()
-            attempt_id = new_typed_id("att")
             connection.execute(
                 """
-                INSERT INTO attempts (
-                    attempt_id, job_id, step_id, state, fencing_token,
+                INSERT INTO challenges (
+                    challenge_id, job_id, attempt_id, state, prompt_json,
+                    response_json, response_hash, response_attempt_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
                 """,
                 (
-                    attempt_id,
+                    challenge_id,
                     job_id,
-                    step_id,
-                    AttemptState.PENDING.value,
+                    attempt_id,
+                    ChallengeState.PENDING.value,
+                    prompt_json,
                     now,
                     now,
                 ),
             )
-            return self._get_attempt(connection, attempt_id)
+            next_state = transition_job(job.state, JobState.WAITING_FOR_INPUT)
+            connection.execute(
+                "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
+                (next_state.value, now, job_id),
+            )
+            return self._get_challenge(connection, challenge_id)
+
+    def respond_challenge_atomic(
+        self,
+        job_id: str,
+        challenge_id: str,
+        *,
+        response_hash: str,
+        response_json: str,
+    ) -> tuple[Job, Attempt]:
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            challenge = self._get_challenge(connection, challenge_id)
+            if challenge.job_id != job_id:
+                raise DomainError(
+                    "challenge_job_mismatch",
+                    ErrorCategory.CONFLICT,
+                    "Challenge does not belong to the Job",
+                )
+            if challenge.state is ChallengeState.CONSUMED:
+                if challenge.response_hash != response_hash:
+                    raise DomainError(
+                        "challenge_response_conflict",
+                        ErrorCategory.CONFLICT,
+                        "Challenge was consumed with another response",
+                    )
+                if challenge.response_attempt_id is None:
+                    raise DomainError(
+                        "challenge_response_invalid",
+                        ErrorCategory.INTERNAL,
+                        "Consumed Challenge has no response Attempt",
+                    )
+                return job, self._get_attempt(
+                    connection, challenge.response_attempt_id
+                )
+            if job.state is not JobState.WAITING_FOR_INPUT:
+                raise DomainError(
+                    "challenge_job_not_waiting",
+                    ErrorCategory.CONFLICT,
+                    "Challenge response requires a waiting Job",
+                )
+            source_attempt = self._get_attempt(connection, challenge.attempt_id)
+            response_attempt = self._create_attempt(
+                connection, job_id, source_attempt.step_id
+            )
+            now = utc_now_millis()
+            connection.execute(
+                """
+                UPDATE challenges
+                SET state = ?, response_json = ?, response_hash = ?,
+                    response_attempt_id = ?, updated_at = ?
+                WHERE challenge_id = ?
+                """,
+                (
+                    ChallengeState.CONSUMED.value,
+                    response_json,
+                    response_hash,
+                    response_attempt.attempt_id,
+                    now,
+                    challenge_id,
+                ),
+            )
+            next_state = transition_job(job.state, JobState.QUEUED)
+            connection.execute(
+                "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
+                (next_state.value, now, job_id),
+            )
+            return self._get_job(connection, job_id), response_attempt
+
+    def create_retry_job_atomic(
+        self,
+        original_job_id: str,
+        *,
+        expected_original_state: JobState,
+        confirmed_unknown_operation_ids: tuple[str, ...],
+        client_request_id: str,
+    ) -> Job:
+        with self._transaction(immediate=True) as connection:
+            original = self._get_job(connection, original_job_id)
+            if original.state not in TERMINAL_JOB_STATES:
+                raise DomainError(
+                    "retry_original_not_terminal",
+                    ErrorCategory.CONFLICT,
+                    "Retry requires a terminal original Job",
+                )
+            if original.state is not expected_original_state:
+                raise DomainError(
+                    "retry_original_state_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Original Job state does not match retry expectation",
+                )
+            if original.client_request_id == client_request_id:
+                raise DomainError(
+                    "retry_client_request_id_reused",
+                    ErrorCategory.CONFLICT,
+                    "Retry requires a new client request ID",
+                )
+            confirmed = tuple(confirmed_unknown_operation_ids)
+            if len(confirmed) != len(set(confirmed)):
+                raise DomainError(
+                    "retry_unknown_operations_invalid",
+                    ErrorCategory.INVALID_REQUEST,
+                    "Unknown operation confirmations must be unique",
+                )
+            unknown_rows = connection.execute(
+                """
+                SELECT operation_id FROM external_operations
+                WHERE job_id = ? AND outcome = ?
+                """,
+                (original_job_id, "external_outcome_unknown"),
+            ).fetchall()
+            unknown_ids = {row["operation_id"] for row in unknown_rows}
+            if set(confirmed) != unknown_ids:
+                raise DomainError(
+                    "retry_unknown_operations_unconfirmed",
+                    ErrorCategory.CONFLICT,
+                    "Retry must confirm exactly every unknown operation",
+                )
+            return self._create_job(
+                connection,
+                request_hash=original.request_hash,
+                principal=original.principal,
+                client_request_id=client_request_id,
+                retry_of_job_id=original.job_id,
+            )
 
     def transition_job(self, job_id: str, state: JobState) -> Job:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
             next_state = transition_job(job.state, state)
             if next_state in TERMINAL_JOB_STATES:
-                unsettled = connection.execute(
-                    """
-                    SELECT 1 FROM attempts
-                    WHERE job_id = ? AND state IN (?, ?)
-                    LIMIT 1
-                    """,
-                    (
-                        job_id,
-                        AttemptState.PENDING.value,
-                        AttemptState.RUNNING.value,
-                    ),
-                ).fetchone()
-                if unsettled is not None:
-                    raise DomainError(
-                        "attempt_not_settled",
-                        ErrorCategory.CONFLICT,
-                        "All Attempts must be terminal before the Job",
-                    )
+                self._ensure_attempts_settled(connection, job_id)
             connection.execute(
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (next_state.value, utc_now_millis(), job_id),
@@ -399,6 +575,113 @@ class SqliteJobRepository:
             )
         return self._job_from_row(row)
 
+    def _create_job(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        request_hash: str,
+        principal: str,
+        client_request_id: str | None,
+        retry_of_job_id: str | None,
+    ) -> Job:
+        if client_request_id is not None:
+            existing = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE principal = ? AND client_request_id = ?
+                """,
+                (principal, client_request_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["request_hash"] != request_hash
+                    or existing["retry_of_job_id"] != retry_of_job_id
+                ):
+                    raise DomainError(
+                        "idempotency_conflict",
+                        ErrorCategory.CONFLICT,
+                        "Idempotency key is already bound to another request",
+                    )
+                return self._job_from_row(existing)
+
+        now = utc_now_millis()
+        job_id = new_typed_id("job")
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_id, request_hash, principal, client_request_id, state,
+                retry_of_job_id, result_json, error_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            """,
+            (
+                job_id,
+                request_hash,
+                principal,
+                client_request_id,
+                JobState.QUEUED.value,
+                retry_of_job_id,
+                now,
+                now,
+            ),
+        )
+        return self._get_job(connection, job_id)
+
+    def _create_attempt(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        step_id: str,
+    ) -> Attempt:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO steps (job_id, step_id, step_name, ordinal)
+            VALUES (?, ?, ?, 0)
+            """,
+            (job_id, step_id, step_id),
+        )
+        now = utc_now_millis()
+        attempt_id = new_typed_id("att")
+        connection.execute(
+            """
+            INSERT INTO attempts (
+                attempt_id, job_id, step_id, state, fencing_token,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                attempt_id,
+                job_id,
+                step_id,
+                AttemptState.PENDING.value,
+                now,
+                now,
+            ),
+        )
+        return self._get_attempt(connection, attempt_id)
+
+    @staticmethod
+    def _ensure_attempts_settled(
+        connection: sqlite3.Connection, job_id: str
+    ) -> None:
+        unsettled = connection.execute(
+            """
+            SELECT 1 FROM attempts
+            WHERE job_id = ? AND state IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                job_id,
+                AttemptState.PENDING.value,
+                AttemptState.RUNNING.value,
+            ),
+        ).fetchone()
+        if unsettled is not None:
+            raise DomainError(
+                "attempt_not_settled",
+                ErrorCategory.CONFLICT,
+                "All Attempts must be terminal before the Job",
+            )
+
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> Job:
         return Job(
@@ -424,11 +707,45 @@ class SqliteJobRepository:
                 ErrorCategory.INVALID_REQUEST,
                 "Attempt does not exist",
             )
+        return self._attempt_from_row(row)
+
+    @staticmethod
+    def _attempt_from_row(row: sqlite3.Row) -> Attempt:
         return Attempt(
             attempt_id=row["attempt_id"],
             job_id=row["job_id"],
             step_id=row["step_id"],
             state=AttemptState(row["state"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _get_challenge(
+        self, connection: sqlite3.Connection, challenge_id: str
+    ) -> Challenge:
+        row = connection.execute(
+            "SELECT * FROM challenges WHERE challenge_id = ?",
+            (challenge_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "challenge_not_found",
+                ErrorCategory.INVALID_REQUEST,
+                "Challenge does not exist",
+            )
+        return self._challenge_from_row(row)
+
+    @staticmethod
+    def _challenge_from_row(row: sqlite3.Row) -> Challenge:
+        return Challenge(
+            challenge_id=row["challenge_id"],
+            job_id=row["job_id"],
+            attempt_id=row["attempt_id"],
+            state=ChallengeState(row["state"]),
+            prompt_json=row["prompt_json"],
+            response_json=row["response_json"],
+            response_hash=row["response_hash"],
+            response_attempt_id=row["response_attempt_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

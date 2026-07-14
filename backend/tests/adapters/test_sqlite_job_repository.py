@@ -706,3 +706,432 @@ def test_commit_guard_rolls_back_when_guarded_work_fails(
             raise RuntimeError("portable commit failed")
 
     assert repo.get_job(job.job_id).state is JobState.RUNNING
+
+
+def _create_needs_input_attempt(repo: SqliteJobRepository):
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="challenge-original",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    attempt = repo.create_attempt(job.job_id, "acquire")
+    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
+    attempt = repo.transition_attempt(attempt.attempt_id, AttemptState.NEEDS_INPUT)
+    return job, attempt
+
+
+def _record_unknown_operation(
+    repo: SqliteJobRepository,
+    *,
+    job_id: str,
+    step_id: str,
+    attempt_id: str,
+    operation_id: str,
+) -> None:
+    with repo._transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO external_operations (
+                operation_id, job_id, step_id, attempt_id, provider,
+                request_hash, operation_idempotency_key, provider_request_id,
+                outcome, summary_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'provider', ?, NULL, NULL,
+                      'external_outcome_unknown', '{}', 'created', 'updated')
+            """,
+            (operation_id, job_id, step_id, attempt_id, HASH_A),
+        )
+
+
+def _create_failed_job_with_unknown_operations(
+    repo: SqliteJobRepository,
+    operation_ids: tuple[str, ...] = ("op_unknown_a", "op_unknown_b"),
+):
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="original-request",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    attempt = repo.create_attempt(job.job_id, "model")
+    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
+    for operation_id in operation_ids:
+        _record_unknown_operation(
+            repo,
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+            operation_id=operation_id,
+        )
+    repo.transition_attempt(attempt.attempt_id, AttemptState.FAILED)
+    return repo.transition_job(job.job_id, JobState.FAILED), attempt
+
+
+def test_schema_v1_persists_challenge_response_hash_and_attempt_binding(
+    repo: SqliteJobRepository,
+) -> None:
+    with repo._connect() as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(challenges)")
+        }
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(challenges)"
+        ).fetchall()
+
+    assert {"response_hash", "response_attempt_id"} <= columns
+    assert any(row[2] == "attempts" and row[3] == "response_attempt_id" for row in foreign_keys)
+
+
+def test_create_job_persists_retry_lineage_and_replays_only_same_binding(
+    repo: SqliteJobRepository,
+) -> None:
+    original = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="original",
+    )
+
+    retry = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="retry-1",
+        retry_of_job_id=original.job_id,
+    )
+    replay = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="retry-1",
+        retry_of_job_id=original.job_id,
+    )
+
+    assert retry.retry_of_job_id == original.job_id
+    assert replay == retry
+    with pytest.raises(DomainError, match="idempotency_conflict"):
+        repo.create_job(
+            request_hash=HASH_A,
+            principal="agent",
+            client_request_id="retry-1",
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED),
+)
+def test_cancel_is_stable_for_terminal_jobs(
+    repo: SqliteJobRepository,
+    terminal_state: JobState,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id=None,
+    )
+    if terminal_state is JobState.CANCELLED:
+        terminal = repo.transition_job(job.job_id, terminal_state)
+    else:
+        repo.transition_job(job.job_id, JobState.RUNNING)
+        terminal = repo.transition_job(job.job_id, terminal_state)
+
+    assert repo.cancel_job(job.job_id) == terminal
+    assert repo.cancel_job(job.job_id) == terminal
+
+
+@pytest.mark.parametrize(
+    "state",
+    (JobState.QUEUED, JobState.RUNNING, JobState.WAITING_FOR_INPUT),
+)
+def test_cancel_transitions_settled_nonterminal_job(
+    repo: SqliteJobRepository,
+    state: JobState,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id=None,
+    )
+    if state is not JobState.QUEUED:
+        repo.transition_job(job.job_id, JobState.RUNNING)
+    if state is JobState.WAITING_FOR_INPUT:
+        repo.transition_job(job.job_id, JobState.WAITING_FOR_INPUT)
+
+    assert repo.cancel_job(job.job_id).state is JobState.CANCELLED
+
+
+def test_cancel_rejects_unsettled_attempt_without_partial_write(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    repo.create_attempt(job.job_id, "running-step")
+
+    with pytest.raises(DomainError, match="attempt_not_settled"):
+        repo.cancel_job(job.job_id)
+
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
+
+
+def test_create_challenge_atomically_waits_for_input(
+    repo: SqliteJobRepository,
+) -> None:
+    job, attempt = _create_needs_input_attempt(repo)
+
+    challenge = repo.create_challenge(
+        job.job_id,
+        attempt.attempt_id,
+        '{"kind":"credential_profile"}',
+    )
+
+    assert challenge.job_id == job.job_id
+    assert challenge.attempt_id == attempt.attempt_id
+    assert challenge.state == "pending"
+    assert repo.get_job(job.job_id).state is JobState.WAITING_FOR_INPUT
+
+
+def test_respond_challenge_is_hash_idempotent_across_process_reopen(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "machine-root"
+    repo = SqliteJobRepository.open(machine_root)
+    job, attempt = _create_needs_input_attempt(repo)
+    challenge = repo.create_challenge(job.job_id, attempt.attempt_id, "{}")
+
+    first_job, first_attempt = repo.respond_challenge_atomic(
+        job.job_id,
+        challenge.challenge_id,
+        response_hash=HASH_A,
+        response_json='{"credential_profile":"配置"}',
+    )
+    reopened = SqliteJobRepository.open(machine_root)
+    replay_job, replay_attempt = reopened.respond_challenge_atomic(
+        job.job_id,
+        challenge.challenge_id,
+        response_hash=HASH_A,
+        response_json='{"credential_profile":"配置"}',
+    )
+
+    assert first_job.state is JobState.QUEUED
+    assert first_attempt.step_id == attempt.step_id
+    assert first_attempt.state is AttemptState.PENDING
+    assert replay_job == first_job
+    assert replay_attempt == first_attempt
+    with reopened._connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM challenges WHERE challenge_id = ?",
+            (challenge.challenge_id,),
+        ).fetchone()
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM attempts WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()[0]
+    assert row["state"] == "consumed"
+    assert row["response_hash"] == HASH_A
+    assert row["response_attempt_id"] == first_attempt.attempt_id
+    assert attempt_count == 2
+
+
+def test_respond_challenge_rejects_different_hash_without_mutation(
+    repo: SqliteJobRepository,
+) -> None:
+    job, attempt = _create_needs_input_attempt(repo)
+    challenge = repo.create_challenge(job.job_id, attempt.attempt_id, "{}")
+    first_job, first_attempt = repo.respond_challenge_atomic(
+        job.job_id,
+        challenge.challenge_id,
+        response_hash=HASH_A,
+        response_json="{}",
+    )
+
+    with pytest.raises(DomainError, match="challenge_response_conflict"):
+        repo.respond_challenge_atomic(
+            job.job_id,
+            challenge.challenge_id,
+            response_hash=HASH_B,
+            response_json="{}",
+        )
+
+    assert repo.get_job(job.job_id) == first_job
+    with repo._connect() as connection:
+        row = connection.execute(
+            "SELECT response_hash, response_attempt_id FROM challenges WHERE challenge_id = ?",
+            (challenge.challenge_id,),
+        ).fetchone()
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM attempts WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()[0]
+    assert tuple(row) == (HASH_A, first_attempt.attempt_id)
+    assert attempt_count == 2
+
+
+def test_respond_challenge_rolls_back_when_attempt_insert_fails(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, attempt = _create_needs_input_attempt(repo)
+    challenge = repo.create_challenge(job.job_id, attempt.attempt_id, "{}")
+    monkeypatch.setattr(
+        "app.adapters.jobs.sqlite_repository.new_typed_id",
+        lambda prefix: attempt.attempt_id,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.respond_challenge_atomic(
+            job.job_id,
+            challenge.challenge_id,
+            response_hash=HASH_A,
+            response_json="{}",
+        )
+
+    assert repo.get_job(job.job_id).state is JobState.WAITING_FOR_INPUT
+    with repo._connect() as connection:
+        row = connection.execute(
+            """
+            SELECT state, response_hash, response_json, response_attempt_id
+            FROM challenges WHERE challenge_id = ?
+            """,
+            (challenge.challenge_id,),
+        ).fetchone()
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM attempts WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()[0]
+    assert tuple(row) == ("pending", None, None, None)
+    assert attempt_count == 1
+
+
+def test_retry_atomically_creates_new_job_and_replays_after_reopen(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "machine-root"
+    repo = SqliteJobRepository.open(machine_root)
+    original, _ = _create_failed_job_with_unknown_operations(repo)
+
+    retry = repo.create_retry_job_atomic(
+        original.job_id,
+        expected_original_state=JobState.FAILED,
+        confirmed_unknown_operation_ids=("op_unknown_a", "op_unknown_b"),
+        client_request_id="retry-1",
+    )
+    reopened = SqliteJobRepository.open(machine_root)
+    replay = reopened.create_retry_job_atomic(
+        original.job_id,
+        expected_original_state=JobState.FAILED,
+        confirmed_unknown_operation_ids=("op_unknown_b", "op_unknown_a"),
+        client_request_id="retry-1",
+    )
+
+    assert retry.job_id != original.job_id
+    assert retry.request_hash == original.request_hash
+    assert retry.principal == original.principal
+    assert retry.retry_of_job_id == original.job_id
+    assert replay == retry
+    assert reopened.get_job(original.job_id) == original
+
+
+@pytest.mark.parametrize(
+    ("expected_state", "confirmed_ids", "client_request_id", "error_code"),
+    (
+        (
+            JobState.CANCELLED,
+            ("op_unknown_a", "op_unknown_b"),
+            "retry-state",
+            "retry_original_state_conflict",
+        ),
+        (
+            JobState.FAILED,
+            ("op_unknown_a",),
+            "retry-missing",
+            "retry_unknown_operations_unconfirmed",
+        ),
+        (
+            JobState.FAILED,
+            ("op_unknown_a", "op_unknown_b", "op_extra"),
+            "retry-extra",
+            "retry_unknown_operations_unconfirmed",
+        ),
+        (
+            JobState.FAILED,
+            ("op_unknown_a", "op_unknown_a", "op_unknown_b"),
+            "retry-duplicate",
+            "retry_unknown_operations_invalid",
+        ),
+        (
+            JobState.FAILED,
+            ("op_unknown_a", "op_unknown_b"),
+            "original-request",
+            "retry_client_request_id_reused",
+        ),
+    ),
+)
+def test_retry_rejects_invalid_preconditions_before_insert(
+    repo: SqliteJobRepository,
+    expected_state: JobState,
+    confirmed_ids: tuple[str, ...],
+    client_request_id: str,
+    error_code: str,
+) -> None:
+    original, _ = _create_failed_job_with_unknown_operations(repo)
+
+    with pytest.raises(DomainError, match=error_code):
+        repo.create_retry_job_atomic(
+            original.job_id,
+            expected_original_state=expected_state,
+            confirmed_unknown_operation_ids=confirmed_ids,
+            client_request_id=client_request_id,
+        )
+
+    with repo._connect() as connection:
+        retry_count = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE retry_of_job_id = ?",
+            (original.job_id,),
+        ).fetchone()[0]
+    assert retry_count == 0
+    assert repo.get_job(original.job_id) == original
+
+
+def test_retry_rejects_nonterminal_original_before_insert(
+    repo: SqliteJobRepository,
+) -> None:
+    original = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="original",
+    )
+
+    with pytest.raises(DomainError, match="retry_original_not_terminal"):
+        repo.create_retry_job_atomic(
+            original.job_id,
+            expected_original_state=JobState.QUEUED,
+            confirmed_unknown_operation_ids=(),
+            client_request_id="retry-queued",
+        )
+
+    with repo._connect() as connection:
+        count = connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_retry_key_bound_by_normal_submit_is_a_stable_conflict(
+    repo: SqliteJobRepository,
+) -> None:
+    original, _ = _create_failed_job_with_unknown_operations(repo, ())
+    normal = repo.create_job(
+        request_hash=original.request_hash,
+        principal=original.principal,
+        client_request_id="occupied",
+    )
+
+    with pytest.raises(DomainError, match="idempotency_conflict"):
+        repo.create_retry_job_atomic(
+            original.job_id,
+            expected_original_state=JobState.FAILED,
+            confirmed_unknown_operation_ids=(),
+            client_request_id="occupied",
+        )
+
+    assert repo.get_job(normal.job_id) == normal
