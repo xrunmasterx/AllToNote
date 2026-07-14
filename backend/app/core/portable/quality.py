@@ -117,7 +117,7 @@ def _load_evidence_records(evidence_set: EvidenceSet) -> list[object] | None:
         if encode_ndjson(records) != payload:
             return None
         return records
-    except (DomainError, UnicodeError, ValueError):
+    except (DomainError, RecursionError, UnicodeError, ValueError):
         return None
 
 

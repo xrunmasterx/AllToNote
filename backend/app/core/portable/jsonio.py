@@ -63,7 +63,7 @@ def encode_ndjson(records: Iterable[object]) -> bytes:
         raise
     except MemoryError:
         raise
-    except (OSError, RecursionError, TypeError):
+    except (OSError, RuntimeError, TypeError, ValueError):
         raise _json_invalid() from None
 
 

@@ -10,11 +10,11 @@ from app.core.errors import DomainError, ErrorCategory
 
 
 _ACTIVE_TAG = re.compile(
-    r"<\s*/?\s*(?:script|iframe|object|embed|form|svg|style|link|meta|base|math|video|audio|source|track|canvas)\b",
+    r"<\s*/?\s*(?:script|iframe|object|embed|form|input|button|svg|style|link|meta|base|math|video|audio|source|track|canvas)\b",
     re.IGNORECASE,
 )
 _ACTIVE_ATTRIBUTE = re.compile(
-    r"\b(?:on[a-z0-9_-]+|style|srcdoc|srcset)\s*=",
+    r"\b(?:on[a-z0-9_-]+|style|srcdoc|srcset|ping|formaction)\s*=",
     re.IGNORECASE,
 )
 _DANGEROUS_SCHEME = re.compile(
@@ -31,12 +31,12 @@ _HTML_IMAGE_SOURCE = re.compile(
     re.IGNORECASE,
 )
 _AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*)>")
-_REFERENCE_DEFINITION = re.compile(
-    r"^ {0,3}\[(?!\^)[^\]\r\n]+\]:\s*(<[^>]*>|\S+)",
-    re.MULTILINE,
-)
 _ENCODED_PATH_CONTROL = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[/\\]")
+_WINDOWS_DEVICE = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)",
+    re.IGNORECASE,
+)
 _FOOTNOTE = re.compile(r"\[\^(ev_[0-9a-f-]+)\]")
 _FOOTNOTE_DEFINITION = re.compile(r"^ {0,3}\[\^(ev_[0-9a-f-]+)\]:")
 _SEGMENT_CITATION = re.compile(r"\[\^seg_[^\]\r\n]*\]")
@@ -182,55 +182,138 @@ def _visible_lines(markdown: str) -> tuple[str, ...]:
     return tuple(_scan_markdown(markdown).visible_text.splitlines())
 
 
-def _iter_markdown_destinations(markdown: str):
-    cursor = 0
+def _reference_label(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _closing_bracket(markdown: str, opening: int) -> int | None:
+    depth = 1
+    cursor = opening + 1
     while cursor < len(markdown):
-        opening = markdown.find("[", cursor)
-        if opening < 0:
-            return
-        if opening + 1 < len(markdown) and markdown[opening + 1] == "[":
-            closing = markdown.find("]]", opening + 2)
-            if closing < 0:
-                return
-            yield markdown[opening + 2 : closing].split("|", 1)[0], False
+        if markdown[cursor] == "[" and not _backslash_escaped(markdown, cursor):
+            depth += 1
+        elif markdown[cursor] == "]" and not _backslash_escaped(markdown, cursor):
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor += 1
+    return None
+
+
+def _destination_after(markdown: str, start: int) -> tuple[str, int] | None:
+    cursor = start
+    while cursor < len(markdown) and markdown[cursor] in " \t":
+        cursor += 1
+    if cursor >= len(markdown):
+        return None
+    if markdown[cursor] == "<":
+        end = cursor + 1
+        while end < len(markdown):
+            if markdown[end] == ">" and not _backslash_escaped(markdown, end):
+                return markdown[cursor : end + 1], end + 1
+            if markdown[end] in "\r\n":
+                return None
+            end += 1
+        return None
+    end = cursor
+    parentheses = 0
+    while end < len(markdown):
+        character = markdown[end]
+        if character in " \t\r\n" and parentheses == 0:
+            break
+        if character == "(" and not _backslash_escaped(markdown, end):
+            parentheses += 1
+        elif character == ")" and not _backslash_escaped(markdown, end):
+            if parentheses == 0:
+                break
+            parentheses -= 1
+        end += 1
+    return (markdown[cursor:end], end) if end > cursor else None
+
+
+def _iter_markdown_destinations(markdown: str):
+    definitions: dict[str, str] = {}
+    references: list[tuple[str, bool]] = []
+    destinations: list[tuple[str, bool]] = []
+    cursor = 0
+    line_start = 0
+    while cursor < len(markdown):
+        if markdown[cursor] == "\n":
+            line_start = cursor + 1
+            cursor += 1
+            continue
+        if markdown[cursor] != "[" or _backslash_escaped(markdown, cursor):
+            cursor += 1
+            continue
+        is_image = (
+            cursor > 0
+            and markdown[cursor - 1] == "!"
+            and not _backslash_escaped(markdown, cursor - 1)
+        )
+        if cursor + 1 < len(markdown) and markdown[cursor + 1] == "[":
+            closing = cursor + 2
+            while closing + 1 < len(markdown) and markdown[closing : closing + 2] != "]]":
+                closing += 1
+            if closing + 1 >= len(markdown):
+                break
+            destinations.append(
+                (markdown[cursor + 2 : closing].split("|", 1)[0], is_image)
+            )
             cursor = closing + 2
             continue
-        closing = markdown.find("]", opening + 1)
-        if closing < 0:
-            return
+        closing = _closing_bracket(markdown, cursor)
+        if closing is None:
+            break
+        label = markdown[cursor + 1 : closing]
+        after = closing + 1
+        is_definition = (
+            not is_image
+            and not label.startswith("^")
+            and after < len(markdown)
+            and markdown[after] == ":"
+            and cursor - line_start <= 3
+            and not markdown[line_start:cursor].strip(" ")
+        )
+        if is_definition:
+            parsed = _destination_after(markdown, after + 1)
+            if parsed is not None:
+                destination, end = parsed
+                definitions.setdefault(_reference_label(label), destination)
+                destinations.append((destination, False))
+                cursor = end
+                continue
         destination_start = closing + 1
-        if destination_start >= len(markdown) or markdown[destination_start] != "(":
+        if destination_start < len(markdown) and markdown[destination_start] == "(":
+            parsed = _destination_after(markdown, destination_start + 1)
+            if parsed is not None:
+                destination, end = parsed
+                destinations.append((destination, is_image))
+                cursor = end + (
+                    1 if end < len(markdown) and markdown[end] == ")" else 0
+                )
+                continue
+        if label.startswith("^"):
             cursor = closing + 1
             continue
-        destination_start += 1
-        while destination_start < len(markdown) and markdown[destination_start] in " \t":
-            destination_start += 1
-        if destination_start < len(markdown) and markdown[destination_start] == "<":
-            destination_end = markdown.find(">", destination_start + 1)
-            if destination_end < 0:
-                return
-            is_image = (
-                opening > 0
-                and markdown[opening - 1] == "!"
-                and not _backslash_escaped(markdown, opening - 1)
-            )
-            yield markdown[destination_start : destination_end + 1], is_image
-            cursor = destination_end + 1
-            continue
-        destination_end = destination_start
-        while (
-            destination_end < len(markdown)
-            and markdown[destination_end] not in " \t\r\n)"
-        ):
-            destination_end += 1
-        if destination_end > destination_start:
-            is_image = (
-                opening > 0
-                and markdown[opening - 1] == "!"
-                and not _backslash_escaped(markdown, opening - 1)
-            )
-            yield markdown[destination_start:destination_end], is_image
-        cursor = max(destination_end, closing + 1)
+        reference_label = label
+        if after < len(markdown) and markdown[after] == "[":
+            reference_closing = _closing_bracket(markdown, after)
+            if reference_closing is not None:
+                explicit_label = markdown[after + 1 : reference_closing]
+                reference_label = explicit_label or label
+                cursor = reference_closing + 1
+            else:
+                cursor = closing + 1
+        else:
+            cursor = closing + 1
+        references.append((_reference_label(reference_label), is_image))
+
+    for destination in destinations:
+        yield destination
+    for label, is_image in references:
+        destination = definitions.get(label)
+        if destination is not None:
+            yield destination, is_image
 
 
 def _validate_destination(
@@ -281,6 +364,32 @@ def _validate_destination(
         raise _unsafe()
 
 
+def _is_portable_bundle_path(value: str) -> bool:
+    decoded = value
+    for _ in range(8):
+        if (
+            any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+            or _ENCODED_PATH_CONTROL.search(decoded) is not None
+        ):
+            return False
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    else:
+        return False
+    if (
+        not decoded
+        or "\\" in decoded
+        or decoded.startswith("/")
+        or _WINDOWS_DRIVE.match(decoded) is not None
+        or posixpath.normpath(decoded) != decoded
+        or posixpath.normpath(decoded).startswith("../")
+    ):
+        return False
+    return not any(_WINDOWS_DEVICE.match(segment) for segment in decoded.split("/"))
+
+
 def validate_markdown_safety(
     markdown: str,
     *,
@@ -288,14 +397,7 @@ def validate_markdown_safety(
 ) -> None:
     if not isinstance(markdown, str) or not isinstance(bundle_relative_path, str):
         raise _unsafe()
-    if (
-        not bundle_relative_path
-        or "\\" in bundle_relative_path
-        or bundle_relative_path.startswith("/")
-        or _WINDOWS_DRIVE.match(bundle_relative_path) is not None
-        or posixpath.normpath(bundle_relative_path) != bundle_relative_path
-        or posixpath.normpath(bundle_relative_path).startswith("../")
-    ):
+    if not _is_portable_bundle_path(bundle_relative_path):
         raise _unsafe()
     if any(ord(character) < 32 and character not in "\t\n\r" for character in markdown):
         raise _unsafe()
@@ -315,9 +417,6 @@ def validate_markdown_safety(
     destinations: list[tuple[str, bool]] = []
     destinations.extend(_iter_markdown_destinations(visible))
     destinations.extend((match.group(1), False) for match in _AUTOLINK.finditer(visible))
-    destinations.extend(
-        (match.group(1), False) for match in _REFERENCE_DEFINITION.finditer(visible)
-    )
     for match in _HTML_LINK.finditer(visible):
         destinations.append(
             (next(value for value in match.groups() if value is not None), False)
@@ -382,17 +481,32 @@ def _analyze_markdown(markdown: str) -> _MarkdownAnalysis:
             finish_section()
             current_section = []
             continue
-        definition = _FOOTNOTE_DEFINITION.match(line)
+        indent = len(line) - len(line.lstrip(" "))
+        definition_line = line
+        if indent <= 3:
+            slash_end = indent
+            while slash_end < len(line) and line[slash_end] == "\\":
+                slash_end += 1
+            if (slash_end - indent) % 2:
+                definition_line = ""
+            elif slash_end > indent:
+                definition_line = line[:indent] + line[slash_end:]
+        definition = _FOOTNOTE_DEFINITION.match(definition_line)
         if definition is not None:
             evidence_id = definition.group(1)
             if evidence_id in definitions:
                 duplicate_definitions.add(evidence_id)
             definitions.append(evidence_id)
             continue
-        line_citations = [match.group(1) for match in _FOOTNOTE.finditer(line)]
+        line_citations = [
+            match.group(1)
+            for match in _FOOTNOTE.finditer(line)
+            if not _backslash_escaped(line, match.start())
+        ]
         citations.extend(line_citations)
-        has_segment_citation = has_segment_citation or (
-            _SEGMENT_CITATION.search(line) is not None
+        has_segment_citation = has_segment_citation or any(
+            not _backslash_escaped(line, match.start())
+            for match in _SEGMENT_CITATION.finditer(line)
         )
         if current_section is not None and line.strip():
             current_substantive = True

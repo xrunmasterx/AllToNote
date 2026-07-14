@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -120,9 +121,12 @@ def test_ndjson_rejects_ambiguous_byte_and_text_iterables(records: object) -> No
         encode_ndjson(records)  # type: ignore[arg-type]
 
 
-def test_ndjson_sanitizes_generator_io_failures() -> None:
+@pytest.mark.parametrize("failure", (ValueError, RuntimeError, OSError))
+def test_ndjson_sanitizes_generator_failures(
+    failure: type[Exception],
+) -> None:
     def records():
-        raise OSError("secret C:/private/records.jsonl")
+        raise failure("secret C:/private/records.jsonl")
         yield None
 
     with pytest.raises(DomainError) as caught:
@@ -130,6 +134,16 @@ def test_ndjson_sanitizes_generator_io_failures() -> None:
 
     assert caught.value.code == "portable_json_invalid"
     assert "C:/private" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+def test_ndjson_does_not_swallow_generator_memory_error() -> None:
+    def records():
+        raise MemoryError()
+        yield None
+
+    with pytest.raises(MemoryError):
+        encode_ndjson(records())
 
 
 def test_canonical_json_sanitizes_circular_values() -> None:
@@ -206,6 +220,31 @@ def test_transcript_sanitizes_invalid_segment_collections() -> None:
 
     assert caught.value.code == "transcript_invalid"
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize("failure", (ValueError, RuntimeError, OSError))
+def test_transcript_sanitizes_segment_iterator_failures(
+    failure: type[Exception],
+) -> None:
+    def segments() -> Iterator[TranscriptSegment]:
+        raise failure("secret C:/private/segments.jsonl")
+        yield SEGMENTS[0]
+
+    with pytest.raises(DomainError) as caught:
+        build_transcript(REVISION_ID, "zh-CN", segments())
+
+    assert caught.value.code == "transcript_invalid"
+    assert "C:/private" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+def test_transcript_does_not_swallow_segment_iterator_memory_error() -> None:
+    def segments() -> Iterator[TranscriptSegment]:
+        raise MemoryError()
+        yield SEGMENTS[0]
+
+    with pytest.raises(MemoryError):
+        build_transcript(REVISION_ID, "zh-CN", segments())
 
 
 def test_evidence_set_exactly_maps_segments_to_verifiable_records() -> None:
@@ -312,6 +351,73 @@ def test_evidence_set_sanitizes_invalid_boundary_inputs(bad_input: str) -> None:
 
     assert caught.value.code == "evidence_input_invalid"
     assert caught.value.__cause__ is None
+
+
+class _FailingMapping(Mapping[str, str]):
+    def __init__(self, failure: type[BaseException]) -> None:
+        self.failure = failure
+
+    def __getitem__(self, key: str) -> str:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        raise self.failure("secret C:/private/evidence.jsonl")
+
+    def __len__(self) -> int:
+        return 1
+
+
+@pytest.mark.parametrize("failure", (RuntimeError, OSError))
+@pytest.mark.parametrize("operation", ("build", "rewrite"))
+def test_evidence_mapping_failures_are_sanitized(
+    failure: type[Exception],
+    operation: str,
+) -> None:
+    mapping = _FailingMapping(failure)
+
+    with pytest.raises(DomainError) as caught:
+        if operation == "build":
+            transcript = TranscriptDocument("zh-CN", SEGMENTS)
+            reference = PortableArtifactRef(
+                BUNDLE_ID,
+                TRANSCRIPT_ARTIFACT_ID,
+                sha256_digest(build_transcript(REVISION_ID, "zh-CN", SEGMENTS)),
+            )
+            build_evidence_set(
+                BUNDLE_ID,
+                REVISION_ID,
+                reference,
+                transcript,
+                mapping,
+            )
+        else:
+            rewrite_segment_citations("claim[^seg_000001]", mapping)
+
+    assert "C:/private" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize("operation", ("build", "rewrite"))
+def test_evidence_mapping_memory_error_is_not_swallowed(operation: str) -> None:
+    mapping = _FailingMapping(MemoryError)
+
+    with pytest.raises(MemoryError):
+        if operation == "build":
+            transcript = TranscriptDocument("zh-CN", SEGMENTS)
+            reference = PortableArtifactRef(
+                BUNDLE_ID,
+                TRANSCRIPT_ARTIFACT_ID,
+                sha256_digest(build_transcript(REVISION_ID, "zh-CN", SEGMENTS)),
+            )
+            build_evidence_set(
+                BUNDLE_ID,
+                REVISION_ID,
+                reference,
+                transcript,
+                mapping,
+            )
+        else:
+            rewrite_segment_citations("claim[^seg_000001]", mapping)
 
 
 def test_segment_citations_are_rewritten_to_trusted_evidence_ids() -> None:
@@ -421,6 +527,54 @@ def test_markdown_scan_scales_linearly_on_unclosed_link_markers() -> None:
     assert durations[-1] < max(0.2, durations[0] * 6)
 
 
+def test_markdown_safety_rejects_remote_reference_images() -> None:
+    markdown = "![frame][asset]\n[asset]: https://tracker.example/frame.webp\n"
+
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+def test_markdown_safety_rejects_absolute_destination_after_nested_label() -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(
+            "[outer [inner]](/etc/passwd)",
+            bundle_relative_path="drafts/note.md",
+        )
+
+
+def test_markdown_safety_rejects_remote_obsidian_embeds() -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(
+            "![[https://tracker.example/frame.webp]]",
+            bundle_relative_path="drafts/note.md",
+        )
+
+
+def test_markdown_safety_preserves_link_and_embed_destination_kinds() -> None:
+    validate_markdown_safety(
+        "[source][site]\n[site]: https://example.com/watch\n"
+        "![[../assets/frame.webp]]\n",
+        bundle_relative_path="drafts/note.md",
+    )
+
+
+@pytest.mark.parametrize("shape", ("nested", "unclosed"))
+def test_balanced_destination_scan_scales_linearly(shape: str) -> None:
+    durations: list[float] = []
+    for size in (4_000, 8_000, 16_000):
+        markdown = (
+            "[" * size + "label" + "]" * size
+            if shape == "nested"
+            else "[" * size
+        )
+        started = time.perf_counter()
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+        durations.append(time.perf_counter() - started)
+
+    assert durations[-1] < 1.0
+    assert durations[-1] < max(0.2, durations[0] * 6)
+
+
 @pytest.mark.parametrize(
     "markdown",
     (
@@ -521,6 +675,20 @@ def test_markdown_safety_rejects_active_media_and_external_images(
 @pytest.mark.parametrize(
     "markdown",
     (
+        "<input type='image' src='https://tracker.example/pixel'>",
+        "<button formaction='https://tracker.example/submit'>send</button>",
+        "<a href='https://example.com' ping='https://tracker.example/ping'>link</a>",
+        "<a formaction='https://tracker.example/submit'>link</a>",
+    ),
+)
+def test_markdown_safety_rejects_active_network_html(markdown: str) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(markdown, bundle_relative_path="drafts/note.md")
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
         "[source](https://example.com/watch?v=1)",
         "![frame](../assets/frame.webp)",
         "<img src='../assets/frame.webp' alt='frame'>",
@@ -557,6 +725,58 @@ def test_markdown_safety_rejects_absolute_or_noncanonical_base_paths(
 ) -> None:
     with pytest.raises(DomainError, match="draft_markdown_unsafe"):
         validate_markdown_safety("safe", bundle_relative_path=base_path)
+
+
+@pytest.mark.parametrize(
+    "base_path",
+    (
+        "drafts/%2e%2e/note.md",
+        "drafts/%252e%252e/note.md",
+        "drafts/%252fetc/note.md",
+        "drafts/%2500note.md",
+        "drafts/no\x00te.md",
+        "drafts/no\x01te.md",
+    ),
+)
+def test_markdown_safety_rejects_encoded_or_raw_controls_in_base_paths(
+    base_path: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety("safe", bundle_relative_path=base_path)
+
+
+@pytest.mark.parametrize(
+    "device_name",
+    (
+        "CON",
+        "prn.txt",
+        "AuX",
+        "nul.md",
+        *(f"COM{index}.txt" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    ),
+)
+def test_markdown_safety_rejects_windows_device_names_in_any_base_segment(
+    device_name: str,
+) -> None:
+    with pytest.raises(DomainError, match="draft_markdown_unsafe"):
+        validate_markdown_safety(
+            "safe",
+            bundle_relative_path=f"drafts/{device_name}/note.md",
+        )
+
+
+@pytest.mark.parametrize(
+    "base_path",
+    (
+        "drafts/console/note.md",
+        "drafts/prn-notes.md",
+        "drafts/com10.txt",
+        "drafts/lpt0.txt",
+    ),
+)
+def test_markdown_safety_allows_portable_non_device_base_names(base_path: str) -> None:
+    validate_markdown_safety("safe", bundle_relative_path=base_path)
 
 
 def test_markdown_safety_accepts_bundle_relative_obsidian_anchor_and_https_links() -> None:
@@ -643,6 +863,36 @@ def test_quality_does_not_require_an_h2_when_all_citations_are_valid() -> None:
     )
 
     outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.PASS
+    assert outcome.publish_eligible is True
+
+
+@pytest.mark.parametrize(
+    ("slashes", "expected_overall"),
+    (
+        ("\\", QualityOverall.PASS),
+        ("\\\\", QualityOverall.FAIL),
+    ),
+)
+def test_quality_citation_and_definition_escapes_use_backslash_parity(
+    slashes: str,
+    expected_overall: QualityOverall,
+) -> None:
+    unknown = "ev_018f0000-0000-7000-8000-000000000099"
+    markdown = (
+        _good_markdown()
+        + f"\n{slashes}[^{unknown}]\n"
+        + f"{slashes}[^{unknown}]: escaped or active definition\n"
+    )
+
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is expected_overall
+
+
+def test_quality_ignores_an_escaped_unknown_segment_citation() -> None:
+    outcome = _evaluate(_draft(_good_markdown() + r"\[^seg_unknown]" + "\n"))
 
     assert outcome.overall is QualityOverall.PASS
     assert outcome.publish_eligible is True
@@ -820,6 +1070,21 @@ def test_quality_rejects_noncanonical_evidence_ndjson() -> None:
         json.dumps(record, ensure_ascii=False).encode() + b"\n" for record in records
     )
     corrupted = replace(evidence_set, payload=noncanonical)
+
+    outcome = _evaluate(_draft(_good_markdown()), evidence_set=corrupted)
+
+    assert outcome.overall is QualityOverall.FAIL
+    assert "evidence_integrity" in {
+        check.check_id
+        for check in outcome.report.checks
+        if check.status == "fail"
+    }
+
+
+def test_quality_treats_deeply_nested_evidence_json_as_an_integrity_failure() -> None:
+    evidence_set = _evidence_set()
+    deeply_nested = b"[" * 2_000 + b"0" + b"]" * 2_000 + b"\n"
+    corrupted = replace(evidence_set, payload=deeply_nested)
 
     outcome = _evaluate(_draft(_good_markdown()), evidence_set=corrupted)
 

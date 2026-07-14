@@ -80,7 +80,7 @@ def build_evidence_set(
         citation_map = dict(evidence_ids_by_segment)
     except MemoryError:
         raise
-    except (TypeError, ValueError):
+    except (OSError, RuntimeError, TypeError, ValueError):
         raise _evidence_error(
             "evidence_input_invalid",
             "Evidence input is invalid",
@@ -173,7 +173,7 @@ def rewrite_segment_citations(
         citation_map = dict(evidence_ids_by_segment)
     except MemoryError:
         raise
-    except (TypeError, ValueError):
+    except (OSError, RuntimeError, TypeError, ValueError):
         raise _evidence_error(
             "draft_segment_citation_invalid",
             "Evidence citation mapping is invalid",

@@ -69,7 +69,7 @@ def build_transcript(
         raise
     except MemoryError:
         raise
-    except (AttributeError, TypeError):
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         raise DomainError(
             "transcript_invalid",
             ErrorCategory.INVALID_REQUEST,
