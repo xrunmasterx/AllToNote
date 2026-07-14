@@ -13,7 +13,9 @@ from app.core.jobs.model import (
     AttemptState,
     Challenge,
     ChallengeState,
+    CheckpointMetadata,
     Job,
+    JobEvent,
 )
 from app.core.jobs.state_machine import (
     TERMINAL_JOB_STATES,
@@ -519,6 +521,97 @@ class SqliteJobRepository:
                 retry_of_job_id=original.job_id,
             )
 
+    def record_checkpoint(
+        self, metadata: CheckpointMetadata
+    ) -> CheckpointMetadata:
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO checkpoints (
+                    checkpoint_id, job_id, step_id, attempt_id, relative_path,
+                    schema_id, input_hash, output_hash, byte_length,
+                    metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metadata.checkpoint_id,
+                    metadata.job_id,
+                    metadata.step_id,
+                    metadata.attempt_id,
+                    metadata.relative_path,
+                    metadata.schema_id,
+                    metadata.input_hash,
+                    metadata.output_hash,
+                    metadata.byte_length,
+                    metadata.metadata_json,
+                    metadata.created_at,
+                ),
+            )
+            return self._checkpoint_from_row(
+                connection.execute(
+                    "SELECT * FROM checkpoints WHERE checkpoint_id = ?",
+                    (metadata.checkpoint_id,),
+                ).fetchone()
+            )
+
+    def latest_checkpoint(
+        self, job_id: str, step_id: str
+    ) -> CheckpointMetadata | None:
+        with self._transaction(immediate=False) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM checkpoints
+                WHERE job_id = ? AND step_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (job_id, step_id),
+            ).fetchone()
+            return self._checkpoint_from_row(row) if row is not None else None
+
+    def append_event(
+        self, job_id: str, event_type: str, payload_json: str
+    ) -> JobEvent:
+        with self._transaction(immediate=True) as connection:
+            self._get_job(connection, job_id)
+            sequence = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+            event_id = new_typed_id("evt")
+            created_at = utc_now_millis()
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, job_id, sequence, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, job_id, sequence, event_type, payload_json, created_at),
+            )
+            return JobEvent(
+                event_id=event_id,
+                job_id=job_id,
+                sequence=sequence,
+                event_type=event_type,
+                payload_json=payload_json,
+                created_at=created_at,
+            )
+
+    def list_events(
+        self, job_id: str, after_sequence: int = 0
+    ) -> tuple[JobEvent, ...]:
+        with self._transaction(immediate=False) as connection:
+            self._get_job(connection, job_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM events
+                WHERE job_id = ? AND sequence > ?
+                ORDER BY sequence
+                """,
+                (job_id, after_sequence),
+            ).fetchall()
+            return tuple(self._event_from_row(row) for row in rows)
+
     def transition_job(self, job_id: str, state: JobState) -> Job:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
@@ -748,4 +841,31 @@ class SqliteJobRepository:
             response_attempt_id=row["response_attempt_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _checkpoint_from_row(row: sqlite3.Row) -> CheckpointMetadata:
+        return CheckpointMetadata(
+            checkpoint_id=row["checkpoint_id"],
+            job_id=row["job_id"],
+            step_id=row["step_id"],
+            attempt_id=row["attempt_id"],
+            relative_path=row["relative_path"],
+            schema_id=row["schema_id"],
+            input_hash=row["input_hash"],
+            output_hash=row["output_hash"],
+            byte_length=row["byte_length"],
+            metadata_json=row["metadata_json"],
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _event_from_row(row: sqlite3.Row) -> JobEvent:
+        return JobEvent(
+            event_id=row["event_id"],
+            job_id=row["job_id"],
+            sequence=row["sequence"],
+            event_type=row["event_type"],
+            payload_json=row["payload_json"],
+            created_at=row["created_at"],
         )

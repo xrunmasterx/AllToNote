@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -454,7 +455,6 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
         ScreenshotPort,
         PortableWorkspacePort,
         CredentialBrokerPort,
-        AttemptStoragePort,
     )
 
     assert all(getattr(port, "_is_protocol", False) for port in marker_ports)
@@ -475,3 +475,27 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     event_argument, event_return = get_args(EventSink)
     assert event_argument[0].__forward_arg__ == "JobEvent"
     assert event_return is type(None)
+
+
+def test_task6_checkpoint_and_event_ports_have_exact_frozen_methods() -> None:
+    jobs_ports = importlib.import_module("app.core.ports.jobs")
+    metadata_port = jobs_ports.AttemptMetadataRepositoryPort
+
+    assert getattr(metadata_port, "_is_protocol", False)
+    assert {
+        name for name in metadata_port.__dict__ if not name.startswith("_")
+    } == {
+        "append_event",
+        "latest_checkpoint",
+        "list_events",
+        "record_checkpoint",
+    }
+    assert getattr(AttemptStoragePort, "_is_protocol", False)
+    assert {
+        name for name in AttemptStoragePort.__dict__ if not name.startswith("_")
+    } == {
+        "append_event",
+        "reconcile_event_projection",
+        "save_checkpoint",
+        "validate_checkpoint",
+    }

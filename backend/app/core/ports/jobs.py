@@ -1,7 +1,14 @@
 from typing import Protocol
 
 from app.core.domain.video import JobState
-from app.core.jobs.model import Attempt, Challenge, Job
+from app.core.jobs.model import (
+    Attempt,
+    Challenge,
+    CheckpointMetadata,
+    CheckpointRecord,
+    Job,
+    JobEvent,
+)
 
 
 class JobRepositoryPort(Protocol):
@@ -41,5 +48,41 @@ class JobRepositoryPort(Protocol):
     ) -> Job: ...
 
 
+class AttemptMetadataRepositoryPort(Protocol):
+    """Durable metadata boundary for checkpoints and Job events."""
+
+    def record_checkpoint(
+        self, metadata: CheckpointMetadata
+    ) -> CheckpointMetadata: ...
+
+    def latest_checkpoint(
+        self, job_id: str, step_id: str
+    ) -> CheckpointMetadata | None: ...
+
+    def append_event(
+        self, job_id: str, event_type: str, payload_json: str
+    ) -> JobEvent: ...
+
+    def list_events(
+        self, job_id: str, after_sequence: int = 0
+    ) -> tuple[JobEvent, ...]: ...
+
+
 class AttemptStoragePort(Protocol):
     """Boundary for private attempt staging and checkpoints."""
+
+    def save_checkpoint(self, record: CheckpointRecord) -> CheckpointMetadata: ...
+
+    def validate_checkpoint(
+        self,
+        metadata: CheckpointMetadata,
+        *,
+        expected_schema_id: str,
+        expected_input_hash: str,
+    ) -> bool: ...
+
+    def append_event(
+        self, job_id: str, event_type: str, payload_json: str
+    ) -> JobEvent: ...
+
+    def reconcile_event_projection(self, job_id: str) -> tuple[JobEvent, ...]: ...
