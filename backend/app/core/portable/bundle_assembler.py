@@ -1,29 +1,35 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import stat
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
+from urllib.parse import parse_qsl, urlsplit
 
 from app.core.domain.ids import sha256_digest
-from app.core.domain.video import TranscriptDocument
+from app.core.domain.video import QualityOverall, TranscriptDocument
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import EvidenceSet, build_evidence_set
 from app.core.portable.jsonio import encode_json
 from app.core.portable.quality import QualityOutcome
+from app.core.ports.portable import (
+    CandidateBundleLocation,
+    CandidateLocationCapabilityPort,
+)
 
 
-_TARGET_AREA = "raw_personal"
 _CONTROL_FILES = frozenset({"bundle.json", "receipt.json", "commit.json"})
-_WINDOWS_RESERVED_NAME = re.compile(
-    r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?\Z",
-    re.IGNORECASE,
+_WINDOWS_DEVICE_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{number}" for number in range(1, 10)}
+    | {f"lpt{number}" for number in range(1, 10)}
+    | {f"com{number}" for number in "¹²³"}
+    | {f"lpt{number}" for number in "¹²³"}
 )
 _TYPED_ID = re.compile(
     r"(?P<prefix>[a-z]+)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
@@ -31,6 +37,9 @@ _TYPED_ID = re.compile(
 )
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
+_EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
+_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
+_EXECUTOR_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,127}\Z")
 _FORBIDDEN_FIELD_NAMES = frozenset(
     {
         "api_key",
@@ -55,6 +64,44 @@ _FORBIDDEN_FIELD_NAMES = frozenset(
         "fencing_token",
     }
 )
+_FORBIDDEN_CANONICAL_FIELD_NAMES = frozenset(
+    re.sub(r"[^a-z0-9]", "", name.casefold()) for name in _FORBIDDEN_FIELD_NAMES
+)
+_SENSITIVE_URL_QUERY_KEYS = frozenset(
+    {
+        "accesskey",
+        "accesskeyid",
+        "accesstoken",
+        "apikey",
+        "auth",
+        "authtoken",
+        "authorization",
+        "awsaccesskeyid",
+        "credential",
+        "expires",
+        "expiration",
+        "keypairid",
+        "oauth",
+        "oauthtoken",
+        "password",
+        "policy",
+        "secret",
+        "securitytoken",
+        "sig",
+        "signature",
+        "token",
+        "xamzcredential",
+        "xamzsecuritytoken",
+        "xamzsignature",
+    }
+)
+_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
+_REDACTION_FIELDS = frozenset({"secrets", "prompts", "provider_payloads"})
+_REDACTION_VALUES = {
+    "secrets": frozenset({"omitted"}),
+    "prompts": frozenset({"hash_only", "omitted"}),
+    "provider_payloads": frozenset({"omitted"}),
+}
 
 def _error(code: str, message: str) -> DomainError:
     return DomainError(code, ErrorCategory.INVALID_REQUEST, message)
@@ -96,7 +143,11 @@ def _snapshot_mapping(value: Mapping[str, object], field_name: str) -> Mapping[s
         raise _error("video_bundle_input_invalid", f"{field_name} must be an object")
     try:
         document = json.loads(encode_json(dict(value)))
+    except MemoryError:
+        raise
     except DomainError:
+        raise _error("video_bundle_input_invalid", f"{field_name} must be JSON-safe") from None
+    except Exception:
         raise _error("video_bundle_input_invalid", f"{field_name} must be JSON-safe") from None
     assert isinstance(document, dict)
     return MappingProxyType(document)
@@ -115,20 +166,26 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
     if value is None or type(value) in {bool, int, float}:
         return
     if type(value) is str:
-        if _is_absolute_or_local_path(value) or _EMBEDDED_WINDOWS_PATH.search(value):
+        if (
+            _is_absolute_or_local_path(value)
+            or _EMBEDDED_WINDOWS_PATH.search(value)
+            or _EMBEDDED_UNC_PATH.search(value)
+            or _EMBEDDED_POSIX_PATH.search(value)
+        ):
             raise _error(
                 "video_bundle_sensitive_data",
-                f"{field_name} must not contain an absolute local path",
+                "Portable bundle content contains an absolute local path",
             )
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
             if type(key) is not str:
                 raise _error("video_bundle_input_invalid", f"{field_name} has a non-text key")
-            if key.lower() in _FORBIDDEN_FIELD_NAMES:
+            canonical_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+            if canonical_key in _FORBIDDEN_CANONICAL_FIELD_NAMES:
                 raise _error(
                     "video_bundle_sensitive_data",
-                    f"{field_name} contains forbidden provenance data",
+                    "Portable bundle content contains forbidden provenance data",
                 )
             _validate_safe_value(item, f"{field_name}.{key}")
         return
@@ -144,7 +201,7 @@ def _portable_path(value: str, *, allow_control: bool = False) -> str:
         type(value) is not str
         or not value
         or "\\" in value
-        or any(ord(character) < 32 for character in value)
+        or "\0" in value
     ):
         raise _error("video_bundle_path_invalid", "Bundle path is invalid")
     path = PurePosixPath(value)
@@ -155,39 +212,80 @@ def _portable_path(value: str, *, allow_control: bool = False) -> str:
     ):
         raise _error("video_bundle_path_invalid", "Bundle path is invalid")
     for part in path.parts:
-        if ":" in part or part.endswith((" ", ".")) or _WINDOWS_RESERVED_NAME.fullmatch(part):
+        try:
+            part.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            raise _error("video_bundle_path_invalid", "Bundle path is not portable") from None
+        if (
+            ":" in part
+            or part.endswith((" ", "."))
+            or unicodedata.normalize("NFC", part) != part
+            or part.split(".", 1)[0].casefold() in _WINDOWS_DEVICE_STEMS
+        ):
             raise _error("video_bundle_path_invalid", "Bundle path is not portable")
     if not allow_control and value.lower() in _CONTROL_FILES:
         raise _error("video_bundle_path_invalid", "Artifact path collides with a control file")
     return value
 
 
-def _has_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+def _portable_path_key(value: str) -> tuple[str, ...]:
+    return tuple(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in PurePosixPath(value).parts
+    )
 
 
-def _require_safe_existing_chain(root: Path, leaf: Path) -> None:
-    relative = leaf.relative_to(root)
-    current = root
-    for part in (".", *relative.parts):
-        current = current if part == "." else current / part
-        if not current.exists() or not current.is_dir() or _has_reparse_point(current):
-            raise _error(
-                "video_bundle_location_invalid",
-                "Candidate parent chain must contain existing ordinary directories",
-            )
+def _require_safe_url(value: str, field_name: str) -> None:
+    try:
+        parsed = urlsplit(value)
+        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+    except (UnicodeError, ValueError):
+        raise _error("video_bundle_sensitive_data", f"{field_name} is not a safe URL") from None
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(_is_sensitive_url_query_key(key) for key, _ in query)
+    ):
+        raise _error("video_bundle_sensitive_data", f"{field_name} is not a safe URL")
 
 
-@dataclass(frozen=True)
-class CandidateLocation:
-    workspace_root: Path
-    target_root: Path
-    candidate_path: Path
-    staging_relative_path: str
-    target_area: str
+def _require_executor_identity(value: str, field_name: str) -> None:
+    if _EXECUTOR_IDENTITY.fullmatch(value) is None:
+        raise _error(
+            "video_bundle_sensitive_data",
+            f"{field_name} is not an approved executor identity",
+        )
+
+
+def _is_sensitive_url_query_key(key: str) -> bool:
+    canonical = re.sub(r"[^a-z0-9]", "", key.casefold())
+    return (
+        canonical in _SENSITIVE_URL_QUERY_KEYS
+        or canonical.startswith("xamz")
+        or canonical.startswith("xgoog")
+    )
+
+
+def _is_webp(payload: bytes) -> bool:
+    if (
+        len(payload) < 20
+        or payload[:4] != b"RIFF"
+        or payload[8:12] != b"WEBP"
+        or int.from_bytes(payload[4:8], "little") != len(payload) - 8
+        or payload[12:16] not in {b"VP8 ", b"VP8L", b"VP8X"}
+    ):
+        return False
+    offset = 12
+    while offset < len(payload):
+        if offset + 8 > len(payload):
+            return False
+        chunk_length = int.from_bytes(payload[offset + 4 : offset + 8], "little")
+        offset += 8 + chunk_length + (chunk_length % 2)
+        if offset > len(payload):
+            return False
+    return offset == len(payload)
 
 
 @dataclass(frozen=True)
@@ -266,6 +364,8 @@ class VideoSourceMetadata:
             raise _error("video_bundle_input_invalid", "license is invalid")
         if self.privacy not in {"public", "personal", "sensitive", "confidential", "unknown"}:
             raise _error("video_bundle_input_invalid", "privacy is invalid")
+        _require_safe_url(self.canonical_uri, "canonical_uri")
+        _require_safe_url(self.source_link, "source_link")
         object.__setattr__(self, "extensions", _snapshot_mapping(self.extensions, "extensions"))
 
 
@@ -348,6 +448,23 @@ class ReceiptProvenance:
             raise _error("video_bundle_input_invalid", "Receipt step summary is invalid")
         if any(type(warning) is not str or not warning for warning in self.warnings):
             raise _error("video_bundle_input_invalid", "Receipt warnings are invalid")
+        _require_executor_identity(self.model_identity, "model_identity")
+        _require_executor_identity(self.transcriber_identity, "transcriber_identity")
+        if frozenset(self.usage) - _USAGE_FIELDS or any(
+            type(value) is not int or value < 0 for value in self.usage.values()
+        ):
+            raise _error(
+                "video_bundle_sensitive_data",
+                "Receipt usage contains unapproved fields or values",
+            )
+        if frozenset(self.redactions) != _REDACTION_FIELDS or any(
+            self.redactions[field_name] not in allowed
+            for field_name, allowed in _REDACTION_VALUES.items()
+        ):
+            raise _error(
+                "video_bundle_sensitive_data",
+                "Receipt redactions contain unapproved fields or values",
+            )
 
 
 @dataclass(frozen=True)
@@ -363,10 +480,17 @@ class DisplayAssetInput:
         path = _portable_path(self.relative_path)
         if not path.startswith("assets/"):
             raise _error("video_bundle_path_invalid", "Display assets must be stored under assets/")
-        _require_text(self.media_type, "display_asset.media_type")
-        _require_text(self.artifact_type, "display_asset.artifact_type")
+        if not path.endswith(".webp"):
+            raise _error("video_bundle_path_invalid", "Display assets must use a .webp path")
+        if self.media_type != "image/webp" or self.artifact_type != "evidence.asset.v1":
+            raise _error(
+                "video_bundle_input_invalid",
+                "Display asset type and media type are invalid",
+            )
         if not isinstance(self.payload, bytes) or not self.payload:
             raise _error("video_bundle_input_invalid", "Display asset payload must not be empty")
+        if not _is_webp(self.payload):
+            raise _error("video_bundle_input_invalid", "Display asset payload is not valid WebP")
         object.__setattr__(self, "payload", bytes(self.payload))
 
 
@@ -374,7 +498,7 @@ class DisplayAssetInput:
 class VideoBundleInput:
     bundle_id: str
     created_at: str
-    location: CandidateLocation
+    location: CandidateLocationCapabilityPort
     source: VideoSourceMetadata
     artifact_ids: VideoArtifactIds
     transcript: TranscriptDocument
@@ -386,7 +510,7 @@ class VideoBundleInput:
     def __post_init__(self) -> None:
         _require_id(self.bundle_id, "bnd", "bundle_id")
         _require_text(self.created_at, "created_at")
-        if not isinstance(self.location, CandidateLocation):
+        if not callable(getattr(self.location, "begin", None)):
             raise _error("video_bundle_input_invalid", "location is invalid")
         if not isinstance(self.source, VideoSourceMetadata):
             raise _error("video_bundle_input_invalid", "source is invalid")
@@ -407,7 +531,7 @@ class VideoBundleInput:
 
 @dataclass(frozen=True)
 class CandidateBundle:
-    location: CandidateLocation
+    location: CandidateBundleLocation
     bundle_id: str
     manifest_sha256: str
     artifact_ids: tuple[str, ...]
@@ -447,7 +571,6 @@ class BundleAssembler:
     def assemble(self, bundle_input: VideoBundleInput) -> CandidateBundle:
         if not isinstance(bundle_input, VideoBundleInput):
             raise _error("video_bundle_input_invalid", "Bundle input is invalid")
-        self._validate_location(bundle_input.location)
         self._validate_timestamps(bundle_input)
         payloads = self._build_payloads(bundle_input)
         self._validate_input_bindings(bundle_input, payloads)
@@ -488,14 +611,16 @@ class BundleAssembler:
         _validate_safe_value(manifest_document, "manifest")
         manifest_bytes = encode_json(manifest_document)
 
-        candidate_path = bundle_input.location.candidate_path
-        candidate_path.mkdir()
-        for payload in payloads:
-            self._write_exclusive(candidate_path, payload.path, payload.data)
-        self._write_exclusive(candidate_path, "receipt.json", receipt_bytes)
-        self._write_exclusive(candidate_path, "bundle.json", manifest_bytes)
+        writer = bundle_input.location.begin(bundle_input.receipt.job_id)
+        try:
+            for payload in payloads:
+                writer.write_payload(payload.path, payload.data)
+            writer.write_payload("receipt.json", receipt_bytes)
+            location = writer.complete(manifest_bytes)
+        finally:
+            writer.close()
         return CandidateBundle(
-            location=bundle_input.location,
+            location=location,
             bundle_id=bundle_input.bundle_id,
             manifest_sha256=sha256_digest(manifest_bytes),
             artifact_ids=tuple(payload.artifact_id for payload in payloads),
@@ -523,46 +648,6 @@ class BundleAssembler:
                     "video_bundle_input_invalid",
                     "Receipt step timestamps are not ordered",
                 )
-
-    @staticmethod
-    def _validate_location(location: CandidateLocation) -> None:
-        if location.target_area != _TARGET_AREA:
-            raise _error("video_bundle_location_invalid", "Candidate target area is invalid")
-        if any(
-            not isinstance(value, Path)
-            for value in (location.workspace_root, location.target_root, location.candidate_path)
-        ):
-            raise _error("video_bundle_location_invalid", "Candidate paths must be Path values")
-        if not all(
-            value.is_absolute()
-            for value in (location.workspace_root, location.target_root, location.candidate_path)
-        ):
-            raise _error("video_bundle_location_invalid", "Candidate paths must be absolute")
-        staging_relative = _portable_path(location.staging_relative_path)
-        workspace = location.workspace_root.resolve(strict=True)
-        target = location.target_root.resolve(strict=True)
-        candidate = location.candidate_path.resolve(strict=False)
-        try:
-            target.relative_to(workspace)
-            relative_to_target = candidate.relative_to(target)
-        except ValueError:
-            raise _error(
-                "video_bundle_location_invalid",
-                "Candidate path escapes its target",
-            ) from None
-        if (
-            not relative_to_target.parts
-            or relative_to_target.parts[0] != ".staging"
-            or candidate.name != "bundle.partial"
-        ):
-            raise _error("video_bundle_location_invalid", "Candidate staging path is invalid")
-        expected = workspace.joinpath(*PurePosixPath(staging_relative).parts).resolve(strict=False)
-        if expected != candidate:
-            raise _error("video_bundle_location_invalid", "Candidate relative path does not match")
-        if location.candidate_path.exists() or location.candidate_path.is_symlink():
-            raise _error("video_bundle_candidate_exists", "Candidate path already exists")
-        _require_safe_existing_chain(workspace, target)
-        _require_safe_existing_chain(target, location.candidate_path.parent)
 
     @staticmethod
     def _build_payloads(bundle_input: VideoBundleInput) -> tuple[_ArtifactPayload, ...]:
@@ -659,12 +744,12 @@ class BundleAssembler:
             )
             for asset in bundle_input.display_assets
         )
-        paths = [payload.path.lower() for payload in payloads]
+        for payload in payloads:
+            _portable_path(payload.path)
+        paths = [_portable_path_key(payload.path) for payload in payloads]
         ids = [payload.artifact_id for payload in payloads]
         if len(paths) != len(set(paths)) or len(ids) != len(set(ids)):
             raise _error("video_bundle_reference_invalid", "Artifact paths and IDs must be unique")
-        for payload in payloads:
-            _portable_path(payload.path)
         return tuple(sorted(payloads, key=lambda payload: payload.path))
 
     @staticmethod
@@ -699,22 +784,53 @@ class BundleAssembler:
         )
         if rebuilt_evidence.payload != evidence.payload:
             raise _error("video_bundle_reference_mismatch", "Evidence payload is inconsistent")
-        try:
-            report = json.loads(bundle_input.quality.report.payload)
-        except (UnicodeError, ValueError):
-            raise _error("video_bundle_reference_mismatch", "Quality report is invalid") from None
+        quality = bundle_input.quality
+        if quality.execution_error is not None:
+            raise _error(
+                "video_bundle_quality_execution_failed",
+                "Quality evaluation did not complete successfully",
+            )
         expected_subject = {
             "bundle_id": bundle_input.bundle_id,
             "artifact_id": ids.primary_draft,
-            "sha256": sha256_digest(bundle_input.quality.final_draft),
+            "sha256": sha256_digest(quality.final_draft),
         }
+        check_documents: list[dict[str, object]] = []
+        for check in quality.report.checks:
+            document: dict[str, object] = {
+                "id": check.check_id,
+                "status": check.status,
+            }
+            if check.reason is not None:
+                document["reason"] = check.reason
+            check_documents.append(document)
+        expected_report = encode_json(
+            {
+                "quality_report_schema_version": 1,
+                "subject": expected_subject,
+                "profile": {"id": "alltonote.video-course-note", "version": 1},
+                "overall": quality.overall.value,
+                "checks": check_documents,
+                "method": {"kind": "deterministic"},
+                "metrics": {"quality_repair_attempts": quality.repair_attempts},
+                "messages": sorted(
+                    check.check_id
+                    for check in quality.report.checks
+                    if check.status == "fail"
+                ),
+                "evidence_ids": list(quality.report.evidence_ids),
+            }
+        )
+        expected_publish_eligible = quality.overall is not QualityOverall.FAIL
         if (
-            not isinstance(report, dict)
-            or report.get("subject") != expected_subject
-            or bundle_input.quality.report.subject_sha256 != expected_subject["sha256"]
-            or report.get("overall") != bundle_input.quality.overall.value
+            quality.report.payload != expected_report
+            or quality.report.subject_sha256 != expected_subject["sha256"]
+            or quality.report.overall is not quality.overall
+            or quality.publish_eligible is not expected_publish_eligible
+            or type(quality.repair_attempts) is not int
+            or not 0 <= quality.repair_attempts <= 1
         ):
-            raise _error("video_bundle_reference_mismatch", "Quality report binding is invalid")
+            raise _error("video_bundle_quality_invalid", "Quality outcome is inconsistent")
 
     @staticmethod
     def _build_source_documents(
@@ -960,17 +1076,3 @@ class BundleAssembler:
                 "alltonote.video:bundle": {"video_bundle_schema_version": 1},
             },
         }
-
-    @staticmethod
-    def _write_exclusive(root: Path, relative_path: str, data: bytes) -> None:
-        parts = PurePosixPath(
-            _portable_path(relative_path, allow_control=True)
-        ).parts
-        path = root.joinpath(*parts)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)

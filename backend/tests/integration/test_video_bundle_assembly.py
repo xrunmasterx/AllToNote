@@ -2,22 +2,30 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import shutil
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
+from ctypes import wintypes
 
 import pytest
 from iwiki.workspace import open_workspace
 
+from app.adapters.iwiki import portable_gateway as gateway_module
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.core.domain.ids import sha256_digest
-from app.core.domain.video import GeneratedVideoDraft, TranscriptDocument, TranscriptSegment
-from app.core.errors import DomainError
+from app.core.domain.video import (
+    GeneratedVideoDraft,
+    QualityOverall,
+    TranscriptDocument,
+    TranscriptSegment,
+)
+from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable import bundle_assembler as assembler_module
 from app.core.portable.bundle_assembler import (
     BundleAssembler,
-    CandidateLocation,
     DisplayAssetInput,
     ReceiptProvenance,
     StepAttemptSummary,
@@ -46,6 +54,23 @@ ATTEMPT_ID = "att_018f0000-0000-7000-8000-00000000010c"
 STARTED_AT = "2026-07-14T01:02:03.000Z"
 COMPLETED_AT = "2026-07-14T01:02:04.000Z"
 CREATED_AT = "2026-07-14T01:02:05.000Z"
+VALID_WEBP = bytes.fromhex(
+    "524946461a000000574542505650384c0d0000002f00000010071011118888fe0700"
+)
+
+
+class _ExplodingMapping(Mapping[str, object]):
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def __getitem__(self, key: str) -> object:
+        raise self._error
+
+    def __iter__(self) -> Iterator[str]:
+        raise self._error
+
+    def __len__(self) -> int:
+        return 1
 
 
 @pytest.fixture
@@ -58,17 +83,6 @@ def workspace_root(tmp_path: Path) -> Path:
 
 
 def _bundle_input(workspace_root: Path) -> VideoBundleInput:
-    workspace = open_workspace(workspace_root, writable=True)
-    target_root = workspace.resolve_contract_path("raw_personal")
-    candidate_path = (
-        target_root
-        / ".staging"
-        / "task10"
-        / "job.nonce"
-        / "bundle.partial"
-    )
-    candidate_path.parent.mkdir(parents=True)
-
     transcript = TranscriptDocument(
         language="zh-CN",
         segments=(
@@ -121,12 +135,10 @@ def _bundle_input(workspace_root: Path) -> VideoBundleInput:
     return VideoBundleInput(
         bundle_id=BUNDLE_ID,
         created_at=CREATED_AT,
-        location=CandidateLocation(
-            workspace_root=workspace_root,
-            target_root=target_root,
-            candidate_path=candidate_path,
-            staging_relative_path=workspace.relative(candidate_path),
-            target_area="raw_personal",
+        location=IWikiPortableGateway().candidate_location(
+            workspace_root,
+            local_instance_id="task10",
+            nonce="nonce",
         ),
         source=VideoSourceMetadata(
             source_id=SOURCE_ID,
@@ -202,6 +214,17 @@ def _bundle_input(workspace_root: Path) -> VideoBundleInput:
                 ),
             ),
         ),
+    )
+
+
+def _candidate_path(workspace_root: Path) -> Path:
+    workspace = open_workspace(workspace_root, writable=True)
+    return (
+        workspace.resolve_contract_path("raw_personal")
+        / ".staging"
+        / "task10"
+        / f"{JOB_ID}.nonce"
+        / "bundle.partial"
     )
 
 
@@ -488,27 +511,33 @@ def test_prepare_and_commit_adds_iwiki_commit_seal_only_after_assembly(
     assert not candidate.absolute_path.exists()
 
 
-@pytest.mark.parametrize("target_area", ["raw_common", "wiki_personal", "wiki_common"])
-def test_assembler_rejects_every_non_personal_raw_target(
+def test_gateway_minted_location_uses_raw_personal_contract_without_path_authority(
     workspace_root: Path,
-    target_area: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
-    invalid = replace(
-        bundle_input,
-        location=replace(bundle_input.location, target_area=target_area),
+
+    assert not hasattr(bundle_input.location, "target_root")
+    assert not hasattr(bundle_input.location, "candidate_path")
+    assert not hasattr(bundle_input.location, "target_area")
+
+    candidate = BundleAssembler().assemble(bundle_input)
+
+    workspace = open_workspace(workspace_root, writable=True)
+    assert candidate.absolute_path == _candidate_path(workspace_root)
+    assert candidate.absolute_path.is_relative_to(
+        workspace.resolve_contract_path("raw_personal")
     )
-
-    with pytest.raises(DomainError) as raised:
-        BundleAssembler().assemble(invalid)
-
-    assert raised.value.code == "video_bundle_location_invalid"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not candidate.absolute_path.is_relative_to(
+        workspace.resolve_contract_path("wiki_personal")
+    )
+    assert candidate.staging_relative_path == (
+        f"raw/personal/.staging/task10/{JOB_ID}.nonce/bundle.partial"
+    )
 
 
 def test_assembler_rejects_existing_candidate_even_when_empty(workspace_root: Path) -> None:
     bundle_input = _bundle_input(workspace_root)
-    bundle_input.location.candidate_path.mkdir()
+    _candidate_path(workspace_root).mkdir(parents=True)
 
     with pytest.raises(DomainError) as raised:
         BundleAssembler().assemble(bundle_input)
@@ -516,23 +545,71 @@ def test_assembler_rejects_existing_candidate_even_when_empty(workspace_root: Pa
     assert raised.value.code == "video_bundle_candidate_exists"
 
 
-def test_assembler_rejects_candidate_escape_without_external_write(
+@pytest.mark.parametrize(
+    "invalid_component",
+    ("../outside", "two/parts", ".", "", "CON", "COM\u00b9", "abc.", "e\u0301"),
+)
+def test_gateway_rejects_invalid_staging_identity_without_external_write(
     workspace_root: Path,
     tmp_path: Path,
+    invalid_component: str,
 ) -> None:
-    bundle_input = _bundle_input(workspace_root)
-    escaped = tmp_path / "outside" / "bundle.partial"
-    escaped.parent.mkdir()
-    invalid = replace(
-        bundle_input,
-        location=replace(bundle_input.location, candidate_path=escaped),
-    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
 
     with pytest.raises(DomainError) as raised:
-        BundleAssembler().assemble(invalid)
+        IWikiPortableGateway().candidate_location(
+            workspace_root,
+            local_instance_id=invalid_component,
+            nonce="nonce",
+        )
 
     assert raised.value.code == "video_bundle_location_invalid"
-    assert list(escaped.parent.iterdir()) == []
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "invalid_path",
+    (
+        "sources/CON",
+        "sources/COM\u00b9.webp",
+        "sources/abc.",
+        "sources/e\u0301.webp",
+        "sources/name:stream",
+    ),
+)
+def test_writer_direct_call_enforces_portable_path_policy(
+    workspace_root: Path,
+    invalid_path: str,
+) -> None:
+    writer = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce="direct-invalid-path",
+    ).begin(JOB_ID)
+
+    try:
+        with pytest.raises(DomainError) as raised:
+            writer.write_payload(invalid_path, b"probe")
+    finally:
+        writer.close()
+
+    assert raised.value.code == "video_bundle_location_invalid"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 API contract")
+def test_windows_directory_apis_use_pointer_sized_handle_signatures() -> None:
+    kernel32 = gateway_module._FileCandidateBundleWriter._kernel32()
+
+    assert kernel32.CreateFileW.restype is wintypes.HANDLE
+    assert kernel32.GetFileInformationByHandle.argtypes[0] is wintypes.HANDLE
+    assert kernel32.GetFinalPathNameByHandleW.argtypes[0] is wintypes.HANDLE
+    assert kernel32.FlushFileBuffers.argtypes == (wintypes.HANDLE,)
+    assert kernel32.CloseHandle.argtypes == (wintypes.HANDLE,)
+    assert kernel32.GetFileInformationByHandle.restype is wintypes.BOOL
+    assert kernel32.GetFinalPathNameByHandleW.restype is wintypes.DWORD
+    assert kernel32.FlushFileBuffers.restype is wintypes.BOOL
+    assert kernel32.CloseHandle.restype is wintypes.BOOL
 
 
 def test_assembler_rejects_symlinked_staging_parent(
@@ -542,27 +619,246 @@ def test_assembler_rejects_symlinked_staging_parent(
     bundle_input = _bundle_input(workspace_root)
     target = tmp_path / "outside"
     target.mkdir()
-    link = bundle_input.location.target_root / ".staging" / "linked"
+    target_root = open_workspace(workspace_root, writable=True).resolve_contract_path(
+        "raw_personal"
+    )
+    link = target_root / ".staging" / "task10"
+    link.parent.mkdir(parents=True, exist_ok=True)
     try:
         link.symlink_to(target, target_is_directory=True)
     except OSError as error:
         pytest.skip(f"directory symlink creation unavailable: {error}")
-    candidate_path = link / "bundle.partial"
-    staging = candidate_path.relative_to(workspace_root).as_posix()
-    invalid = replace(
-        bundle_input,
-        location=replace(
-            bundle_input.location,
-            candidate_path=candidate_path,
-            staging_relative_path=staging,
-        ),
-    )
 
     with pytest.raises(DomainError) as raised:
-        BundleAssembler().assemble(invalid)
+        BundleAssembler().assemble(bundle_input)
 
     assert raised.value.code == "video_bundle_location_invalid"
     assert list(target.iterdir()) == []
+
+
+def test_candidate_writer_prevents_or_detects_parent_swap_without_external_write(
+    workspace_root: Path,
+    tmp_path: Path,
+) -> None:
+    gateway = IWikiPortableGateway()
+    capability = gateway.candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce="swap",
+    )
+    writer = capability.begin(JOB_ID)
+    target_root = open_workspace(workspace_root, writable=True).resolve_contract_path(
+        "raw_personal"
+    )
+    instance_root = target_root / ".staging" / "task10"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    held_root = outside / "held"
+
+    try:
+        instance_root.rename(held_root)
+    except OSError:
+        assert os.name == "nt"
+        writer.close()
+    else:
+        try:
+            with pytest.raises(DomainError) as write_error:
+                writer.write_payload("sources/probe.bin", b"probe")
+            with pytest.raises(DomainError) as completion_error:
+                writer.complete(b'{"completion":true}\n')
+        finally:
+            writer.close()
+        assert write_error.value.code == "video_bundle_location_invalid"
+        assert completion_error.value.code == "video_bundle_location_invalid"
+
+    assert list(outside.rglob("probe.bin")) == []
+    assert list(outside.rglob("bundle.json")) == []
+
+
+def test_candidate_capability_and_writer_are_single_use_and_close_is_idempotent(
+    workspace_root: Path,
+) -> None:
+    capability = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce="single-use",
+    )
+    writer = capability.begin(JOB_ID)
+    writer.close()
+    writer.close()
+
+    with pytest.raises(DomainError, match="video_bundle_writer_closed"):
+        writer.write_payload("sources/probe.bin", b"probe")
+    with pytest.raises(DomainError, match="video_bundle_location_consumed"):
+        capability.begin(JOB_ID)
+
+
+def test_write_failure_is_sanitized_and_never_leaves_completion_marker(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = str((workspace_root / "private" / "secret.bin").resolve())
+    calls = 0
+    real_fsync = os.fsync
+
+    def fail_second_sync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(f"failed to sync {secret}")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(gateway_module.os, "fsync", fail_second_sync)
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(_bundle_input(workspace_root))
+
+    assert raised.value.code == "video_bundle_write_failed"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+    assert not (_candidate_path(workspace_root) / "bundle.json").exists()
+
+
+def test_directory_sync_failure_removes_completion_marker(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nonce = "directory-sync-failure"
+    capability = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce=nonce,
+    )
+    writer = capability.begin(JOB_ID)
+    writer.write_payload("sources/probe.bin", b"probe")
+    secret = str((workspace_root / "private" / "secret.bin").resolve())
+
+    def fail_directory_sync() -> None:
+        raise OSError(f"failed to sync {secret}")
+
+    monkeypatch.setattr(writer, "_sync_directories", fail_directory_sync)
+
+    try:
+        with pytest.raises(DomainError) as raised:
+            writer.complete(b'{"completion":true}\n')
+    finally:
+        writer.close()
+
+    candidate_path = (
+        open_workspace(workspace_root, writable=True).resolve_contract_path("raw_personal")
+        / ".staging"
+        / "task10"
+        / f"{JOB_ID}.{nonce}"
+        / "bundle.partial"
+    )
+    assert raised.value.code == "video_bundle_write_failed"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+    assert not (candidate_path / "bundle.json").exists()
+
+
+def test_completion_marker_collision_never_deletes_foreign_marker(
+    workspace_root: Path,
+) -> None:
+    nonce = "foreign-completion-marker"
+    writer = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce=nonce,
+    ).begin(JOB_ID)
+    candidate_path = (
+        open_workspace(workspace_root, writable=True).resolve_contract_path("raw_personal")
+        / ".staging"
+        / "task10"
+        / f"{JOB_ID}.{nonce}"
+        / "bundle.partial"
+    )
+    foreign_marker = b'{"owner":"foreign"}\n'
+    marker_path = candidate_path / "bundle.json"
+    marker_path.write_bytes(foreign_marker)
+
+    try:
+        with pytest.raises(DomainError) as raised:
+            writer.complete(b'{"owner":"writer"}\n')
+    finally:
+        writer.close()
+
+    assert raised.value.code == "video_bundle_write_failed"
+    assert marker_path.read_bytes() == foreign_marker
+
+
+def test_completion_cleanup_failure_does_not_mask_primary_io_error(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce="cleanup-precedence-io",
+    ).begin(JOB_ID)
+
+    def fail_directory_sync() -> None:
+        raise OSError("primary sync failure")
+
+    def fail_cleanup() -> None:
+        raise MemoryError("secondary cleanup failure")
+
+    monkeypatch.setattr(writer, "_sync_directories", fail_directory_sync)
+    monkeypatch.setattr(writer, "_discard_completion_marker", fail_cleanup)
+
+    try:
+        with pytest.raises(DomainError) as raised:
+            writer.complete(b'{"completion":true}\n')
+    finally:
+        writer.close()
+
+    assert raised.value.code == "video_bundle_write_failed"
+
+
+def test_completion_cleanup_failure_does_not_mask_primary_fatal_error(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce="cleanup-precedence-fatal",
+    ).begin(JOB_ID)
+
+    def fail_directory_sync() -> None:
+        raise MemoryError("primary fatal failure")
+
+    def fail_cleanup() -> None:
+        raise KeyboardInterrupt("secondary cleanup failure")
+
+    monkeypatch.setattr(writer, "_sync_directories", fail_directory_sync)
+    monkeypatch.setattr(writer, "_discard_completion_marker", fail_cleanup)
+
+    try:
+        with pytest.raises(MemoryError, match="primary fatal failure"):
+            writer.complete(b'{"completion":true}\n')
+    finally:
+        writer.close()
+
+
+def test_successful_assembly_syncs_every_file_before_return(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    real_fsync = os.fsync
+
+    def record_sync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(gateway_module.os, "fsync", record_sync)
+
+    candidate = BundleAssembler().assemble(_bundle_input(workspace_root))
+
+    assert calls >= 7
+    assert (candidate.absolute_path / "bundle.json").is_file()
 
 
 def test_assembler_rejects_absolute_path_in_portable_metadata(
@@ -579,7 +875,7 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_sensitive_data"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not _candidate_path(workspace_root).exists()
 
 
 def test_assembler_rejects_forbidden_receipt_field_before_writing(
@@ -588,14 +884,183 @@ def test_assembler_rejects_forbidden_receipt_field_before_writing(
     bundle_input = _bundle_input(workspace_root)
     invalid = replace(
         bundle_input,
-        receipt=replace(bundle_input.receipt, redactions={"api_key": "redacted"}),
+        source=replace(
+            bundle_input.source,
+            extensions={"safe_container": {"api_key": "redacted"}},
+        ),
     )
 
     with pytest.raises(DomainError) as raised:
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_sensitive_data"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    (
+        "APIKey",
+        "api-key",
+        "FullPrompt",
+        "providerRaw",
+        "Provider-Raw-Response",
+        "PID",
+        "processID",
+        "LeaseID",
+        "fencingToken",
+    ),
+)
+def test_assembler_canonicalizes_forbidden_provenance_keys(
+    workspace_root: Path,
+    forbidden_key: str,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    secret = "secret-value-must-not-leak"
+    invalid = replace(
+        bundle_input,
+        source=replace(
+            bundle_input.source,
+            extensions={"safe_container": {forbidden_key: secret}},
+        ),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    (
+        "diagnostic /home/alice/private.log failed",
+        r"diagnostic C:\Users\alice\private.log failed",
+        r"diagnostic \\server\share\private.log failed",
+    ),
+)
+def test_assembler_rejects_embedded_absolute_paths_without_leaking_them(
+    workspace_root: Path,
+    unsafe_text: str,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    invalid = replace(
+        bundle_input,
+        receipt=replace(bundle_input.receipt, warnings=(unsafe_text,)),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+    assert unsafe_text not in str(raised.value)
+    assert unsafe_text not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "file:///home/alice/video.mp4",
+        r"\\server\share\video.mp4",
+        "https://user:password@example.com/video",
+        "https://example.com/video?token=secret",
+        "https://example.com/video?sig=secret",
+        "https://example.com/video?Signature=secret",
+        "https://example.com/video?Expires=secret",
+        "https://example.com/video?Policy=secret",
+        "https://example.com/video?Key-Pair-Id=secret",
+        "https://example.com/video?Access-Key-Id=secret",
+        "https://example.com/video?AWSAccessKeyId=secret",
+        "https://example.com/video?X-Amz-Credential=secret",
+        "https://example.com/video?X-Goog-Signature=secret",
+        "https://example.com/video?oauth_token=secret",
+        "https://example.com/video?auth_token=secret",
+    ),
+)
+def test_source_urls_reject_local_credentials_and_signed_queries(
+    workspace_root: Path,
+    unsafe_url: str,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    secret = unsafe_url.rsplit("=", 1)[-1]
+
+    with pytest.raises(DomainError) as raised:
+        replace(bundle_input.source, canonical_uri=unsafe_url, source_link=unsafe_url)
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_mapping"),
+    (
+        ("usage", {"input_tokens": 1, "raw_provider_cost": 2}),
+        ("redactions", {"secrets": "omitted", "unknown": "value"}),
+    ),
+)
+def test_receipt_rejects_unapproved_usage_and_redaction_fields(
+    workspace_root: Path,
+    field_name: str,
+    unsafe_mapping: dict[str, object],
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+
+    with pytest.raises(DomainError) as raised:
+        replace(bundle_input.receipt, **{field_name: unsafe_mapping})
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_identity"),
+    (
+        ("model_identity", "openai/gpt?api_key=secret"),
+        ("transcriber_identity", "provider raw response: secret"),
+    ),
+)
+def test_receipt_rejects_unbounded_executor_identity(
+    workspace_root: Path,
+    field_name: str,
+    unsafe_identity: str,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+
+    with pytest.raises(DomainError) as raised:
+        replace(bundle_input.receipt, **{field_name: unsafe_identity})
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+    assert "secret" not in str(raised.value)
+
+
+def test_snapshot_mapping_sanitizes_plain_exceptions_without_secret_leak(
+    workspace_root: Path,
+) -> None:
+    secret = "mapping-secret-never-print"
+    bundle_input = _bundle_input(workspace_root)
+
+    with pytest.raises(DomainError) as raised:
+        replace(
+            bundle_input.source,
+            extensions=_ExplodingMapping(RuntimeError(secret)),
+        )
+
+    assert raised.value.code == "video_bundle_input_invalid"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+
+
+def test_snapshot_mapping_preserves_fatal_base_exception(workspace_root: Path) -> None:
+    bundle_input = _bundle_input(workspace_root)
+
+    with pytest.raises(KeyboardInterrupt):
+        replace(
+            bundle_input.source,
+            extensions=_ExplodingMapping(KeyboardInterrupt()),
+        )
 
 
 def test_assembler_rejects_absolute_path_in_final_draft_before_writing(
@@ -628,7 +1093,7 @@ def test_assembler_rejects_absolute_path_in_final_draft_before_writing(
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_sensitive_data"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not _candidate_path(workspace_root).exists()
 
 
 def test_assembler_rejects_invalid_or_inverted_receipt_timestamps_before_writing(
@@ -645,7 +1110,7 @@ def test_assembler_rejects_invalid_or_inverted_receipt_timestamps_before_writing
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_input_invalid"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not _candidate_path(workspace_root).exists()
 
 
 def test_display_asset_rejects_windows_reserved_path() -> None:
@@ -658,6 +1123,39 @@ def test_display_asset_rejects_windows_reserved_path() -> None:
         )
 
     assert raised.value.code == "video_bundle_path_invalid"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "assets/COM¹.webp",
+        "assets/lpt².webp",
+        "assets/pre\u0301view.webp",
+    ),
+)
+def test_display_asset_path_matches_task9_portable_device_and_control_policy(
+    relative_path: str,
+) -> None:
+    with pytest.raises(DomainError) as raised:
+        DisplayAssetInput(
+            artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+            relative_path=relative_path,
+            media_type="image/webp",
+            payload=VALID_WEBP,
+        )
+
+    assert raised.value.code == "video_bundle_path_invalid"
+
+
+def test_display_asset_path_keeps_pinned_percent_literal_policy() -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview%20literal.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    assert asset.relative_path == "assets/preview%20literal.webp"
 
 
 @pytest.mark.parametrize(
@@ -682,6 +1180,34 @@ def test_display_asset_rejects_nonportable_path(relative_path: str) -> None:
     assert raised.value.code == "video_bundle_path_invalid"
 
 
+@pytest.mark.parametrize(
+    ("changes", "error_code"),
+    (
+        ({"artifact_type": "image.preview.v1"}, "video_bundle_input_invalid"),
+        ({"media_type": "image/png"}, "video_bundle_input_invalid"),
+        ({"relative_path": "assets/preview.png"}, "video_bundle_path_invalid"),
+        ({"payload": b"RIFF\x04\x00\x00\x00WEBP"}, "video_bundle_input_invalid"),
+        ({"payload": b"not-a-webp"}, "video_bundle_input_invalid"),
+    ),
+)
+def test_display_asset_is_exact_valid_webp_evidence_asset(
+    changes: dict[str, object],
+    error_code: str,
+) -> None:
+    values: dict[str, object] = {
+        "artifact_id": "art_018f0000-0000-7000-8000-00000000010d",
+        "relative_path": "assets/preview.webp",
+        "media_type": "image/webp",
+        "payload": VALID_WEBP,
+    }
+    values.update(changes)
+
+    with pytest.raises(DomainError) as raised:
+        DisplayAssetInput(**values)
+
+    assert raised.value.code == error_code
+
+
 def test_declared_display_asset_is_in_inventory_outputs_and_semantically_valid(
     workspace_root: Path,
 ) -> None:
@@ -690,7 +1216,7 @@ def test_declared_display_asset_is_in_inventory_outputs_and_semantically_valid(
         artifact_id="art_018f0000-0000-7000-8000-00000000010d",
         relative_path="assets/preview.webp",
         media_type="image/webp",
-        payload=b"webp",
+        payload=VALID_WEBP,
     )
     candidate = BundleAssembler().assemble(
         replace(bundle_input, display_assets=(asset,))
@@ -698,7 +1224,9 @@ def test_declared_display_asset_is_in_inventory_outputs_and_semantically_valid(
     manifest = _read_json(candidate.absolute_path / "bundle.json")
 
     assert manifest["outputs"]["display_assets"] == [asset.artifact_id]
-    assert (candidate.absolute_path / "assets" / "preview.webp").read_bytes() == b"webp"
+    assert (
+        candidate.absolute_path / "assets" / "preview.webp"
+    ).read_bytes() == VALID_WEBP
     assert IWikiPortableGateway().validate_candidate(
         workspace_root,
         candidate.staging_relative_path,
@@ -711,7 +1239,7 @@ def test_assembler_rejects_duplicate_artifact_id(workspace_root: Path) -> None:
         artifact_id=DRAFT_ARTIFACT_ID,
         relative_path="assets/preview.webp",
         media_type="image/webp",
-        payload=b"webp",
+        payload=VALID_WEBP,
     )
     invalid = replace(bundle_input, display_assets=(duplicate,))
 
@@ -719,7 +1247,136 @@ def test_assembler_rejects_duplicate_artifact_id(workspace_root: Path) -> None:
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_reference_invalid"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_assembler_rejects_unicode_casefold_artifact_path_collision(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    assets = (
+        DisplayAssetInput(
+            artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+            relative_path="assets/straße.webp",
+            media_type="image/webp",
+            payload=VALID_WEBP,
+        ),
+        DisplayAssetInput(
+            artifact_id="art_018f0000-0000-7000-8000-00000000010e",
+            relative_path="assets/STRASSE.webp",
+            media_type="image/webp",
+            payload=VALID_WEBP,
+        ),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(replace(bundle_input, display_assets=assets))
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_quality_execution_error_fails_closed_before_writing(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    execution_error = ErrorDetail(
+        code="quality_repair_failed",
+        category=ErrorCategory.RECIPE_FAILED,
+        message="repair failed at C:/private/secret.log",
+    )
+    invalid_quality = replace(
+        bundle_input.quality,
+        execution_error=execution_error,
+        publish_eligible=False,
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(replace(bundle_input, quality=invalid_quality))
+
+    assert raised.value.code == "video_bundle_quality_execution_failed"
+    assert "C:/private/secret.log" not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "profile",
+        "method",
+        "metrics",
+        "checks",
+        "publish_eligible",
+        "repair_attempts",
+    ),
+)
+def test_quality_outcome_rejects_mutated_typed_or_payload_fields(
+    workspace_root: Path,
+    mutation: str,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    quality = bundle_input.quality
+    if mutation in {"publish_eligible", "repair_attempts"}:
+        quality = replace(
+            quality,
+            **{
+                mutation: (
+                    not quality.publish_eligible
+                    if mutation == "publish_eligible"
+                    else quality.repair_attempts + 1
+                )
+            },
+        )
+    else:
+        document = json.loads(quality.report.payload)
+        if mutation == "profile":
+            document["profile"] = {"id": "untrusted", "version": 1}
+        elif mutation == "method":
+            document["method"] = {"kind": "model-self-report"}
+        elif mutation == "metrics":
+            document["metrics"] = {"quality_repair_attempts": 99}
+        else:
+            document["checks"] = []
+        quality = replace(
+            quality,
+            report=replace(quality.report, payload=encode_json(document)),
+        )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(replace(bundle_input, quality=quality))
+
+    assert raised.value.code == "video_bundle_quality_invalid"
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_policy_quality_failure_without_execution_error_remains_representable(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    failing_draft = GeneratedVideoDraft(
+        markdown=(
+            "# Incomplete note\n\n"
+            "## Unsupported claim\n\n"
+            "This substantive section has no evidence citation.\n"
+        ),
+        cited_segment_ids=(),
+        screenshot_requests=(),
+        model_identity="openai/gpt-4.1-mini",
+        usage={"input_tokens": 1, "output_tokens": 1},
+        warnings=(),
+    )
+    quality = evaluate_video_draft(
+        failing_draft,
+        bundle_input.evidence_set,
+        draft_bundle_id=BUNDLE_ID,
+        draft_artifact_id=DRAFT_ARTIFACT_ID,
+    )
+    assert quality.overall is QualityOverall.FAIL
+    assert quality.execution_error is None
+
+    candidate = BundleAssembler().assemble(replace(bundle_input, quality=quality))
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
 
 
 def test_assembler_rejects_mutated_evidence_reference_before_writing(
@@ -739,7 +1396,7 @@ def test_assembler_rejects_mutated_evidence_reference_before_writing(
         BundleAssembler().assemble(invalid)
 
     assert raised.value.code == "video_bundle_reference_mismatch"
-    assert not bundle_input.location.candidate_path.exists()
+    assert not _candidate_path(workspace_root).exists()
 
 
 def test_real_validator_rejects_duplicate_output_mutation(workspace_root: Path) -> None:
