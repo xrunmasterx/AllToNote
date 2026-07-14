@@ -39,7 +39,7 @@ _TYPED_ID = re.compile(
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
-_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/#A-Za-z0-9._-])/(?!/)[^\s]+")
+_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
 _EXECUTOR_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,127}\Z")
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
@@ -67,6 +67,14 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset(
         "xamzcredential",
         "xamzsecuritytoken",
         "xamzsignature",
+    }
+)
+_VALIDATED_SOURCE_URL_FIELDS = frozenset(
+    {
+        "manifest.sources[0].extensions.alltonote.video:source.canonical_uri",
+        "source.extensions.alltonote.video:source.canonical_uri",
+        "source_metadata.canonical_uri",
+        "source_metadata.safe_source_link",
     }
 )
 _USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
@@ -162,6 +170,9 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
     if value is None or type(value) in {bool, int, float}:
         return
     if type(value) is str:
+        if field_name in _VALIDATED_SOURCE_URL_FIELDS:
+            _require_safe_url(value, field_name)
+            return
         if (
             _is_absolute_or_local_path(value)
             or _EMBEDDED_WINDOWS_PATH.search(value)

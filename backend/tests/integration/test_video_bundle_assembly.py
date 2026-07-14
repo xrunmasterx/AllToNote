@@ -1128,6 +1128,25 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
     assert not _candidate_path(workspace_root).exists()
 
 
+def test_assembler_rejects_hash_route_like_posix_path_in_general_metadata(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    unsafe_title = "diagnostic #/home/alice/private.log"
+    invalid = replace(
+        bundle_input,
+        source=replace(bundle_input.source, title=unsafe_title),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+    assert unsafe_title not in str(raised.value)
+    assert unsafe_title not in repr(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
 def test_assembler_rejects_nested_nonempty_source_extensions_before_writing(
     workspace_root: Path,
 ) -> None:
@@ -1257,21 +1276,21 @@ def test_source_urls_reject_local_credentials_and_signed_queries(
 
 
 @pytest.mark.parametrize(
-    "safe_url",
+    "field_name",
     (
-        "https://example.com/video#chapter-2",
-        "https://example.com/video#/callback?chapter=2",
+        "canonical_uri",
+        "source_link",
     ),
 )
-def test_source_urls_allow_ordinary_fragments(
+def test_source_url_fields_allow_ordinary_hash_route_query(
     workspace_root: Path,
-    safe_url: str,
+    field_name: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
+    safe_url = "https://example.com/video#/callback?chapter=2"
     valid_source = replace(
         bundle_input.source,
-        canonical_uri=safe_url,
-        source_link=safe_url,
+        **{field_name: safe_url},
     )
 
     candidate = BundleAssembler().assemble(replace(bundle_input, source=valid_source))
