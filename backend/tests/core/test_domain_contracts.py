@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import get_args
@@ -60,6 +60,29 @@ def test_typed_id_is_deterministic_uuid7_with_stable_prefix() -> None:
     assert int.from_bytes(parsed.bytes[:6], "big") == 1_721_000_000_000
 
 
+def test_typed_id_nonzero_vector_freezes_uuid7_random_bit_layout() -> None:
+    randomness = bytes.fromhex("123456789abcdef00100")
+
+    value = new_typed_id("bnd", now_ms=0x0123456789AB, randomness=randomness)
+    parsed = UUID(value[4:])
+
+    assert value == "bnd_01234567-89ab-7123-9159-e26af37bc004"
+    assert (parsed.int >> 64) & 0xFFF == 0x123
+    assert parsed.int & ((1 << 62) - 1) == 0x1159E26AF37BC004
+    assert parsed.version == 7
+    assert parsed.variant == "specified in RFC 4122"
+    assert new_typed_id(
+        "bnd",
+        now_ms=0x0123456789AB,
+        randomness=bytes.fromhex("123456789abcdef0013f"),
+    ) == value
+    assert new_typed_id(
+        "bnd",
+        now_ms=0x0123456789AB,
+        randomness=bytes.fromhex("123456789abcdef00140"),
+    ) != value
+
+
 @pytest.mark.parametrize("prefix", sorted(ALLOWED_ID_PREFIXES))
 def test_typed_id_accepts_only_frozen_runtime_and_portable_prefixes(prefix: str) -> None:
     assert new_typed_id(prefix, now_ms=0, randomness=b"\x00" * 10).startswith(
@@ -91,6 +114,24 @@ def test_digest_and_timestamp_match_portable_wire_formats() -> None:
     assert utc_now_millis(
         datetime(2026, 7, 14, 8, 9, 10, 123_999, tzinfo=timezone.utc)
     ) == "2026-07-14T08:09:10.123Z"
+
+
+def test_timestamp_normalizes_offsets_and_rejects_naive_values() -> None:
+    assert utc_now_millis(
+        datetime(
+            2026,
+            7,
+            14,
+            16,
+            9,
+            10,
+            123_999,
+            tzinfo=timezone(timedelta(hours=8)),
+        )
+    ) == "2026-07-14T08:09:10.123Z"
+
+    with pytest.raises(DomainError, match="timestamp_timezone_required"):
+        utc_now_millis(datetime(2026, 7, 14, 8, 9, 10, 123_999))
 
 
 def test_error_categories_are_the_exact_frozen_set() -> None:
@@ -125,6 +166,70 @@ def test_domain_error_has_stable_safe_surface_and_redacts_details_from_text() ->
     assert "do-not-print" not in repr(error)
     with pytest.raises(TypeError):
         error.details["secret"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_snapshot_nested_caller_collections(error_type: type) -> None:
+    source = {
+        "mapping": {"value": "original"},
+        "list": [{"value": "original"}],
+        "tuple": ({"value": "original"},),
+        "set": {"original"},
+        "frozenset": frozenset({"original"}),
+    }
+    error = error_type(
+        code="nested_details",
+        category=ErrorCategory.INTERNAL,
+        message="Nested details",
+        details=source,
+    )
+
+    source["mapping"]["value"] = "changed"
+    source["list"][0]["value"] = "changed"
+    source["list"].append("changed")
+    source["tuple"][0]["value"] = "changed"
+    source["set"].add("changed")
+    source["frozenset"] = frozenset({"changed"})
+
+    assert error.details == {
+        "mapping": {"value": "original"},
+        "list": ({"value": "original"},),
+        "tuple": ({"value": "original"},),
+        "set": frozenset({"original"}),
+        "frozenset": frozenset({"original"}),
+    }
+
+
+@pytest.mark.parametrize("error_type", [ErrorDetail, DomainError])
+def test_error_details_reject_nested_internal_mutation(error_type: type) -> None:
+    error = error_type(
+        code="nested_details",
+        category=ErrorCategory.INTERNAL,
+        message="Nested details",
+        details={
+            "mapping": {"value": "original"},
+            "list": [{"value": "original"}],
+            "set": {"original"},
+        },
+    )
+
+    nested_mapping = error.details["mapping"]
+    nested_list = error.details["list"]
+    nested_set = error.details["set"]
+
+    assert isinstance(nested_mapping, MappingProxyType)
+    assert isinstance(nested_list, tuple)
+    assert isinstance(nested_set, frozenset)
+    list_item = nested_list[0]
+    assert isinstance(list_item, MappingProxyType)
+    with pytest.raises(TypeError):
+        nested_mapping["value"] = "changed"
+    with pytest.raises(TypeError):
+        nested_list[0] = "changed"
+    with pytest.raises(TypeError):
+        list_item["value"] = "changed"
+    with pytest.raises(AttributeError):
+        nested_set.add("changed")
 
 
 def test_transcript_rejects_invalid_half_open_range() -> None:

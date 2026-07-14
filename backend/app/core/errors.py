@@ -17,8 +17,22 @@ class ErrorCategory(StrEnum):
     INTERNAL = "internal"
 
 
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    return value
+
+
 def immutable_details(details: Mapping[str, object] | None) -> Mapping[str, object]:
-    return MappingProxyType(dict(details or {}))
+    return MappingProxyType(
+        {key: _freeze_value(value) for key, value in (details or {}).items()}
+    )
 
 
 @dataclass(frozen=True)
