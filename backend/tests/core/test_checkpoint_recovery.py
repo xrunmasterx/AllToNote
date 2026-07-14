@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -91,7 +94,60 @@ def _storage(tmp_path: Path, repository: object):
 
 
 def _projection_path(storage_root: Path, job_id: str) -> Path:
-    return storage_root / "events" / f"{job_id}.jsonl"
+    return storage_root / "jobs" / job_id / "events.jsonl"
+
+
+def _event_record(event, **overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "created_at": event.created_at,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "job_id": event.job_id,
+        "payload_json": event.payload_json,
+        "sequence": event.sequence,
+    }
+    record.update(overrides)
+    return record
+
+
+def _event_bytes(event, **overrides: object) -> bytes:
+    return json.dumps(
+        _event_record(event, **overrides),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        result = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(link),
+                str(target),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"directory junction creation unavailable: {result.stderr}")
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink creation unavailable: {error}")
+
+
+def _remove_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink()
 
 
 def test_task6_value_objects_are_frozen_and_checkpoint_payload_is_bytes() -> None:
@@ -170,6 +226,46 @@ def test_save_checkpoint_writes_unique_immutable_payload_then_metadata(
     assert not tuple(storage.root.rglob("*.tmp"))
 
 
+def test_checkpoint_and_event_projection_use_job_scoped_layout(
+    tmp_path: Path,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    storage = _storage(tmp_path, repository)
+    record = _record(repository)
+
+    metadata = storage.save_checkpoint(record)
+    event = storage.append_event(record.job_id, "checkpoint.saved", "{}")
+
+    assert Path(metadata.relative_path).parts == (
+        "jobs",
+        record.job_id,
+        "checkpoints",
+        f"{metadata.checkpoint_id}.payload",
+    )
+    assert (storage.root / metadata.relative_path).read_bytes() == record.payload
+    projection = storage.root / "jobs" / record.job_id / "events.jsonl"
+    assert json.loads(projection.read_text(encoding="utf-8"))[
+        "event_id"
+    ] == event.event_id
+
+
+def test_validate_checkpoint_rejects_another_jobs_checkpoint_path(
+    tmp_path: Path,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    storage = _storage(tmp_path, repository)
+    first = storage.save_checkpoint(_record(repository))
+    second = storage.save_checkpoint(_record(repository))
+    cross_job = replace(first, relative_path=second.relative_path)
+
+    assert first.output_hash == second.output_hash
+    assert not storage.validate_checkpoint(
+        cross_job,
+        expected_schema_id=first.schema_id,
+        expected_input_hash=first.input_hash,
+    )
+
+
 def test_invalid_content_is_rejected_before_file_or_metadata_write(
     tmp_path: Path,
 ) -> None:
@@ -183,7 +279,62 @@ def test_invalid_content_is_rejected_before_file_or_metadata_write(
     assert caught.value.code == "checkpoint_content_invalid"
     assert caught.value.category is ErrorCategory.INVALID_REQUEST
     assert repository.latest_checkpoint(record.job_id, record.step_id) is None
-    assert not tuple((storage.root / "checkpoints").rglob("*.payload"))
+    assert not tuple((storage.root / "jobs").rglob("*.payload"))
+
+
+@pytest.mark.parametrize("operation", ("save", "append", "reconcile"))
+def test_storage_rejects_reparse_parent_without_external_write(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    storage = _storage(tmp_path, repository)
+    record = _record(repository)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    jobs_link = storage.root / "jobs"
+    _create_directory_link(jobs_link, outside)
+    try:
+        with pytest.raises(DomainError):
+            if operation == "save":
+                storage.save_checkpoint(record)
+            elif operation == "append":
+                storage.append_event(record.job_id, "job.started", "{}")
+            else:
+                storage.reconcile_event_projection(record.job_id)
+        assert not tuple(outside.rglob("*"))
+    finally:
+        _remove_directory_link(jobs_link)
+
+
+@pytest.mark.parametrize(
+    "unsafe_job_id",
+    (
+        "",
+        ".",
+        "..",
+        "../outside",
+        "job/child",
+        "job\\child",
+        "C:drive",
+        "CON",
+        "job.",
+    ),
+)
+def test_storage_rejects_job_ids_that_are_not_safe_path_segments(
+    tmp_path: Path,
+    unsafe_job_id: str,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    storage = _storage(tmp_path, repository)
+    record = replace(_record(repository), job_id=unsafe_job_id)
+
+    with pytest.raises(DomainError):
+        storage.save_checkpoint(record)
+    with pytest.raises(DomainError):
+        storage.reconcile_event_projection(unsafe_job_id)
+
+    assert not tuple((storage.root / "jobs").rglob("*.payload"))
 
 
 class _FailingRecordMetadataPort:
@@ -217,7 +368,7 @@ def test_metadata_failure_after_replace_leaves_ignored_orphan_payload(
     with pytest.raises(DomainError, match="checkpoint_metadata_injected_failure"):
         storage.save_checkpoint(record)
 
-    payloads = tuple((storage.root / "checkpoints").rglob("*.payload"))
+    payloads = tuple((storage.root / "jobs").rglob("*.payload"))
     assert len(payloads) == 1
     assert payloads[0].read_bytes() == record.payload
     assert repository.latest_checkpoint(record.job_id, record.step_id) is None
@@ -303,7 +454,13 @@ def test_recovery_ignores_orphans_and_rewinds_from_first_invalid_artifact(
     )
     draft_metadata = storage.save_checkpoint(draft)
     (storage.root / draft_metadata.relative_path).write_bytes(b"changed")
-    orphan = storage.root / "checkpoints" / transcript.job_id / "orphan.payload"
+    orphan = (
+        storage.root
+        / "jobs"
+        / transcript.job_id
+        / "checkpoints"
+        / "orphan.payload"
+    )
     orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(b"not metadata-backed")
     steps = (
@@ -397,27 +554,105 @@ def test_event_sequences_are_strictly_monotonic_per_job_across_connections(
     )
 
 
+class _PauseFirstProjectionSnapshotPort:
+    def __init__(self, repository: SqliteJobRepository) -> None:
+        self.repository = repository
+        self.snapshot_read = Event()
+        self.release_snapshot = Event()
+        self._paused = False
+
+    def record_checkpoint(self, metadata):
+        return self.repository.record_checkpoint(metadata)
+
+    def latest_checkpoint(self, job_id: str, step_id: str):
+        return self.repository.latest_checkpoint(job_id, step_id)
+
+    def append_event(self, job_id: str, event_type: str, payload_json: str):
+        return self.repository.append_event(job_id, event_type, payload_json)
+
+    def list_events(self, job_id: str, after_sequence: int = 0):
+        events = self.repository.list_events(job_id, after_sequence)
+        if after_sequence == 0 and not self._paused:
+            self._paused = True
+            self.snapshot_read.set()
+            if not self.release_snapshot.wait(timeout=5):
+                raise TimeoutError("projection snapshot was not released")
+        return events
+
+
+def test_stale_event_projection_writer_publishes_until_caught_up(
+    tmp_path: Path,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    job, _ = _job_attempt(repository)
+    paused_port = _PauseFirstProjectionSnapshotPort(repository)
+    paused_storage = _storage(tmp_path, paused_port)
+    normal_storage = _storage(tmp_path, repository)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_future = pool.submit(
+            paused_storage.append_event, job.job_id, "event.first", "{}"
+        )
+        assert paused_port.snapshot_read.wait(timeout=5)
+        second = normal_storage.append_event(job.job_id, "event.second", "{}")
+        paused_port.release_snapshot.set()
+        first = first_future.result(timeout=5)
+
+    projection = _projection_path(paused_storage.root, job.job_id)
+    projected = tuple(
+        json.loads(line)
+        for line in projection.read_text(encoding="utf-8").splitlines()
+    )
+    assert [record["sequence"] for record in projected] == [1, 2]
+    assert [record["event_id"] for record in projected] == [
+        first.event_id,
+        second.event_id,
+    ]
+    assert normal_storage.reconcile_event_projection(job.job_id) == (
+        first,
+        second,
+    )
+
+
 def test_append_event_commits_sqlite_before_projection_and_reconcile_backfills(
     tmp_path: Path,
 ) -> None:
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     job, _ = _job_attempt(repository)
     storage = _storage(tmp_path, repository)
-    events_path = storage.root / "events"
-    events_path.parent.mkdir(parents=True, exist_ok=True)
-    events_path.write_text("blocks-directory", encoding="utf-8")
+    job_directory = storage.root / "jobs" / job.job_id
+    job_directory.parent.mkdir(parents=True, exist_ok=True)
+    job_directory.write_text("blocks-directory", encoding="utf-8")
 
-    with pytest.raises(OSError):
+    with pytest.raises(DomainError, match="attempt_storage_path_invalid"):
         storage.append_event(job.job_id, "checkpoint.saved", '{"step":"draft"}')
 
     committed = repository.list_events(job.job_id)
     assert len(committed) == 1
-    events_path.unlink()
+    job_directory.unlink()
     reconciled = storage.reconcile_event_projection(job.job_id)
     assert reconciled == committed
     projection = _projection_path(storage.root, job.job_id)
     assert projection.read_bytes().endswith(b"\n")
     assert len(projection.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_append_event_commits_sqlite_but_preserves_malformed_projection(
+    tmp_path: Path,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    job, _ = _job_attempt(repository)
+    storage = _storage(tmp_path, repository)
+    projection = _projection_path(storage.root, job.job_id)
+    projection.parent.mkdir(parents=True, exist_ok=True)
+    original = b"not-json\n"
+    projection.write_bytes(original)
+
+    with pytest.raises(DomainError, match="event_projection_invalid"):
+        storage.append_event(job.job_id, "job.started", "{}")
+
+    assert len(repository.list_events(job.job_id)) == 1
+    assert projection.read_bytes() == original
 
 
 def test_reconcile_uses_only_sqlite_and_discards_valid_file_only_rows(
@@ -462,6 +697,40 @@ def test_reconcile_tolerates_only_truncated_unterminated_final_line(
     assert storage.reconcile_event_projection(job.job_id) == (committed,)
     assert projection.read_bytes().endswith(b"\n")
     assert b"truncated" not in projection.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("empty_object", "complete_object", "wrong_type", "nonmonotonic", "malformed"),
+)
+def test_reconcile_rejects_complete_or_malformed_unterminated_final_record(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "machine-root")
+    job, _ = _job_attempt(repository)
+    storage = _storage(tmp_path, repository)
+    committed = storage.append_event(job.job_id, "job.started", "{}")
+    projection = _projection_path(storage.root, job.job_id)
+    if case == "empty_object":
+        original = b"{}"
+    elif case == "complete_object":
+        original = b'{"complete":"json"}'
+    elif case == "wrong_type":
+        original = _event_bytes(committed, sequence="1")
+    elif case == "nonmonotonic":
+        original = _event_bytes(committed) + b"\n" + _event_bytes(
+            committed, event_id="evt_duplicate"
+        )
+    else:
+        original = b"not-json"
+    projection.write_bytes(original)
+
+    with pytest.raises(DomainError) as caught:
+        storage.reconcile_event_projection(job.job_id)
+
+    assert caught.value.code == "event_projection_invalid"
+    assert projection.read_bytes() == original
 
 
 def test_reconcile_rejects_non_monotonic_projection_without_overwrite(
