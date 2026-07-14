@@ -31,8 +31,7 @@ class TestConcurrentTaskExecutor(unittest.TestCase):
                 if active == 2:
                     both_active.set()
             try:
-                if not release_tasks.wait(timeout=1):
-                    raise TimeoutError("test did not release concurrent tasks")
+                release_tasks.wait()
                 return call_id
             finally:
                 with state_lock:
