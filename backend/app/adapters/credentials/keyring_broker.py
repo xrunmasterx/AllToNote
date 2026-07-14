@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Mapping
 from typing import Protocol
 
 import keyring
 
-from app.adapters.credentials.profile_catalog import CredentialProfileCatalog
+from app.adapters.credentials.profile_catalog import (
+    CredentialProfileCatalog,
+    validate_credential_profile,
+)
 from app.core.errors import DomainError, ErrorCategory
 
 
@@ -36,26 +38,12 @@ class SecretValue:
 
 
 def _profile_environment_name(profile: str) -> str:
-    profile_name = profile.rsplit("/", 1)[-1]
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", profile_name).strip("_").upper()
-    if not normalized:
-        raise DomainError(
-            "credential_profile_invalid",
-            ErrorCategory.INVALID_REQUEST,
-            "Credential profile is invalid",
-        )
-    return f"ALLTONOTE_CREDENTIAL_{normalized}"
-
-
-def _profile_kind(profile: str) -> str:
-    kind, separator, _ = profile.partition("/")
-    if not separator or not kind:
-        raise DomainError(
-            "credential_profile_invalid",
-            ErrorCategory.INVALID_REQUEST,
-            "Credential profile is invalid",
-        )
-    return kind
+    kind, name = validate_credential_profile(profile)
+    normalized_name = name.replace("-", "_").upper()
+    if kind == "providers":
+        return f"ALLTONOTE_CREDENTIAL_{normalized_name}"
+    normalized_kind = kind.replace("-", "_").upper()
+    return f"ALLTONOTE_CREDENTIAL_{normalized_kind}__{normalized_name}"
 
 
 class CredentialBroker:
@@ -96,12 +84,12 @@ class CredentialBroker:
         )
 
     def set(self, profile: str, secret: str) -> None:
-        kind = _profile_kind(profile)
+        kind, _ = validate_credential_profile(profile)
         self._keyring.set_password(self._service_name, profile, secret)
         self._catalog.store_profile(profile, kind)
 
     def delete(self, profile: str) -> None:
-        _profile_kind(profile)
+        validate_credential_profile(profile)
         self._keyring.delete_password(self._service_name, profile)
         self._catalog.delete_profile(profile)
 

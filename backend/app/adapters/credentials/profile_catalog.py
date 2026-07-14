@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,14 @@ from app.core.errors import DomainError, ErrorCategory
 _CATALOG_VERSION = 1
 _CATALOG_FILENAME = "credential-profiles.toml"
 _PROFILE_KEYS = frozenset({"profile_id", "kind", "created_at", "updated_at"})
+_PROFILE_PATTERN = re.compile(
+    r"(?P<kind>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)/"
+    r"(?P<name>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)"
+)
+_TIMESTAMP_PATTERN = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
+)
 
 
 def _utc_now_millis() -> str:
@@ -30,6 +39,26 @@ def _utc_now_millis() -> str:
 
 def _catalog_error(code: str, message: str) -> DomainError:
     return DomainError(code, ErrorCategory.INVALID_REQUEST, message)
+
+
+def validate_credential_profile(profile_id: object) -> tuple[str, str]:
+    if type(profile_id) is str:
+        match = _PROFILE_PATTERN.fullmatch(profile_id)
+        if match is not None:
+            return match.group("kind"), match.group("name")
+    raise DomainError(
+        "credential_profile_invalid",
+        ErrorCategory.INVALID_REQUEST,
+        "Credential profile is invalid",
+    )
+
+
+def _parse_catalog_timestamp(value: object) -> datetime:
+    if type(value) is not str or _TIMESTAMP_PATTERN.fullmatch(value) is None:
+        raise ValueError("Timestamp is not canonical UTC milliseconds")
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc
+    )
 
 
 @dataclass(frozen=True)
@@ -61,13 +90,35 @@ class CredentialProfileCatalog:
         return tuple(sorted(profiles, key=lambda profile: profile.profile_id))
 
     def store_profile(self, profile_id: str, kind: str) -> None:
+        profile_kind, _ = validate_credential_profile(profile_id)
+        if type(kind) is not str or kind != profile_kind:
+            raise DomainError(
+                "credential_profile_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Credential profile is invalid",
+            )
         with self._lock:
             profiles = self._read_unlocked()
             timestamp = self._clock()
+            try:
+                updated_at = _parse_catalog_timestamp(timestamp)
+            except ValueError as exc:
+                raise _catalog_error(
+                    "credential_catalog_invalid",
+                    "Credential profile catalog is invalid",
+                ) from exc
             existing = next(
                 (profile for profile in profiles if profile.profile_id == profile_id),
                 None,
             )
+            if (
+                existing is not None
+                and updated_at < _parse_catalog_timestamp(existing.created_at)
+            ):
+                raise _catalog_error(
+                    "credential_catalog_invalid",
+                    "Credential profile catalog is invalid",
+                )
             metadata = CredentialProfileMetadata(
                 profile_id=profile_id,
                 kind=kind,
@@ -81,6 +132,7 @@ class CredentialProfileCatalog:
             self._write_unlocked(updated)
 
     def delete_profile(self, profile_id: str) -> None:
+        validate_credential_profile(profile_id)
         with self._lock:
             profiles = self._read_unlocked()
             updated = [
@@ -103,20 +155,26 @@ class CredentialProfileCatalog:
             raise _catalog_error(
                 "credential_catalog_invalid", "Credential profile catalog is invalid"
             )
-        if values["catalog_version"] != _CATALOG_VERSION:
+        catalog_version = values["catalog_version"]
+        if type(catalog_version) is not int:
+            raise _catalog_error(
+                "credential_catalog_invalid", "Credential profile catalog is invalid"
+            )
+        if catalog_version != _CATALOG_VERSION:
             raise _catalog_error(
                 "credential_catalog_version_unsupported",
                 "Credential profile catalog version is not supported",
             )
         raw_profiles = values["profiles"]
-        if not isinstance(raw_profiles, list):
+        if type(raw_profiles) is not list:
             raise _catalog_error(
                 "credential_catalog_invalid", "Credential profile catalog is invalid"
             )
 
         profiles: list[CredentialProfileMetadata] = []
+        profile_ids: set[str] = set()
         for raw_profile in raw_profiles:
-            if not isinstance(raw_profile, Mapping) or set(raw_profile) != _PROFILE_KEYS:
+            if type(raw_profile) is not dict or set(raw_profile) != _PROFILE_KEYS:
                 raise _catalog_error(
                     "credential_catalog_invalid", "Credential profile catalog is invalid"
                 )
@@ -124,6 +182,26 @@ class CredentialProfileCatalog:
                 raise _catalog_error(
                     "credential_catalog_invalid", "Credential profile catalog is invalid"
                 )
+            profile_id = raw_profile["profile_id"]
+            try:
+                profile_kind, _ = validate_credential_profile(profile_id)
+                created_at = _parse_catalog_timestamp(raw_profile["created_at"])
+                updated_at = _parse_catalog_timestamp(raw_profile["updated_at"])
+            except (DomainError, ValueError) as exc:
+                raise _catalog_error(
+                    "credential_catalog_invalid",
+                    "Credential profile catalog is invalid",
+                ) from exc
+            if (
+                raw_profile["kind"] != profile_kind
+                or profile_id in profile_ids
+                or updated_at < created_at
+            ):
+                raise _catalog_error(
+                    "credential_catalog_invalid",
+                    "Credential profile catalog is invalid",
+                )
+            profile_ids.add(profile_id)
             profiles.append(CredentialProfileMetadata(**raw_profile))
         return profiles
 
