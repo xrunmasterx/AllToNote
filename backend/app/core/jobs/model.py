@@ -29,6 +29,7 @@ class Job:
     principal: str
     client_request_id: str | None
     state: JobState
+    cancellation_requested: bool
     retry_of_job_id: str | None
     created_at: str
     updated_at: str
@@ -40,6 +41,7 @@ class Attempt:
     job_id: str
     step_id: str
     state: AttemptState
+    fencing_token: int
     created_at: str
     updated_at: str
 

@@ -58,6 +58,12 @@ def _new_service(repo: SqliteJobRepository):
     return module.JobService(repo)
 
 
+def _authority(repo: SqliteJobRepository):
+    return repo.acquire_scheduler_lease(
+        "test-workspace:test-process", ttl_seconds=300
+    )
+
+
 def _request(
     tmp_path: Path,
     *,
@@ -85,8 +91,9 @@ def _failed_job(
         client_request_id="original",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
     attempt = repo.create_attempt(job.job_id, "model")
-    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
+    attempt = repo.start_attempt(attempt.attempt_id, authority)
     with repo._transaction(immediate=True) as connection:
         for operation_id in operation_ids:
             connection.execute(
@@ -107,7 +114,9 @@ def _failed_job(
                     job.request_hash,
                 ),
             )
-    repo.transition_attempt(attempt.attempt_id, AttemptState.FAILED)
+    repo.transition_attempt(
+        attempt.attempt_id, AttemptState.FAILED, authority=authority
+    )
     return repo.transition_job(job.job_id, JobState.FAILED)
 
 
@@ -118,9 +127,12 @@ def _waiting_job(repo: SqliteJobRepository):
         client_request_id="waiting",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
     attempt = repo.create_attempt(job.job_id, "acquire")
-    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
-    attempt = repo.transition_attempt(attempt.attempt_id, AttemptState.NEEDS_INPUT)
+    attempt = repo.start_attempt(attempt.attempt_id, authority)
+    attempt = repo.transition_attempt(
+        attempt.attempt_id, AttemptState.NEEDS_INPUT, authority=authority
+    )
     challenge = repo.create_challenge(job.job_id, attempt.attempt_id, "{}")
     return job, attempt, challenge
 
@@ -416,6 +428,7 @@ def test_cancel_is_stable_and_terminal_state_is_immutable(
     replay = service.cancel(queued.job_id)
 
     assert cancelled.state is JobState.CANCELLED
+    assert cancelled.cancellation_requested is True
     assert replay == cancelled
 
 

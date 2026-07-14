@@ -59,8 +59,16 @@ def _job_attempt(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    attempt = repository.create_attempt(job.job_id, step_id)
+    authority = _authority(repository)
+    pending = repository.create_attempt(job.job_id, step_id)
+    attempt = repository.start_attempt(pending.attempt_id, authority)
     return job, attempt
+
+
+def _authority(repository: SqliteJobRepository):
+    return repository.acquire_scheduler_lease(
+        "test-workspace:test-process", ttl_seconds=300
+    )
 
 
 def _record(
@@ -208,9 +216,9 @@ def test_save_checkpoint_writes_unique_immutable_payload_then_metadata(
     storage = _storage(tmp_path, repository)
     first_record = _record(repository)
 
-    first = storage.save_checkpoint(first_record)
+    first = storage.save_checkpoint(first_record, _authority(repository))
     second_record = replace(first_record, payload=TRANSCRIPT_PAYLOAD + b"second\n")
-    second = storage.save_checkpoint(second_record)
+    second = storage.save_checkpoint(second_record, _authority(repository))
 
     first_path = storage.root / first.relative_path
     second_path = storage.root / second.relative_path
@@ -233,7 +241,7 @@ def test_checkpoint_and_event_projection_use_job_scoped_layout(
     storage = _storage(tmp_path, repository)
     record = _record(repository)
 
-    metadata = storage.save_checkpoint(record)
+    metadata = storage.save_checkpoint(record, _authority(repository))
     event = storage.append_event(record.job_id, "checkpoint.saved", "{}")
 
     assert Path(metadata.relative_path).parts == (
@@ -254,8 +262,8 @@ def test_validate_checkpoint_rejects_another_jobs_checkpoint_path(
 ) -> None:
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     storage = _storage(tmp_path, repository)
-    first = storage.save_checkpoint(_record(repository))
-    second = storage.save_checkpoint(_record(repository))
+    first = storage.save_checkpoint(_record(repository), _authority(repository))
+    second = storage.save_checkpoint(_record(repository), _authority(repository))
     cross_job = replace(first, relative_path=second.relative_path)
 
     assert first.output_hash == second.output_hash
@@ -274,7 +282,7 @@ def test_invalid_content_is_rejected_before_file_or_metadata_write(
     record = _record(repository, payload=b"not a transcript")
 
     with pytest.raises(DomainError) as caught:
-        storage.save_checkpoint(record)
+        storage.save_checkpoint(record, _authority(repository))
 
     assert caught.value.code == "checkpoint_content_invalid"
     assert caught.value.category is ErrorCategory.INVALID_REQUEST
@@ -297,7 +305,7 @@ def test_storage_rejects_reparse_parent_without_external_write(
     try:
         with pytest.raises(DomainError):
             if operation == "save":
-                storage.save_checkpoint(record)
+                storage.save_checkpoint(record, _authority(repository))
             elif operation == "append":
                 storage.append_event(record.job_id, "job.started", "{}")
             else:
@@ -330,7 +338,7 @@ def test_storage_rejects_job_ids_that_are_not_safe_path_segments(
     record = replace(_record(repository), job_id=unsafe_job_id)
 
     with pytest.raises(DomainError):
-        storage.save_checkpoint(record)
+        storage.save_checkpoint(record, _authority(repository))
     with pytest.raises(DomainError):
         storage.reconcile_event_projection(unsafe_job_id)
 
@@ -341,7 +349,7 @@ class _FailingRecordMetadataPort:
     def __init__(self, repository: SqliteJobRepository) -> None:
         self.repository = repository
 
-    def record_checkpoint(self, metadata):
+    def record_checkpoint(self, metadata, authority):
         raise DomainError(
             "checkpoint_metadata_injected_failure",
             ErrorCategory.INTERNAL,
@@ -366,7 +374,7 @@ def test_metadata_failure_after_replace_leaves_ignored_orphan_payload(
     record = _record(repository)
 
     with pytest.raises(DomainError, match="checkpoint_metadata_injected_failure"):
-        storage.save_checkpoint(record)
+        storage.save_checkpoint(record, _authority(repository))
 
     payloads = tuple((storage.root / "jobs").rglob("*.payload"))
     assert len(payloads) == 1
@@ -394,7 +402,7 @@ def test_checkpoint_reuse_validates_all_frozen_conditions(
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     storage = _storage(tmp_path, repository)
     record = _record(repository)
-    metadata = storage.save_checkpoint(record)
+    metadata = storage.save_checkpoint(record, _authority(repository))
     candidate = metadata
     expected_schema = metadata.schema_id
     expected_input = metadata.input_hash
@@ -428,7 +436,7 @@ def test_validate_checkpoint_accepts_registered_valid_payload(tmp_path: Path) ->
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     storage = _storage(tmp_path, repository)
     record = _record(repository)
-    metadata = storage.save_checkpoint(record)
+    metadata = storage.save_checkpoint(record, _authority(repository))
 
     assert storage.validate_checkpoint(
         metadata,
@@ -444,7 +452,9 @@ def test_recovery_ignores_orphans_and_rewinds_from_first_invalid_artifact(
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     storage = _storage(tmp_path, repository)
     transcript = _record(repository)
-    transcript_metadata = storage.save_checkpoint(transcript)
+    transcript_metadata = storage.save_checkpoint(
+        transcript, _authority(repository)
+    )
     draft = _record(
         repository,
         payload=DRAFT_PAYLOAD,
@@ -452,7 +462,7 @@ def test_recovery_ignores_orphans_and_rewinds_from_first_invalid_artifact(
         input_hash=transcript_metadata.output_hash,
         step_id="generate_draft",
     )
-    draft_metadata = storage.save_checkpoint(draft)
+    draft_metadata = storage.save_checkpoint(draft, _authority(repository))
     (storage.root / draft_metadata.relative_path).write_bytes(b"changed")
     orphan = (
         storage.root
@@ -500,7 +510,7 @@ def test_recovery_rewinds_transcript_and_all_downstream_steps_when_it_is_corrupt
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     storage = _storage(tmp_path, repository)
     transcript = _record(repository)
-    metadata = storage.save_checkpoint(transcript)
+    metadata = storage.save_checkpoint(transcript, _authority(repository))
     (storage.root / metadata.relative_path).write_bytes(b"corrupt")
     steps = (
         ArtifactStepDescriptor(
@@ -561,8 +571,8 @@ class _PauseFirstProjectionSnapshotPort:
         self.release_snapshot = Event()
         self._paused = False
 
-    def record_checkpoint(self, metadata):
-        return self.repository.record_checkpoint(metadata)
+    def record_checkpoint(self, metadata, authority):
+        return self.repository.record_checkpoint(metadata, authority)
 
     def latest_checkpoint(self, job_id: str, step_id: str):
         return self.repository.latest_checkpoint(job_id, step_id)

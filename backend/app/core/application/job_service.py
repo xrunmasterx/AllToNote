@@ -191,6 +191,7 @@ class JobService:
         return JobSnapshot(
             job_id=job.job_id,
             state=job.state,
+            cancellation_requested=job.cancellation_requested,
             active_attempt_id=(
                 active_attempt.attempt_id if active_attempt is not None else None
             ),

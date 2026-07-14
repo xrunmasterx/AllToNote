@@ -15,6 +15,7 @@ from app.core.jobs.model import (
     CheckpointRecord,
     JobEvent,
 )
+from app.core.jobs.resource_lease import ExecutionAuthority
 from app.core.ports.jobs import AttemptMetadataRepositoryPort
 
 
@@ -66,7 +67,11 @@ class FileAttemptStorage:
         self._metadata_repository = metadata_repository
         self._validators = dict(validators)
 
-    def save_checkpoint(self, record: CheckpointRecord) -> CheckpointMetadata:
+    def save_checkpoint(
+        self,
+        record: CheckpointRecord,
+        authority: ExecutionAuthority,
+    ) -> CheckpointMetadata:
         self._validate_job_id(record.job_id)
         if not self._content_is_valid(record.schema_id, record.payload):
             raise DomainError(
@@ -104,7 +109,7 @@ class FileAttemptStorage:
                 metadata_json=record.metadata_json,
                 created_at=utc_now_millis(),
             )
-            return self._metadata_repository.record_checkpoint(metadata)
+            return self._metadata_repository.record_checkpoint(metadata, authority)
         finally:
             if temporary.exists():
                 temporary.unlink()

@@ -420,6 +420,7 @@ def test_result_job_snapshot_and_retry_request_keep_frozen_contract() -> None:
     snapshot = JobSnapshot(
         job_id=result.job_id,
         state=JobState.SUCCEEDED,
+        cancellation_requested=False,
         active_attempt_id=None,
         challenge_id=None,
         retry_of_job_id=None,

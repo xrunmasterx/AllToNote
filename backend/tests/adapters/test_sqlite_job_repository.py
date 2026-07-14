@@ -123,6 +123,12 @@ def repo(tmp_path: Path) -> SqliteJobRepository:
     yield SqliteJobRepository.open(tmp_path / "machine-root")
 
 
+def _authority(repo: SqliteJobRepository):
+    return repo.acquire_scheduler_lease(
+        "test-workspace:test-process", ttl_seconds=300
+    )
+
+
 def _database_path(tmp_path: Path, name: str) -> tuple[Path, Path]:
     machine_root = tmp_path / name
     machine_root.mkdir()
@@ -319,6 +325,33 @@ def test_json_columns_are_utf8_text_and_schema_has_no_secret_columns(
         for column_name in all_column_names
         for forbidden in ("secret", "api_key", "cookie", "authorization")
     )
+    assert "cancellation_requested" in all_column_names
+
+
+def test_schema_rejects_non_boolean_cancellation_and_non_scheduler_lease(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        with repo._transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE jobs SET cancellation_requested = 2 WHERE job_id = ?",
+                (job.job_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        with repo._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO leases (
+                    lease_name, job_id, owner, fencing_token,
+                    expires_at, heartbeat_at
+                ) VALUES ('not-scheduler', NULL, 'owner', 1, '1', '0')
+                """
+            )
 
 
 def _insert_challenge(
@@ -652,7 +685,7 @@ def test_job_cannot_be_terminal_while_an_attempt_is_unsettled(
     repo.transition_job(job.job_id, JobState.RUNNING)
     attempt = repo.create_attempt(job.job_id, "resolve")
     if attempt_state is AttemptState.RUNNING:
-        repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
+        repo.start_attempt(attempt.attempt_id, _authority(repo))
 
     with pytest.raises(DomainError, match="attempt_not_settled"):
         repo.transition_job(job.job_id, JobState.FAILED)
@@ -668,8 +701,11 @@ def test_job_can_be_terminal_after_all_attempts_are_settled(
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
     attempt = repo.create_attempt(job.job_id, "resolve")
-    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
-    repo.transition_attempt(attempt.attempt_id, AttemptState.SUCCEEDED)
+    authority = _authority(repo)
+    repo.start_attempt(attempt.attempt_id, authority)
+    repo.transition_attempt(
+        attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
+    )
 
     assert repo.transition_job(job.job_id, JobState.SUCCEEDED).state is JobState.SUCCEEDED
 
@@ -680,9 +716,11 @@ def test_commit_guard_rejects_non_running_job(repo: SqliteJobRepository) -> None
         principal="local",
         client_request_id=None,
     )
+    attempt = repo.create_attempt(job.job_id, "resolve")
+    authority = _authority(repo)
 
     with pytest.raises(DomainError, match="commit_guard_not_running"):
-        with repo.commit_guard(job.job_id):
+        with repo.commit_guard(job.job_id, attempt.attempt_id, authority):
             pass
 
 
@@ -695,9 +733,14 @@ def test_commit_guard_rolls_back_when_guarded_work_fails(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    pending = repo.create_attempt(job.job_id, "commit")
+    attempt = repo.start_attempt(pending.attempt_id, authority)
 
     with pytest.raises(RuntimeError, match="portable commit failed"):
-        with repo.commit_guard(job.job_id) as transaction:
+        with repo.commit_guard(
+            job.job_id, attempt.attempt_id, authority
+        ) as transaction:
             assert isinstance(transaction, sqlite3.Connection)
             transaction.execute(
                 "UPDATE jobs SET state = ? WHERE job_id = ?",
@@ -715,9 +758,14 @@ def _create_needs_input_attempt(repo: SqliteJobRepository):
         client_request_id="challenge-original",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
     attempt = repo.create_attempt(job.job_id, "acquire")
-    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
-    attempt = repo.transition_attempt(attempt.attempt_id, AttemptState.NEEDS_INPUT)
+    attempt = repo.start_attempt(attempt.attempt_id, authority)
+    attempt = repo.transition_attempt(
+        attempt.attempt_id,
+        AttemptState.NEEDS_INPUT,
+        authority=authority,
+    )
     return job, attempt
 
 
@@ -753,8 +801,9 @@ def _create_failed_job_with_unknown_operations(
         client_request_id="original-request",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
     attempt = repo.create_attempt(job.job_id, "model")
-    repo.transition_attempt(attempt.attempt_id, AttemptState.RUNNING)
+    attempt = repo.start_attempt(attempt.attempt_id, authority)
     for operation_id in operation_ids:
         _record_unknown_operation(
             repo,
@@ -763,7 +812,9 @@ def _create_failed_job_with_unknown_operations(
             attempt_id=attempt.attempt_id,
             operation_id=operation_id,
         )
-    repo.transition_attempt(attempt.attempt_id, AttemptState.FAILED)
+    repo.transition_attempt(
+        attempt.attempt_id, AttemptState.FAILED, authority=authority
+    )
     return repo.transition_job(job.job_id, JobState.FAILED), attempt
 
 
@@ -858,7 +909,7 @@ def test_cancel_transitions_settled_nonterminal_job(
     assert repo.cancel_job(job.job_id).state is JobState.CANCELLED
 
 
-def test_cancel_rejects_unsettled_attempt_without_partial_write(
+def test_cancel_cancels_pending_attempt_and_persists_request(
     repo: SqliteJobRepository,
 ) -> None:
     job = repo.create_job(
@@ -867,12 +918,14 @@ def test_cancel_rejects_unsettled_attempt_without_partial_write(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    repo.create_attempt(job.job_id, "running-step")
+    pending = repo.create_attempt(job.job_id, "pending-step")
 
-    with pytest.raises(DomainError, match="attempt_not_settled"):
-        repo.cancel_job(job.job_id)
+    cancelled = repo.cancel_job(job.job_id)
 
-    assert repo.get_job(job.job_id).state is JobState.RUNNING
+    assert cancelled.state is JobState.CANCELLED
+    assert cancelled.cancellation_requested is True
+    with pytest.raises(DomainError, match="attempt_terminal"):
+        repo.start_attempt(pending.attempt_id, _authority(repo))
 
 
 def test_create_challenge_atomically_waits_for_input(

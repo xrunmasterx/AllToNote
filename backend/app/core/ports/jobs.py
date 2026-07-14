@@ -9,6 +9,7 @@ from app.core.jobs.model import (
     Job,
     JobEvent,
 )
+from app.core.jobs.resource_lease import ExecutionAuthority
 
 
 class JobRepositoryPort(Protocol):
@@ -52,7 +53,9 @@ class AttemptMetadataRepositoryPort(Protocol):
     """Durable metadata boundary for checkpoints and Job events."""
 
     def record_checkpoint(
-        self, metadata: CheckpointMetadata
+        self,
+        metadata: CheckpointMetadata,
+        authority: ExecutionAuthority,
     ) -> CheckpointMetadata: ...
 
     def latest_checkpoint(
@@ -71,7 +74,9 @@ class AttemptMetadataRepositoryPort(Protocol):
 class AttemptStoragePort(Protocol):
     """Boundary for private attempt staging and checkpoints."""
 
-    def save_checkpoint(self, record: CheckpointRecord) -> CheckpointMetadata: ...
+    def save_checkpoint(
+        self, record: CheckpointRecord, authority: ExecutionAuthority
+    ) -> CheckpointMetadata: ...
 
     def validate_checkpoint(
         self,

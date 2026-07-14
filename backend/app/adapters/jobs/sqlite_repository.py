@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from app.core.jobs.model import (
     Job,
     JobEvent,
 )
+from app.core.jobs.external_operation import ExternalOperation, ExternalOutcome
+from app.core.jobs.resource_lease import ExecutionAuthority, validate_lease_ttl
 from app.core.jobs.state_machine import (
     TERMINAL_JOB_STATES,
     transition_attempt,
@@ -34,6 +37,8 @@ _SCHEMA_STATEMENTS = (
         principal TEXT NOT NULL,
         client_request_id TEXT,
         state TEXT NOT NULL,
+        cancellation_requested INTEGER NOT NULL
+            CHECK (cancellation_requested IN (0, 1)),
         retry_of_job_id TEXT REFERENCES jobs(job_id),
         result_json TEXT,
         error_json TEXT,
@@ -130,7 +135,7 @@ _SCHEMA_STATEMENTS = (
     """,
     """
     CREATE TABLE leases (
-        lease_name TEXT PRIMARY KEY,
+        lease_name TEXT PRIMARY KEY CHECK (lease_name = 'scheduler'),
         job_id TEXT REFERENCES jobs(job_id) ON DELETE CASCADE,
         owner TEXT NOT NULL,
         fencing_token INTEGER NOT NULL,
@@ -185,15 +190,26 @@ def _raise_schema_invalid(error: BaseException | None = None) -> None:
 
 
 class SqliteJobRepository:
-    def __init__(self, machine_root: Path) -> None:
+    def __init__(
+        self, machine_root: Path, *, clock: Callable[[], int]
+    ) -> None:
         self.machine_root = machine_root
         self.database_path = machine_root / "jobs.sqlite"
+        self._clock = clock
 
     @classmethod
-    def open(cls, machine_root: Path) -> SqliteJobRepository:
+    def open(
+        cls,
+        machine_root: Path,
+        *,
+        clock: Callable[[], int] | None = None,
+    ) -> SqliteJobRepository:
         resolved_root = Path(machine_root).resolve()
         resolved_root.mkdir(parents=True, exist_ok=True)
-        repository = cls(resolved_root)
+        repository = cls(
+            resolved_root,
+            clock=clock or (lambda: time.time_ns() // 1_000_000),
+        )
         try:
             repository._initialize_schema()
         except DomainError:
@@ -320,20 +336,183 @@ class SqliteJobRepository:
                     ErrorCategory.CONFLICT,
                     "Terminal Job cannot create an Attempt",
                 )
+            if job.cancellation_requested:
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
             return self._create_attempt(connection, job_id, step_id)
+
+    def acquire_scheduler_lease(
+        self, owner_id: str, *, ttl_seconds: int
+    ) -> ExecutionAuthority:
+        validate_lease_ttl(ttl_seconds)
+        self._validate_owner_id(owner_id)
+        now_ms = self._clock()
+        expires_at = str(now_ms + ttl_seconds * 1_000)
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM leases WHERE lease_name = 'scheduler'"
+            ).fetchone()
+            if row is None:
+                fencing_token = 1
+                connection.execute(
+                    """
+                    INSERT INTO leases (
+                        lease_name, job_id, owner, fencing_token,
+                        expires_at, heartbeat_at
+                    ) VALUES ('scheduler', NULL, ?, ?, ?, ?)
+                    """,
+                    (owner_id, fencing_token, expires_at, str(now_ms)),
+                )
+            elif int(row["expires_at"]) > now_ms:
+                if row["owner"] != owner_id:
+                    raise DomainError(
+                        "scheduler_busy",
+                        ErrorCategory.CONFLICT,
+                        "Workspace scheduler is held by another process instance",
+                    )
+                fencing_token = row["fencing_token"]
+                connection.execute(
+                    """
+                    UPDATE leases SET expires_at = ?, heartbeat_at = ?
+                    WHERE lease_name = 'scheduler'
+                    """,
+                    (expires_at, str(now_ms)),
+                )
+            else:
+                fencing_token = row["fencing_token"] + 1
+                connection.execute(
+                    """
+                    UPDATE leases
+                    SET job_id = NULL, owner = ?, fencing_token = ?,
+                        expires_at = ?, heartbeat_at = ?
+                    WHERE lease_name = 'scheduler'
+                    """,
+                    (
+                        owner_id,
+                        fencing_token,
+                        expires_at,
+                        str(now_ms),
+                    ),
+                )
+            return ExecutionAuthority(owner_id, fencing_token)
+
+    def heartbeat_scheduler_lease(
+        self, authority: ExecutionAuthority, *, ttl_seconds: int
+    ) -> ExecutionAuthority:
+        validate_lease_ttl(ttl_seconds)
+        now_ms = self._clock()
+        with self._transaction(immediate=True) as connection:
+            updated = connection.execute(
+                """
+                UPDATE leases SET expires_at = ?, heartbeat_at = ?
+                WHERE lease_name = 'scheduler' AND owner = ?
+                  AND fencing_token = ? AND CAST(expires_at AS INTEGER) > ?
+                """,
+                (
+                    str(now_ms + ttl_seconds * 1_000),
+                    str(now_ms),
+                    authority.owner_id,
+                    authority.fencing_token,
+                    now_ms,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise DomainError(
+                    "scheduler_lease_lost",
+                    ErrorCategory.CONFLICT,
+                    "Workspace scheduler lease is expired or fenced",
+                )
+        return authority
+
+    def release_scheduler_lease(
+        self, authority: ExecutionAuthority
+    ) -> bool:
+        with self._transaction(immediate=True) as connection:
+            updated = connection.execute(
+                """
+                UPDATE leases SET expires_at = '0'
+                WHERE lease_name = 'scheduler' AND owner = ?
+                  AND fencing_token = ?
+                """,
+                (authority.owner_id, authority.fencing_token),
+            )
+            return updated.rowcount == 1
+
+    def start_attempt(
+        self, attempt_id: str, authority: ExecutionAuthority
+    ) -> Attempt:
+        with self._transaction(immediate=True) as connection:
+            attempt = self._get_attempt(connection, attempt_id)
+            if attempt.state is AttemptState.RUNNING:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "Running Attempt cannot be restarted by another owner",
+                )
+            next_state = transition_attempt(attempt.state, AttemptState.RUNNING)
+            job = self._get_job(connection, attempt.job_id)
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "attempt_job_not_running",
+                    ErrorCategory.CONFLICT,
+                    "Attempt start requires a running Job",
+                )
+            if job.cancellation_requested:
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
+            self._assert_scheduler_authority(connection, authority)
+            connection.execute(
+                """
+                UPDATE attempts
+                SET state = ?, fencing_token = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    next_state.value,
+                    authority.fencing_token,
+                    utc_now_millis(),
+                    attempt_id,
+                ),
+            )
+            return self._get_attempt(connection, attempt_id)
 
     def cancel_job(self, job_id: str) -> Job:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
             if job.state in TERMINAL_JOB_STATES:
                 return job
-            next_state = transition_job(job.state, JobState.CANCELLED)
-            self._ensure_attempts_settled(connection, job_id)
+            now = utc_now_millis()
             connection.execute(
-                "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
-                (next_state.value, utc_now_millis(), job_id),
+                """
+                UPDATE jobs SET cancellation_requested = 1, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
             )
+            connection.execute(
+                """
+                UPDATE attempts SET state = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    AttemptState.CANCELLED.value,
+                    now,
+                    job_id,
+                    AttemptState.PENDING.value,
+                ),
+            )
+            self._settle_cancelled_job_if_idle(connection, job_id, now)
             return self._get_job(connection, job_id)
+
+    def is_cancellation_requested(self, job_id: str) -> bool:
+        with self._transaction(immediate=False) as connection:
+            return self._get_job(connection, job_id).cancellation_requested
 
     def create_challenge(
         self,
@@ -522,9 +701,36 @@ class SqliteJobRepository:
             )
 
     def record_checkpoint(
-        self, metadata: CheckpointMetadata
+        self,
+        metadata: CheckpointMetadata,
+        authority: ExecutionAuthority,
     ) -> CheckpointMetadata:
         with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, metadata.job_id)
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "checkpoint_job_not_running",
+                    ErrorCategory.CONFLICT,
+                    "Checkpoint requires a running Job",
+                )
+            if job.cancellation_requested:
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
+            attempt = self._assert_execution_authority(
+                connection,
+                metadata.job_id,
+                metadata.attempt_id,
+                authority,
+            )
+            if attempt.step_id != metadata.step_id:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "Checkpoint step does not belong to the running Attempt",
+                )
             connection.execute(
                 """
                 INSERT INTO checkpoints (
@@ -568,6 +774,172 @@ class SqliteJobRepository:
                 (job_id, step_id),
             ).fetchone()
             return self._checkpoint_from_row(row) if row is not None else None
+
+    def prepare_external_operation(
+        self,
+        *,
+        job_id: str,
+        step_id: str,
+        attempt_id: str,
+        provider: str,
+        request_hash: str,
+        operation_idempotency_key: str | None,
+        summary_json: str,
+    ) -> ExternalOperation:
+        with self._transaction(immediate=True) as connection:
+            operation_id = new_typed_id("op")
+            now = utc_now_millis()
+            connection.execute(
+                """
+                INSERT INTO external_operations (
+                    operation_id, job_id, step_id, attempt_id, provider,
+                    request_hash, operation_idempotency_key,
+                    provider_request_id, outcome, summary_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    job_id,
+                    step_id,
+                    attempt_id,
+                    provider,
+                    request_hash,
+                    operation_idempotency_key,
+                    ExternalOutcome.PREPARED.value,
+                    summary_json,
+                    now,
+                    now,
+                ),
+            )
+            return self._get_external_operation(connection, operation_id)
+
+    def start_external_operation(
+        self, operation_id: str, authority: ExecutionAuthority
+    ) -> ExternalOperation:
+        with self._transaction(immediate=True) as connection:
+            operation = self._get_external_operation(connection, operation_id)
+            if operation.outcome is ExternalOutcome.UNKNOWN:
+                raise DomainError(
+                    "external_operation_unknown",
+                    ErrorCategory.CONFLICT,
+                    "Unknown external outcome requires explicit confirmation",
+                )
+            if operation.outcome is not ExternalOutcome.PREPARED:
+                raise DomainError(
+                    "external_operation_not_prepared",
+                    ErrorCategory.CONFLICT,
+                    "Only a prepared external operation can start",
+                )
+            job = self._get_job(connection, operation.job_id)
+            if job.cancellation_requested:
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
+            attempt = self._assert_execution_authority(
+                connection,
+                operation.job_id,
+                operation.attempt_id,
+                authority,
+            )
+            if attempt.step_id != operation.step_id:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "External operation step is not owned by the Attempt",
+                )
+            connection.execute(
+                """
+                UPDATE external_operations SET outcome = ?, updated_at = ?
+                WHERE operation_id = ? AND outcome = ?
+                """,
+                (
+                    ExternalOutcome.STARTED.value,
+                    utc_now_millis(),
+                    operation_id,
+                    ExternalOutcome.PREPARED.value,
+                ),
+            )
+            return self._get_external_operation(connection, operation_id)
+
+    def finish_external_operation(
+        self,
+        operation_id: str,
+        outcome: ExternalOutcome,
+        *,
+        provider_request_id: str | None,
+        summary_json: str,
+    ) -> ExternalOperation:
+        if outcome not in (ExternalOutcome.SUCCEEDED, ExternalOutcome.FAILED):
+            raise DomainError(
+                "external_operation_outcome_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "External operation can finish only as succeeded or failed",
+            )
+        with self._transaction(immediate=True) as connection:
+            current = self._get_external_operation(connection, operation_id)
+            if current.outcome is not ExternalOutcome.STARTED:
+                raise DomainError(
+                    "external_operation_not_started",
+                    ErrorCategory.CONFLICT,
+                    "Only a started external operation can finish",
+                )
+            connection.execute(
+                """
+                UPDATE external_operations
+                SET outcome = ?, provider_request_id = ?, summary_json = ?,
+                    updated_at = ?
+                WHERE operation_id = ? AND outcome = ?
+                """,
+                (
+                    outcome.value,
+                    provider_request_id,
+                    summary_json,
+                    utc_now_millis(),
+                    operation_id,
+                    ExternalOutcome.STARTED.value,
+                ),
+            )
+            return self._get_external_operation(connection, operation_id)
+
+    def get_external_operation(self, operation_id: str) -> ExternalOperation:
+        with self._transaction(immediate=False) as connection:
+            return self._get_external_operation(connection, operation_id)
+
+    def reconcile_external_operations_after_process_loss(
+        self, job_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        with self._transaction(immediate=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT operation_id FROM external_operations
+                WHERE job_id = ? AND outcome = ? ORDER BY operation_id
+                """,
+                (job_id, ExternalOutcome.STARTED.value),
+            ).fetchall()
+            operation_ids = tuple(row["operation_id"] for row in rows)
+            if operation_ids:
+                connection.executemany(
+                    """
+                    UPDATE external_operations SET outcome = ?, updated_at = ?
+                    WHERE operation_id = ? AND outcome = ?
+                    """,
+                    (
+                        (
+                            ExternalOutcome.UNKNOWN.value,
+                            utc_now_millis(),
+                            operation_id,
+                            ExternalOutcome.STARTED.value,
+                        )
+                        for operation_id in operation_ids
+                    ),
+                )
+            return tuple(
+                self._get_external_operation(connection, operation_id)
+                for operation_id in operation_ids
+            )
 
     def append_event(
         self, job_id: str, event_type: str, payload_json: str
@@ -625,19 +997,46 @@ class SqliteJobRepository:
             return self._get_job(connection, job_id)
 
     def transition_attempt(
-        self, attempt_id: str, state: AttemptState
+        self,
+        attempt_id: str,
+        state: AttemptState,
+        *,
+        authority: ExecutionAuthority | None = None,
     ) -> Attempt:
         with self._transaction(immediate=True) as connection:
+            if state is AttemptState.RUNNING:
+                raise DomainError(
+                    "attempt_start_required",
+                    ErrorCategory.CONFLICT,
+                    "Attempt must enter running through the fenced start operation",
+                )
             attempt = self._get_attempt(connection, attempt_id)
+            if attempt.state is AttemptState.RUNNING:
+                if authority is None:
+                    raise DomainError(
+                        "execution_authority_required",
+                        ErrorCategory.CONFLICT,
+                        "Running Attempt transition requires execution authority",
+                    )
+                self._assert_execution_authority(
+                    connection, attempt.job_id, attempt.attempt_id, authority
+                )
             next_state = transition_attempt(attempt.state, state)
+            now = utc_now_millis()
             connection.execute(
                 "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
-                (next_state.value, utc_now_millis(), attempt_id),
+                (next_state.value, now, attempt_id),
             )
+            self._settle_cancelled_job_if_idle(connection, attempt.job_id, now)
             return self._get_attempt(connection, attempt_id)
 
     @contextmanager
-    def commit_guard(self, job_id: str) -> Iterator[sqlite3.Connection]:
+    def commit_guard(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -648,7 +1047,55 @@ class SqliteJobRepository:
                     ErrorCategory.CONFLICT,
                     "Commit guard requires a running Job",
                 )
+            if job.cancellation_requested:
+                raise DomainError(
+                    "commit_guard_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Cancellation won before portable commit",
+                )
+            self._assert_execution_authority(
+                connection, job_id, attempt_id, authority
+            )
             yield connection
+            now = utc_now_millis()
+            attempt_updated = connection.execute(
+                """
+                UPDATE attempts SET state = ?, updated_at = ?
+                WHERE attempt_id = ? AND state = ? AND fencing_token = ?
+                """,
+                (
+                    AttemptState.SUCCEEDED.value,
+                    now,
+                    attempt_id,
+                    AttemptState.RUNNING.value,
+                    authority.fencing_token,
+                ),
+            )
+            if attempt_updated.rowcount != 1:
+                raise DomainError(
+                    "commit_guard_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Attempt authority changed before success",
+                )
+            self._ensure_attempts_settled(connection, job_id)
+            updated = connection.execute(
+                """
+                UPDATE jobs SET state = ?, updated_at = ?
+                WHERE job_id = ? AND state = ? AND cancellation_requested = 0
+                """,
+                (
+                    JobState.SUCCEEDED.value,
+                    now,
+                    job_id,
+                    JobState.RUNNING.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise DomainError(
+                    "commit_guard_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Portable commit authority changed before success",
+                )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -703,8 +1150,9 @@ class SqliteJobRepository:
             """
             INSERT INTO jobs (
                 job_id, request_hash, principal, client_request_id, state,
-                retry_of_job_id, result_json, error_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                cancellation_requested, retry_of_job_id, result_json,
+                error_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
             """,
             (
                 job_id,
@@ -739,7 +1187,7 @@ class SqliteJobRepository:
             INSERT INTO attempts (
                 attempt_id, job_id, step_id, state, fencing_token,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 1, ?, ?)
+            ) VALUES (?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 attempt_id,
@@ -751,6 +1199,95 @@ class SqliteJobRepository:
             ),
         )
         return self._get_attempt(connection, attempt_id)
+
+    def _assert_scheduler_authority(
+        self,
+        connection: sqlite3.Connection,
+        authority: ExecutionAuthority,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT 1 FROM leases
+            WHERE lease_name = 'scheduler' AND owner = ?
+              AND fencing_token = ? AND CAST(expires_at AS INTEGER) > ?
+            """,
+            (
+                authority.owner_id,
+                authority.fencing_token,
+                self._clock(),
+            ),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "attempt_fenced",
+                ErrorCategory.CONFLICT,
+                "Execution authority is expired or fenced",
+            )
+
+    def _assert_execution_authority(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> Attempt:
+        attempt = self._get_attempt(connection, attempt_id)
+        if (
+            attempt.job_id != job_id
+            or attempt.state is not AttemptState.RUNNING
+            or attempt.fencing_token < 1
+            or attempt.fencing_token != authority.fencing_token
+        ):
+            raise DomainError(
+                "attempt_fenced",
+                ErrorCategory.CONFLICT,
+                "Attempt is not owned by the current execution authority",
+            )
+        self._assert_scheduler_authority(connection, authority)
+        return attempt
+
+    @staticmethod
+    def _validate_owner_id(owner_id: str) -> None:
+        if (
+            type(owner_id) is not str
+            or not owner_id.strip()
+            or owner_id.isdecimal()
+        ):
+            raise DomainError(
+                "execution_authority_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Scheduler owner must identify a process instance, not only a PID",
+            )
+
+    @staticmethod
+    def _settle_cancelled_job_if_idle(
+        connection: sqlite3.Connection,
+        job_id: str,
+        now: str,
+    ) -> None:
+        job_row = connection.execute(
+            "SELECT state, cancellation_requested FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if job_row is None or not job_row["cancellation_requested"]:
+            return
+        running = connection.execute(
+            """
+            SELECT 1 FROM attempts
+            WHERE job_id = ? AND state = ? LIMIT 1
+            """,
+            (job_id, AttemptState.RUNNING.value),
+        ).fetchone()
+        if running is not None:
+            return
+        current = JobState(job_row["state"])
+        if current in TERMINAL_JOB_STATES:
+            return
+        next_state = transition_job(current, JobState.CANCELLED)
+        connection.execute(
+            "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
+            (next_state.value, now, job_id),
+        )
 
     @staticmethod
     def _ensure_attempts_settled(
@@ -783,6 +1320,7 @@ class SqliteJobRepository:
             principal=row["principal"],
             client_request_id=row["client_request_id"],
             state=JobState(row["state"]),
+            cancellation_requested=bool(row["cancellation_requested"]),
             retry_of_job_id=row["retry_of_job_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -809,6 +1347,7 @@ class SqliteJobRepository:
             job_id=row["job_id"],
             step_id=row["step_id"],
             state=AttemptState(row["state"]),
+            fencing_token=row["fencing_token"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -828,6 +1367,21 @@ class SqliteJobRepository:
             )
         return self._challenge_from_row(row)
 
+    def _get_external_operation(
+        self, connection: sqlite3.Connection, operation_id: str
+    ) -> ExternalOperation:
+        row = connection.execute(
+            "SELECT * FROM external_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "external_operation_not_found",
+                ErrorCategory.INVALID_REQUEST,
+                "External operation does not exist",
+            )
+        return self._external_operation_from_row(row)
+
     @staticmethod
     def _challenge_from_row(row: sqlite3.Row) -> Challenge:
         return Challenge(
@@ -839,6 +1393,23 @@ class SqliteJobRepository:
             response_json=row["response_json"],
             response_hash=row["response_hash"],
             response_attempt_id=row["response_attempt_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _external_operation_from_row(row: sqlite3.Row) -> ExternalOperation:
+        return ExternalOperation(
+            operation_id=row["operation_id"],
+            job_id=row["job_id"],
+            step_id=row["step_id"],
+            attempt_id=row["attempt_id"],
+            provider=row["provider"],
+            request_hash=row["request_hash"],
+            operation_idempotency_key=row["operation_idempotency_key"],
+            provider_request_id=row["provider_request_id"],
+            outcome=ExternalOutcome(row["outcome"]),
+            summary_json=row["summary_json"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

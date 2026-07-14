@@ -259,6 +259,7 @@ class VideoProduceResult:
 class JobSnapshot:
     job_id: str
     state: JobState
+    cancellation_requested: bool
     active_attempt_id: str | None
     challenge_id: str | None
     retry_of_job_id: str | None
