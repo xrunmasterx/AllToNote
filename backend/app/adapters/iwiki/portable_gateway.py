@@ -63,6 +63,7 @@ _COMPATIBILITY_ERRORS = (
     ValueError,
 )
 _STAGING_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_NONCE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _WINDOWS_DEVICE_STEMS = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
@@ -629,6 +630,7 @@ class _FileCandidateBundleWriter:
         discard_on_failure: bool = False,
     ) -> None:
         created = False
+        descriptor: int | None = None
         try:
             if os.name == "nt":
                 parent_path, _ = self._windows_parent(parts[:-1])
@@ -651,11 +653,18 @@ class _FileCandidateBundleWriter:
                 )
                 descriptor = os.open(parts[-1], flags, 0o600, dir_fd=parent_fd)
             created = True
-            with os.fdopen(descriptor, "wb") as stream:
+            stream = os.fdopen(descriptor, "wb")
+            descriptor = None
+            with stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
         except BaseException:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
             if created and discard_on_failure:
                 self._discard_completion_marker_preserving_primary()
             raise
@@ -832,11 +841,11 @@ class IWikiPortableGateway:
     ) -> CandidateLocationCapabilityPort:
         if not isinstance(workspace_root, Path):
             raise _location_invalid()
-        for component in (local_instance_id, nonce):
-            if (
-                type(component) is not str
-                or _STAGING_COMPONENT.fullmatch(component) is None
-            ):
+        for component, pattern in (
+            (local_instance_id, _STAGING_COMPONENT),
+            (nonce, _NONCE_COMPONENT),
+        ):
+            if type(component) is not str or pattern.fullmatch(component) is None:
                 raise _location_invalid()
             _require_portable_component(component)
         return _CandidateLocationCapability(

@@ -35,7 +35,11 @@ from app.core.portable.bundle_assembler import (
 )
 from app.core.portable.evidence import build_evidence_set
 from app.core.portable.jsonio import encode_json
-from app.core.portable.quality import evaluate_video_draft
+from app.core.portable.quality import (
+    QualityCheck,
+    evaluate_video_draft,
+)
+from app.core.ports.portable import CandidateBundleLocation
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
@@ -71,6 +75,46 @@ class _ExplodingMapping(Mapping[str, object]):
 
     def __len__(self) -> int:
         return 1
+
+
+class _ExplodingIterable:
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def __iter__(self) -> Iterator[object]:
+        raise self._error
+
+
+class _TestCandidateWriter:
+    def __init__(
+        self,
+        location: CandidateBundleLocation,
+        *,
+        primary_error: BaseException | None,
+        close_error: BaseException | None,
+    ) -> None:
+        self._location = location
+        self._primary_error = primary_error
+        self._close_error = close_error
+
+    def write_payload(self, relative_path: str, data: bytes) -> None:
+        if self._primary_error is not None:
+            raise self._primary_error
+
+    def complete(self, manifest: bytes) -> CandidateBundleLocation:
+        return self._location
+
+    def close(self) -> None:
+        if self._close_error is not None:
+            raise self._close_error
+
+
+class _TestCandidateCapability:
+    def __init__(self, writer: _TestCandidateWriter) -> None:
+        self._writer = writer
+
+    def begin(self, job_id: str) -> _TestCandidateWriter:
+        return self._writer
 
 
 @pytest.fixture
@@ -568,6 +612,45 @@ def test_gateway_rejects_invalid_staging_identity_without_external_write(
     assert list(outside.iterdir()) == []
 
 
+def test_gateway_rejects_dotted_nonce_before_any_staging_write(
+    workspace_root: Path,
+) -> None:
+    target_root = open_workspace(workspace_root, writable=True).resolve_contract_path(
+        "raw_personal"
+    )
+    before = tuple(target_root.rglob("*"))
+
+    with pytest.raises(DomainError) as raised:
+        IWikiPortableGateway().candidate_location(
+            workspace_root,
+            local_instance_id="task10",
+            nonce="a.b",
+        )
+
+    assert raised.value.code == "video_bundle_location_invalid"
+    assert tuple(target_root.rglob("*")) == before
+
+
+def test_gateway_allows_dotted_local_instance_and_real_validator_accepts_bundle(
+    workspace_root: Path,
+) -> None:
+    bundle_input = replace(
+        _bundle_input(workspace_root),
+        location=IWikiPortableGateway().candidate_location(
+            workspace_root,
+            local_instance_id="task.10",
+            nonce="nonce",
+        ),
+    )
+
+    candidate = BundleAssembler().assemble(bundle_input)
+
+    assert IWikiPortableGateway().validate_candidate(
+        workspace_root,
+        candidate.staging_relative_path,
+    ).valid
+
+
 @pytest.mark.parametrize(
     "invalid_path",
     (
@@ -693,6 +776,99 @@ def test_candidate_capability_and_writer_are_single_use_and_close_is_idempotent(
         capability.begin(JOB_ID)
 
 
+@pytest.mark.parametrize("primary_kind", ("domain", "fatal"))
+@pytest.mark.parametrize("close_kind", ("ordinary", "fatal"))
+def test_assembler_close_never_masks_primary_error(
+    workspace_root: Path,
+    primary_kind: str,
+    close_kind: str,
+) -> None:
+    primary: BaseException = (
+        DomainError("primary_error", ErrorCategory.INVALID_REQUEST, "primary")
+        if primary_kind == "domain"
+        else MemoryError("primary fatal")
+    )
+    close_error: BaseException = (
+        OSError("secondary close secret C:/private/close.log")
+        if close_kind == "ordinary"
+        else KeyboardInterrupt("secondary close fatal")
+    )
+    location = CandidateBundleLocation(
+        workspace_root=workspace_root,
+        candidate_path=workspace_root / "unused",
+        staging_relative_path="raw/personal/unused",
+        target_area="raw_personal",
+    )
+    writer = _TestCandidateWriter(
+        location,
+        primary_error=primary,
+        close_error=close_error,
+    )
+    bundle_input = replace(
+        _bundle_input(workspace_root),
+        location=_TestCandidateCapability(writer),
+    )
+
+    with pytest.raises(type(primary)) as raised:
+        BundleAssembler().assemble(bundle_input)
+
+    assert raised.value is primary
+
+
+def test_assembler_sanitizes_close_error_without_primary(
+    workspace_root: Path,
+) -> None:
+    secret = "C:/private/close.log"
+    location = CandidateBundleLocation(
+        workspace_root=workspace_root,
+        candidate_path=workspace_root / "unused",
+        staging_relative_path="raw/personal/unused",
+        target_area="raw_personal",
+    )
+    writer = _TestCandidateWriter(
+        location,
+        primary_error=None,
+        close_error=OSError(f"close failed {secret}"),
+    )
+    bundle_input = replace(
+        _bundle_input(workspace_root),
+        location=_TestCandidateCapability(writer),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(bundle_input)
+
+    assert raised.value.code == "video_bundle_write_failed"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+
+
+def test_assembler_preserves_fatal_close_error_without_primary(
+    workspace_root: Path,
+) -> None:
+    fatal = MemoryError("fatal close")
+    location = CandidateBundleLocation(
+        workspace_root=workspace_root,
+        candidate_path=workspace_root / "unused",
+        staging_relative_path="raw/personal/unused",
+        target_area="raw_personal",
+    )
+    writer = _TestCandidateWriter(
+        location,
+        primary_error=None,
+        close_error=fatal,
+    )
+    bundle_input = replace(
+        _bundle_input(workspace_root),
+        location=_TestCandidateCapability(writer),
+    )
+
+    with pytest.raises(MemoryError) as raised:
+        BundleAssembler().assemble(bundle_input)
+
+    assert raised.value is fatal
+
+
 def test_write_failure_is_sanitized_and_never_leaves_completion_marker(
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -717,6 +893,66 @@ def test_write_failure_is_sanitized_and_never_leaves_completion_marker(
     assert secret not in str(raised.value)
     assert secret not in repr(raised.value)
     assert not (_candidate_path(workspace_root) / "bundle.json").exists()
+
+
+@pytest.mark.parametrize("operation", ("payload", "completion"))
+@pytest.mark.parametrize("failure_kind", ("ordinary", "fatal"))
+def test_fdopen_failure_closes_owned_descriptor_and_cleans_own_marker(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    failure_kind: str,
+) -> None:
+    nonce = f"fdopen-{operation}-{failure_kind}"
+    writer = IWikiPortableGateway().candidate_location(
+        workspace_root,
+        local_instance_id="task10",
+        nonce=nonce,
+    ).begin(JOB_ID)
+    captured: list[int] = []
+    failure: BaseException = (
+        OSError("fdopen secret C:/private/descriptor.log")
+        if failure_kind == "ordinary"
+        else MemoryError("fatal fdopen failure")
+    )
+
+    def fail_fdopen(descriptor: int, mode: str):
+        captured.append(descriptor)
+        raise failure
+
+    monkeypatch.setattr(gateway_module.os, "fdopen", fail_fdopen)
+    candidate_path = (
+        open_workspace(workspace_root, writable=True).resolve_contract_path("raw_personal")
+        / ".staging"
+        / "task10"
+        / f"{JOB_ID}.{nonce}"
+        / "bundle.partial"
+    )
+
+    try:
+        expected = DomainError if failure_kind == "ordinary" else MemoryError
+        with pytest.raises(expected) as raised:
+            if operation == "payload":
+                writer.write_payload("sources/probe.bin", b"probe")
+            else:
+                writer.complete(b'{"completion":true}\n')
+        if failure_kind == "ordinary":
+            assert raised.value.code == "video_bundle_write_failed"
+            assert "C:/private" not in str(raised.value)
+        else:
+            assert raised.value is failure
+        assert captured
+        with pytest.raises(OSError):
+            os.fstat(captured[0])
+        if operation == "completion":
+            assert not (candidate_path / "bundle.json").exists()
+    finally:
+        for descriptor in captured:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        writer.close()
 
 
 def test_directory_sync_failure_removes_completion_marker(
@@ -909,6 +1145,9 @@ def test_assembler_rejects_forbidden_receipt_field_before_writing(
         "processID",
         "LeaseID",
         "fencingToken",
+        "X-API-Key",
+        "X-Auth-Token",
+        "aws_secret_access_key",
     ),
 )
 def test_assembler_canonicalizes_forbidden_provenance_keys(
@@ -932,6 +1171,26 @@ def test_assembler_canonicalizes_forbidden_provenance_keys(
     assert secret not in str(raised.value)
     assert secret not in repr(raised.value)
     assert not _candidate_path(workspace_root).exists()
+
+
+def test_provenance_key_matching_does_not_reject_unrelated_monkey_field(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    valid = replace(
+        bundle_input,
+        source=replace(
+            bundle_input.source,
+            extensions={"monkey": "banana"},
+        ),
+    )
+
+    candidate = BundleAssembler().assemble(valid)
+
+    assert IWikiPortableGateway().validate_candidate(
+        workspace_root,
+        candidate.staging_relative_path,
+    ).valid
 
 
 @pytest.mark.parametrize(
@@ -1061,6 +1320,43 @@ def test_snapshot_mapping_preserves_fatal_base_exception(workspace_root: Path) -
             bundle_input.source,
             extensions=_ExplodingMapping(KeyboardInterrupt()),
         )
+
+
+@pytest.mark.parametrize("field_name", ("warnings", "steps", "display_assets"))
+def test_tuple_snapshot_sanitizes_plain_iterable_exceptions(
+    workspace_root: Path,
+    field_name: str,
+) -> None:
+    secret = "iterable-secret-never-print"
+    bundle_input = _bundle_input(workspace_root)
+    exploding = _ExplodingIterable(RuntimeError(secret))
+
+    with pytest.raises(DomainError) as raised:
+        if field_name == "display_assets":
+            replace(bundle_input, display_assets=exploding)
+        else:
+            replace(bundle_input.receipt, **{field_name: exploding})
+
+    assert raised.value.code == "video_bundle_input_invalid"
+    assert secret not in str(raised.value)
+    assert secret not in repr(raised.value)
+
+
+@pytest.mark.parametrize("fatal_type", (MemoryError, KeyboardInterrupt, SystemExit))
+def test_tuple_snapshot_preserves_fatal_iterable_exceptions(
+    workspace_root: Path,
+    fatal_type: type[BaseException],
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    fatal = fatal_type("fatal iterable")
+
+    with pytest.raises(fatal_type) as raised:
+        replace(
+            bundle_input.receipt,
+            warnings=_ExplodingIterable(fatal),
+        )
+
+    assert raised.value is fatal
 
 
 def test_assembler_rejects_absolute_path_in_final_draft_before_writing(
@@ -1344,6 +1640,33 @@ def test_quality_outcome_rejects_mutated_typed_or_payload_fields(
 
     with pytest.raises(DomainError) as raised:
         BundleAssembler().assemble(replace(bundle_input, quality=quality))
+
+    assert raised.value.code == "video_bundle_quality_invalid"
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_quality_outcome_rejects_self_consistent_fabricated_assessment(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    quality = bundle_input.quality
+    made_up_check = QualityCheck("made_up_check", "pass")
+    document = json.loads(quality.report.payload)
+    document["checks"] = [{"id": "made_up_check", "status": "pass"}]
+    document["messages"] = []
+    document["evidence_ids"] = []
+    forged = replace(
+        quality,
+        report=replace(
+            quality.report,
+            checks=(made_up_check,),
+            evidence_ids=(),
+            payload=encode_json(document),
+        ),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(replace(bundle_input, quality=forged))
 
     assert raised.value.code == "video_bundle_quality_invalid"
     assert not _candidate_path(workspace_root).exists()

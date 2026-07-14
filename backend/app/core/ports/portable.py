@@ -16,7 +16,9 @@ class CandidateBundleWriterPort(Protocol):
 
     def complete(self, manifest: bytes) -> CandidateBundleLocation: ...
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Release resources; this may raise, but an active primary error wins."""
+        ...
 
 
 class CandidateLocationCapabilityPort(Protocol):

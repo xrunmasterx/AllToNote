@@ -334,6 +334,65 @@ def _make_report(
     )
 
 
+def rebuild_quality_outcome(
+    final_draft: bytes,
+    evidence_set: EvidenceSet,
+    *,
+    draft_bundle_id: str,
+    draft_artifact_id: str,
+    repair_attempts: int,
+) -> QualityOutcome:
+    if (
+        type(final_draft) is not bytes
+        or not isinstance(evidence_set, EvidenceSet)
+        or type(repair_attempts) is not int
+        or not 0 <= repair_attempts <= 1
+    ):
+        raise _quality_input_invalid()
+    try:
+        PortableArtifactRef(
+            draft_bundle_id,
+            draft_artifact_id,
+            "sha256:" + "0" * 64,
+        )
+        markdown = final_draft.decode("utf-8")
+        if encode_utf8_lf(markdown) != final_draft:
+            raise _quality_input_invalid()
+        cited_evidence_ids = set(_analyze_markdown(markdown).citation_ids)
+        cited_segment_ids = tuple(
+            segment_id
+            for segment_id, evidence_id in evidence_set.citation_map.items()
+            if evidence_id in cited_evidence_ids
+        )
+        draft = GeneratedVideoDraft(
+            markdown=markdown,
+            cited_segment_ids=cited_segment_ids,
+            screenshot_requests=(),
+            model_identity="quality-canonical-rebuild",
+            usage={},
+            warnings=(),
+        )
+        assessment = _assess(draft, evidence_set)
+        report = _make_report(
+            assessment,
+            draft_bundle_id=draft_bundle_id,
+            draft_artifact_id=draft_artifact_id,
+            repair_attempts=repair_attempts,
+        )
+    except MemoryError:
+        raise
+    except Exception:
+        raise _quality_input_invalid() from None
+    return QualityOutcome(
+        final_draft=assessment.draft_bytes,
+        report=report,
+        overall=report.overall,
+        publish_eligible=report.overall is not QualityOverall.FAIL,
+        repair_attempts=repair_attempts,
+        execution_error=None,
+    )
+
+
 def evaluate_video_draft(
     draft: GeneratedVideoDraft,
     evidence_set: EvidenceSet,
@@ -382,19 +441,20 @@ def evaluate_video_draft(
                 message="Draft quality repair failed",
             )
 
-    report = _make_report(
-        assessment,
+    canonical = rebuild_quality_outcome(
+        assessment.draft_bytes,
+        evidence_set,
         draft_bundle_id=draft_bundle_id,
         draft_artifact_id=draft_artifact_id,
         repair_attempts=repair_attempts,
     )
     publish_eligible = (
-        report.overall is not QualityOverall.FAIL and execution_error is None
+        canonical.overall is not QualityOverall.FAIL and execution_error is None
     )
     return QualityOutcome(
-        final_draft=assessment.draft_bytes,
-        report=report,
-        overall=report.overall,
+        final_draft=canonical.final_draft,
+        report=canonical.report,
+        overall=canonical.overall,
         publish_eligible=publish_eligible,
         repair_attempts=repair_attempts,
         execution_error=execution_error,

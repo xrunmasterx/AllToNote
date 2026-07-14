@@ -3,20 +3,21 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
+from typing import TypeVar
 from urllib.parse import parse_qsl, urlsplit
 
 from app.core.domain.ids import sha256_digest
-from app.core.domain.video import QualityOverall, TranscriptDocument
+from app.core.domain.video import TranscriptDocument
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import EvidenceSet, build_evidence_set
 from app.core.portable.jsonio import encode_json
-from app.core.portable.quality import QualityOutcome
+from app.core.portable.quality import QualityOutcome, rebuild_quality_outcome
 from app.core.ports.portable import (
     CandidateBundleLocation,
     CandidateLocationCapabilityPort,
@@ -43,7 +44,12 @@ _EXECUTOR_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,127}\Z")
 _FORBIDDEN_FIELD_NAMES = frozenset(
     {
         "api_key",
+        "access_token",
+        "auth_token",
         "authorization",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "client_secret",
         "cookie",
         "credential",
         "credentials",
@@ -57,6 +63,8 @@ _FORBIDDEN_FIELD_NAMES = frozenset(
         "provider_request_id",
         "secret",
         "secret_value",
+        "secret_access_key",
+        "session_token",
         "lease",
         "lease_id",
         "fence",
@@ -67,6 +75,7 @@ _FORBIDDEN_FIELD_NAMES = frozenset(
 _FORBIDDEN_CANONICAL_FIELD_NAMES = frozenset(
     re.sub(r"[^a-z0-9]", "", name.casefold()) for name in _FORBIDDEN_FIELD_NAMES
 )
+_FIELD_NAME_WRAPPER_TOKENS = frozenset({"header", "headers", "http", "x"})
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
         "accesskey",
@@ -102,9 +111,19 @@ _REDACTION_VALUES = {
     "prompts": frozenset({"hash_only", "omitted"}),
     "provider_payloads": frozenset({"omitted"}),
 }
+_T = TypeVar("_T")
+
 
 def _error(code: str, message: str) -> DomainError:
     return DomainError(code, ErrorCategory.INVALID_REQUEST, message)
+
+
+def _write_failed() -> DomainError:
+    return DomainError(
+        "video_bundle_write_failed",
+        ErrorCategory.RETRYABLE_RUNTIME,
+        "Candidate bundle writer could not be closed cleanly",
+    )
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -153,6 +172,18 @@ def _snapshot_mapping(value: Mapping[str, object], field_name: str) -> Mapping[s
     return MappingProxyType(document)
 
 
+def _snapshot_tuple(value: Iterable[_T], field_name: str) -> tuple[_T, ...]:
+    try:
+        return tuple(value)
+    except MemoryError:
+        raise
+    except Exception:
+        raise _error(
+            "video_bundle_input_invalid",
+            f"{field_name} could not be read safely",
+        ) from None
+
+
 def _is_absolute_or_local_path(value: str) -> bool:
     lowered = value.lower()
     return (
@@ -181,8 +212,7 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
         for key, item in value.items():
             if type(key) is not str:
                 raise _error("video_bundle_input_invalid", f"{field_name} has a non-text key")
-            canonical_key = re.sub(r"[^a-z0-9]", "", key.casefold())
-            if canonical_key in _FORBIDDEN_CANONICAL_FIELD_NAMES:
+            if _is_forbidden_field_name(key):
                 raise _error(
                     "video_bundle_sensitive_data",
                     "Portable bundle content contains forbidden provenance data",
@@ -194,6 +224,16 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
             _validate_safe_value(item, f"{field_name}[{index}]")
         return
     raise _error("video_bundle_input_invalid", f"{field_name} is not JSON-safe")
+
+
+def _is_forbidden_field_name(key: str) -> bool:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    tokens = re.findall(r"[a-z0-9]+", separated.casefold())
+    candidates = {"".join(tokens)}
+    while tokens and tokens[0] in _FIELD_NAME_WRAPPER_TOKENS:
+        tokens = tokens[1:]
+        candidates.add("".join(tokens))
+    return bool(candidates & _FORBIDDEN_CANONICAL_FIELD_NAMES)
 
 
 def _portable_path(value: str, *, allow_control: bool = False) -> str:
@@ -437,8 +477,8 @@ class ReceiptProvenance:
         object.__setattr__(self, "effective_policy_hashes", policy_hashes)
         object.__setattr__(self, "usage", _snapshot_mapping(self.usage, "usage"))
         object.__setattr__(self, "redactions", _snapshot_mapping(self.redactions, "redactions"))
-        object.__setattr__(self, "warnings", tuple(self.warnings))
-        object.__setattr__(self, "steps", tuple(self.steps))
+        object.__setattr__(self, "warnings", _snapshot_tuple(self.warnings, "warnings"))
+        object.__setattr__(self, "steps", _snapshot_tuple(self.steps, "steps"))
         if not self.steps or len(self.steps) > 32:
             raise _error(
                 "video_bundle_input_invalid",
@@ -524,7 +564,11 @@ class VideoBundleInput:
             raise _error("video_bundle_input_invalid", "quality is invalid")
         if not isinstance(self.receipt, ReceiptProvenance):
             raise _error("video_bundle_input_invalid", "receipt is invalid")
-        object.__setattr__(self, "display_assets", tuple(self.display_assets))
+        object.__setattr__(
+            self,
+            "display_assets",
+            _snapshot_tuple(self.display_assets, "display_assets"),
+        )
         if any(not isinstance(asset, DisplayAssetInput) for asset in self.display_assets):
             raise _error("video_bundle_input_invalid", "display_assets are invalid")
 
@@ -617,8 +661,18 @@ class BundleAssembler:
                 writer.write_payload(payload.path, payload.data)
             writer.write_payload("receipt.json", receipt_bytes)
             location = writer.complete(manifest_bytes)
-        finally:
+        except BaseException:
+            try:
+                writer.close()
+            except BaseException:
+                pass
+            raise
+        try:
             writer.close()
+        except MemoryError:
+            raise
+        except Exception:
+            raise _write_failed() from None
         return CandidateBundle(
             location=location,
             bundle_id=bundle_input.bundle_id,
@@ -790,46 +844,22 @@ class BundleAssembler:
                 "video_bundle_quality_execution_failed",
                 "Quality evaluation did not complete successfully",
             )
-        expected_subject = {
-            "bundle_id": bundle_input.bundle_id,
-            "artifact_id": ids.primary_draft,
-            "sha256": sha256_digest(quality.final_draft),
-        }
-        check_documents: list[dict[str, object]] = []
-        for check in quality.report.checks:
-            document: dict[str, object] = {
-                "id": check.check_id,
-                "status": check.status,
-            }
-            if check.reason is not None:
-                document["reason"] = check.reason
-            check_documents.append(document)
-        expected_report = encode_json(
-            {
-                "quality_report_schema_version": 1,
-                "subject": expected_subject,
-                "profile": {"id": "alltonote.video-course-note", "version": 1},
-                "overall": quality.overall.value,
-                "checks": check_documents,
-                "method": {"kind": "deterministic"},
-                "metrics": {"quality_repair_attempts": quality.repair_attempts},
-                "messages": sorted(
-                    check.check_id
-                    for check in quality.report.checks
-                    if check.status == "fail"
-                ),
-                "evidence_ids": list(quality.report.evidence_ids),
-            }
-        )
-        expected_publish_eligible = quality.overall is not QualityOverall.FAIL
-        if (
-            quality.report.payload != expected_report
-            or quality.report.subject_sha256 != expected_subject["sha256"]
-            or quality.report.overall is not quality.overall
-            or quality.publish_eligible is not expected_publish_eligible
-            or type(quality.repair_attempts) is not int
-            or not 0 <= quality.repair_attempts <= 1
-        ):
+        try:
+            expected_quality = rebuild_quality_outcome(
+                quality.final_draft,
+                evidence,
+                draft_bundle_id=bundle_input.bundle_id,
+                draft_artifact_id=ids.primary_draft,
+                repair_attempts=quality.repair_attempts,
+            )
+        except MemoryError:
+            raise
+        except DomainError:
+            raise _error(
+                "video_bundle_quality_invalid",
+                "Quality outcome is inconsistent",
+            ) from None
+        if quality != expected_quality:
             raise _error("video_bundle_quality_invalid", "Quality outcome is inconsistent")
 
     @staticmethod

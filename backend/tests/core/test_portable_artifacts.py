@@ -19,7 +19,7 @@ from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import build_evidence_set, rewrite_segment_citations
 from app.core.portable.jsonio import encode_json, encode_ndjson
 from app.core.portable.markdown_safety import validate_markdown_safety
-from app.core.portable.quality import evaluate_video_draft
+from app.core.portable.quality import evaluate_video_draft, rebuild_quality_outcome
 
 
 BUNDLE_ID = "bnd_018f0000-0000-7000-8000-000000000001"
@@ -1017,6 +1017,21 @@ def test_quality_report_uses_the_video_course_note_profile() -> None:
     report = json.loads(_evaluate(_draft(_good_markdown())).report.payload)
 
     assert report["profile"] == {"id": "alltonote.video-course-note", "version": 1}
+
+
+def test_canonical_quality_rebuild_uses_final_artifact_and_evidence() -> None:
+    evidence_set = _evidence_set()
+    expected = _evaluate(_draft(_good_markdown()), evidence_set=evidence_set)
+
+    rebuilt = rebuild_quality_outcome(
+        expected.final_draft,
+        evidence_set,
+        draft_bundle_id=BUNDLE_ID,
+        draft_artifact_id=DRAFT_ARTIFACT_ID,
+        repair_attempts=expected.repair_attempts,
+    )
+
+    assert rebuilt == expected
 
 
 @pytest.mark.parametrize("bad_input", ("draft", "evidence", "bundle_id", "artifact_id"))
