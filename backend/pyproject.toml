@@ -1,0 +1,19 @@
+[project]
+name = "alltonote-runtime"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["filelock>=3.18,<4", "keyring>=25,<26", "llm-iwiki==0.1.0", "platformdirs>=4.3,<5", "tomli-w>=1.2,<2"]
+
+[project.scripts]
+alltonote = "app.cli.main:entrypoint"
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["runtime-lock.json"]

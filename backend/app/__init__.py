@@ -1,7 +1,13 @@
-from fastapi import FastAPI
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 
 def create_app(lifespan) -> FastAPI:
+    from fastapi import FastAPI
     from .routers import chat, codex_app_server, config, model, note, provider
 
     app = FastAPI(title="BiliNote",lifespan=lifespan)
