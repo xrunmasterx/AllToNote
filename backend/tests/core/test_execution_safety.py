@@ -417,6 +417,173 @@ def test_external_operation_binding_freezes_existing_outcome_semantics(
     assert retry.outcome is ExternalOutcome.PREPARED
 
 
+def test_prepared_binding_rebinds_same_operation_to_current_fenced_attempt(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, ExternalOutcome, _ = _task7_api()
+    clock = _Clock()
+    repository = _repository(tmp_path, clock)
+    job, old_attempt, old_authority = _running_attempt(repository)
+    request_hash = sha256_digest(b"prepared before takeover")
+    prepared = ExternalOperationGuard(repository, old_authority).prepare(
+        job_id=job.job_id,
+        step_id=old_attempt.step_id,
+        attempt_id=old_attempt.attempt_id,
+        provider="paid-provider",
+        request_hash=request_hash,
+        summary_json="{}",
+    )
+    with repository._connect() as connection:
+        before_count = connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0]
+
+    clock.advance(31_000)
+    authority = repository.acquire_scheduler_lease(
+        "workspace-a:process-b", ttl_seconds=30
+    )
+    current_attempt = repository.create_attempt(job.job_id, old_attempt.step_id)
+    current_attempt = repository.start_attempt(current_attempt.attempt_id, authority)
+    guard = ExternalOperationGuard(repository, authority)
+    replay = guard.prepare(
+        job_id=job.job_id,
+        step_id=current_attempt.step_id,
+        attempt_id=current_attempt.attempt_id,
+        provider="paid-provider",
+        request_hash=request_hash,
+        summary_json='{"replayed":true}',
+    )
+
+    assert replay.operation_id == prepared.operation_id
+    assert replay.attempt_id == current_attempt.attempt_id
+    assert replay.summary_json == prepared.summary_json
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == before_count
+    assert guard.start(replay.operation_id).outcome is ExternalOutcome.STARTED
+
+
+@pytest.mark.parametrize("existing_outcome", (None, "prepared", "failed"))
+def test_prepare_rejects_stale_authority_before_reuse_or_insert(
+    tmp_path: Path,
+    existing_outcome: str | None,
+) -> None:
+    _, ExternalOperationGuard, _, _ = _task7_api()
+    clock = _Clock()
+    repository = _repository(tmp_path, clock)
+    job, attempt, old_authority = _running_attempt(repository)
+    old_guard = ExternalOperationGuard(repository, old_authority)
+    request_hash = sha256_digest(b"stale prepare")
+    if existing_outcome is not None:
+        operation = old_guard.prepare(
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+            provider="paid-provider",
+            request_hash=request_hash,
+            summary_json="{}",
+        )
+        if existing_outcome == "failed":
+            old_guard.start(operation.operation_id)
+            old_guard.fail(operation.operation_id, summary_json="{}")
+    with repository._connect() as connection:
+        before = connection.execute(
+            "SELECT operation_id, attempt_id, outcome FROM external_operations"
+        ).fetchall()
+
+    clock.advance(31_000)
+    repository.acquire_scheduler_lease(
+        "workspace-a:process-b", ttl_seconds=30
+    )
+    with pytest.raises(DomainError, match="attempt_fenced"):
+        old_guard.prepare(
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+            provider="paid-provider",
+            request_hash=request_hash,
+            summary_json="{}",
+        )
+
+    with repository._connect() as connection:
+        after = connection.execute(
+            "SELECT operation_id, attempt_id, outcome FROM external_operations"
+        ).fetchall()
+    assert tuple(map(tuple, after)) == tuple(map(tuple, before))
+
+
+def test_prepare_validates_cancellation_and_attempt_binding_before_insert(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, _, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, attempt, authority = _running_attempt(repository)
+    guard = ExternalOperationGuard(repository, authority)
+    repository.cancel_job(job.job_id)
+
+    with pytest.raises(DomainError, match="job_cancelled"):
+        guard.prepare(
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+            provider="provider",
+            request_hash=sha256_digest(b"cancelled"),
+            summary_json="{}",
+        )
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == 0
+
+
+def test_prepare_rejects_attempt_from_another_job_before_insert(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, _, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, attempt, authority = _running_attempt(repository)
+    _, other_attempt, _ = _running_attempt(repository)
+
+    with pytest.raises(DomainError, match="attempt_fenced"):
+        ExternalOperationGuard(repository, authority).prepare(
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=other_attempt.attempt_id,
+            provider="provider",
+            request_hash=sha256_digest(b"wrong attempt"),
+            summary_json="{}",
+        )
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == 0
+
+
+def test_prepare_rejects_attempt_from_another_step_before_insert(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, _, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, attempt, authority = _running_attempt(repository)
+    other = repository.create_attempt(job.job_id, "other-step")
+    other = repository.start_attempt(other.attempt_id, authority)
+
+    with pytest.raises(DomainError, match="attempt_fenced"):
+        ExternalOperationGuard(repository, authority).prepare(
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=other.attempt_id,
+            provider="provider",
+            request_hash=sha256_digest(b"wrong step"),
+            summary_json="{}",
+        )
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == 0
+
+
 def test_unknown_binding_blocks_prepare_and_defensive_start_but_not_new_job(
     tmp_path: Path,
 ) -> None:

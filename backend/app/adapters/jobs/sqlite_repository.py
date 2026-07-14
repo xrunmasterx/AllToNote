@@ -785,6 +785,7 @@ class SqliteJobRepository:
         request_hash: str,
         operation_idempotency_key: str | None,
         summary_json: str,
+        authority: ExecutionAuthority,
     ) -> ExternalOperation:
         with self._transaction(immediate=True) as connection:
             rows = connection.execute(
@@ -816,13 +817,45 @@ class SqliteJobRepository:
                     ErrorCategory.CONFLICT,
                     "An external operation for this request is already in progress",
                 )
-            for reusable_outcome in (
-                ExternalOutcome.SUCCEEDED,
-                ExternalOutcome.PREPARED,
-            ):
-                reusable = by_outcome[reusable_outcome]
-                if reusable:
-                    return self._get_external_operation(connection, reusable[0])
+            succeeded = by_outcome[ExternalOutcome.SUCCEEDED]
+            if succeeded:
+                return self._get_external_operation(connection, succeeded[0])
+            job = self._get_job(connection, job_id)
+            if job.cancellation_requested:
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "external_operation_job_not_running",
+                    ErrorCategory.CONFLICT,
+                    "External operation requires a running Job",
+                )
+            attempt = self._assert_execution_authority(
+                connection, job_id, attempt_id, authority
+            )
+            if attempt.step_id != step_id:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "External operation step is not owned by the Attempt",
+                )
+            prepared = by_outcome[ExternalOutcome.PREPARED]
+            if prepared:
+                connection.execute(
+                    """
+                    UPDATE external_operations SET attempt_id = ?
+                    WHERE operation_id = ? AND outcome = ?
+                    """,
+                    (
+                        attempt_id,
+                        prepared[0],
+                        ExternalOutcome.PREPARED.value,
+                    ),
+                )
+                return self._get_external_operation(connection, prepared[0])
             operation_id = new_typed_id("op")
             now = utc_now_millis()
             connection.execute(

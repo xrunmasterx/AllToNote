@@ -42,6 +42,7 @@ class _ExternalOperationStore(Protocol):
         request_hash: str,
         operation_idempotency_key: str | None,
         summary_json: str,
+        authority: ExecutionAuthority,
     ) -> ExternalOperation: ...
 
     def start_external_operation(
@@ -94,6 +95,7 @@ class ExternalOperationGuard:
             request_hash=request_hash,
             operation_idempotency_key=operation_idempotency_key,
             summary_json=summary_json,
+            authority=self._authority,
         )
 
     def start(self, operation_id: str) -> ExternalOperation:
