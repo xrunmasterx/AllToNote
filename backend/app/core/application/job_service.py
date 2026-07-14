@@ -18,12 +18,15 @@ _SECRET_FIELD_NAMES = frozenset(
     {
         "accesstoken",
         "apikey",
+        "authtoken",
         "authorization",
         "cookie",
         "password",
         "refreshtoken",
         "secret",
+        "setcookie",
         "token",
+        "xapikey",
     }
 )
 _SECRET_IDENTIFIER_TOKENS = frozenset(

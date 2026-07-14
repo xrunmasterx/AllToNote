@@ -238,7 +238,17 @@ def test_secret_named_field_never_enters_hash_database_or_error(
     assert secret.encode("utf-8") not in repo.database_path.read_bytes()
 
 
-@pytest.mark.parametrize("secret_field", ("X-API-Key", "auth_token", "set-cookie"))
+@pytest.mark.parametrize(
+    "secret_field",
+    (
+        "X-API-Key",
+        "auth_token",
+        "set-cookie",
+        "xapikey",
+        "authtoken",
+        "setcookie",
+    ),
+)
 def test_secret_field_alias_is_rejected_by_submit_and_respond(
     repo: SqliteJobRepository,
     tmp_path: Path,
@@ -262,6 +272,13 @@ def test_secret_field_alias_is_rejected_by_submit_and_respond(
         assert secret_field not in repr(caught.value)
         assert secret not in str(caught.value)
         assert secret not in repr(caught.value)
+    with repo._connect() as connection:
+        challenge_row = connection.execute(
+            "SELECT state, response_json FROM challenges WHERE challenge_id = ?",
+            (challenge.challenge_id,),
+        ).fetchone()
+
+    assert tuple(challenge_row) == ("pending", None)
     assert secret.encode("utf-8") not in repo.database_path.read_bytes()
     assert service.get(job.job_id).challenge_id == challenge.challenge_id
 
