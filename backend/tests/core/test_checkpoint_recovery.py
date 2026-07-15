@@ -816,6 +816,7 @@ def test_sqlite_repository_structurally_satisfies_metadata_port(tmp_path: Path) 
         "record_checkpoint",
         "latest_checkpoint",
         "append_event",
+        "authorize_attempt_storage",
         "list_events",
     }.issubset(set(dir(repository)))
     assert {
@@ -826,5 +827,6 @@ def test_sqlite_repository_structurally_satisfies_metadata_port(tmp_path: Path) 
         "record_checkpoint",
         "latest_checkpoint",
         "append_event",
+        "authorize_attempt_storage",
         "list_events",
     }

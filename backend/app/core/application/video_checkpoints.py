@@ -16,6 +16,8 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.application.video_acquisition import (
+    AttemptStoredAsset,
+    StoredAssetRole,
     TranscriptProvenance,
     VideoAcquisition,
 )
@@ -240,7 +242,7 @@ def decode_preflight(payload: bytes) -> str:
 
 
 def encode_source(source: ResolvedVideoSource) -> bytes:
-    if not isinstance(source, ResolvedVideoSource) or source.local_binding is not None:
+    if not isinstance(source, ResolvedVideoSource):
         raise checkpoint_error()
     return encode_object(
         {
@@ -323,14 +325,24 @@ def encode_acquired(value: VideoAcquisition) -> bytes:
                 if value.transcript_provenance is not None
                 else None
             ),
+            "stored_media": (
+                None
+                if value.stored_media is None
+                else {
+                    "relative_locator": value.stored_media.relative_locator,
+                    "sha256": value.stored_media.sha256,
+                    "byte_length": value.stored_media.byte_length,
+                    "role": value.stored_media.role.value,
+                }
+            ),
         }
     )
 
 
 def decode_acquired(payload: bytes) -> VideoAcquisition:
-    value = decode_object(
-        payload,
-        keys=frozenset(
+    try:
+        value = json.loads(payload)
+        legacy_keys = frozenset(
             {
                 "step",
                 "metadata",
@@ -339,12 +351,23 @@ def decode_acquired(payload: bytes) -> VideoAcquisition:
                 "transcript_identity",
                 "transcript_provenance",
             }
-        ),
-    )
-    try:
+        )
+        current_keys = legacy_keys | {"stored_media"}
+        if type(value) is not dict or frozenset(value) not in {
+            legacy_keys,
+            current_keys,
+        }:
+            raise TypeError
         if value["step"] != "acquire" or type(value["metadata"]) is not dict:
             raise TypeError
         transcript_value = value["transcript"]
+        stored_value = value.get("stored_media")
+        if stored_value is not None and (
+            type(stored_value) is not dict
+            or frozenset(stored_value)
+            != frozenset({"relative_locator", "sha256", "byte_length", "role"})
+        ):
+            raise TypeError
         transcript = (
             None
             if transcript_value is None
@@ -367,8 +390,26 @@ def decode_acquired(payload: bytes) -> VideoAcquisition:
                 if value["transcript_provenance"] is None
                 else TranscriptProvenance(value["transcript_provenance"])
             ),
+            stored_media=(
+                None
+                if stored_value is None
+                else AttemptStoredAsset(
+                    relative_locator=stored_value["relative_locator"],
+                    sha256=stored_value["sha256"],
+                    byte_length=stored_value["byte_length"],
+                    role=StoredAssetRole(stored_value["role"]),
+                )
+            ),
         )
-    except (DomainError, KeyError, TypeError, ValueError):
+    except (
+        DomainError,
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ):
         raise checkpoint_error() from None
 
 

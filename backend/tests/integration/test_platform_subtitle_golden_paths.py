@@ -28,6 +28,7 @@ from app.core.application.video_checkpoints import (
     encode_source,
 )
 from app.core.application.video_service import VideoService
+from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
     JobState,
     QualityOverall,
@@ -270,6 +271,30 @@ def _decode_acquisition_checkpoint(runtime: object, job_id: str) -> object:
     return decode_acquired(payload_path.read_bytes())
 
 
+def _rewrite_acquisition_as_literal_pre16a_payload(runtime: object, job_id: str) -> None:
+    metadata = runtime.job_repository.latest_checkpoint(job_id, "acquire")
+    assert metadata is not None
+    payload_path = (
+        runtime.job_repository.machine_root.parent
+        / "attempts"
+        / metadata.relative_path
+    )
+    current = json.loads(payload_path.read_bytes())
+    assert current.pop("stored_media") is None
+    legacy_payload = json.dumps(
+        current,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    payload_path.write_bytes(legacy_payload)
+    with runtime.job_repository._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE checkpoints SET output_hash = ?, byte_length = ? WHERE checkpoint_id = ?",
+            (sha256_digest(legacy_payload), len(legacy_payload), metadata.checkpoint_id),
+        )
+
+
 def _assert_challenge_matches_unknown_operations(runtime: object, job_id: str) -> None:
     _, _, challenge = runtime.job_repository.get_job_details(job_id)
     assert challenge is not None
@@ -452,6 +477,7 @@ def test_process_loss_before_model_reuses_acquisition_checkpoints(
     process.start()
     process.join(timeout=30)
     assert process.exitcode == 23
+    _rewrite_acquisition_as_literal_pre16a_payload(first_runtime, submitted.job_id)
 
     recovered_runtime, recovered_calls = runtime_factory(
         platform="youtube",

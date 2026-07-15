@@ -599,6 +599,7 @@ def test_task6_checkpoint_and_event_ports_have_exact_frozen_methods() -> None:
         name for name in metadata_port.__dict__ if not name.startswith("_")
     } == {
         "append_event",
+        "authorize_attempt_storage",
         "latest_checkpoint",
         "list_events",
         "record_checkpoint",
@@ -609,6 +610,8 @@ def test_task6_checkpoint_and_event_ports_have_exact_frozen_methods() -> None:
     } == {
         "append_event",
         "reconcile_event_projection",
+        "resolve_asset",
         "save_checkpoint",
+        "snapshot_asset",
         "validate_checkpoint",
     }

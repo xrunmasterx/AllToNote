@@ -200,6 +200,7 @@ class VideoRecipeOperations(Protocol):
         request: VideoProduceRequest,
         acquired: VideoAcquisition,
         *,
+        acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> TranscriptDocument: ...
 
@@ -370,6 +371,9 @@ class VideoService:
             decode=_decode_acquired,
             resumed_attempt=resumed_attempt,
         )
+        acquisition_checkpoint = self._repository.latest_checkpoint(job_id, "acquire")
+        if acquisition_checkpoint is None:
+            raise _checkpoint_error()
         transcript = self._checkpointed(
             job_id,
             "normalize_transcript",
@@ -378,6 +382,7 @@ class VideoService:
             lambda execution: self._operations.transcribe(
                 request,
                 acquired,
+                acquisition_checkpoint=acquisition_checkpoint,
                 execution=execution,
             ),
             encode=_encode_transcript,

@@ -24,6 +24,7 @@ from app.adapters.transcription.legacy_transcriber import (
     normalize_platform_subtitle,
 )
 from app.core.application.video_acquisition import (
+    StoredAssetRole,
     TranscriptProvenance,
     VideoAcquisition,
     transcript_identity,
@@ -56,6 +57,7 @@ from app.core.ports.source import (
     VideoSourcePort,
 )
 from app.core.ports.transcript import MediaInput
+from app.core.ports.transcript import TranscriptPort
 from app.core.sdk import AllToNoteSDK
 from iwiki.workspace import open_workspace
 
@@ -208,8 +210,10 @@ class _FakeVideoOperations(VideoRecipeOperations):
         request: VideoProduceRequest,
         acquired: VideoAcquisition,
         *,
+        acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> TranscriptDocument:
+        del acquisition_checkpoint
         self._calls.transcribe += 1
         self._record("transcribe")
         self._crash_if_requested("transcribe")
@@ -420,8 +424,10 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         request: VideoProduceRequest,
         acquired: VideoAcquisition,
         *,
+        acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> TranscriptDocument:
+        del acquisition_checkpoint
         token = CancellationToken(self._repository, execution.job_id)
         transcript = acquired.transcript
         if transcript is None:
@@ -486,6 +492,175 @@ class _PlatformVideoOperations(VideoRecipeOperations):
 
     def after_portable_commit(self, result: object) -> None:
         del result
+
+
+class _LocalVideoOperations(_PlatformVideoOperations):
+    def __init__(
+        self,
+        repository: SqliteJobRepository,
+        storage: FileAttemptStorage,
+        source: VideoSourcePort,
+        source_metadata: Mapping[str, Mapping[str, object]],
+        transcriber: TranscriptPort,
+        model: LegacyModelBinding,
+        result_root: Path,
+    ) -> None:
+        super().__init__(repository, source, source_metadata, model, result_root)
+        self._storage = storage
+        self._transcriber = transcriber
+
+    def acquire(
+        self,
+        request: VideoProduceRequest,
+        source: ResolvedVideoSource,
+        *,
+        source_id: str,
+        source_revision_id: str,
+        execution: VideoStepExecutionContext,
+    ) -> VideoAcquisition:
+        token = CancellationToken(self._repository, execution.job_id)
+        live_source = source
+        if live_source.local_binding is None:
+            live_source = self._source.resolve(request.input_value)
+            if (
+                live_source.connector_id != source.connector_id
+                or live_source.connector_version != source.connector_version
+                or live_source.canonical_identity != source.canonical_identity
+                or live_source.logical_reference != source.logical_reference
+                or live_source.content_sha256 != source.content_sha256
+            ):
+                raise DomainError(
+                    "source_local_changed",
+                    ErrorCategory.INVALID_REQUEST,
+                    "The local source changed after it was resolved",
+                )
+        binding = live_source.local_binding
+        digest = live_source.content_sha256
+        fixture = self._source_metadata.get("local")
+        if (
+            binding is None
+            or digest is None
+            or fixture is None
+            or frozenset(fixture) != _SOURCE_METADATA_FIELDS
+        ):
+            raise DomainError(
+                "source_metadata_unavailable",
+                ErrorCategory.RECIPE_FAILED,
+                "Complete source metadata is required for local composition",
+            )
+        provided = request.provided_transcript
+        self._source.acquire(
+            live_source,
+            need_media=False,
+            need_subtitles=False,
+            output_dir=self._acquisition_root / execution.job_id,
+            token=token,
+        )
+        stored = self._storage.snapshot_asset(
+            binding.path,
+            job_id=execution.job_id,
+            attempt_id=execution.attempt_id,
+            role=StoredAssetRole.SOURCE_MEDIA,
+            expected_sha256=digest,
+            authority=execution.authority,
+            token=token,
+        )
+        try:
+            metadata = VideoSourceMetadata(
+                source_id=source_id,
+                source_revision_id=source_revision_id,
+                connector_id=live_source.connector_id,
+                connector_version=live_source.connector_version,
+                platform="local",
+                canonical_identity_scheme=live_source.canonical_identity_scheme,
+                stable_video_identity=live_source.stable_video_identity,
+                canonical_uri=None,
+                title=fixture["title"],
+                author=fixture["author"],
+                channel=fixture["channel"],
+                duration_ms=fixture["duration_ms"],
+                published_at=fixture["published_at"],
+                observed_at=fixture["observed_at"],
+                language=fixture["language"],
+                subtitle_acquisition=(
+                    TranscriptProvenance.PROVIDED.value
+                    if provided is not None
+                    else TranscriptProvenance.GENERATED.value
+                ),
+                source_link=None,
+                materialization_reason="external_local_content",
+                license="unknown",
+                privacy="personal",
+                freshness="point_in_time",
+                logical_reference=live_source.logical_reference,
+                materialization_kind=MaterializationPolicy.EXTERNAL_LOCAL.value,
+            )
+        except (DomainError, TypeError, ValueError):
+            raise DomainError(
+                "source_metadata_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Complete source metadata is invalid",
+            ) from None
+        return VideoAcquisition(
+            metadata=metadata,
+            subtitle_availability=(
+                SubtitleAvailability.AVAILABLE
+                if provided is not None
+                else SubtitleAvailability.NOT_SUPPORTED
+            ),
+            transcript=provided,
+            transcript_identity=(
+                transcript_identity(provided) if provided is not None else None
+            ),
+            transcript_provenance=(
+                TranscriptProvenance.PROVIDED if provided is not None else None
+            ),
+            stored_media=stored,
+        )
+
+    def transcribe(
+        self,
+        request: VideoProduceRequest,
+        acquired: VideoAcquisition,
+        *,
+        acquisition_checkpoint: CheckpointMetadata,
+        execution: VideoStepExecutionContext,
+    ) -> TranscriptDocument:
+        del request
+        token = CancellationToken(self._repository, execution.job_id)
+        if acquired.transcript is not None:
+            return acquired.transcript
+        stored = acquired.stored_media
+        if stored is None:
+            raise DomainError(
+                "source_media_missing",
+                ErrorCategory.RECIPE_FAILED,
+                "Local source media is unavailable",
+            )
+        media_path = self._storage.resolve_asset(
+            stored,
+            expected_job_id=acquisition_checkpoint.job_id,
+            expected_attempt_id=acquisition_checkpoint.attempt_id,
+        )
+        try:
+            return self._transcriber.transcribe(MediaInput(media_path=media_path), token)
+        except DomainError as error:
+            if (
+                error.category
+                in {ErrorCategory.CANCELLED, ErrorCategory.RETRYABLE_RUNTIME}
+                or error.code
+                in {"attempt_fenced", "job_cancelled", "external_outcome_unknown"}
+            ):
+                raise DomainError(
+                    error.code,
+                    error.category,
+                    "Local media transcription failed",
+                ) from None
+            raise DomainError(
+                "local_transcription_failed",
+                ErrorCategory.RECIPE_FAILED,
+                "Local media transcription failed",
+            ) from None
 
 
 class AllToNoteRuntime:
@@ -559,6 +734,50 @@ def create_platform_video_runtime(
         repository,
         source,
         source_metadata,
+        model,
+        resolved_machine_root / "external-results",
+    )
+    service = VideoService(
+        repository,
+        storage,
+        IWikiPortableGateway(),
+        operations,
+        checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
+        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        work_root=storage.root,
+        local_instance_id=local_instance_id
+        or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+    )
+    return AllToNoteRuntime(AllToNoteSDK(service), repository)
+
+
+def create_local_video_runtime(
+    machine_root: Path,
+    *,
+    source: VideoSourcePort,
+    source_metadata: Mapping[str, Mapping[str, object]],
+    transcriber: TranscriptPort,
+    model: LegacyModelBinding,
+    owner_id: str | None = None,
+    local_instance_id: str | None = None,
+    clock: Callable[[], int] | None = None,
+) -> AllToNoteRuntime:
+    resolved_machine_root = Path(machine_root).resolve()
+    resolved_machine_root.mkdir(parents=True, exist_ok=True)
+    repository = SqliteJobRepository.open(
+        resolved_machine_root / "job-store", clock=clock
+    )
+    storage = FileAttemptStorage(
+        resolved_machine_root / "attempts",
+        repository,
+        validators={CHECKPOINT_SCHEMA: _checkpoint_payload_is_valid},
+    )
+    operations = _LocalVideoOperations(
+        repository,
+        storage,
+        source,
+        source_metadata,
+        transcriber,
         model,
         resolved_machine_root / "external-results",
     )
@@ -662,5 +881,6 @@ __all__ = [
     "VideoPreflightCapabilities",
     "create_fake_runtime",
     "create_fake_runtime_for_workspace",
+    "create_local_video_runtime",
     "create_platform_video_runtime",
 ]

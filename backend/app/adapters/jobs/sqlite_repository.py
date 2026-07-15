@@ -930,6 +930,20 @@ class SqliteJobRepository:
                 ).fetchone()
             )
 
+    def authorize_attempt_storage(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> None:
+        with self._connect() as connection:
+            self._assert_execution_authority(
+                connection,
+                job_id,
+                attempt_id,
+                authority,
+            )
+
     def latest_checkpoint(
         self, job_id: str, step_id: str
     ) -> CheckpointMetadata | None:

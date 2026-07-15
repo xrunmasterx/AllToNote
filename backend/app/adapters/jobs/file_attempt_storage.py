@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import stat
@@ -9,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.core.domain.ids import sha256_digest, utc_now_millis
+from app.core.application.video_acquisition import AttemptStoredAsset, StoredAssetRole
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import (
     CheckpointMetadata,
@@ -17,6 +19,7 @@ from app.core.jobs.model import (
 )
 from app.core.jobs.resource_lease import ExecutionAuthority
 from app.core.ports.jobs import AttemptMetadataRepositoryPort
+from app.core.ports.source import CancellationTokenPort
 
 
 ContentValidator = Callable[[bytes], bool]
@@ -51,6 +54,22 @@ def _storage_path_invalid() -> DomainError:
         "attempt_storage_path_invalid",
         ErrorCategory.WORKSPACE_INCOMPATIBLE,
         "Attempt storage path is unsafe",
+    )
+
+
+def _stored_asset_invalid() -> DomainError:
+    return DomainError(
+        "attempt_stored_asset_invalid",
+        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+        "Attempt stored asset is invalid",
+    )
+
+
+def _storage_io_failed() -> DomainError:
+    return DomainError(
+        "attempt_storage_io_failed",
+        ErrorCategory.RETRYABLE_RUNTIME,
+        "Attempt storage could not publish the asset",
     )
 
 
@@ -153,6 +172,135 @@ class FileAttemptStorage:
             sha256_digest(payload) == metadata.output_hash
             and self._content_is_valid(metadata.schema_id, payload)
         )
+
+    def snapshot_asset(
+        self,
+        source_path: Path,
+        *,
+        job_id: str,
+        attempt_id: str,
+        role: StoredAssetRole,
+        expected_sha256: str,
+        authority: ExecutionAuthority,
+        token: CancellationTokenPort,
+    ) -> AttemptStoredAsset:
+        self._validate_job_id(job_id)
+        self._validate_job_id(attempt_id)
+        if (
+            role is not StoredAssetRole.SOURCE_MEDIA
+            or type(expected_sha256) is not str
+            or len(expected_sha256) != 71
+            or not expected_sha256.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in expected_sha256[7:])
+        ):
+            raise _stored_asset_invalid()
+        self._metadata_repository.authorize_attempt_storage(
+            job_id, attempt_id, authority
+        )
+        token.raise_if_cancelled()
+        source = self._checked_regular_source(Path(source_path))
+        suffix = source.suffix
+        if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix) is None:
+            suffix = ".media"
+        relative = (
+            Path("jobs")
+            / job_id
+            / "attempts"
+            / attempt_id
+            / "assets"
+            / f"{role.value}{suffix.lower()}"
+        )
+        try:
+            target = self._checked_target(relative, create_parent=True)
+            if os.path.lexists(target):
+                raise _stored_asset_invalid()
+        except DomainError:
+            raise
+        except OSError:
+            raise _storage_io_failed() from None
+        temporary = target.with_name(f".{target.name}.{uuid4().hex}.partial")
+        verified_length = 0
+        try:
+            with source.open("rb") as source_stream:
+                source_stat = os.fstat(source_stream.fileno())
+                path_stat = os.lstat(source)
+                if (
+                    not stat.S_ISREG(source_stat.st_mode)
+                    or (source_stat.st_dev, source_stat.st_ino)
+                    != (path_stat.st_dev, path_stat.st_ino)
+                    or self._path_chain_has_reparse_point(source)
+                ):
+                    raise _stored_asset_invalid()
+                with temporary.open("xb") as target_stream:
+                    while chunk := source_stream.read(1024 * 1024):
+                        token.raise_if_cancelled()
+                        if target_stream.write(chunk) != len(chunk):
+                            raise OSError("short attempt asset write")
+                    target_stream.flush()
+                    os.fsync(target_stream.fileno())
+            verified_digest, verified_length = self._verified_file_digest(temporary)
+            if verified_length <= 0 or verified_digest != expected_sha256:
+                raise _stored_asset_invalid()
+            token.raise_if_cancelled()
+            self._metadata_repository.authorize_attempt_storage(
+                job_id, attempt_id, authority
+            )
+            self._checked_target(relative, create_parent=False)
+            os.replace(temporary, target)
+        except DomainError:
+            raise
+        except OSError:
+            raise _storage_io_failed() from None
+        finally:
+            try:
+                if os.path.lexists(temporary):
+                    temporary.unlink()
+            except OSError:
+                pass
+        return AttemptStoredAsset(
+            relative_locator=relative.as_posix(),
+            sha256=expected_sha256,
+            byte_length=verified_length,
+            role=role,
+        )
+
+    def resolve_asset(
+        self,
+        stored: AttemptStoredAsset,
+        *,
+        expected_job_id: str,
+        expected_attempt_id: str,
+    ) -> Path:
+        if not isinstance(stored, AttemptStoredAsset):
+            raise _stored_asset_invalid()
+        try:
+            self._validate_job_id(expected_job_id)
+            self._validate_job_id(expected_attempt_id)
+        except DomainError:
+            raise _stored_asset_invalid() from None
+        expected_prefix = (
+            "jobs",
+            expected_job_id,
+            "attempts",
+            expected_attempt_id,
+            "assets",
+        )
+        relative = Path(stored.relative_locator)
+        if relative.parts[:5] != expected_prefix or len(relative.parts) != 6:
+            raise _stored_asset_invalid()
+        try:
+            resolved = self._checked_target(relative, create_parent=False)
+            if self._path_chain_has_reparse_point(resolved):
+                raise _stored_asset_invalid()
+            digest, byte_length = self._verified_file_digest(resolved)
+        except (DomainError, OSError):
+            raise _stored_asset_invalid() from None
+        if (
+            byte_length != stored.byte_length
+            or digest != stored.sha256
+        ):
+            raise _stored_asset_invalid()
+        return resolved
 
     def append_event(
         self, job_id: str, event_type: str, payload_json: str
@@ -265,6 +413,52 @@ class FileAttemptStorage:
         attributes = getattr(path_stat, "st_file_attributes", 0)
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         return stat.S_ISLNK(path_stat.st_mode) or bool(attributes & reparse_flag)
+
+    @classmethod
+    def _path_chain_has_reparse_point(cls, path: Path) -> bool:
+        current = path
+        while True:
+            if cls._is_reparse_point(current):
+                return True
+            if current.parent == current:
+                return False
+            current = current.parent
+
+    @classmethod
+    def _checked_regular_source(cls, path: Path) -> Path:
+        try:
+            if cls._path_chain_has_reparse_point(path):
+                raise _stored_asset_invalid()
+            resolved = path.resolve(strict=True)
+            path_stat = os.lstat(resolved)
+            unresolved = path.resolve(strict=False)
+        except DomainError:
+            raise
+        except (OSError, RuntimeError):
+            raise _storage_io_failed() from None
+        if resolved != unresolved or not stat.S_ISREG(path_stat.st_mode):
+            raise _stored_asset_invalid()
+        return resolved
+
+    @classmethod
+    def _verified_file_digest(cls, path: Path) -> tuple[str, int]:
+        if cls._path_chain_has_reparse_point(path):
+            raise _stored_asset_invalid()
+        digest = hashlib.sha256()
+        byte_length = 0
+        with path.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            path_stat = os.lstat(path)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or (opened_stat.st_dev, opened_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)
+            ):
+                raise _stored_asset_invalid()
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                byte_length += len(chunk)
+        return f"sha256:{digest.hexdigest()}", byte_length
 
     def _content_is_valid(self, schema_id: str, payload: bytes) -> bool:
         validator = self._validators.get(schema_id)

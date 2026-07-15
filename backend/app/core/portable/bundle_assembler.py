@@ -330,7 +330,7 @@ class VideoSourceMetadata:
     platform: str
     canonical_identity_scheme: str
     stable_video_identity: str
-    canonical_uri: str
+    canonical_uri: str | None
     title: str
     author: str
     channel: str
@@ -339,12 +339,14 @@ class VideoSourceMetadata:
     observed_at: str
     language: str
     subtitle_acquisition: str
-    source_link: str
+    source_link: str | None
     materialization_reason: str
     license: str
     privacy: str
     freshness: str
     extensions: Mapping[str, object] = field(default_factory=dict)
+    logical_reference: str | None = None
+    materialization_kind: str = "reference_only"
 
     def __post_init__(self) -> None:
         _require_id(self.source_id, "src", "source_id")
@@ -355,14 +357,12 @@ class VideoSourceMetadata:
             "platform",
             "canonical_identity_scheme",
             "stable_video_identity",
-            "canonical_uri",
             "title",
             "author",
             "channel",
             "observed_at",
             "language",
             "subtitle_acquisition",
-            "source_link",
             "materialization_reason",
             "license",
             "privacy",
@@ -377,8 +377,38 @@ class VideoSourceMetadata:
             raise _error("video_bundle_input_invalid", "license is invalid")
         if self.privacy not in {"public", "personal", "sensitive", "confidential", "unknown"}:
             raise _error("video_bundle_input_invalid", "privacy is invalid")
-        _require_safe_url(self.canonical_uri, "canonical_uri")
-        _require_safe_url(self.source_link, "source_link")
+        if self.materialization_kind == "reference_only":
+            if self.canonical_uri is None or self.source_link is None:
+                raise _error(
+                    "video_bundle_input_invalid",
+                    "Reference-only source requires safe source URLs",
+                )
+            _require_safe_url(self.canonical_uri, "canonical_uri")
+            _require_safe_url(self.source_link, "source_link")
+            if self.logical_reference is not None:
+                raise _error(
+                    "video_bundle_input_invalid",
+                    "Reference-only source cannot have a local logical reference",
+                )
+        elif self.materialization_kind == "external_local":
+            expected_reference = (
+                f"urn:alltonote:local-content:{self.stable_video_identity}"
+            )
+            if (
+                self.canonical_uri is not None
+                or self.source_link is not None
+                or self.logical_reference != expected_reference
+                or _DIGEST.fullmatch(self.stable_video_identity) is None
+            ):
+                raise _error(
+                    "video_bundle_input_invalid",
+                    "External-local source requires a logical content reference",
+                )
+        else:
+            raise _error(
+                "video_bundle_input_invalid",
+                "materialization_kind is invalid",
+            )
         object.__setattr__(self, "extensions", _snapshot_mapping(self.extensions, "extensions"))
 
 
@@ -710,7 +740,7 @@ class BundleAssembler:
             "subtitle": {"acquisition_mode": source.subtitle_acquisition},
             "safe_source_link": source.source_link,
             "materialization": {
-                "kind": "reference_only",
+                "kind": source.materialization_kind,
                 "reason_code": source.materialization_reason,
             },
             "license": {
@@ -724,6 +754,8 @@ class BundleAssembler:
             },
             "extensions": {"alltonote.video:metadata": dict(source.extensions)},
         }
+        if source.logical_reference is not None:
+            metadata["logical_reference"] = source.logical_reference
         _validate_safe_value(metadata, "source_metadata")
         transcript = build_transcript(
             source.source_revision_id,
@@ -880,6 +912,10 @@ class BundleAssembler:
                 }
             },
         }
+        if source.logical_reference is not None:
+            source_document["extensions"]["alltonote.video:source"][
+                "logical_reference"
+            ] = source.logical_reference
         revision_document = {
             "source_revision_schema_version": 1,
             "source_revision_id": source.source_revision_id,
@@ -893,10 +929,17 @@ class BundleAssembler:
                 "observed_at": source.observed_at,
             },
             "content_digest": sha256_digest(metadata_payload.data),
-            "materialization": {
-                "kind": "reference_only",
-                "reason_code": source.materialization_reason,
-            },
+            "materialization": (
+                {
+                    "kind": "external_local",
+                    "external_ref_id": f"ext_{source.source_id.removeprefix('src_')}",
+                }
+                if source.materialization_kind == "external_local"
+                else {
+                    "kind": "reference_only",
+                    "reason_code": source.materialization_reason,
+                }
+            ),
             "license": {
                 "status": source.license,
                 "archive_permission": "unknown",

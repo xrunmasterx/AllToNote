@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import TranscriptDocument
@@ -15,6 +16,52 @@ class TranscriptProvenance(StrEnum):
     PROVIDED = "provided"
     PLATFORM = "platform"
     GENERATED = "generated"
+
+
+class StoredAssetRole(StrEnum):
+    SOURCE_MEDIA = "source_media"
+
+
+@dataclass(frozen=True)
+class AttemptStoredAsset:
+    relative_locator: str
+    sha256: str
+    byte_length: int
+    role: StoredAssetRole
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.relative_locator) is not str
+        ):
+            raise DomainError(
+                "attempt_stored_asset_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Attempt stored asset is invalid",
+            )
+        path = PurePosixPath(self.relative_locator)
+        if (
+            "\\" in self.relative_locator
+            or path.is_absolute()
+            or PureWindowsPath(self.relative_locator).is_absolute()
+            or path.as_posix() != self.relative_locator
+            or len(path.parts) != 6
+            or path.parts[0] != "jobs"
+            or path.parts[2] != "attempts"
+            or path.parts[4] != "assets"
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or type(self.sha256) is not str
+            or len(self.sha256) != 71
+            or not self.sha256.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in self.sha256[7:])
+            or type(self.byte_length) is not int
+            or self.byte_length <= 0
+            or not isinstance(self.role, StoredAssetRole)
+        ):
+            raise DomainError(
+                "attempt_stored_asset_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Attempt stored asset is invalid",
+            )
 
 
 def transcript_identity(transcript: TranscriptDocument) -> str:
@@ -52,6 +99,7 @@ class VideoAcquisition:
     transcript: TranscriptDocument | None
     transcript_identity: str | None
     transcript_provenance: TranscriptProvenance | None
+    stored_media: AttemptStoredAsset | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, VideoSourceMetadata) or not isinstance(
@@ -61,6 +109,14 @@ class VideoAcquisition:
                 "video_acquisition_invalid",
                 ErrorCategory.INVALID_REQUEST,
                 "Video acquisition metadata is invalid",
+            )
+        if self.stored_media is not None and not isinstance(
+            self.stored_media, AttemptStoredAsset
+        ):
+            raise DomainError(
+                "video_acquisition_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Stored acquisition media is invalid",
             )
         if self.transcript is None:
             if (
@@ -93,6 +149,8 @@ class VideoAcquisition:
 
 
 __all__ = [
+    "AttemptStoredAsset",
+    "StoredAssetRole",
     "TranscriptProvenance",
     "VideoAcquisition",
     "transcript_identity",

@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
@@ -8,6 +9,7 @@ from app.core.domain.video import (
     QualityOverall,
     VideoProduceResult,
 )
+from app.core.application.video_acquisition import AttemptStoredAsset, StoredAssetRole
 from app.core.errors import ErrorDetail
 from app.core.jobs.external_operation import ExternalOperation
 from app.core.jobs.model import (
@@ -20,6 +22,7 @@ from app.core.jobs.model import (
     JobEvent,
 )
 from app.core.jobs.resource_lease import ExecutionAuthority
+from app.core.ports.source import CancellationTokenPort
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,13 @@ class AttemptMetadataRepositoryPort(Protocol):
         self, job_id: str, after_sequence: int = 0
     ) -> tuple[JobEvent, ...]: ...
 
+    def authorize_attempt_storage(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> None: ...
+
 
 class AttemptStoragePort(Protocol):
     """Boundary for private attempt staging and checkpoints."""
@@ -232,3 +242,23 @@ class AttemptStoragePort(Protocol):
     ) -> JobEvent: ...
 
     def reconcile_event_projection(self, job_id: str) -> tuple[JobEvent, ...]: ...
+
+    def snapshot_asset(
+        self,
+        source_path: Path,
+        *,
+        job_id: str,
+        attempt_id: str,
+        role: StoredAssetRole,
+        expected_sha256: str,
+        authority: ExecutionAuthority,
+        token: CancellationTokenPort,
+    ) -> AttemptStoredAsset: ...
+
+    def resolve_asset(
+        self,
+        stored: AttemptStoredAsset,
+        *,
+        expected_job_id: str,
+        expected_attempt_id: str,
+    ) -> Path: ...
