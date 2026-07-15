@@ -70,6 +70,7 @@ from app.core.ports.source import ResolvedVideoSource
 RUNTIME_VERSION = "0.1.0"
 CHECKPOINT_SCHEMA = "video-step.v1"
 _CANDIDATE_ASSEMBLY_BEHAVIOR = "linked-screenshot-draft-v2"
+_HISTORICAL_COMMIT_CANDIDATE_BEHAVIOR = "linked-screenshot-draft-v1"
 _SCHEDULER_LEASE_TTL_SECONDS = 300
 _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _AUTHORITY_LOSS_CODES = frozenset({"attempt_fenced", "scheduler_lease_lost"})
@@ -458,7 +459,7 @@ class VideoService:
         attempt: Attempt,
         authority: ExecutionAuthority,
     ) -> JobSnapshot:
-        checkpoint = self._load_candidate_checkpoint(
+        checkpoint = self._load_commit_candidate_checkpoint(
             attempt.job_id, self._request_hash(request)
         )
         return self._commit(request, checkpoint, attempt, authority)
@@ -730,16 +731,26 @@ class VideoService:
             raise
         return self._snapshot(attempt.job_id)
 
-    def _load_candidate_checkpoint(
+    def _load_commit_candidate_checkpoint(
         self, job_id: str, request_hash: str
     ) -> _CandidateCheckpoint:
         metadata = self._repository.latest_checkpoint(
             job_id, "assemble_candidate_bundle"
         )
-        if metadata is None or not self._attempt_storage.validate_checkpoint(
-            metadata,
-            expected_schema_id=CHECKPOINT_SCHEMA,
-            expected_input_hash=self._candidate_assembly_input_hash(request_hash),
+        accepted_hashes = (
+            self._candidate_assembly_input_hash(request_hash),
+            self._candidate_assembly_input_hash_for_behavior(
+                request_hash,
+                _HISTORICAL_COMMIT_CANDIDATE_BEHAVIOR,
+            ),
+        )
+        if metadata is None or not any(
+            self._attempt_storage.validate_checkpoint(
+                metadata,
+                expected_schema_id=CHECKPOINT_SCHEMA,
+                expected_input_hash=input_hash,
+            )
+            for input_hash in accepted_hashes
         ):
             raise DomainError(
                 "candidate_checkpoint_invalid",
@@ -1157,10 +1168,20 @@ class VideoService:
 
     @staticmethod
     def _candidate_assembly_input_hash(request_hash: str) -> str:
+        return VideoService._candidate_assembly_input_hash_for_behavior(
+            request_hash,
+            _CANDIDATE_ASSEMBLY_BEHAVIOR,
+        )
+
+    @staticmethod
+    def _candidate_assembly_input_hash_for_behavior(
+        request_hash: str,
+        behavior: str,
+    ) -> str:
         return sha256_digest(
             json.dumps(
                 {
-                    "behavior": _CANDIDATE_ASSEMBLY_BEHAVIOR,
+                    "behavior": behavior,
                     "request": request_hash,
                 },
                 sort_keys=True,

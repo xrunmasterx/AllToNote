@@ -13,6 +13,7 @@ import pytest
 from iwiki.portable import PortableBundleRef, ValidationLevel, validate_bundle
 from iwiki.workspace import open_workspace
 
+import app.core.application.video_service as video_service_module
 from app.core.domain.video import (
     GeneratedVideoDraft,
     JobState,
@@ -441,6 +442,91 @@ def test_crash_after_rename_recovers_after_runtime_reopen_and_new_fence(
     assert assembly_attempts == 1
 
 
+def test_v2_reconciles_v1_candidate_after_portable_rename(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "v1-commit-recovery-machine"
+    call_log = tmp_path / "v1-commit-recovery-calls.ndjson"
+    monkeypatch.setattr(
+        video_service_module,
+        "_CANDIDATE_ASSEMBLY_BEHAVIOR",
+        "linked-screenshot-draft-v1",
+    )
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        crash_after_commit_once=True,
+        owner_id="v1-commit-process",
+        clock=lambda: 1_000,
+    )
+    request = valid_request(
+        workspace_root,
+        client_request_id="v1-commit-recovery",
+    )
+    submitted = first.submit_video(request)
+
+    with pytest.raises(RuntimeError, match="injected crash after portable rename"):
+        first.wait_job(submitted.job_id)
+
+    candidate_metadata = first.job_repository.latest_checkpoint(
+        submitted.job_id, "assemble_candidate_bundle"
+    )
+    assert candidate_metadata is not None
+    candidate = _CandidateCheckpoint.decode(
+        (
+            Path(first.job_repository.database_path).parent.parent
+            / "attempts"
+            / candidate_metadata.relative_path
+        ).read_bytes()
+    )
+    committed_bundles = tuple(
+        (workspace_root / "raw" / "personal" / "bundles").iterdir()
+    )
+    assert [bundle.name for bundle in committed_bundles] == [candidate.bundle_id]
+    assert candidate_metadata.input_hash == VideoService._candidate_assembly_input_hash(
+        VideoService._request_hash(request)
+    )
+
+    monkeypatch.setattr(
+        video_service_module,
+        "_CANDIDATE_ASSEMBLY_BEHAVIOR",
+        "linked-screenshot-draft-v2",
+    )
+    del first
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        owner_id="v2-commit-process",
+        clock=lambda: 302_000,
+    )
+    recovered = reopened.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    assert recovered.result is not None
+    assert recovered.result.idempotent is True
+    assert recovered.result.bundle_id == candidate.bundle_id
+    assert recovered.result.manifest_sha256 == candidate.manifest_sha256
+    operations = _read_call_log(call_log)
+    assert operations.count("model") == 1
+    assert operations.count("portable_commit") == 1
+    assert [
+        bundle.name
+        for bundle in (workspace_root / "raw" / "personal" / "bundles").iterdir()
+    ] == [candidate.bundle_id]
+    with reopened.job_repository._connect() as connection:
+        assembly_attempts = connection.execute(
+            """
+            SELECT COUNT(*) FROM attempts
+            WHERE job_id = ? AND step_id = 'assemble_candidate_bundle'
+            """,
+            (submitted.job_id,),
+        ).fetchone()[0]
+    assert assembly_attempts == 1
+
+
 def test_restart_after_draft_failure_reuses_transcript_checkpoint(
     tmp_path: Path,
     workspace_root: Path,
@@ -522,6 +608,7 @@ def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
 def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
     tmp_path: Path,
     workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "legacy-citation-spacing-machine"
@@ -536,15 +623,17 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
     request = replace(
         valid_request(workspace_root, client_request_id="legacy-citation-spacing"),
         provided_transcript=transcript,
-        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
+    monkeypatch.setattr(
+        video_service_module,
+        "_CANDIDATE_ASSEMBLY_BEHAVIOR",
+        "linked-screenshot-draft-v1",
     )
     first = runtime_module.create_fake_runtime(
         machine_root,
         call_log_path=call_log,
-        crash_operation_once="screenshots",
         owner_id="legacy-spacing-first",
         clock=lambda: 1_000,
-        screenshot_requests=(ScreenshotRequest("seg_000001", 0),),
     )
     service = first._sdk._video_service
     delegate = service._operations
@@ -575,9 +664,17 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
             )
 
     service._operations = AdjacentCitationOperations()
+    original_validate = service._validate_candidate
+
+    def crash_after_v1_candidate(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        service._validate_candidate = original_validate
+        raise RuntimeError("injected after v1 candidate checkpoint")
+
+    service._validate_candidate = crash_after_v1_candidate
     submitted = first.submit_video(request)
 
-    with pytest.raises(RuntimeError, match="injected screenshots crash"):
+    with pytest.raises(RuntimeError, match="injected after v1 candidate checkpoint"):
         first.wait_job(submitted.job_id)
 
     draft_metadata = first.job_repository.latest_checkpoint(
@@ -625,8 +722,18 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
             separators=(",", ":"),
         )
     )
-    assert VideoService._candidate_assembly_input_hash(request_hash) != old_candidate_hash
+    v1_candidate_metadata = first.job_repository.latest_checkpoint(
+        submitted.job_id, "assemble_candidate_bundle"
+    )
+    assert v1_candidate_metadata is not None
+    assert v1_candidate_metadata.input_hash == old_candidate_hash
 
+    monkeypatch.setattr(
+        video_service_module,
+        "_CANDIDATE_ASSEMBLY_BEHAVIOR",
+        "linked-screenshot-draft-v2",
+    )
+    assert VideoService._candidate_assembly_input_hash(request_hash) != old_candidate_hash
     del first
     reopened = runtime_module.create_fake_runtime(
         machine_root,
@@ -646,6 +753,14 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
     assert recovered_draft_metadata is not None
     assert recovered_draft_metadata.checkpoint_id == draft_metadata.checkpoint_id
     assert recovered_draft_metadata.input_hash == request_hash
+    v2_candidate_metadata = reopened.job_repository.latest_checkpoint(
+        submitted.job_id, "assemble_candidate_bundle"
+    )
+    assert v2_candidate_metadata is not None
+    assert v2_candidate_metadata.checkpoint_id != v1_candidate_metadata.checkpoint_id
+    assert v2_candidate_metadata.input_hash == VideoService._candidate_assembly_input_hash(
+        request_hash
+    )
     committed = workspace_root / recovered.result.workspace_relative_bundle_path
     final_markdown = (
         committed
@@ -656,6 +771,15 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
     assert adjacent not in final_markdown
     assert final_markdown.count(f"[^{evidence_ids[0]}]") == 2
     assert final_markdown.count(f"[^{evidence_ids[1]}]") == 2
+    with reopened.job_repository._connect() as connection:
+        assembly_attempts = connection.execute(
+            """
+            SELECT COUNT(*) FROM attempts
+            WHERE job_id = ? AND step_id = 'assemble_candidate_bundle'
+            """,
+            (submitted.job_id,),
+        ).fetchone()[0]
+    assert assembly_attempts == 2
     _validate_committed_bundle(workspace_root, recovered.result.bundle_id)
 
 
