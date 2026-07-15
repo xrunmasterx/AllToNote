@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import app.runtime as runtime_module
+import app.core.portable.bundle_assembler as bundle_assembler_module
 from app.adapters.models.legacy_gpt import (
     LegacyModelBinding,
     LegacyModelCapabilities,
@@ -21,8 +22,15 @@ from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.screenshots.ffmpeg import FFmpegScreenshotAdapter
 from app.adapters.sources.legacy_video import LegacyVideoSourceAdapter
 from app.core.application import video_acquisition
-from app.core.application.video_checkpoints import decode_acquired, decode_screenshots
+from app.core.application.video_checkpoints import (
+    CandidateCheckpoint,
+    decode_acquired,
+    decode_draft,
+    decode_screenshots,
+    encode_screenshots,
+)
 from app.core.application.video_checkpoints import decode_source
+from app.core.application.video_service import VideoService
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
     JobState,
@@ -34,6 +42,8 @@ from app.core.domain.video import (
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.resource_lease import ExecutionAuthority
+from app.core.portable.bundle_assembler import DisplayAssetInput
+from app.core.portable.quality import evaluate_video_draft
 from app.core.ports.transcript import MediaInput
 
 
@@ -587,6 +597,7 @@ def test_valid_local_screenshot_uses_snapshot_once_and_checkpoints_verified_webp
     result = runtime.wait_job(submitted.job_id)
 
     assert result.state is JobState.SUCCEEDED
+    assert result.result is not None
     assert calls.ffmpeg == 1
     assert resolves == 1
     assets = decode_screenshots(
@@ -596,6 +607,39 @@ def test_valid_local_screenshot_uses_snapshot_once_and_checkpoints_verified_webp
     assert assets[0].payload == bytes.fromhex(
         "524946461a000000574542505650384c0d0000002f00000010071011118888fe0700"
     )
+    assert result.result.display_asset_ids == (assets[0].artifact_id,)
+    bundle = workspace_root / result.result.workspace_relative_bundle_path
+    draft_path = (
+        bundle
+        / "drafts"
+        / f"{result.result.primary_draft_artifact_id}.md"
+    )
+    draft_bytes = draft_path.read_bytes()
+    assert (
+        f"![Video screenshot 1 at 00:00.000](../{assets[0].relative_path})\n".encode()
+        in draft_bytes
+    )
+    assert b"[SCREENSHOT:" not in draft_bytes
+    assert b"/static/screenshots" not in draft_bytes
+    assert str(local_video.resolve()).encode() not in draft_bytes
+    manifest = json.loads((bundle / "bundle.json").read_bytes())
+    asset_documents = [
+        artifact
+        for artifact in manifest["artifacts"]
+        if artifact["artifact_id"] == assets[0].artifact_id
+    ]
+    assert len(asset_documents) == 1
+    assert asset_documents[0]["artifact_type"] == "evidence.asset.v1"
+    assert asset_documents[0]["payload"]["path"] == assets[0].relative_path
+    assert (bundle / assets[0].relative_path).read_bytes() == assets[0].payload
+    quality = json.loads(
+        (
+            bundle
+            / "quality"
+            / f"{result.result.quality_report_artifact_id}.json"
+        ).read_bytes()
+    )
+    assert quality["subject"]["sha256"] == sha256_digest(draft_bytes)
     assert not tuple((tmp_path / "screenshot-machine" / "attempts").rglob("*.partial.webp"))
 
 
@@ -661,9 +705,13 @@ def test_restart_after_screenshot_checkpoint_does_not_run_ffmpeg_again(
     )
     service = first._sdk._video_service
     original_assemble = service._assemble
+    linked_drafts: list[bytes] = []
+    linked_asset_ids: list[tuple[str, ...]] = []
 
     def crash_after_screenshot_checkpoint(value: object) -> object:
         service._assemble = original_assemble
+        linked_drafts.append(value.quality.final_draft)
+        linked_asset_ids.append(tuple(asset.artifact_id for asset in value.display_assets))
         raise RuntimeError("injected post-screenshot crash")
 
     service._assemble = crash_after_screenshot_checkpoint
@@ -686,7 +734,278 @@ def test_restart_after_screenshot_checkpoint_does_not_run_ffmpeg_again(
     result = recovered.wait_job(submitted.job_id)
 
     assert result.state is JobState.SUCCEEDED
+    assert result.result is not None
     assert calls.ffmpeg == 1
+    assert result.result.display_asset_ids == linked_asset_ids[0]
+    recovered_bundle = workspace_root / result.result.workspace_relative_bundle_path
+    recovered_draft = (
+        recovered_bundle
+        / "drafts"
+        / f"{result.result.primary_draft_artifact_id}.md"
+    ).read_bytes()
+    assert recovered_draft == linked_drafts[0]
+    assert f"../assets/{linked_asset_ids[0][0]}.webp".encode() in recovered_draft
+
+
+def test_plan_mismatched_screenshot_checkpoint_fails_before_candidate_commit(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    calls = Calls()
+    process_factory = _ScreenshotProcessFactory(calls)
+    runtime = _create_runtime(
+        tmp_path / "screenshot-binding-mismatch-machine",
+        calls=calls,
+        screenshot_process_factory=process_factory,
+    )
+    submitted = runtime.submit_video(
+        _request(
+            local_video,
+            workspace_root,
+            "local-screenshot-binding-mismatch",
+            screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+        )
+    )
+    service = runtime._sdk._video_service
+    original_assemble = service._assemble
+
+    def crash_after_screenshot_checkpoint(value: object) -> object:
+        del value
+        service._assemble = original_assemble
+        raise RuntimeError("injected post-screenshot crash")
+
+    service._assemble = crash_after_screenshot_checkpoint
+    with pytest.raises(RuntimeError, match="post-screenshot crash"):
+        runtime.wait_job(submitted.job_id)
+
+    checkpoint = runtime.job_repository.latest_checkpoint(
+        submitted.job_id, "optional_screenshots"
+    )
+    assert checkpoint is not None
+    original_reader = service._checkpoint_reader
+    verified = decode_screenshots(original_reader(checkpoint))
+    assert len(verified) == 1
+    private_id = "art_018f0000-0000-7000-8000-000000000999"
+    forged = DisplayAssetInput(
+        artifact_id=private_id,
+        relative_path=f"assets/{private_id}.webp",
+        media_type="image/webp",
+        payload=verified[0].payload,
+    )
+
+    def forged_reader(metadata: object) -> bytes:
+        if metadata.step_id == "optional_screenshots":
+            return encode_screenshots((forged,))
+        return original_reader(metadata)
+
+    service._checkpoint_reader = forged_reader
+
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.FAILED
+    assert result.result is None
+    assert result.error is not None
+    assert result.error.code == "screenshot_asset_binding_invalid"
+    assert private_id not in result.error.message
+    assert dict(result.error.details) == {}
+    assert calls.ffmpeg == 1
+    assert runtime.job_repository.latest_checkpoint(
+        submitted.job_id, "assemble_candidate_bundle"
+    ) is None
+    assert tuple((workspace_root / "raw" / "personal" / ".staging").iterdir()) == ()
+    bundle_id = VideoService._ids(submitted.job_id)["bundle"]
+    assert not (
+        workspace_root / "raw" / "personal" / "bundles" / bundle_id
+    ).exists()
+
+
+def test_pre16a3_candidate_checkpoint_is_rebuilt_without_repeating_paid_work(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    calls = Calls()
+    process_factory = _ScreenshotProcessFactory(calls)
+    machine = tmp_path / "candidate-version-machine"
+    request = _request(
+        local_video,
+        workspace_root,
+        "pre16a3-candidate-recovery",
+        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
+    first = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="candidate-version-first",
+        now_ms=1_000,
+        screenshot_process_factory=process_factory,
+    )
+    submitted = first.submit_video(request)
+    service = first._sdk._video_service
+    original_assemble = service._assemble
+    original_validate = service._validate_candidate
+
+    def assemble_pre16a3_candidate(bundle_input: object) -> CandidateCheckpoint:
+        service._assemble = original_assemble
+        durable_draft = decode_draft(
+            _checkpoint_payload(first, submitted.job_id, "generate_draft")
+        )
+        quality = evaluate_video_draft(
+            durable_draft,
+            bundle_input.evidence_set,
+            draft_bundle_id=bundle_input.bundle_id,
+            draft_artifact_id=bundle_input.artifact_ids.primary_draft,
+        )
+        old_location = service._portable.candidate_location(
+            workspace_root,
+            local_instance_id=service._local_instance_id,
+            nonce=submitted.job_id.removeprefix("job_").replace("-", ""),
+        )
+        old_input = replace(
+            bundle_input,
+            quality=quality,
+            location=old_location,
+        )
+        original_collector = bundle_assembler_module.rendered_image_bundle_paths
+        bundle_assembler_module.rendered_image_bundle_paths = (
+            lambda *_args, **_kwargs: tuple(
+                asset.relative_path for asset in old_input.display_assets
+            )
+        )
+        try:
+            return original_assemble(old_input)
+        finally:
+            bundle_assembler_module.rendered_image_bundle_paths = original_collector
+
+    def crash_after_old_candidate(
+        _request_value: object,
+        _checkpoint: object,
+    ) -> object:
+        service._validate_candidate = original_validate
+        raise RuntimeError("injected after pre16a3 candidate checkpoint")
+
+    service._assemble = assemble_pre16a3_candidate
+    service._validate_candidate = crash_after_old_candidate
+
+    with pytest.raises(RuntimeError, match="pre16a3 candidate checkpoint"):
+        first.wait_job(submitted.job_id)
+
+    old_metadata = first.job_repository.latest_checkpoint(
+        submitted.job_id, "assemble_candidate_bundle"
+    )
+    assert old_metadata is not None
+    old_checkpoint = CandidateCheckpoint.decode(
+        _checkpoint_payload(first, submitted.job_id, "assemble_candidate_bundle")
+    )
+    old_candidate = workspace_root / old_checkpoint.staging_relative_path
+    old_draft = (
+        old_candidate
+        / "drafts"
+        / f"{old_checkpoint.primary_draft_artifact_id}.md"
+    ).read_bytes()
+    assert b"## Screenshots" not in old_draft
+    original_assets = decode_screenshots(
+        _checkpoint_payload(first, submitted.job_id, "optional_screenshots")
+    )
+    assert len(original_assets) == 1
+    old_request_hash = VideoService._request_hash(request)
+    with first.job_repository._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE checkpoints SET input_hash = ? WHERE checkpoint_id = ?",
+            (old_request_hash, old_metadata.checkpoint_id),
+        )
+
+    del first
+    second = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="candidate-version-second",
+        now_ms=302_001,
+        screenshot_process_factory=process_factory,
+    )
+    second_service = second._sdk._video_service
+    original_after_commit = second_service._operations.after_portable_commit
+
+    def crash_after_rename(result: object) -> None:
+        second_service._operations.after_portable_commit = original_after_commit
+        original_after_commit(result)
+        raise RuntimeError("injected after rebuilt candidate rename")
+
+    second_service._operations.after_portable_commit = crash_after_rename
+
+    try:
+        unexpected = second.wait_job(submitted.job_id)
+    except RuntimeError as error:
+        assert "rebuilt candidate rename" in str(error)
+    else:
+        pytest.fail(f"rebuilt candidate did not reach rename: {unexpected!r}")
+
+    current_metadata = second.job_repository.latest_checkpoint(
+        submitted.job_id, "assemble_candidate_bundle"
+    )
+    assert current_metadata is not None
+    assert current_metadata.checkpoint_id != old_metadata.checkpoint_id
+    assert current_metadata.input_hash != old_request_hash
+    committed = workspace_root / "raw" / "personal" / "bundles" / old_checkpoint.bundle_id
+    linked_draft_path = (
+        committed
+        / "drafts"
+        / f"{old_checkpoint.primary_draft_artifact_id}.md"
+    )
+    linked_draft = linked_draft_path.read_bytes()
+    assert b"## Screenshots\n\n![Video screenshot 1 at 00:00.000]" in linked_draft
+    quality = json.loads(
+        (
+            committed
+            / "quality"
+            / f"{old_checkpoint.quality_report_artifact_id}.json"
+        ).read_bytes()
+    )
+    assert quality["subject"]["sha256"] == sha256_digest(linked_draft)
+    assert (
+        committed / original_assets[0].relative_path
+    ).read_bytes() == original_assets[0].payload
+
+    del second
+    third = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="candidate-version-third",
+        now_ms=603_002,
+        screenshot_process_factory=process_factory,
+    )
+    recovered = third.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    assert recovered.result is not None
+    assert recovered.result.display_asset_ids == (original_assets[0].artifact_id,)
+    assert calls.resolve == 1
+    assert calls.acquire == 1
+    assert calls.transcriber == 1
+    assert calls.model == 1
+    assert calls.ffmpeg == 1
+    with third.job_repository._connect() as connection:
+        candidate_attempts = connection.execute(
+            """
+            SELECT COUNT(*) FROM attempts
+            WHERE job_id = ? AND step_id = 'assemble_candidate_bundle'
+            """,
+            (submitted.job_id,),
+        ).fetchone()[0]
+    assert candidate_attempts == 2
+    for step_id in (
+        "resolve_source",
+        "acquire",
+        "normalize_transcript",
+        "create_source_revision",
+        "generate_draft",
+        "optional_screenshots",
+        "quality_and_portable_validation",
+    ):
+        metadata = third.job_repository.latest_checkpoint(submitted.job_id, step_id)
+        assert metadata is not None
+        assert metadata.input_hash == old_request_hash
 
 
 def test_restart_before_screenshot_checkpoint_rebuilds_identical_plan(

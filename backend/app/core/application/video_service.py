@@ -69,6 +69,7 @@ from app.core.ports.source import ResolvedVideoSource
 
 RUNTIME_VERSION = "0.1.0"
 CHECKPOINT_SCHEMA = "video-step.v1"
+_CANDIDATE_ASSEMBLY_BEHAVIOR = "linked-screenshot-draft-v1"
 PREFLIGHT_CHECKS = (
     "request_schema",
     "workspace_contract",
@@ -415,10 +416,11 @@ class VideoService:
             request_hash=request_hash,
             resumed_attempt=resumed_attempt,
         )
+        candidate_input_hash = self._candidate_assembly_input_hash(request_hash)
         checkpoint = self._checkpointed(
             job_id,
             "assemble_candidate_bundle",
-            request_hash,
+            candidate_input_hash,
             authority,
             lambda _execution: self._assemble(bundle_input),
             encode=lambda value: value.encode(),
@@ -519,8 +521,15 @@ class VideoService:
             decode=_decode_screenshots,
             resumed_attempt=resumed_attempt,
         )
-        quality = evaluate_video_draft(
+        screenshot_plan = build_screenshot_plan(
+            job_id,
+            request.screenshot_policy,
             draft,
+            transcript,
+        )
+        linked_draft = bind_screenshot_assets(draft, screenshot_plan, screenshots)
+        quality = evaluate_video_draft(
+            linked_draft,
             evidence,
             draft_bundle_id=ids["bundle"],
             draft_artifact_id=ids["draft"],
@@ -532,7 +541,7 @@ class VideoService:
             location=self._portable.candidate_location(
                 request.workspace_root,
                 local_instance_id=self._local_instance_id,
-                nonce=job_id.removeprefix("job_").replace("-", ""),
+                nonce=self._candidate_location_nonce(job_id),
             ),
             source=source,
             artifact_ids=VideoArtifactIds(
@@ -717,7 +726,7 @@ class VideoService:
         if metadata is None or not self._attempt_storage.validate_checkpoint(
             metadata,
             expected_schema_id=CHECKPOINT_SCHEMA,
-            expected_input_hash=request_hash,
+            expected_input_hash=self._candidate_assembly_input_hash(request_hash),
         ):
             raise DomainError(
                 "candidate_checkpoint_invalid",
@@ -1089,6 +1098,25 @@ class VideoService:
             )
         )
 
+    @staticmethod
+    def _candidate_assembly_input_hash(request_hash: str) -> str:
+        return sha256_digest(
+            json.dumps(
+                {
+                    "behavior": _CANDIDATE_ASSEMBLY_BEHAVIOR,
+                    "request": request_hash,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    @staticmethod
+    def _candidate_location_nonce(job_id: str) -> str:
+        return sha256_digest(
+            f"{_CANDIDATE_ASSEMBLY_BEHAVIOR}:{job_id}"
+        )[7:39]
+
     @classmethod
     def _derived_id(cls, job_id: str, prefix: str, role: str) -> str:
         uuid_value = UUID(job_id.removeprefix("job_"))
@@ -1199,6 +1227,53 @@ def build_screenshot_plan(
     return tuple(plan)
 
 
+def bind_screenshot_assets(
+    draft: GeneratedVideoDraft,
+    plan: tuple[ScreenshotPlanItem, ...],
+    assets: tuple[DisplayAssetInput, ...],
+) -> GeneratedVideoDraft:
+    def invalid() -> DomainError:
+        return DomainError(
+            "screenshot_asset_binding_invalid",
+            ErrorCategory.RECIPE_FAILED,
+            "Screenshot asset binding is invalid",
+        )
+
+    if (
+        not isinstance(draft, GeneratedVideoDraft)
+        or type(plan) is not tuple
+        or type(assets) is not tuple
+        or len(plan) != len(assets)
+    ):
+        raise invalid()
+    for item, asset in zip(plan, assets):
+        if (
+            not isinstance(item, ScreenshotPlanItem)
+            or not isinstance(asset, DisplayAssetInput)
+            or asset.artifact_id != item.artifact_id
+            or asset.relative_path != item.relative_path
+        ):
+            raise invalid()
+    if not plan:
+        return draft
+
+    image_lines = [
+        (
+            f"![Video screenshot {ordinal} at "
+            f"{VideoService._timestamp(item.timestamp_ms)}]"
+            f"(../{item.relative_path})"
+        )
+        for ordinal, item in enumerate(plan, start=1)
+    ]
+    markdown = (
+        draft.markdown.rstrip("\r\n")
+        + "\n\n## Screenshots\n\n"
+        + "\n\n".join(image_lines)
+        + "\n"
+    )
+    return replace(draft, markdown=markdown, screenshot_requests=())
+
+
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "CHECKPOINT_STEPS",
@@ -1207,5 +1282,6 @@ __all__ = [
     "VideoRecipeOperations",
     "VideoService",
     "VideoStepExecutionContext",
+    "bind_screenshot_assets",
     "build_screenshot_plan",
 ]

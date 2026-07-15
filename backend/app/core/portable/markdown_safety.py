@@ -25,11 +25,7 @@ _HTML_LINK = re.compile(
     r"\b(?:href|src|data|action|poster)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
     re.IGNORECASE,
 )
-_HTML_IMAGE = re.compile(r"<\s*img\b[^>]*>", re.IGNORECASE)
-_HTML_IMAGE_SOURCE = re.compile(
-    r"\bsrc\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
-    re.IGNORECASE,
-)
+_HTML_IMAGE_OPEN = re.compile(r"<\s*img(?=[\s/>])", re.IGNORECASE)
 _AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]*:[^<>\s]*)>")
 _ENCODED_PATH_CONTROL = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[/\\]")
@@ -49,6 +45,10 @@ _SEGMENT_CITATION = re.compile(r"\[\^seg_[^\]\r\n]*\]")
 _H2 = re.compile(r"^ {0,3}##(?!#)\s+\S")
 _SETEXT_H2_UNDERLINE = re.compile(r"^ {0,3}-+[ \t]*$")
 _HTML_LITERAL_OPEN = re.compile(r"<(code|pre)(?=[\s/>])", re.IGNORECASE)
+_HTML_LITERAL_CLOSE = {
+    name: re.compile(rf"</\s*{name}\s*>", re.IGNORECASE)
+    for name in ("code", "pre")
+}
 
 
 def _unsafe() -> DomainError:
@@ -196,6 +196,8 @@ def markdown_visible_mask(markdown: str) -> bytes:
 
     mask = bytearray(_scan_markdown(markdown).visible_mask)
     _hide_nonrendered_markdown_regions(markdown, mask)
+    for image in _rendered_images(markdown):
+        _hide(mask, image.start, image.end)
     return bytes(mask)
 
 
@@ -267,8 +269,14 @@ def _html_tag_end(markdown: str, start: int) -> int | None:
     if cursor >= len(markdown):
         return None
     if markdown[cursor] in "!?":
-        closing = markdown.find(">", cursor + 1)
-        return None if closing < 0 else closing + 1
+        cursor += 1
+        while cursor < len(markdown):
+            if markdown[cursor] == ">":
+                return cursor + 1
+            if markdown[cursor] == "<":
+                return None
+            cursor += 1
+        return None
     if markdown[cursor] == "/":
         cursor += 1
     name_start = cursor
@@ -284,14 +292,83 @@ def _html_tag_end(markdown: str, start: int) -> int | None:
     while cursor < len(markdown):
         character = markdown[cursor]
         if quote is not None:
-            if character == quote and not _backslash_escaped(markdown, cursor):
+            if character == quote:
                 quote = None
         elif character in "\"'":
             quote = character
+        elif character == "<":
+            return None
         elif character == ">":
             return cursor + 1
         cursor += 1
     return None
+
+
+def _html_literal_end(markdown: str, tag_name: str, start: int) -> int:
+    closing = _HTML_LITERAL_CLOSE[tag_name.casefold()].search(markdown, start)
+    return len(markdown) if closing is None else closing.end()
+
+
+def _raw_html_image_source(markdown: str, start: int, end: int) -> str | None:
+    sources: list[str] = []
+    cursor = start + 1
+    while cursor < end and markdown[cursor] in " \t\r\n":
+        cursor += 1
+    while cursor < end and (
+        markdown[cursor].isalnum() or markdown[cursor] in "-:"
+    ):
+        cursor += 1
+
+    while cursor < end:
+        while cursor < end and markdown[cursor] in " \t\r\n":
+            cursor += 1
+        if cursor >= end or markdown[cursor] in "/>":
+            break
+        name_start = cursor
+        while (
+            cursor < end
+            and markdown[cursor] not in " \t\r\n/>=\"'"
+        ):
+            cursor += 1
+        if cursor == name_start:
+            raise _unsafe()
+        name = markdown[name_start:cursor]
+        while cursor < end and markdown[cursor] in " \t\r\n":
+            cursor += 1
+
+        value: str | None = None
+        if cursor < end and markdown[cursor] == "=":
+            cursor += 1
+            while cursor < end and markdown[cursor] in " \t\r\n":
+                cursor += 1
+            if cursor < end and markdown[cursor] in "\"'":
+                quote = markdown[cursor]
+                cursor += 1
+                value_start = cursor
+                while cursor < end and markdown[cursor] != quote:
+                    cursor += 1
+                if cursor >= end:
+                    raise _unsafe()
+                value = markdown[value_start:cursor]
+                cursor += 1
+            else:
+                value_start = cursor
+                while (
+                    cursor < end
+                    and markdown[cursor] not in " \t\r\n>"
+                ):
+                    cursor += 1
+                value = markdown[value_start:cursor]
+
+        if (
+            len(name) == 3
+            and name[0] in "sS"
+            and name[1] in "rR"
+            and name[2] in "cC"
+        ):
+            sources.append(value or "")
+
+    return sources[0] if len(sources) == 1 else None
 
 
 def _hide_nonrendered_markdown_regions(markdown: str, mask: bytearray) -> None:
@@ -311,15 +388,10 @@ def _hide_nonrendered_markdown_regions(markdown: str, mask: bytearray) -> None:
             if literal_open is not None:
                 opening_end = _html_tag_end(markdown, cursor)
                 if opening_end is not None:
-                    closing = re.search(
-                        rf"</\s*{literal_open.group(1)}\s*>",
-                        markdown[opening_end:],
-                        re.IGNORECASE,
-                    )
-                    end = (
-                        len(markdown)
-                        if closing is None
-                        else opening_end + closing.end()
+                    end = _html_literal_end(
+                        markdown,
+                        literal_open.group(1),
+                        opening_end,
                     )
                     _hide(mask, cursor, end)
                     cursor = end
@@ -495,12 +567,192 @@ def _iter_markdown_destinations(markdown: str):
             yield destination, is_image
 
 
+@dataclass(frozen=True)
+class _RenderedImage:
+    destination: str | None
+    start: int
+    end: int
+
+
+def _rendered_images(markdown: str) -> tuple[_RenderedImage, ...]:
+    visible = _scan_markdown(markdown).visible_text
+    characters = list(visible)
+    bracket_matches = _bracket_matches(visible)
+    image_label_intervals = [
+        (opening + 1, closing)
+        for opening in range(len(visible))
+        if visible[opening] == "["
+        and opening > 0
+        and visible[opening - 1] == "!"
+        and not _backslash_escaped(visible, opening - 1)
+        and (closing := bracket_matches.get(opening)) is not None
+    ]
+
+    def hide_context(start: int, end: int) -> None:
+        for index in range(start, end):
+            if characters[index] != "\n":
+                characters[index] = " "
+
+    raw_images: dict[int, _RenderedImage] = {}
+    interval_cursor = 0
+    image_label_end = 0
+    cursor = 0
+    while cursor < len(visible):
+        character = visible[cursor]
+        while (
+            interval_cursor < len(image_label_intervals)
+            and image_label_intervals[interval_cursor][0] <= cursor
+        ):
+            image_label_end = max(
+                image_label_end,
+                image_label_intervals[interval_cursor][1],
+            )
+            interval_cursor += 1
+        if (
+            character != "<"
+            or cursor < image_label_end
+            or _backslash_escaped(visible, cursor)
+        ):
+            cursor += 1
+            continue
+        end = _html_tag_end(visible, cursor)
+        if end is None:
+            cursor += 1
+            continue
+        if visible.startswith("<!--", cursor):
+            hide_context(cursor, end)
+            cursor = end
+            continue
+        literal_open = _HTML_LITERAL_OPEN.match(visible, cursor)
+        if literal_open is not None:
+            literal_end = _html_literal_end(
+                visible,
+                literal_open.group(1),
+                end,
+            )
+            hide_context(cursor, literal_end)
+            cursor = literal_end
+            continue
+        if _HTML_IMAGE_OPEN.match(visible, cursor, end) is not None:
+            raw_images[cursor] = _RenderedImage(
+                _raw_html_image_source(visible, cursor, end),
+                cursor,
+                end,
+            )
+        hide_context(cursor, end)
+        cursor = end
+
+    contextual = "".join(characters)
+    bracket_matches = _bracket_matches(contextual)
+    definitions: dict[str, str] = {}
+    found: list[tuple[_RenderedImage | None, str | None, int, int]] = []
+    cursor = 0
+    line_start = 0
+    while cursor < len(contextual):
+        raw_image = raw_images.get(cursor)
+        if raw_image is not None:
+            found.append((raw_image, None, raw_image.start, raw_image.end))
+            cursor = raw_image.end
+            continue
+        if contextual[cursor] == "\n":
+            line_start = cursor + 1
+            cursor += 1
+            continue
+        if contextual[cursor] == "[" and not _backslash_escaped(contextual, cursor):
+            closing = bracket_matches.get(cursor)
+            if closing is not None:
+                after = closing + 1
+                label = contextual[cursor + 1 : closing]
+                if (
+                    not label.startswith("^")
+                    and after < len(contextual)
+                    and contextual[after] == ":"
+                    and cursor - line_start <= 3
+                    and not contextual[line_start:cursor].strip(" ")
+                ):
+                    parsed = _destination_after(contextual, after + 1)
+                    if parsed is not None:
+                        definitions.setdefault(
+                            _reference_label(label), parsed[0]
+                        )
+                    line_end = contextual.find("\n", after + 1)
+                    cursor = len(contextual) if line_end < 0 else line_end
+                    continue
+        if (
+            contextual[cursor] != "!"
+            or _backslash_escaped(contextual, cursor)
+            or cursor + 1 >= len(contextual)
+            or contextual[cursor + 1] != "["
+        ):
+            cursor += 1
+            continue
+
+        opening = cursor + 1
+        if contextual.startswith("![[", cursor):
+            inner_opening = cursor + 2
+            inner_closing = bracket_matches.get(inner_opening)
+            outer_closing = bracket_matches.get(opening)
+            if (
+                inner_closing is not None
+                and outer_closing == inner_closing + 1
+            ):
+                destination = contextual[inner_opening + 1 : inner_closing].split(
+                    "|", 1
+                )[0]
+                end = outer_closing + 1
+                found.append(
+                    (_RenderedImage(destination, cursor, end), None, cursor, end)
+                )
+                cursor = end
+                continue
+
+        closing = bracket_matches.get(opening)
+        if closing is None:
+            cursor += 1
+            continue
+        label = contextual[opening + 1 : closing]
+        after = closing + 1
+        if after < len(contextual) and contextual[after] == "(":
+            end = _parenthesized_end(contextual, after)
+            parsed = _destination_after(contextual, after + 1)
+            if end is not None and parsed is not None and parsed[1] < end:
+                found.append(
+                    (_RenderedImage(parsed[0], cursor, end), None, cursor, end)
+                )
+                cursor = end
+                continue
+        reference_label = label
+        end = closing + 1
+        if after < len(contextual) and contextual[after] == "[":
+            reference_closing = bracket_matches.get(after)
+            if reference_closing is None:
+                cursor += 1
+                continue
+            explicit = contextual[after + 1 : reference_closing]
+            reference_label = explicit or label
+            end = reference_closing + 1
+        normalized_label = _reference_label(reference_label)
+        if not normalized_label.startswith("^"):
+            found.append((None, normalized_label, cursor, end))
+        cursor = end
+
+    images: list[_RenderedImage] = []
+    for image, reference_label, start, end in found:
+        if image is not None:
+            images.append(image)
+            continue
+        destination = definitions.get(reference_label or "")
+        if destination is not None:
+            images.append(_RenderedImage(destination, start, end))
+    return tuple(images)
+
+
 def _validate_destination(
     destination: str,
     bundle_relative_path: str,
     *,
     allow_external: bool = True,
-) -> None:
+) -> str | None:
     value = html.unescape(destination.strip())
     if value.startswith("<") and value.endswith(">"):
         value = value[1:-1].strip()
@@ -528,19 +780,20 @@ def _validate_destination(
     if parsed.scheme:
         if parsed.scheme.lower() not in {"http", "https"} or not allow_external:
             raise _unsafe()
-        return
+        return None
     if decoded.startswith(("/", "//")):
         raise _unsafe()
     if decoded.startswith("#"):
-        return
+        return None
 
     relative_path = decoded.split("#", 1)[0].split("?", 1)[0]
     if not relative_path:
-        return
+        return None
     base_directory = posixpath.dirname(bundle_relative_path)
     normalized = posixpath.normpath(posixpath.join(base_directory, relative_path))
     if normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
         raise _unsafe()
+    return normalized
 
 
 def _is_portable_bundle_path(value: str) -> bool:
@@ -607,18 +860,41 @@ def validate_markdown_safety(
         destinations.append(
             (next(value for value in match.groups() if value is not None), False)
         )
-    for image in _HTML_IMAGE.finditer(visible):
-        source = _HTML_IMAGE_SOURCE.search(image.group(0))
-        if source is not None:
-            destinations.append(
-                (next(value for value in source.groups() if value is not None), True)
-            )
+    for image in _rendered_images(markdown):
+        if image.destination is None:
+            raise _unsafe()
+        destinations.append((image.destination, True))
     for destination, is_image in destinations:
         _validate_destination(
             destination,
             bundle_relative_path,
             allow_external=not is_image,
         )
+
+
+def rendered_image_bundle_paths(
+    markdown: str,
+    *,
+    bundle_relative_path: str,
+) -> tuple[str, ...]:
+    if not isinstance(markdown, str) or not isinstance(bundle_relative_path, str):
+        raise _unsafe()
+    if not _is_portable_bundle_path(bundle_relative_path):
+        raise _unsafe()
+
+    paths: list[str] = []
+    for image in _rendered_images(markdown):
+        if image.destination is None:
+            raise _unsafe()
+        path = _validate_destination(
+            image.destination,
+            bundle_relative_path,
+            allow_external=False,
+        )
+        if path is None:
+            raise _unsafe()
+        paths.append(path)
+    return tuple(paths)
 
 
 @dataclass(frozen=True)

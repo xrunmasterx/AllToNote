@@ -18,6 +18,7 @@ from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import EvidenceSet, build_evidence_set
 from app.core.portable.identity import is_executor_identity
 from app.core.portable.jsonio import encode_json
+from app.core.portable.markdown_safety import rendered_image_bundle_paths
 from app.core.portable.quality import QualityOutcome, rebuild_quality_outcome
 from app.core.portable.webp import is_valid_webp
 from app.core.ports.portable import (
@@ -97,6 +98,14 @@ def _write_failed() -> DomainError:
         "video_bundle_write_failed",
         ErrorCategory.RETRYABLE_RUNTIME,
         "Candidate bundle writer could not be closed cleanly",
+    )
+
+
+def _reference_invalid() -> DomainError:
+    return DomainError(
+        "video_bundle_reference_invalid",
+        ErrorCategory.INVALID_REQUEST,
+        "Video bundle references are invalid",
     )
 
 
@@ -859,6 +868,24 @@ class BundleAssembler:
             ) from None
         if quality != expected_quality:
             raise _error("video_bundle_quality_invalid", "Quality outcome is inconsistent")
+        draft_payload = by_id[ids.primary_draft]
+        try:
+            image_paths = rendered_image_bundle_paths(
+                draft_payload.data.decode("utf-8"),
+                bundle_relative_path=draft_payload.path,
+            )
+        except MemoryError:
+            raise
+        except (DomainError, UnicodeError):
+            raise _reference_invalid() from None
+        declared_paths = {
+            asset.relative_path for asset in bundle_input.display_assets
+        }
+        if (
+            any(path not in declared_paths for path in image_paths)
+            or declared_paths - set(image_paths)
+        ):
+            raise _reference_invalid()
 
     @staticmethod
     def _build_source_documents(

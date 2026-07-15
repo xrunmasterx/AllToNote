@@ -1,25 +1,34 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+import app.core.portable.markdown_safety as markdown_safety_module
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
     GeneratedVideoDraft,
     QualityOverall,
+    ScreenshotPolicy,
+    ScreenshotRequest,
     TranscriptDocument,
     TranscriptSegment,
 )
+from app.core.application.video_service import bind_screenshot_assets, build_screenshot_plan
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import build_evidence_set, rewrite_segment_citations
 from app.core.portable.jsonio import encode_json, encode_ndjson
-from app.core.portable.markdown_safety import validate_markdown_safety
+from app.core.portable.markdown_safety import (
+    rendered_image_bundle_paths,
+    validate_markdown_safety,
+)
 from app.core.portable.quality import evaluate_video_draft, rebuild_quality_outcome
+from app.core.portable.bundle_assembler import DisplayAssetInput
 
 
 BUNDLE_ID = "bnd_018f0000-0000-7000-8000-000000000001"
@@ -1121,6 +1130,143 @@ def test_quality_does_not_require_an_h2_when_all_citations_are_valid() -> None:
     assert outcome.publish_eligible is True
 
 
+def test_punctuation_before_an_evidence_footnote_is_not_a_shortcut_image() -> None:
+    markdown = _good_markdown().replace(
+        f"Content[^{EVIDENCE_IDS[1]}]",
+        f"Content![^{EVIDENCE_IDS[1]}]",
+    )
+
+    assert rendered_image_bundle_paths(
+        markdown,
+        bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+    ) == ()
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.PASS
+    assert outcome.publish_eligible is True
+
+
+def test_malformed_html_tag_collection_has_linear_execution_steps() -> None:
+    tag_end_code = markdown_safety_module._html_tag_end.__code__
+
+    def traced_steps(repetitions: int) -> int:
+        steps = 0
+
+        def trace(frame, event, arg):
+            del arg
+            nonlocal steps
+            if event == "line" and frame.f_code is tag_end_code:
+                steps += 1
+            return trace
+
+        previous = sys.gettrace()
+        sys.settrace(trace)
+        try:
+            rendered_image_bundle_paths(
+                "<span " * repetitions,
+                bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+            )
+        finally:
+            sys.settrace(previous)
+        return steps
+
+    small = traced_steps(128)
+    large = traced_steps(256)
+
+    assert large < small * 3
+
+
+def test_raw_image_uses_only_the_real_src_attribute() -> None:
+    markdown = (
+        '<img alt=\'src="../assets/fake.webp"\' '
+        "src='../assets/real.webp'>"
+    )
+
+    assert rendered_image_bundle_paths(
+        markdown,
+        bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+    ) == ("assets/real.webp",)
+    validate_markdown_safety(
+        markdown,
+        bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+    )
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "<img alt='x\\' src='../assets/real.webp'>",
+        '<img alt="x\\" src="../assets/real.webp">',
+    ),
+)
+def test_raw_image_html_quotes_ignore_markdown_backslash_escaping(
+    markdown: str,
+) -> None:
+    assert rendered_image_bundle_paths(
+        markdown,
+        bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+    ) == ("assets/real.webp",)
+    validate_markdown_safety(
+        markdown,
+        bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+    )
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "<img data-src='../assets/fake.webp'>",
+        "<img ng-src='../assets/fake.webp'>",
+        "<img x:src='../assets/fake.webp'>",
+        '<img title=\'src="../assets/fake.webp"\'>',
+        '<img alt=\'src="../assets/fake.webp"\'>',
+        (
+            "<img src='../assets/first.webp' "
+            "src='../assets/second.webp'>"
+        ),
+    ),
+)
+def test_raw_image_requires_exactly_one_real_src_attribute(markdown: str) -> None:
+    with pytest.raises(DomainError) as collected:
+        rendered_image_bundle_paths(
+            markdown,
+            bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+        )
+    with pytest.raises(DomainError) as validated:
+        validate_markdown_safety(
+            markdown,
+            bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+        )
+
+    assert collected.value.code == "draft_markdown_unsafe"
+    assert validated.value.code == "draft_markdown_unsafe"
+
+
+def test_complete_code_and_pre_collection_has_linear_suffix_work(monkeypatch) -> None:
+    original_search = markdown_safety_module.re.search
+    copied_characters = 0
+
+    def counted_search(pattern, string, flags=0):
+        nonlocal copied_characters
+        copied_characters += len(string)
+        return original_search(pattern, string, flags)
+
+    monkeypatch.setattr(markdown_safety_module.re, "search", counted_search)
+
+    def copied_for(repetitions: int) -> int:
+        before = copied_characters
+        rendered_image_bundle_paths(
+            "<code>x</code><pre>y</pre>" * repetitions,
+            bundle_relative_path=f"drafts/{DRAFT_ARTIFACT_ID}.md",
+        )
+        return copied_characters - before
+
+    small = copied_for(128)
+    large = copied_for(256)
+
+    assert large <= small * 3
+
+
 @pytest.mark.parametrize(
     ("slashes", "expected_overall"),
     (
@@ -1210,6 +1356,55 @@ def test_each_substantive_h2_requires_final_evidence_and_matching_definition() -
     assert outcome.overall is QualityOverall.FAIL
     assert outcome.publish_eligible is False
     assert outcome.execution_error is None
+    assert "h2_evidence" in {
+        check.check_id
+        for check in outcome.report.checks
+        if check.status == "fail"
+    }
+
+
+def test_exact_generated_screenshot_section_keeps_a_passing_draft_publish_eligible() -> None:
+    request = ScreenshotRequest("seg_000001", 0)
+    draft = replace(_draft(_good_markdown()), screenshot_requests=(request,))
+    transcript = TranscriptDocument("zh-CN", SEGMENTS)
+    plan = build_screenshot_plan(
+        "job_018f0000-0000-7000-8000-000000000007",
+        ScreenshotPolicy.ON_DEMAND,
+        draft,
+        transcript,
+    )
+    asset = DisplayAssetInput(
+        artifact_id=plan[0].artifact_id,
+        relative_path=plan[0].relative_path,
+        media_type="image/webp",
+        payload=bytes.fromhex(
+            "524946461a000000574542505650384c0d0000002f00000010071011118888fe0700"
+        ),
+    )
+
+    linked = bind_screenshot_assets(draft, plan, (asset,))
+    outcome = _evaluate(linked)
+
+    assert linked.markdown.endswith(
+        "## Screenshots\n\n"
+        f"![Video screenshot 1 at 00:00.000](../{asset.relative_path})\n"
+    )
+    assert outcome.overall is QualityOverall.PASS
+    assert outcome.publish_eligible is True
+
+
+def test_image_plus_uncited_rendered_text_still_fails_h2_evidence() -> None:
+    markdown = (
+        _good_markdown().rstrip()
+        + "\n\n## Screenshots\n\n"
+        "![Video screenshot 1 at 00:00.000](../assets/preview.webp) "
+        "Uncited rendered claim.\n"
+    )
+
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.FAIL
+    assert outcome.publish_eligible is False
     assert "h2_evidence" in {
         check.check_id
         for check in outcome.report.checks

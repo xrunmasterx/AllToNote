@@ -264,6 +264,30 @@ def _bundle_input(workspace_root: Path) -> VideoBundleInput:
     )
 
 
+def _with_markdown_and_assets(
+    bundle_input: VideoBundleInput,
+    markdown_suffix: str,
+    assets: tuple[DisplayAssetInput, ...],
+) -> VideoBundleInput:
+    markdown = bundle_input.quality.final_draft.decode("utf-8").rstrip() + "\n\n"
+    markdown += markdown_suffix.rstrip() + "\n"
+    draft = GeneratedVideoDraft(
+        markdown=markdown,
+        cited_segment_ids=("seg_000001",),
+        screenshot_requests=(),
+        model_identity="openai/gpt-4.1-mini",
+        usage={"input_tokens": 120, "output_tokens": 40},
+        warnings=(),
+    )
+    quality = evaluate_video_draft(
+        draft,
+        bundle_input.evidence_set,
+        draft_bundle_id=BUNDLE_ID,
+        draft_artifact_id=DRAFT_ARTIFACT_ID,
+    )
+    return replace(bundle_input, quality=quality, display_assets=assets)
+
+
 def _candidate_path(workspace_root: Path) -> Path:
     workspace = open_workspace(workspace_root, writable=True)
     return (
@@ -273,6 +297,22 @@ def _candidate_path(workspace_root: Path) -> Path:
         / f"{JOB_ID}.nonce"
         / "bundle.partial"
     )
+
+
+class _WriterMustRemainClosed:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def begin(self, _job_id: str) -> object:
+        self.calls += 1
+        raise AssertionError("candidate writer opened before reference validation")
+
+
+def _with_closed_writer(
+    bundle_input: VideoBundleInput,
+) -> tuple[VideoBundleInput, _WriterMustRemainClosed]:
+    location = _WriterMustRemainClosed()
+    return replace(bundle_input, location=location), location
 
 
 def test_candidate_bundle_public_type_hints_resolve() -> None:
@@ -1562,18 +1602,703 @@ def test_declared_display_asset_is_in_inventory_outputs_and_semantically_valid(
         payload=VALID_WEBP,
     )
     candidate = BundleAssembler().assemble(
-        replace(bundle_input, display_assets=(asset,))
+        _with_markdown_and_assets(
+            bundle_input,
+            "![Video screenshot 1 at 00:00.000](../assets/preview.webp)",
+            (asset,),
+        )
     )
     manifest = _read_json(candidate.absolute_path / "bundle.json")
 
     assert manifest["outputs"]["display_assets"] == [asset.artifact_id]
+    assert any(
+        artifact["artifact_id"] == asset.artifact_id
+        and artifact["artifact_type"] == "evidence.asset.v1"
+        and artifact["payload"]["path"] == asset.relative_path
+        for artifact in manifest["artifacts"]
+    )
     assert (
         candidate.absolute_path / "assets" / "preview.webp"
     ).read_bytes() == VALID_WEBP
+    assert "../assets/preview.webp" in (
+        candidate.absolute_path / "drafts" / f"{DRAFT_ARTIFACT_ID}.md"
+    ).read_text("utf-8")
     assert IWikiPortableGateway().validate_candidate(
         workspace_root,
         candidate.staging_relative_path,
     ).valid
+
+
+def test_assembler_rejects_an_undeclared_rendered_image_before_writing(
+    workspace_root: Path,
+) -> None:
+    bundle_input, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            "![dangling](../assets/private-dangling.webp)",
+            (),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(bundle_input)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert "private-dangling" not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_assembler_rejects_an_unreferenced_declared_asset_before_writing(
+    workspace_root: Path,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/private-unreferenced.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    bundle_input, location = _with_closed_writer(
+        replace(_bundle_input(workspace_root), display_assets=(asset,))
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(bundle_input)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert location.calls == 0
+    assert "private-unreferenced" not in str(raised.value)
+    assert asset.artifact_id not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "destination",
+    (
+        "/static/screenshots/private.webp",
+        "https://private.example/frame.webp",
+        "/private/frame.webp",
+        "C:/private/frame.webp",
+        "file:///private/frame.webp",
+        "data:image/webp;base64,UklGRg==",
+        "../../private/frame.webp",
+        "%252e%252e%252fprivate.webp",
+        "assets/preview.webp",
+    ),
+)
+def test_assembler_maps_invalid_or_wrong_image_targets_to_path_free_reference_error(
+    workspace_root: Path,
+    destination: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            f"![frame]({destination})",
+            (asset,),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert destination not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_assembler_allows_repeated_declared_image_and_ignores_literal_image_text(
+    workspace_root: Path,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    markdown = (
+        "![frame](../assets/preview.webp)\n\n"
+        "![again][preview]\n\n"
+        "[preview]: ../assets/preview.webp\n\n"
+        "\\![escaped](../assets/private-escaped.webp)\n\n"
+        "`![inline](../assets/private-inline.webp)`\n\n"
+        "```markdown\n![fenced](../assets/private-fenced.webp)\n```\n\n"
+        "    ![indented](../assets/private-indented.webp)\n\n"
+        "<!-- ![comment](../assets/private-comment.webp) -->"
+    )
+    valid = _with_markdown_and_assets(
+        _bundle_input(workspace_root),
+        markdown,
+        (asset,),
+    )
+
+    candidate = BundleAssembler().assemble(valid)
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+def test_assembler_accepts_an_image_nested_inside_an_external_text_link(
+    workspace_root: Path,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    valid = _with_markdown_and_assets(
+        _bundle_input(workspace_root),
+        "[![frame](../assets/preview.webp)](https://example.test/source)",
+        (asset,),
+    )
+
+    candidate = BundleAssembler().assemble(valid)
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "[\n<img src='../assets/preview.webp'>",
+        "[<img src='../assets/preview.webp'>](https://example.test/source)",
+    ),
+)
+def test_raw_image_is_collected_after_unmatched_bracket_and_inside_outer_link(
+    workspace_root: Path,
+    markdown: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    candidate = BundleAssembler().assemble(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown,
+            (asset,),
+        )
+    )
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "markdown_template",
+    (
+        "[\n<img src='{destination}'>",
+        "[<img src='{destination}'>](https://example.test/source)",
+    ),
+)
+@pytest.mark.parametrize(
+    "destination",
+    (
+        "https://private.example/frame.webp",
+        "../assets/undeclared.webp",
+        "/static/screenshots/private.webp",
+        "C:/private/frame.webp",
+        "../../private/frame.webp",
+    ),
+)
+def test_raw_image_context_rejections_are_path_free_and_precede_writer(
+    workspace_root: Path,
+    markdown_template: str,
+    destination: str,
+) -> None:
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown_template.format(destination=destination),
+            (),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert destination not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "markdown_template",
+    (
+        "[\n{literal}",
+        "[{literal}](https://example.test/source)",
+    ),
+)
+@pytest.mark.parametrize(
+    "literal",
+    (
+        "<!-- ![literal](../assets/preview.webp) -->",
+        "<code>![literal](../assets/preview.webp)</code>",
+        "<pre>![literal](../assets/preview.webp)</pre>",
+        '<span title="![literal](../assets/preview.webp)">text</span>',
+    ),
+)
+def test_html_literals_cannot_reference_an_asset_in_bracket_contexts(
+    workspace_root: Path,
+    markdown_template: str,
+    literal: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown_template.format(literal=literal),
+            (asset,),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert "preview.webp" not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+def test_raw_image_with_quoted_greater_than_collects_exact_source(
+    workspace_root: Path,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    candidate = BundleAssembler().assemble(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            "<img alt='1 > 0' src='../assets/preview.webp'>",
+            (asset,),
+        )
+    )
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+def test_raw_image_ignores_src_text_inside_alt_and_uses_real_declared_source(
+    workspace_root: Path,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    markdown = (
+        '<img alt=\'src="../assets/fake-decoy.webp"\' '
+        "src='../assets/preview.webp'>"
+    )
+
+    candidate = BundleAssembler().assemble(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown,
+            (asset,),
+        )
+    )
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "<img alt='x\\' src='../assets/preview.webp'>",
+        '<img alt="x\\" src="../assets/preview.webp">',
+    ),
+)
+def test_raw_image_html_quotes_close_after_backslash_and_use_declared_source(
+    workspace_root: Path,
+    markdown: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    candidate = BundleAssembler().assemble(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown,
+            (asset,),
+        )
+    )
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("markdown", "destination"),
+    (
+        (
+            "<img alt='x\\' "
+            "src='https://private.example/private-remote-single.webp'>",
+            "https://private.example/private-remote-single.webp",
+        ),
+        (
+            '<img alt="x\\" '
+            'src="https://private.example/private-remote-double.webp">',
+            "https://private.example/private-remote-double.webp",
+        ),
+        (
+            "<img alt='x\\' "
+            "src='../assets/private-dangling-single.webp'>",
+            "../assets/private-dangling-single.webp",
+        ),
+        (
+            '<img alt="x\\" '
+            'src="../assets/private-dangling-double.webp">',
+            "../assets/private-dangling-double.webp",
+        ),
+    ),
+)
+def test_raw_image_html_backslash_quote_rejections_are_path_free_before_writer(
+    workspace_root: Path,
+    markdown: str,
+    destination: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            "![declared](../assets/preview.webp)\n\n" + markdown,
+            (asset,),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    for private_value in (
+        destination,
+        "private.example",
+        "private-remote-single.webp",
+        "private-remote-double.webp",
+        "private-dangling-single.webp",
+        "private-dangling-double.webp",
+        asset.artifact_id,
+        asset.relative_path,
+    ):
+        assert private_value not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "\\<img alt='x\\' src='../assets/preview.webp'>",
+        '\\<img alt="x\\" src="../assets/preview.webp">',
+    ),
+)
+def test_escaped_raw_image_opener_with_html_backslash_quote_stays_literal(
+    workspace_root: Path,
+    markdown: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown,
+            (asset,),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert asset.artifact_id not in str(raised.value)
+    assert asset.relative_path not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        (
+            '<img alt=\'src="../assets/preview.webp"\' '
+            "src='https://private.example/real.webp'>"
+        ),
+        (
+            '<img alt=\'src="../assets/preview.webp"\' '
+            "src='../assets/private-undeclared.webp'>"
+        ),
+        (
+            '<img alt=\'src="../assets/preview.webp"\' '
+            "src='../../private-traversal.webp'>"
+        ),
+        (
+            '<img alt=\'src="../assets/preview.webp"\' '
+            "src='/static/screenshots/private-legacy.webp'>"
+        ),
+        (
+            '<img alt=\'src="../assets/preview.webp"\' '
+            "src='C:/private/absolute.webp'>"
+        ),
+        "<img data-src='../assets/preview.webp'>",
+        "<img ng-src='../assets/preview.webp'>",
+        "<img x:src='../assets/preview.webp'>",
+        '<img title=\'src="../assets/preview.webp"\'>',
+        '<img alt=\'src="../assets/preview.webp"\'>',
+        (
+            "<img src='../assets/preview.webp' "
+            "src='../assets/private-duplicate.webp'>"
+        ),
+    ),
+)
+def test_raw_image_src_decoys_and_duplicates_fail_path_free_before_writer(
+    workspace_root: Path,
+    markdown: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown,
+            (asset,),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert asset.artifact_id not in str(raised.value)
+    for private_value in (
+        "preview.webp",
+        "fake-decoy.webp",
+        "private.example",
+        "private-undeclared",
+        "private-traversal",
+        "private-legacy",
+        "private/absolute",
+        "private-duplicate",
+    ):
+        assert private_value not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "destination",
+    (
+        "https://private.example/frame.webp",
+        "../assets/undeclared.webp",
+    ),
+)
+def test_raw_image_with_quoted_greater_than_cannot_bypass_closure(
+    workspace_root: Path,
+    destination: str,
+) -> None:
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            f"<img alt='1 > 0' src='{destination}'>",
+            (),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert destination not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "destination",
+    (
+        "https://private.example/frame.webp",
+        "../assets/undeclared.webp",
+        "/static/screenshots/private.webp",
+        "C:/private/frame.webp",
+        "../../private/frame.webp",
+    ),
+)
+def test_nested_linked_image_rejections_are_path_free_and_precede_candidate_write(
+    workspace_root: Path,
+    destination: str,
+) -> None:
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            f"[![frame]({destination})](https://example.test/source)",
+            (),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert destination not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "rendered",
+    (
+        "![<!--](../assets/preview.webp)",
+        "<img alt='<!--' src='../assets/preview.webp'>",
+    ),
+)
+def test_comment_open_text_inside_rendered_image_metadata_is_not_a_comment(
+    workspace_root: Path,
+    rendered: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    candidate = BundleAssembler().assemble(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            rendered,
+            (asset,),
+        )
+    )
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        '<span title="![literal](../assets/preview.webp)">text</span>',
+        "<code>![literal](../assets/preview.webp)</code>",
+        "<pre>![literal](../assets/preview.webp)</pre>",
+        "<!-- ![literal](../assets/preview.webp) -->",
+        "\\<img src='../assets/preview.webp'>",
+    ),
+)
+def test_nonrendered_image_text_cannot_satisfy_declared_asset_closure(
+    workspace_root: Path,
+    literal: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    invalid, location = _with_closed_writer(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            literal,
+            (asset,),
+        )
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_reference_invalid"
+    assert raised.value.message == "Video bundle references are invalid"
+    assert dict(raised.value.details) == {}
+    assert location.calls == 0
+    assert "preview.webp" not in str(raised.value)
+    assert not _candidate_path(workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    (
+        "![frame][preview]\n\n[preview]: ../assets/preview.webp\n\n"
+        "\\![escaped][missing]\n\n[missing]: ../assets/missing.webp",
+        "![[../assets/preview.webp|frame]]\n\n"
+        "\\![[../assets/missing.webp|literal]]",
+        "<img alt='frame' src='../assets/preview.webp'>\n\n"
+        "\\<img src='../assets/missing.webp'>",
+    ),
+)
+def test_supported_rendered_image_forms_have_exact_closure_and_ignore_escapes(
+    workspace_root: Path,
+    markdown: str,
+) -> None:
+    asset = DisplayAssetInput(
+        artifact_id="art_018f0000-0000-7000-8000-00000000010d",
+        relative_path="assets/preview.webp",
+        media_type="image/webp",
+        payload=VALID_WEBP,
+    )
+
+    candidate = BundleAssembler().assemble(
+        _with_markdown_and_assets(
+            _bundle_input(workspace_root),
+            markdown,
+            (asset,),
+        )
+    )
+
+    assert (candidate.absolute_path / "bundle.json").is_file()
 
 
 def test_assembler_rejects_duplicate_artifact_id(workspace_root: Path) -> None:

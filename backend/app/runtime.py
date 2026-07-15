@@ -75,6 +75,11 @@ class FakeCallCounts:
     commit: int = 0
 
 
+_FAKE_SCREENSHOT_WEBP = bytes.fromhex(
+    "524946461a000000574542505650384c0d0000002f00000010071011118888fe0700"
+)
+
+
 class _FakeVideoOperations(VideoRecipeOperations):
     def __init__(
         self,
@@ -273,7 +278,15 @@ class _FakeVideoOperations(VideoRecipeOperations):
             self._calls.ffmpeg += 1
             self._record("ffmpeg")
             self._run_operation_hook("ffmpeg", execution.heartbeat)
-        return ()
+        return tuple(
+            DisplayAssetInput(
+                artifact_id=item.artifact_id,
+                relative_path=item.relative_path,
+                media_type="image/webp",
+                payload=_FAKE_SCREENSHOT_WEBP,
+            )
+            for item in plan
+        )
 
     def after_portable_commit(self, result: object) -> None:
         if not bool(getattr(result, "idempotent", False)):
