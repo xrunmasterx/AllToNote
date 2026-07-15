@@ -1179,6 +1179,8 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
         "`/`",
         "（/\\）",
         "（/），",
+        "（/、\\）",
+        "(/,\\)",
     ),
 )
 def test_assembler_allows_separator_notation_at_punctuation_boundaries(
@@ -1205,7 +1207,7 @@ def test_assembler_allows_embedded_https_url_in_general_metadata(
     bundle_input = _bundle_input(workspace_root)
     source = replace(
         bundle_input.source,
-        title="Reference https://example.com/docs/path for details",
+        title="Reference https://example.com//docs/path for details",
     )
 
     candidate = BundleAssembler().assemble(replace(bundle_input, source=source))
@@ -1220,8 +1222,11 @@ def test_assembler_allows_embedded_https_url_in_general_metadata(
     "unsafe_title",
     (
         "diagnostic file:///home/alice/private.log failed",
+        r"diagnostic file:\home\alice failed",
         "diagnostic //server/share/private.log failed",
+        "diagnostic ///home/alice failed",
         r"diagnostic \\server/share/private.log failed",
+        r"diagnostic \\\server\share\private.log failed",
         r"diagnostic //server\share/private.log failed",
         "diagnostic (/home/alice/private.log) failed",
         "diagnostic `/etc/passwd` failed",
