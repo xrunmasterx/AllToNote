@@ -97,13 +97,9 @@ def parse_model_output(
                     "model_citation_unknown",
                     "Model output cites a segment outside this chunk",
                 )
-            if segment_id in citation_set:
-                raise _error(
-                    "model_citation_duplicate",
-                    "Model output repeats a transcript citation",
-                )
-            citation_set.add(segment_id)
-            citations.append(segment_id)
+            if segment_id not in citation_set:
+                citation_set.add(segment_id)
+                citations.append(segment_id)
             cursor = closing + 1
             continue
         if markdown.startswith("[^", cursor):

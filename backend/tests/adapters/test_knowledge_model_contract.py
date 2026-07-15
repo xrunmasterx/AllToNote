@@ -148,13 +148,30 @@ def test_prompt_treats_transcript_as_untrusted_jsonl_data() -> None:
     assert "<END_UNTRUSTED_TRANSCRIPT_JSONL>" in prompt
 
 
-def test_prompt_forbids_reusing_a_segment_citation() -> None:
+def test_prompt_allows_reusing_evidence_without_redundant_adjacent_citations() -> None:
     transcript = _transcript(count=2)
 
     prompt = build_video_prompt(_request(transcript), transcript.segments)
 
-    assert "每个分段 ID 全篇最多引用一次" in prompt
-    assert "同源陈述合并后只引用一次" in prompt
+    assert "同一分段可支持不同陈述或章节" in prompt
+    assert "避免无意义相邻重复引用" in prompt
+
+
+def test_parser_preserves_repeated_citation_uses_but_projects_unique_ids() -> None:
+    output = (
+        "# Note\n\n"
+        "## First\n\nClaim one[^seg_000001].\n\n"
+        "## Second\n\nClaim two[^seg_000001].\n"
+    )
+
+    parsed = parse_model_output(
+        output,
+        known_segment_ids=("seg_000001",),
+        allow_screenshots=False,
+    )
+
+    assert parsed.markdown.count("[^seg_000001]") == 2
+    assert parsed.cited_segment_ids == ("seg_000001",)
 
 
 def test_parser_extracts_visible_citations_and_screenshot_actions() -> None:
@@ -188,12 +205,6 @@ def test_parser_extracts_visible_citations_and_screenshot_actions() -> None:
         ("Fact[^other]", ("seg_000001",), False, "model_citation_invalid"),
         ("Fact[^SEG_000001]", ("seg_000001",), False, "model_citation_invalid"),
         ("Fact[^seg_000001", ("seg_000001",), False, "model_citation_invalid"),
-        (
-            "Fact[^seg_000001][^seg_000001]",
-            ("seg_000001",),
-            False,
-            "model_citation_duplicate",
-        ),
         (
             "Fact[^seg_000001]\n\n[^seg_000001]: invented definition",
             ("seg_000001",),

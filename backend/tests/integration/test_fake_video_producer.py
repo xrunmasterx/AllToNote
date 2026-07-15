@@ -167,6 +167,70 @@ def test_fake_recipe_commits_once_and_returns_bundle(
         ) is not None
 
 
+def test_repeated_segment_citations_keep_two_uses_and_one_definition(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, _ = runtime_factory()
+    service = runtime._sdk._video_service
+    delegate = service._operations
+
+    class RepeatedCitationOperations:
+        def __getattr__(self, name: str) -> object:
+            return getattr(delegate, name)
+
+        def generate_draft(
+            self,
+            request_value: VideoProduceRequest,
+            transcript_value: TranscriptDocument,
+            *,
+            execution: object,
+        ) -> GeneratedVideoDraft:
+            generated = delegate.generate_draft(
+                request_value,
+                transcript_value,
+                execution=execution,
+            )
+            return replace(
+                generated,
+                markdown=(
+                    "# Video note\n\n"
+                    "## First\n\nFirst claim[^seg_000001].\n\n"
+                    "## Second\n\nSecond claim[^seg_000001].\n"
+                ),
+                cited_segment_ids=("seg_000001",),
+            )
+
+    service._operations = RepeatedCitationOperations()
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="repeated-citation-uses")
+    )
+    snapshot = runtime.wait_job(submitted.job_id)
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert snapshot.result is not None
+    assert snapshot.result.quality_overall is QualityOverall.PASS
+    evidence_id = VideoService._derived_id(
+        submitted.job_id,
+        "ev",
+        "seg_000001",
+    )
+    label = f"[^{evidence_id}]"
+    draft_path = (
+        workspace_root
+        / snapshot.result.workspace_relative_bundle_path
+        / "drafts"
+        / f"{snapshot.result.primary_draft_artifact_id}.md"
+    )
+    lines = draft_path.read_text(encoding="utf-8").splitlines()
+    definition_lines = [line for line in lines if line.startswith(f"{label}:")]
+    body = "\n".join(line for line in lines if not line.startswith(f"{label}:"))
+
+    assert body.count(label) == 2
+    assert len(definition_lines) == 1
+    _validate_committed_bundle(workspace_root, snapshot.result.bundle_id)
+
+
 def test_quality_fail_still_commits_and_returns_success(
     runtime_factory: Callable[..., tuple[object, object]],
     workspace_root: Path,

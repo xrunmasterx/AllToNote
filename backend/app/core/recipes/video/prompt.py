@@ -39,8 +39,8 @@ def _prompt_parts(request: KnowledgeModelRequest) -> tuple[str, str, str]:
     )
     middle = (
         " 引用事实，仅引用本批次分段。\n"
-        "每个分段 ID 全篇最多引用一次；"
-        "同源陈述合并后只引用一次。\n"
+        "同一分段可支持不同陈述或章节；"
+        "避免无意义相邻重复引用。\n"
         f"{screenshot_rule}\n\n"
         "<BEGIN_UNTRUSTED_TRANSCRIPT_JSONL>\n"
     )
