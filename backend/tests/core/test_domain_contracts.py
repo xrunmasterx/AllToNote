@@ -464,9 +464,12 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     )
 
     assert all(getattr(port, "_is_protocol", False) for port in marker_ports)
+    assert {
+        name for name in VideoSourcePort.__dict__ if not name.startswith("_")
+    } == {"resolve", "acquire"}
     assert all(
         not {name for name in port.__dict__ if not name.startswith("_")}
-        for port in marker_ports
+        for port in marker_ports[1:]
     )
     assert {
         name

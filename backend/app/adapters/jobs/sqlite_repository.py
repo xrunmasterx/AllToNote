@@ -1105,6 +1105,143 @@ class SqliteJobRepository:
         with self._transaction(immediate=False) as connection:
             return self._get_external_operation(connection, operation_id)
 
+    def read_source_identity_candidate(
+        self,
+        connector_id: str,
+        canonical_identity: str,
+    ) -> SourceIdentityBinding | None:
+        """Return an unverified machine-cache candidate for the source adapter."""
+        with self._transaction(immediate=False) as connection:
+            row = connection.execute(
+                """
+                SELECT connector_id, canonical_identity, source_id,
+                       owning_bundle_id, manifest_sha256
+                FROM source_identities
+                WHERE connector_id = ? AND canonical_identity = ?
+                """,
+                (connector_id, canonical_identity),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceIdentityBinding(
+            connector_id=row["connector_id"],
+            canonical_identity=row["canonical_identity"],
+            source_id=row["source_id"],
+            owning_bundle_id=row["owning_bundle_id"],
+            manifest_sha256=row["manifest_sha256"],
+        )
+
+    def cache_source_identity_candidate(
+        self,
+        binding: SourceIdentityBinding,
+    ) -> None:
+        """Cache a binding that the caller already verified against Portable truth."""
+        with self._transaction(immediate=True) as connection:
+            existing = connection.execute(
+                """
+                SELECT source_id, owning_bundle_id, manifest_sha256
+                FROM source_identities
+                WHERE connector_id = ? AND canonical_identity = ?
+                """,
+                (binding.connector_id, binding.canonical_identity),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["source_id"],
+                    existing["owning_bundle_id"],
+                    existing["manifest_sha256"],
+                ) == (
+                    binding.source_id,
+                    binding.owning_bundle_id,
+                    binding.manifest_sha256,
+                ):
+                    return
+                raise DomainError(
+                    "source_identity_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Source identity is already bound to another committed bundle",
+                )
+            connection.execute(
+                """
+                INSERT INTO source_identities (
+                    connector_id, canonical_identity, source_id,
+                    owning_bundle_id, manifest_sha256, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    binding.connector_id,
+                    binding.canonical_identity,
+                    binding.source_id,
+                    binding.owning_bundle_id,
+                    binding.manifest_sha256,
+                    utc_now_millis(),
+                ),
+            )
+
+    def discard_source_identity_candidate(
+        self,
+        binding: SourceIdentityBinding,
+    ) -> None:
+        """Discard only the exact stale candidate observed by the caller."""
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                DELETE FROM source_identities
+                WHERE connector_id = ? AND canonical_identity = ?
+                  AND source_id = ? AND owning_bundle_id = ?
+                  AND manifest_sha256 = ?
+                """,
+                (
+                    binding.connector_id,
+                    binding.canonical_identity,
+                    binding.source_id,
+                    binding.owning_bundle_id,
+                    binding.manifest_sha256,
+                ),
+            )
+
+    def replace_source_identity_candidate(
+        self,
+        observed: SourceIdentityBinding,
+        replacement: SourceIdentityBinding,
+    ) -> bool:
+        """Replace only the exact cache row observed before Portable verification."""
+        if (
+            observed.connector_id,
+            observed.canonical_identity,
+        ) != (
+            replacement.connector_id,
+            replacement.canonical_identity,
+        ):
+            raise DomainError(
+                "source_identity_replacement_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Source identity replacement must preserve its cache key",
+            )
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE source_identities
+                SET source_id = ?, owning_bundle_id = ?, manifest_sha256 = ?,
+                    updated_at = ?
+                WHERE connector_id = ? AND canonical_identity = ?
+                  AND source_id = ? AND owning_bundle_id = ?
+                  AND manifest_sha256 = ?
+                """,
+                (
+                    replacement.source_id,
+                    replacement.owning_bundle_id,
+                    replacement.manifest_sha256,
+                    utc_now_millis(),
+                    observed.connector_id,
+                    observed.canonical_identity,
+                    observed.source_id,
+                    observed.owning_bundle_id,
+                    observed.manifest_sha256,
+                ),
+            )
+            return cursor.rowcount == 1
+
     def reconcile_external_operations_after_process_loss(
         self,
         job_id: str,

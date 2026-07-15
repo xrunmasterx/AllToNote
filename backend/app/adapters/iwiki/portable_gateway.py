@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ from iwiki.portable import (
 from iwiki.workspace import Workspace, open_workspace
 
 from app.core.errors import DomainError, ErrorCategory
+from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.portable import (
     CandidateBundleLocation,
     CandidateBundleWriterPort,
@@ -75,6 +77,16 @@ _JOB_ID = re.compile(
     r"job_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
+_BUNDLE_ID = re.compile(
+    r"bnd_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
+_SOURCE_ID = re.compile(
+    r"src_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
+_MANIFEST_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -243,6 +255,100 @@ def _open_locked_workspace(
     except _COMPATIBILITY_ERRORS:
         raise _contract_incompatible() from None
     return workspace, info
+
+
+def _path_is_reparse_point(path: Path) -> bool:
+    try:
+        attributes = path.lstat().st_file_attributes
+    except AttributeError:
+        return path.is_symlink()
+    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _read_verified_source_bindings(
+    workspace: Workspace,
+    bundle_id: str,
+    manifest_sha256: str,
+) -> tuple[SourceIdentityBinding, ...]:
+    if (
+        _BUNDLE_ID.fullmatch(bundle_id) is None
+        or _MANIFEST_DIGEST.fullmatch(manifest_sha256) is None
+    ):
+        return ()
+    bundles_root = workspace.resolve_contract_path("raw_personal") / "bundles"
+    bundle_root = bundles_root / bundle_id
+    manifest_path = bundle_root / "bundle.json"
+    try:
+        if (
+            _path_is_reparse_point(bundles_root)
+            or _path_is_reparse_point(bundle_root)
+            or _path_is_reparse_point(manifest_path)
+            or not bundle_root.is_dir()
+            or not manifest_path.is_file()
+            or manifest_path.stat().st_size > _MAX_MANIFEST_BYTES
+        ):
+            return ()
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError:
+        return ()
+    actual_sha256 = f"sha256:{hashlib.sha256(manifest_bytes).hexdigest()}"
+    if actual_sha256 != manifest_sha256:
+        return ()
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ()
+    if (
+        type(manifest) is not dict
+        or manifest.get("bundle_id") != bundle_id
+        or type(manifest.get("sources")) is not list
+    ):
+        return ()
+
+    bindings: list[SourceIdentityBinding] = []
+    seen: set[tuple[str, str, str]] = set()
+    for source in manifest["sources"]:
+        if type(source) is not dict or source.get("source_kind") != "video":
+            continue
+        source_id = source.get("source_id")
+        canonical = source.get("canonical_identity")
+        extensions = source.get("extensions")
+        if (
+            type(source_id) is not str
+            or _SOURCE_ID.fullmatch(source_id) is None
+            or type(canonical) is not dict
+            or type(extensions) is not dict
+        ):
+            continue
+        scheme = canonical.get("scheme")
+        value = canonical.get("value")
+        video_extension = extensions.get("alltonote.video:source")
+        if (
+            type(scheme) is not str
+            or not scheme
+            or type(value) is not str
+            or not value
+            or type(video_extension) is not dict
+        ):
+            continue
+        connector_id = video_extension.get("connector_id")
+        if type(connector_id) is not str or not connector_id:
+            continue
+        identity = f"{scheme}:{value}"
+        key = (connector_id, identity, source_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        bindings.append(
+            SourceIdentityBinding(
+                connector_id=connector_id,
+                canonical_identity=identity,
+                source_id=source_id,
+                owning_bundle_id=bundle_id,
+                manifest_sha256=manifest_sha256,
+            )
+        )
+    return tuple(bindings)
 
 
 def _candidate_error(
@@ -857,6 +963,95 @@ class IWikiPortableGateway:
     def inspect(self, workspace_root: Path) -> PortableContractInfo:
         _, info = _open_locked_workspace(workspace_root)
         return info
+
+    def verify_committed_source_binding(
+        self,
+        workspace_root: Path,
+        binding: SourceIdentityBinding,
+    ) -> bool:
+        workspace, _ = _open_locked_workspace(workspace_root)
+        try:
+            report = validate_bundle(
+                workspace,
+                PortableBundleRef.committed(binding.owning_bundle_id),
+                ValidationLevel.SEMANTIC,
+            )
+        except (IWikiError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        if (
+            not report.valid
+            or report.bundle_id != binding.owning_bundle_id
+            or report.manifest_sha256 != binding.manifest_sha256
+        ):
+            return False
+        return binding in _read_verified_source_bindings(
+            workspace,
+            binding.owning_bundle_id,
+            binding.manifest_sha256,
+        )
+
+    def iter_verified_source_bindings(
+        self,
+        workspace_root: Path,
+    ) -> tuple[SourceIdentityBinding, ...]:
+        workspace, _ = _open_locked_workspace(workspace_root)
+        bundles_root = workspace.resolve_contract_path("raw_personal") / "bundles"
+        try:
+            if _path_is_reparse_point(bundles_root) or not bundles_root.is_dir():
+                return ()
+            bundle_ids = sorted(
+                path.name
+                for path in bundles_root.iterdir()
+                if _BUNDLE_ID.fullmatch(path.name) is not None
+                and path.is_dir()
+                and not _path_is_reparse_point(path)
+            )
+        except OSError:
+            return ()
+
+        discovered: list[SourceIdentityBinding] = []
+        for bundle_id in bundle_ids:
+            try:
+                report = validate_bundle(
+                    workspace,
+                    PortableBundleRef.committed(bundle_id),
+                    ValidationLevel.SEMANTIC,
+                )
+            except (IWikiError, OSError, RuntimeError, TypeError, ValueError):
+                continue
+            if (
+                not report.valid
+                or report.bundle_id != bundle_id
+                or type(report.manifest_sha256) is not str
+            ):
+                continue
+            discovered.extend(
+                _read_verified_source_bindings(
+                    workspace,
+                    bundle_id,
+                    report.manifest_sha256,
+                )
+            )
+
+        by_identity: dict[tuple[str, str], list[SourceIdentityBinding]] = {}
+        for binding in discovered:
+            by_identity.setdefault(
+                (binding.connector_id, binding.canonical_identity), []
+            ).append(binding)
+        verified: list[SourceIdentityBinding] = []
+        for candidates in by_identity.values():
+            if len({candidate.source_id for candidate in candidates}) != 1:
+                continue
+            verified.append(max(candidates, key=lambda candidate: candidate.owning_bundle_id))
+        return tuple(
+            sorted(
+                verified,
+                key=lambda binding: (
+                    binding.connector_id,
+                    binding.canonical_identity,
+                ),
+            )
+        )
 
     def validate_candidate(
         self,
