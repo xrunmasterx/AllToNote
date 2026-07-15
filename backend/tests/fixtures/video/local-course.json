@@ -1,0 +1,13 @@
+{
+  "$schema": "urn:alltonote:test-fixture:local-video:v1",
+  "fixture_schema_version": 1,
+  "creation_tool": "Microsoft System.Speech 4.0 SAPI WAV; FFmpeg 8.1.2-full_build-www.gyan.dev",
+  "voice": "Microsoft Zira Desktop, en-US, adult female, rate -1",
+  "source": "Project-authored synthetic speech over an FFmpeg color source; no third-party media bytes",
+  "expected_phrase": "AllToNote turns video into cited knowledge.",
+  "spoken_text": "AllToNote turns video into cited knowledge. AllToNote turns video into cited knowledge.",
+  "duration_ms": 12000,
+  "license": "project_test_fixture",
+  "byte_length": 83228,
+  "sha256": "4493bc26df912798b56a754ede158f229970d2ecb81d2892c13aed058b2ac08e"
+}

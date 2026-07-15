@@ -17,3 +17,9 @@ include = ["app*"]
 
 [tool.setuptools.package-data]
 app = ["runtime-lock.json"]
+
+[tool.pytest.ini_options]
+markers = [
+    "windows_smoke: opt-in real Windows host integration smoke",
+    "macos_smoke: opt-in real Apple Silicon macOS host integration smoke",
+]

@@ -12,7 +12,6 @@ from app.utils.env_checker import is_cuda_available, is_torch_installed
 from app.utils.logger import get_logger
 from app.utils.path_helper import get_model_dir
 
-from events import transcription_finished
 from pathlib import Path
 import os
 import shutil
@@ -150,6 +149,7 @@ class WhisperTranscriber(Transcriber):
 
 
     def on_finish(self,video_path:str,result: TranscriptResult)->None:
+        from events import transcription_finished
         print("转写完成")
         transcription_finished.send({
             "file_path": video_path,

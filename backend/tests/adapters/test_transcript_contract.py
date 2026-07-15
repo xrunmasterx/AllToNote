@@ -340,6 +340,29 @@ print(json.dumps({name: name in sys.modules for name in names}, sort_keys=True))
     }
 
 
+def test_fast_whisper_module_import_does_not_require_legacy_event_entrypoint(
+    tmp_path: Path,
+) -> None:
+    script = """
+import importlib.util
+assert importlib.util.find_spec("events") is None
+import app.transcriber.whisper
+"""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("fast-whisper provider import probe timed out")
+
+    assert completed.returncode == 0, "fast-whisper provider import probe failed"
+
+
 def test_cancellation_before_blocking_call_does_not_load_provider(
     tmp_path: Path,
 ) -> None:
