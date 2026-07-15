@@ -1201,13 +1201,21 @@ def test_assembler_allows_separator_notation_at_punctuation_boundaries(
     ).valid
 
 
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://example.com/docs/path",
+        "https://example.com//docs/path",
+    ),
+)
 def test_assembler_allows_embedded_https_url_in_general_metadata(
     workspace_root: Path,
+    url: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
     source = replace(
         bundle_input.source,
-        title="Reference https://example.com//docs/path for details",
+        title=f"Reference {url} for details",
     )
 
     candidate = BundleAssembler().assemble(replace(bundle_input, source=source))
@@ -1228,6 +1236,12 @@ def test_assembler_allows_embedded_https_url_in_general_metadata(
         r"diagnostic \\server/share/private.log failed",
         r"diagnostic \\\server\share\private.log failed",
         r"diagnostic //server\share/private.log failed",
+        "path=file:///home/alice/private.log",
+        "path=//server/share/private.log",
+        r"path=\\server\share\private.log",
+        "诊断：file:///home/alice/private.log",
+        "诊断：//server/share/private.log",
+        "diagnostic,file:///home/alice/private.log",
         "diagnostic (/home/alice/private.log) failed",
         "diagnostic `/etc/passwd` failed",
         "diagnostic （/home/alice/private.log），failed",

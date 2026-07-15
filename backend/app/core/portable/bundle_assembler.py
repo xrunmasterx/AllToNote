@@ -44,7 +44,8 @@ _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _EMBEDDED_FILE_PATH = re.compile(r"file:[/\\]+", re.IGNORECASE)
 _EMBEDDED_UNC_PATH = re.compile(r"[/\\]{2,}[^/\\\s]+[/\\][^/\\\s]+")
 _EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
-_PATH_TOKEN_OPENING_BOUNDARIES = frozenset("([{'\"`<（【《「『“‘")
+_FILE_PATH_PREFIX_CONTINUATIONS = frozenset("_+.-")
+_NETWORK_PATH_PREFIX_CONTINUATIONS = frozenset(":/\\._-")
 _PATH_TRAILING_BOUNDARIES = ")]}`'\"）】》」』，。；：！？"
 _SEPARATOR_NOTATION_CHARACTERS = frozenset("/\\,，、")
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
@@ -180,14 +181,17 @@ def _is_absolute_or_local_path(value: str) -> bool:
     )
 
 
-def _contains_path_at_token_boundary(pattern: re.Pattern[str], value: str) -> bool:
+def _contains_path_after_prefix_boundary(
+    pattern: re.Pattern[str],
+    value: str,
+    prefix_continuations: frozenset[str],
+) -> bool:
     for match in pattern.finditer(value):
         start = match.start()
-        if (
-            start == 0
-            or value[start - 1].isspace()
-            or value[start - 1] in _PATH_TOKEN_OPENING_BOUNDARIES
-        ):
+        if start == 0:
+            return True
+        previous = value[start - 1]
+        if not previous.isalnum() and previous not in prefix_continuations:
             return True
     return False
 
@@ -213,8 +217,16 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
         if (
             _is_absolute_or_local_path(value)
             or _EMBEDDED_WINDOWS_PATH.search(value)
-            or _contains_path_at_token_boundary(_EMBEDDED_FILE_PATH, value)
-            or _contains_path_at_token_boundary(_EMBEDDED_UNC_PATH, value)
+            or _contains_path_after_prefix_boundary(
+                _EMBEDDED_FILE_PATH,
+                value,
+                _FILE_PATH_PREFIX_CONTINUATIONS,
+            )
+            or _contains_path_after_prefix_boundary(
+                _EMBEDDED_UNC_PATH,
+                value,
+                _NETWORK_PATH_PREFIX_CONTINUATIONS,
+            )
             or _contains_embedded_posix_path(value)
         ):
             raise _error(
