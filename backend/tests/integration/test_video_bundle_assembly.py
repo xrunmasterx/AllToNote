@@ -1168,6 +1168,23 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
     assert not _candidate_path(workspace_root).exists()
 
 
+def test_assembler_allows_standalone_slash_backslash_notation(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    source = replace(
+        bundle_input.source,
+        title="Path separators /\\ are shown for comparison",
+    )
+
+    candidate = BundleAssembler().assemble(replace(bundle_input, source=source))
+
+    assert IWikiPortableGateway().validate_candidate(
+        workspace_root,
+        candidate.staging_relative_path,
+    ).valid
+
+
 def test_assembler_rejects_hash_route_like_posix_path_in_general_metadata(
     workspace_root: Path,
 ) -> None:

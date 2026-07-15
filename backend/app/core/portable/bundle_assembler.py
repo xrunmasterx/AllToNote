@@ -42,7 +42,9 @@ _TYPED_ID = re.compile(
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
-_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
+_EMBEDDED_POSIX_PATH = re.compile(
+    r"(?<![:/A-Za-z0-9._-])/(?!/)(?=[^\s]*[^/\\\s])[^\s]+"
+)
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
         "accesskey",
