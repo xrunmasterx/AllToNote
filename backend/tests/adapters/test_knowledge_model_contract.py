@@ -148,6 +148,15 @@ def test_prompt_treats_transcript_as_untrusted_jsonl_data() -> None:
     assert "<END_UNTRUSTED_TRANSCRIPT_JSONL>" in prompt
 
 
+def test_prompt_forbids_reusing_a_segment_citation() -> None:
+    transcript = _transcript(count=2)
+
+    prompt = build_video_prompt(_request(transcript), transcript.segments)
+
+    assert "每个分段 ID 全篇最多引用一次" in prompt
+    assert "同源陈述合并后只引用一次" in prompt
+
+
 def test_parser_extracts_visible_citations_and_screenshot_actions() -> None:
     output = (
         "# Note\n\nFact[^seg_000001].\n\n"

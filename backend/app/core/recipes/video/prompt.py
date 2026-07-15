@@ -38,7 +38,9 @@ def _prompt_parts(request: KnowledgeModelRequest) -> tuple[str, str, str]:
         "仅输出 Markdown 笔记，不要输出脚注定义。用 "
     )
     middle = (
-        " 引用事实，且只能引用本批次列出的分段。\n"
+        " 引用事实，仅引用本批次分段。\n"
+        "每个分段 ID 全篇最多引用一次；"
+        "同源陈述合并后只引用一次。\n"
         f"{screenshot_rule}\n\n"
         "<BEGIN_UNTRUSTED_TRANSCRIPT_JSONL>\n"
     )
