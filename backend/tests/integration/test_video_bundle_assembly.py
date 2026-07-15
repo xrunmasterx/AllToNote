@@ -1237,6 +1237,7 @@ def test_assembler_allows_embedded_https_url_in_general_metadata(
         r"diagnostic \\\server\share\private.log failed",
         r"diagnostic //server\share/private.log failed",
         "path=file:///home/alice/private.log",
+        "diagnostic path:/home/alice",
         "path=//server/share/private.log",
         r"path=\\server\share\private.log",
         "诊断：file:///home/alice/private.log",
