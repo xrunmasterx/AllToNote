@@ -935,14 +935,22 @@ class SqliteJobRepository:
         job_id: str,
         attempt_id: str,
         authority: ExecutionAuthority,
+        *,
+        expected_step_id: str | None = None,
     ) -> None:
         with self._connect() as connection:
-            self._assert_execution_authority(
+            attempt = self._assert_execution_authority(
                 connection,
                 job_id,
                 attempt_id,
                 authority,
             )
+            if expected_step_id is not None and attempt.step_id != expected_step_id:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "Attempt does not own this storage operation",
+                )
 
     def latest_checkpoint(
         self, job_id: str, step_id: str

@@ -13,6 +13,7 @@ from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
+from app.adapters.screenshots.ffmpeg import FFmpegScreenshotAdapter
 from app.adapters.models.legacy_gpt import (
     LegacyKnowledgeModelAdapter,
     LegacyModelBinding,
@@ -39,7 +40,9 @@ from app.core.application.video_service import (
 from app.core.domain.video import (
     GeneratedVideoDraft,
     JobSnapshot,
+    ScreenshotPlanItem,
     ScreenshotPolicy,
+    ScreenshotRequest,
     TranscriptDocument,
     TranscriptSegment,
     VideoProduceRequest,
@@ -50,6 +53,7 @@ from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import CheckpointMetadata
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
 from app.core.ports.model import KnowledgeModelRequest
+from app.core.ports.screenshot import ScreenshotPort
 from app.core.ports.source import (
     MaterializationPolicy,
     ResolvedVideoSource,
@@ -82,6 +86,7 @@ class _FakeVideoOperations(VideoRecipeOperations):
         crash_operation_once: str | None,
         call_log_path: Path | None,
         operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]],
+        screenshot_requests: tuple[ScreenshotRequest, ...],
     ) -> None:
         self._calls = calls
         self._capabilities = capabilities
@@ -90,6 +95,7 @@ class _FakeVideoOperations(VideoRecipeOperations):
         self._crash_operation_once = crash_operation_once
         self._call_log_path = call_log_path
         self._operation_hooks = dict(operation_hooks)
+        self._screenshot_requests = tuple(screenshot_requests)
 
     def preflight_capabilities(
         self, request: VideoProduceRequest
@@ -246,7 +252,7 @@ class _FakeVideoOperations(VideoRecipeOperations):
         return GeneratedVideoDraft(
             markdown=markdown,
             cited_segment_ids=cited_segment_ids,
-            screenshot_requests=(),
+            screenshot_requests=self._screenshot_requests,
             model_identity="fake/model-v1",
             usage={"input_tokens": 12, "output_tokens": 6},
             warnings=(),
@@ -254,14 +260,16 @@ class _FakeVideoOperations(VideoRecipeOperations):
 
     def screenshots(
         self,
-        request: VideoProduceRequest,
-        draft: GeneratedVideoDraft,
+        plan: tuple[ScreenshotPlanItem, ...],
+        transcript: TranscriptDocument,
+        acquired: VideoAcquisition,
         *,
+        acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> tuple[DisplayAssetInput, ...]:
-        del draft
+        del transcript, acquired, acquisition_checkpoint
         self._crash_if_requested("screenshots")
-        if request.screenshot_policy is ScreenshotPolicy.ON_DEMAND:
+        if plan:
             self._calls.ffmpeg += 1
             self._record("ffmpeg")
             self._run_operation_hook("ffmpeg", execution.heartbeat)
@@ -476,13 +484,15 @@ class _PlatformVideoOperations(VideoRecipeOperations):
 
     def screenshots(
         self,
-        request: VideoProduceRequest,
-        draft: GeneratedVideoDraft,
+        plan: tuple[ScreenshotPlanItem, ...],
+        transcript: TranscriptDocument,
+        acquired: VideoAcquisition,
         *,
+        acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> tuple[DisplayAssetInput, ...]:
-        del draft, execution
-        if request.screenshot_policy is not ScreenshotPolicy.OFF:
+        del transcript, acquired, acquisition_checkpoint, execution
+        if plan:
             raise DomainError(
                 "screenshot_capability_unavailable",
                 ErrorCategory.POLICY_DENIED,
@@ -504,10 +514,12 @@ class _LocalVideoOperations(_PlatformVideoOperations):
         transcriber: TranscriptPort,
         model: LegacyModelBinding,
         result_root: Path,
+        screenshot_adapter: ScreenshotPort,
     ) -> None:
         super().__init__(repository, source, source_metadata, model, result_root)
         self._storage = storage
         self._transcriber = transcriber
+        self._screenshot_adapter = screenshot_adapter
 
     def acquire(
         self,
@@ -662,6 +674,23 @@ class _LocalVideoOperations(_PlatformVideoOperations):
                 "Local media transcription failed",
             ) from None
 
+    def screenshots(
+        self,
+        plan: tuple[ScreenshotPlanItem, ...],
+        transcript: TranscriptDocument,
+        acquired: VideoAcquisition,
+        *,
+        acquisition_checkpoint: CheckpointMetadata,
+        execution: VideoStepExecutionContext,
+    ) -> tuple[DisplayAssetInput, ...]:
+        return self._screenshot_adapter.extract(
+            plan,
+            transcript,
+            acquired,
+            acquisition_checkpoint=acquisition_checkpoint,
+            execution=execution,
+        )
+
 
 class AllToNoteRuntime:
     def __init__(
@@ -761,6 +790,10 @@ def create_local_video_runtime(
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
+    screenshot_adapter_factory: Callable[
+        [FileAttemptStorage, SqliteJobRepository], ScreenshotPort
+    ]
+    | None = None,
 ) -> AllToNoteRuntime:
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
@@ -780,6 +813,11 @@ def create_local_video_runtime(
         transcriber,
         model,
         resolved_machine_root / "external-results",
+        (
+            screenshot_adapter_factory(storage, repository)
+            if screenshot_adapter_factory is not None
+            else FFmpegScreenshotAdapter(storage, repository)
+        ),
     )
     service = VideoService(
         repository,
@@ -808,6 +846,7 @@ def create_fake_runtime(
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
+    screenshot_requests: tuple[ScreenshotRequest, ...] = (),
 ) -> AllToNoteRuntime:
     call_counts = calls or FakeCallCounts()
     resolved_machine_root = Path(machine_root).resolve()
@@ -831,6 +870,7 @@ def create_fake_runtime(
         crash_operation_once=crash_operation_once,
         call_log_path=resolved_call_log,
         operation_hooks=operation_hooks or {},
+        screenshot_requests=screenshot_requests,
     )
     service = VideoService(
         repository,

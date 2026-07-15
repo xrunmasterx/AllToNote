@@ -18,7 +18,11 @@ from app.core.jobs.model import (
     JobEvent,
 )
 from app.core.jobs.resource_lease import ExecutionAuthority
-from app.core.ports.jobs import AttemptMetadataRepositoryPort
+from app.core.ports.jobs import (
+    AttemptMetadataRepositoryPort,
+    ScreenshotOutputCapability,
+    ScreenshotSourceCapability,
+)
 from app.core.ports.source import CancellationTokenPort
 
 
@@ -34,6 +38,9 @@ _EVENT_FIELDS = frozenset(
     }
 )
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_SAFE_ARTIFACT_ID = re.compile(
+    r"art_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
 _WINDOWS_RESERVED_SEGMENTS = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{index}" for index in range(1, 10)}
@@ -301,6 +308,377 @@ class FileAttemptStorage:
         ):
             raise _stored_asset_invalid()
         return resolved
+
+    def verify_screenshot_source(
+        self,
+        stored: AttemptStoredAsset,
+        *,
+        expected_job_id: str,
+        expected_attempt_id: str,
+    ) -> ScreenshotSourceCapability:
+        path = self.resolve_asset(
+            stored,
+            expected_job_id=expected_job_id,
+            expected_attempt_id=expected_attempt_id,
+        )
+        path_stat = os.lstat(path)
+        return ScreenshotSourceCapability(
+            job_id=expected_job_id,
+            attempt_id=expected_attempt_id,
+            relative_locator=stored.relative_locator,
+            device=path_stat.st_dev,
+            inode=path_stat.st_ino,
+            byte_length=path_stat.st_size,
+        )
+
+    def validate_screenshot_source(
+        self, capability: ScreenshotSourceCapability
+    ) -> Path:
+        if not isinstance(capability, ScreenshotSourceCapability):
+            raise _stored_asset_invalid()
+        try:
+            path = self._checked_target(
+                Path(capability.relative_locator), create_parent=False
+            )
+            path = self._checked_regular_source(path)
+            path_stat = os.lstat(path)
+        except (DomainError, OSError):
+            raise _stored_asset_invalid() from None
+        if (
+            path_stat.st_dev != capability.device
+            or path_stat.st_ino != capability.inode
+            or path_stat.st_size != capability.byte_length
+            or Path(capability.relative_locator).parts[:5]
+            != (
+                "jobs",
+                capability.job_id,
+                "attempts",
+                capability.attempt_id,
+                "assets",
+            )
+        ):
+            raise _stored_asset_invalid()
+        return path
+
+    def allocate_screenshot_output(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        artifact_id: str,
+        authority: ExecutionAuthority,
+    ) -> ScreenshotOutputCapability:
+        relative = self._screenshot_output_relative(
+            job_id, attempt_id, artifact_id
+        )
+        self._metadata_repository.authorize_attempt_storage(
+            job_id,
+            attempt_id,
+            authority,
+            expected_step_id="optional_screenshots",
+        )
+        output: Path | None = None
+        parent_identity: tuple[int, int] | None = None
+        leaf_identity: tuple[int, int] | None = None
+        try:
+            output = self._checked_target(relative, create_parent=True)
+            if os.path.lexists(output):
+                raise _stored_asset_invalid()
+            parent_stat = os.lstat(output.parent)
+            parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+            with output.open("xb") as stream:
+                try:
+                    opened_stat = os.fstat(stream.fileno())
+                except OSError as opened_error:
+                    opened_stat = os.stat(stream.fileno())
+                    leaf_identity = (opened_stat.st_dev, opened_stat.st_ino)
+                    raise opened_error
+                leaf_identity = (opened_stat.st_dev, opened_stat.st_ino)
+                path_stat = os.lstat(output)
+                if (
+                    not stat.S_ISREG(path_stat.st_mode)
+                    or not stat.S_ISREG(opened_stat.st_mode)
+                    or (path_stat.st_dev, path_stat.st_ino) != leaf_identity
+                ):
+                    raise _stored_asset_invalid()
+                stream.flush()
+                os.fsync(stream.fileno())
+            capability = ScreenshotOutputCapability(
+                job_id=job_id,
+                attempt_id=attempt_id,
+                artifact_id=artifact_id,
+                relative_locator=relative.as_posix(),
+                parent_device=parent_identity[0],
+                parent_inode=parent_identity[1],
+                leaf_device=leaf_identity[0],
+                leaf_inode=leaf_identity[1],
+                authority_owner_id=authority.owner_id,
+                authority_fencing_token=authority.fencing_token,
+            )
+        except BaseException as error:
+            try:
+                self._cleanup_created_screenshot_output(
+                    output,
+                    parent_identity=parent_identity,
+                    leaf_identity=leaf_identity,
+                )
+            except BaseException:
+                pass
+            if isinstance(error, DomainError):
+                raise
+            if isinstance(error, Exception):
+                raise _storage_io_failed() from None
+            raise
+        return capability
+
+    def validate_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        *,
+        authority: ExecutionAuthority,
+    ) -> Path:
+        self._authorize_screenshot_output(capability, authority)
+        output = self._validated_screenshot_output(capability)
+        return output
+
+    def read_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        *,
+        job_id: str,
+        attempt_id: str,
+        artifact_id: str,
+        authority: ExecutionAuthority,
+    ) -> bytes:
+        if (
+            not isinstance(capability, ScreenshotOutputCapability)
+            or capability.job_id != job_id
+            or capability.attempt_id != attempt_id
+            or capability.artifact_id != artifact_id
+        ):
+            raise _stored_asset_invalid()
+        try:
+            self._authorize_screenshot_output(capability, authority)
+            expected = self._validated_screenshot_output(capability)
+            with expected.open("rb") as stream:
+                opened_stat = os.fstat(stream.fileno())
+                path_stat = os.lstat(expected)
+                capability_identity = (
+                    capability.leaf_device,
+                    capability.leaf_inode,
+                )
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or not stat.S_ISREG(path_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != capability_identity
+                    or (path_stat.st_dev, path_stat.st_ino)
+                    != capability_identity
+                ):
+                    raise _stored_asset_invalid()
+                return bytes(stream.read())
+        except DomainError:
+            raise
+        except OSError:
+            raise _storage_io_failed() from None
+
+    def cleanup_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        *,
+        authority: ExecutionAuthority,
+    ) -> None:
+        self._validate_cleanup_authority_binding(capability, authority)
+        authority_error: DomainError | None = None
+        try:
+            self._metadata_repository.authorize_attempt_storage(
+                capability.job_id,
+                capability.attempt_id,
+                authority,
+                expected_step_id="optional_screenshots",
+            )
+        except DomainError as error:
+            authority_error = error
+        try:
+            output = self._validated_screenshot_output(capability)
+            output.unlink()
+            self._remove_empty_screenshot_directory(
+                output.parent,
+                (capability.parent_device, capability.parent_inode),
+            )
+        except DomainError:
+            raise
+        except OSError:
+            raise _storage_io_failed() from None
+        if authority_error is not None:
+            raise authority_error
+
+    def _authorize_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        authority: ExecutionAuthority,
+    ) -> None:
+        self._validate_cleanup_authority_binding(capability, authority)
+        self._metadata_repository.authorize_attempt_storage(
+            capability.job_id,
+            capability.attempt_id,
+            authority,
+            expected_step_id="optional_screenshots",
+        )
+
+    @staticmethod
+    def _validate_cleanup_authority_binding(
+        capability: ScreenshotOutputCapability,
+        authority: ExecutionAuthority,
+    ) -> None:
+        if (
+            not isinstance(capability, ScreenshotOutputCapability)
+            or not isinstance(authority, ExecutionAuthority)
+            or capability.authority_owner_id != authority.owner_id
+            or capability.authority_fencing_token != authority.fencing_token
+        ):
+            raise _stored_asset_invalid()
+
+    def _validated_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+    ) -> Path:
+        if not isinstance(capability, ScreenshotOutputCapability):
+            raise _stored_asset_invalid()
+        self._validate_job_id(capability.job_id)
+        self._validate_job_id(capability.attempt_id)
+        if _SAFE_ARTIFACT_ID.fullmatch(capability.artifact_id) is None:
+            raise _stored_asset_invalid()
+        expected_relative = Path(capability.relative_locator)
+        parts = expected_relative.parts
+        leaf_prefix = f".{capability.artifact_id}."
+        leaf_suffix = ".partial.webp"
+        leaf_nonce = (
+            parts[6][len(leaf_prefix) : -len(leaf_suffix)]
+            if len(parts) == 7
+            and parts[6].startswith(leaf_prefix)
+            and parts[6].endswith(leaf_suffix)
+            else ""
+        )
+        if (
+            len(parts) != 7
+            or parts[:5]
+            != (
+                "jobs",
+                capability.job_id,
+                "attempts",
+                capability.attempt_id,
+                "screenshots",
+            )
+            or len(parts[5]) != 32
+            or any(character not in "0123456789abcdef" for character in parts[5])
+            or len(leaf_nonce) != 32
+            or any(character not in "0123456789abcdef" for character in leaf_nonce)
+        ):
+            raise _stored_asset_invalid()
+        output = self._checked_target(expected_relative, create_parent=False)
+        parent_stat = os.lstat(output.parent)
+        if (
+            self._path_chain_has_reparse_point(output.parent)
+            or (parent_stat.st_dev, parent_stat.st_ino)
+            != (capability.parent_device, capability.parent_inode)
+        ):
+            raise _stored_asset_invalid()
+        if not os.path.lexists(output):
+            raise _stored_asset_invalid()
+        leaf_stat = os.lstat(output)
+        if (
+            self._is_reparse_point(output)
+            or not stat.S_ISREG(leaf_stat.st_mode)
+            or (leaf_stat.st_dev, leaf_stat.st_ino)
+            != (capability.leaf_device, capability.leaf_inode)
+        ):
+            raise _stored_asset_invalid()
+        return output
+
+    @classmethod
+    def _cleanup_created_screenshot_output(
+        cls,
+        output: Path | None,
+        *,
+        parent_identity: tuple[int, int] | None,
+        leaf_identity: tuple[int, int] | None,
+    ) -> None:
+        if output is None or parent_identity is None:
+            return
+        if leaf_identity is None:
+            try:
+                cls._remove_empty_screenshot_directory(
+                    output.parent, parent_identity
+                )
+            except DomainError:
+                pass
+            return
+        try:
+            parent_stat = os.lstat(output.parent)
+            leaf_stat = os.lstat(output)
+            if (
+                cls._path_chain_has_reparse_point(output.parent)
+                or cls._is_reparse_point(output)
+                or not stat.S_ISREG(leaf_stat.st_mode)
+                or (parent_stat.st_dev, parent_stat.st_ino) != parent_identity
+                or (leaf_stat.st_dev, leaf_stat.st_ino) != leaf_identity
+            ):
+                return
+            output.unlink()
+            try:
+                cls._remove_empty_screenshot_directory(
+                    output.parent, parent_identity
+                )
+            except DomainError:
+                pass
+        except OSError:
+            pass
+
+    @classmethod
+    def _remove_empty_screenshot_directory(
+        cls,
+        directory: Path,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        try:
+            directory_stat = os.lstat(directory)
+            if (
+                cls._is_reparse_point(directory)
+                or not stat.S_ISDIR(directory_stat.st_mode)
+                or (directory_stat.st_dev, directory_stat.st_ino)
+                != expected_identity
+            ):
+                raise _stored_asset_invalid()
+            directory.rmdir()
+        except DomainError:
+            raise
+        except OSError:
+            raise _storage_io_failed() from None
+
+    @classmethod
+    def _screenshot_output_relative(
+        cls,
+        job_id: str,
+        attempt_id: str,
+        artifact_id: str,
+    ) -> Path:
+        cls._validate_job_id(job_id)
+        cls._validate_job_id(attempt_id)
+        if (
+            type(artifact_id) is not str
+            or _SAFE_ARTIFACT_ID.fullmatch(artifact_id) is None
+        ):
+            raise _stored_asset_invalid()
+        return (
+            Path("jobs")
+            / job_id
+            / "attempts"
+            / attempt_id
+            / "screenshots"
+            / uuid4().hex
+            / f".{artifact_id}.{uuid4().hex}.partial.webp"
+        )
 
     def append_event(
         self, job_id: str, event_type: str, payload_json: str

@@ -473,10 +473,12 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     assert {
         name for name in KnowledgeModelPort.__dict__ if not name.startswith("_")
     } == {"generate"}
-    assert all(
-        not {name for name in port.__dict__ if not name.startswith("_")}
-        for port in marker_ports[3:]
-    )
+    assert {
+        name for name in ScreenshotPort.__dict__ if not name.startswith("_")
+    } == {"extract"}
+    assert not {
+        name for name in CredentialBrokerPort.__dict__ if not name.startswith("_")
+    }
     assert {
         name
         for name in PortableWorkspacePort.__dict__
@@ -609,9 +611,15 @@ def test_task6_checkpoint_and_event_ports_have_exact_frozen_methods() -> None:
         name for name in AttemptStoragePort.__dict__ if not name.startswith("_")
     } == {
         "append_event",
+        "allocate_screenshot_output",
+        "cleanup_screenshot_output",
         "reconcile_event_projection",
+        "read_screenshot_output",
         "resolve_asset",
         "save_checkpoint",
         "snapshot_asset",
         "validate_checkpoint",
+        "validate_screenshot_output",
+        "validate_screenshot_source",
+        "verify_screenshot_source",
     }

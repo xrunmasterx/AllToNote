@@ -4,7 +4,8 @@ import json
 import multiprocessing
 import os
 import shutil
-from dataclasses import dataclass
+import subprocess
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -17,13 +18,15 @@ from app.adapters.models.legacy_gpt import (
 )
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
+from app.adapters.screenshots.ffmpeg import FFmpegScreenshotAdapter
 from app.adapters.sources.legacy_video import LegacyVideoSourceAdapter
 from app.core.application import video_acquisition
-from app.core.application.video_checkpoints import decode_acquired
+from app.core.application.video_checkpoints import decode_acquired, decode_screenshots
 from app.core.application.video_checkpoints import decode_source
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
     JobState,
+    ScreenshotPolicy,
     TranscriptDocument,
     TranscriptSegment,
     VideoProduceRequest,
@@ -54,6 +57,7 @@ class Calls:
     transcriber: int = 0
     model: int = 0
     commit: int = 0
+    ffmpeg: int = 0
 
 
 def _record(path: Path | None, operation: str) -> None:
@@ -225,6 +229,87 @@ class _Completion:
         )
 
 
+class _ScreenshotCompletion(_Completion):
+    def complete_once(self, prompt: str) -> LegacyModelResponse:
+        response = super().complete_once(prompt)
+        return replace(
+            response,
+            markdown=(
+                "# Local video note\n\n"
+                "The local source becomes cited knowledge.[^seg_000001]\n\n"
+                "[SCREENSHOT:seg_000001]\n"
+            ),
+        )
+
+
+class _ScreenshotProcess:
+    pid = 4321
+
+    def __init__(self, output: Path) -> None:
+        self.output = output
+
+    def poll(self) -> int:
+        self.output.write_bytes(
+            bytes.fromhex(
+                "524946461a000000574542505650384c0d0000002f00000010071011118888fe0700"
+            )
+        )
+        return 0
+
+    def wait(self, timeout: float) -> int:
+        del timeout
+        return 0
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+
+class _ScreenshotProcessFactory:
+    def __init__(self, calls: Calls) -> None:
+        self.calls = calls
+        self.argv: list[list[str]] = []
+
+    def __call__(self, argv: list[str], **kwargs: object) -> _ScreenshotProcess:
+        assert kwargs["shell"] is False
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        self.calls.ffmpeg += 1
+        self.argv.append(list(argv))
+        return _ScreenshotProcess(Path(argv[-1]))
+
+
+class _CrashOnceScreenshotProcess(_ScreenshotProcess):
+    def poll(self) -> int:
+        raise SystemExit("injected screenshot process loss")
+
+
+class _CrashOnceScreenshotProcessFactory(_ScreenshotProcessFactory):
+    def __init__(self, calls: Calls) -> None:
+        super().__init__(calls)
+        self._crashed = False
+
+    def __call__(self, argv: list[str], **kwargs: object) -> _ScreenshotProcess:
+        process = super().__call__(argv, **kwargs)
+        if not self._crashed:
+            self._crashed = True
+            return _CrashOnceScreenshotProcess(process.output)
+        return process
+
+
+class _RecordingScreenshotAdapter:
+    def __init__(self, delegate: object, plans: list[tuple[object, ...]]) -> None:
+        self._delegate = delegate
+        self._plans = plans
+
+    def extract(self, plan: tuple[object, ...], *args: object, **kwargs: object) -> object:
+        self._plans.append(tuple(plan))
+        return self._delegate.extract(plan, *args, **kwargs)
+
+
 class _TerminateBeforeModel:
     def __init__(self, delegate: object) -> None:
         self._delegate = delegate
@@ -260,6 +345,7 @@ def _create_runtime(
     owner_id: str | None = None,
     now_ms: int | None = None,
     transcriber: object | None = None,
+    screenshot_process_factory: _ScreenshotProcessFactory | None = None,
 ) -> object:
     factory = getattr(runtime_module, "create_local_video_runtime", None)
     assert callable(factory), "Task 16A.1 local runtime composition is missing"
@@ -272,8 +358,14 @@ def _create_runtime(
     model = LegacyModelBinding(
         provider_kind="fixture/provider-v1",
         model_identity="fixture/model-v1",
-        bridge=_Completion(observed, call_log),
-        capabilities=LegacyModelCapabilities(),
+        bridge=(
+            _ScreenshotCompletion(observed, call_log)
+            if screenshot_process_factory is not None
+            else _Completion(observed, call_log)
+        ),
+        capabilities=LegacyModelCapabilities(
+            screenshot_requests=screenshot_process_factory is not None
+        ),
     )
     runtime = factory(
         machine_root,
@@ -283,6 +375,18 @@ def _create_runtime(
         model=model,
         owner_id=owner_id,
         clock=(None if now_ms is None else lambda: now_ms),
+        screenshot_adapter_factory=(
+            None
+            if screenshot_process_factory is None
+            else lambda storage, repository: FFmpegScreenshotAdapter(
+                storage,
+                repository,
+                ffmpeg_executable="injected-ffmpeg",
+                process_factory=screenshot_process_factory,
+                taskkill_factory=lambda *_args, **_kwargs: None,
+                platform_name="windows",
+            )
+        ),
     )
     service = runtime._sdk._video_service
     service._portable = _RecordingPortableGateway(
@@ -299,6 +403,7 @@ def _request(
     request_id: str,
     *,
     provided_transcript: TranscriptDocument | None = None,
+    screenshot_policy: ScreenshotPolicy = ScreenshotPolicy.OFF,
 ) -> VideoProduceRequest:
     return VideoProduceRequest(
         request_schema_version=1,
@@ -306,6 +411,7 @@ def _request(
         input_value=str(source),
         client_request_id=request_id,
         provided_transcript=provided_transcript,
+        screenshot_policy=screenshot_policy,
     )
 
 
@@ -437,6 +543,208 @@ def test_local_video_copies_and_transcribes_once_then_commits_private_safe_bundl
         "kind": "external_local",
         "external_ref_id": f"ext_{source_id.removeprefix('src_')}",
     }
+
+
+def test_valid_local_screenshot_uses_snapshot_once_and_checkpoints_verified_webp(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    calls = Calls()
+    process_factory = _ScreenshotProcessFactory(calls)
+    runtime = _create_runtime(
+        tmp_path / "screenshot-machine",
+        calls=calls,
+        screenshot_process_factory=process_factory,
+    )
+    storage = runtime._sdk._video_service._attempt_storage
+    original_resolve = storage.resolve_asset
+    resolves = 0
+
+    def resolve_once(*args: object, **kwargs: object) -> Path:
+        nonlocal resolves
+        resolves += 1
+        return original_resolve(*args, **kwargs)
+
+    storage.resolve_asset = resolve_once
+    submitted = runtime.submit_video(
+        _request(
+            local_video,
+            workspace_root,
+            "local-screenshot",
+            provided_transcript=TranscriptDocument(
+                language="en",
+                segments=(
+                    TranscriptSegment(
+                        "seg_000001", 0, 2_000, "provided screenshot text"
+                    ),
+                ),
+            ),
+            screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+        )
+    )
+
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.SUCCEEDED
+    assert calls.ffmpeg == 1
+    assert resolves == 1
+    assets = decode_screenshots(
+        _checkpoint_payload(runtime, submitted.job_id, "optional_screenshots")
+    )
+    assert len(assets) == 1
+    assert assets[0].payload == bytes.fromhex(
+        "524946461a000000574542505650384c0d0000002f00000010071011118888fe0700"
+    )
+    assert not tuple((tmp_path / "screenshot-machine" / "attempts").rglob("*.partial.webp"))
+
+
+def test_screenshot_cleanup_failure_never_checkpoints_accepted_asset(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    calls = Calls()
+    process_factory = _ScreenshotProcessFactory(calls)
+    runtime = _create_runtime(
+        tmp_path / "screenshot-cleanup-failure-machine",
+        calls=calls,
+        screenshot_process_factory=process_factory,
+    )
+    storage = runtime._sdk._video_service._operations._storage
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise OSError("private cleanup path")
+
+    storage.cleanup_screenshot_output = fail_cleanup
+    submitted = runtime.submit_video(
+        _request(
+            local_video,
+            workspace_root,
+            "local-screenshot-cleanup-failure",
+            screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+        )
+    )
+
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.FAILED
+    assert result.error is not None
+    assert result.error.code == "screenshot_io_failed"
+    assert runtime.job_repository.latest_checkpoint(
+        submitted.job_id, "optional_screenshots"
+    ) is None
+
+
+def test_restart_after_screenshot_checkpoint_does_not_run_ffmpeg_again(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    calls = Calls()
+    process_factory = _ScreenshotProcessFactory(calls)
+    machine = tmp_path / "screenshot-replay-machine"
+    first = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="first-screenshot-owner",
+        now_ms=1_000,
+        screenshot_process_factory=process_factory,
+    )
+    submitted = first.submit_video(
+        _request(
+            local_video,
+            workspace_root,
+            "local-screenshot-replay",
+            screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+        )
+    )
+    service = first._sdk._video_service
+    original_assemble = service._assemble
+
+    def crash_after_screenshot_checkpoint(value: object) -> object:
+        service._assemble = original_assemble
+        raise RuntimeError("injected post-screenshot crash")
+
+    service._assemble = crash_after_screenshot_checkpoint
+
+    with pytest.raises(RuntimeError, match="post-screenshot crash"):
+        first.wait_job(submitted.job_id)
+
+    assert first.job_repository.latest_checkpoint(
+        submitted.job_id, "optional_screenshots"
+    ) is not None
+    assert calls.ffmpeg == 1
+    recovered = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="second-screenshot-owner",
+        now_ms=302_001,
+        screenshot_process_factory=process_factory,
+    )
+
+    result = recovered.wait_job(submitted.job_id)
+
+    assert result.state is JobState.SUCCEEDED
+    assert calls.ffmpeg == 1
+
+
+def test_restart_before_screenshot_checkpoint_rebuilds_identical_plan(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine = tmp_path / "screenshot-plan-replay-machine"
+    calls = Calls()
+    process_factory = _CrashOnceScreenshotProcessFactory(calls)
+    first = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="first-plan-owner",
+        now_ms=1_000,
+        screenshot_process_factory=process_factory,
+    )
+    first_plans: list[tuple[object, ...]] = []
+    first_operations = first._sdk._video_service._operations
+    first_operations._screenshot_adapter = _RecordingScreenshotAdapter(
+        first_operations._screenshot_adapter, first_plans
+    )
+    submitted = first.submit_video(
+        _request(
+            local_video,
+            workspace_root,
+            "local-screenshot-plan-replay",
+            screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+        )
+    )
+
+    with pytest.raises(SystemExit, match="screenshot process loss"):
+        first.wait_job(submitted.job_id)
+
+    assert first.job_repository.latest_checkpoint(
+        submitted.job_id, "generate_draft"
+    ) is not None
+    assert first.job_repository.latest_checkpoint(
+        submitted.job_id, "optional_screenshots"
+    ) is None
+    recovered = _create_runtime(
+        machine,
+        calls=calls,
+        owner_id="second-plan-owner",
+        now_ms=302_001,
+        screenshot_process_factory=process_factory,
+    )
+    recovered_plans: list[tuple[object, ...]] = []
+    recovered_operations = recovered._sdk._video_service._operations
+    recovered_operations._screenshot_adapter = _RecordingScreenshotAdapter(
+        recovered_operations._screenshot_adapter, recovered_plans
+    )
+
+    result = recovered.wait_job(submitted.job_id)
+
+    assert result.state is JobState.SUCCEEDED
+    assert first_plans == recovered_plans
+    assert len(first_plans) == len(recovered_plans) == 1
 
 
 def test_pre16a_acquisition_json_shape_decodes_to_no_stored_media(

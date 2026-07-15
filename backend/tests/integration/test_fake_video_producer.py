@@ -14,9 +14,11 @@ from iwiki.portable import PortableBundleRef, ValidationLevel, validate_bundle
 from iwiki.workspace import open_workspace
 
 from app.core.domain.video import (
+    GeneratedVideoDraft,
     JobState,
     QualityOverall,
     ScreenshotPolicy,
+    ScreenshotRequest,
     VideoProduceRequest,
 )
 from app.core.application.video_service import (
@@ -216,6 +218,80 @@ def test_screenshot_capability_is_checked_only_when_requested(
     assert calls.download == calls.transcribe == calls.model == calls.ffmpeg == 0
 
 
+def test_empty_on_demand_request_does_not_execute_ffmpeg(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+    request = replace(
+        valid_request(workspace_root, client_request_id="screenshots-empty"),
+        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
+
+    snapshot = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert snapshot.error is None
+    assert calls.ffmpeg == 0
+
+
+@pytest.mark.parametrize(
+    ("policy", "screenshot_request", "error_code"),
+    (
+        (
+            ScreenshotPolicy.OFF,
+            ScreenshotRequest("seg_000001", 0),
+            "screenshot_request_not_allowed",
+        ),
+        (
+            ScreenshotPolicy.ON_DEMAND,
+            ScreenshotRequest("seg_000001", 2_000),
+            "screenshot_request_invalid",
+        ),
+    ),
+)
+def test_invalid_screenshot_work_never_reaches_screenshot_operation(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+    policy: ScreenshotPolicy,
+    screenshot_request: ScreenshotRequest,
+    error_code: str,
+) -> None:
+    runtime, calls = runtime_factory()
+    service = runtime._sdk._video_service
+    delegate = service._operations
+
+    class InvalidDraftOperations:
+        screenshot_calls = 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(delegate, name)
+
+        def generate_draft(self, *args: object, **kwargs: object) -> GeneratedVideoDraft:
+            draft = delegate.generate_draft(*args, **kwargs)
+            return replace(draft, screenshot_requests=(screenshot_request,))
+
+        def screenshots(self, *args: object, **kwargs: object) -> tuple[object, ...]:
+            del args, kwargs
+            self.screenshot_calls += 1
+            return ()
+
+    operations = InvalidDraftOperations()
+    service._operations = operations
+    request = replace(
+        valid_request(workspace_root, client_request_id=f"invalid-{policy.value}"),
+        screenshot_policy=policy,
+    )
+
+    snapshot = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert snapshot.state is JobState.FAILED
+    assert snapshot.error is not None
+    assert snapshot.error.code == error_code
+    assert operations.screenshot_calls == 0
+    assert calls.ffmpeg == 0
+
+
 @pytest.mark.parametrize(
     ("policy", "expected_state"),
     (
@@ -400,8 +476,12 @@ def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
         crash_operation_once="screenshots",
         owner_id="process-a",
         clock=lambda: 1_000,
+        screenshot_requests=(ScreenshotRequest("seg_000001", 0),),
     )
-    request = valid_request(workspace_root, client_request_id="draft-replay")
+    request = replace(
+        valid_request(workspace_root, client_request_id="draft-replay"),
+        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
     submitted = first.submit_video(request)
 
     with pytest.raises(RuntimeError, match="injected screenshots crash"):
@@ -413,6 +493,7 @@ def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
         call_log_path=call_log,
         owner_id="process-b",
         clock=lambda: 302_000,
+        screenshot_requests=(ScreenshotRequest("seg_000001", 0),),
     )
     recovered = reopened.wait_job(submitted.job_id)
 

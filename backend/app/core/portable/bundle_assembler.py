@@ -19,6 +19,7 @@ from app.core.portable.evidence import EvidenceSet, build_evidence_set
 from app.core.portable.identity import is_executor_identity
 from app.core.portable.jsonio import encode_json
 from app.core.portable.quality import QualityOutcome, rebuild_quality_outcome
+from app.core.portable.webp import is_valid_webp
 from app.core.ports.portable import (
     CandidateBundleLocation,
     CandidateLocationCapabilityPort,
@@ -279,26 +280,6 @@ def _is_sensitive_url_query_key(key: str) -> bool:
     )
 
 
-def _is_webp(payload: bytes) -> bool:
-    if (
-        len(payload) < 20
-        or payload[:4] != b"RIFF"
-        or payload[8:12] != b"WEBP"
-        or int.from_bytes(payload[4:8], "little") != len(payload) - 8
-        or payload[12:16] not in {b"VP8 ", b"VP8L", b"VP8X"}
-    ):
-        return False
-    offset = 12
-    while offset < len(payload):
-        if offset + 8 > len(payload):
-            return False
-        chunk_length = int.from_bytes(payload[offset + 4 : offset + 8], "little")
-        offset += 8 + chunk_length + (chunk_length % 2)
-        if offset > len(payload):
-            return False
-    return offset == len(payload)
-
-
 @dataclass(frozen=True)
 class VideoArtifactIds:
     source_metadata: str
@@ -532,7 +513,7 @@ class DisplayAssetInput:
             )
         if not isinstance(self.payload, bytes) or not self.payload:
             raise _error("video_bundle_input_invalid", "Display asset payload must not be empty")
-        if not _is_webp(self.payload):
+        if not is_valid_webp(self.payload):
             raise _error("video_bundle_input_invalid", "Display asset payload is not valid WebP")
         object.__setattr__(self, "payload", bytes(self.payload))
 

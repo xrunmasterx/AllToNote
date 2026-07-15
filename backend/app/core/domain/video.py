@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping
 
@@ -11,6 +11,9 @@ from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 
 
 _SEGMENT_ID_PATTERN = re.compile(r"seg_[0-9]{6,}\Z")
+_ARTIFACT_ID_PATTERN = re.compile(
+    r"art_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
 
 
 class ScreenshotPolicy(StrEnum):
@@ -126,6 +129,40 @@ class ScreenshotRequest:
                 "screenshot_request_invalid",
                 ErrorCategory.INVALID_REQUEST,
                 "Screenshot request must reference a segment and integer offset",
+            )
+
+
+@dataclass(frozen=True)
+class ScreenshotPlanItem:
+    ordinal: int
+    segment_id: str
+    segment_start_ms: int
+    segment_end_ms: int
+    timestamp_ms: int
+    artifact_id: str
+    relative_path: str
+
+    def __post_init__(self) -> None:
+        expected_path = f"assets/{self.artifact_id}.webp"
+        if (
+            type(self.ordinal) is not int
+            or self.ordinal < 0
+            or type(self.segment_id) is not str
+            or _SEGMENT_ID_PATTERN.fullmatch(self.segment_id) is None
+            or type(self.segment_start_ms) is not int
+            or type(self.segment_end_ms) is not int
+            or type(self.timestamp_ms) is not int
+            or not self.segment_start_ms <= self.timestamp_ms < self.segment_end_ms
+            or type(self.artifact_id) is not str
+            or _ARTIFACT_ID_PATTERN.fullmatch(self.artifact_id) is None
+            or type(self.relative_path) is not str
+            or PurePosixPath(self.relative_path).as_posix() != self.relative_path
+            or self.relative_path != expected_path
+        ):
+            raise DomainError(
+                "screenshot_plan_invalid",
+                ErrorCategory.INTERNAL,
+                "Screenshot plan contains an invalid item",
             )
 
 

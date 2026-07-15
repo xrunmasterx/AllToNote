@@ -35,7 +35,9 @@ from app.core.domain.video import (
     GeneratedVideoDraft,
     JobSnapshot,
     JobState,
+    ScreenshotPlanItem,
     ScreenshotPolicy,
+    ScreenshotRequest,
     TranscriptDocument,
     VideoProduceRequest,
 )
@@ -214,9 +216,11 @@ class VideoRecipeOperations(Protocol):
 
     def screenshots(
         self,
-        request: VideoProduceRequest,
-        draft: GeneratedVideoDraft,
+        plan: tuple[ScreenshotPlanItem, ...],
+        transcript: TranscriptDocument,
+        acquired: VideoAcquisition,
         *,
+        acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> tuple[DisplayAssetInput, ...]: ...
 
@@ -404,7 +408,8 @@ class VideoService:
         bundle_input = self._build_input(
             request,
             job_id=job_id,
-            source=acquired.metadata,
+            acquired=acquired,
+            acquisition_checkpoint=acquisition_checkpoint,
             transcript=transcript,
             authority=authority,
             request_hash=request_hash,
@@ -452,12 +457,14 @@ class VideoService:
         request: VideoProduceRequest,
         *,
         job_id: str,
-        source: VideoSourceMetadata,
+        acquired: VideoAcquisition,
+        acquisition_checkpoint: CheckpointMetadata,
         transcript: TranscriptDocument,
         authority: ExecutionAuthority,
         request_hash: str,
         resumed_attempt: Attempt | None,
     ) -> VideoBundleInput:
+        source = acquired.metadata
         ids = self._ids(job_id)
         transcript_payload = build_transcript(
             source.source_revision_id, transcript.language, transcript.segments
@@ -499,10 +506,14 @@ class VideoService:
             "optional_screenshots",
             request_hash,
             authority,
-            lambda execution: self._operations.screenshots(
-                request,
+            lambda execution: self._capture_screenshots(
+                job_id,
+                request.screenshot_policy,
                 draft,
-                execution=execution,
+                transcript,
+                acquired,
+                acquisition_checkpoint,
+                execution,
             ),
             encode=_encode_screenshots,
             decode=_decode_screenshots,
@@ -577,6 +588,27 @@ class VideoService:
                 ),
             ),
             display_assets=screenshots,
+        )
+
+    def _capture_screenshots(
+        self,
+        job_id: str,
+        policy: ScreenshotPolicy,
+        draft: GeneratedVideoDraft,
+        transcript: TranscriptDocument,
+        acquired: VideoAcquisition,
+        acquisition_checkpoint: CheckpointMetadata,
+        execution: VideoStepExecutionContext,
+    ) -> tuple[DisplayAssetInput, ...]:
+        plan = build_screenshot_plan(job_id, policy, draft, transcript)
+        if not plan:
+            return ()
+        return self._operations.screenshots(
+            plan,
+            transcript,
+            acquired,
+            acquisition_checkpoint=acquisition_checkpoint,
+            execution=execution,
         )
 
     def _assemble(self, bundle_input: VideoBundleInput) -> _CandidateCheckpoint:
@@ -1091,6 +1123,82 @@ class VideoService:
         ), render(base)
 
 
+def build_screenshot_plan(
+    job_id: str,
+    policy: ScreenshotPolicy,
+    draft: GeneratedVideoDraft,
+    transcript: TranscriptDocument,
+) -> tuple[ScreenshotPlanItem, ...]:
+    if (
+        not isinstance(policy, ScreenshotPolicy)
+        or not isinstance(draft, GeneratedVideoDraft)
+        or not isinstance(transcript, TranscriptDocument)
+    ):
+        raise DomainError(
+            "screenshot_request_invalid",
+            ErrorCategory.RECIPE_FAILED,
+            "Screenshot requests are invalid",
+        )
+    requests = draft.screenshot_requests
+    if policy is ScreenshotPolicy.OFF:
+        if requests:
+            raise DomainError(
+                "screenshot_request_not_allowed",
+                ErrorCategory.RECIPE_FAILED,
+                "Screenshot requests are disabled for this generation",
+            )
+        return ()
+    if not requests:
+        return ()
+
+    segments = {segment.segment_id: segment for segment in transcript.segments}
+    seen: set[tuple[str, int]] = set()
+    plan: list[ScreenshotPlanItem] = []
+    for ordinal, request in enumerate(requests):
+        if not isinstance(request, ScreenshotRequest):
+            raise DomainError(
+                "screenshot_request_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Screenshot request is invalid",
+            )
+        key = (request.segment_id, request.offset_ms)
+        if key in seen:
+            raise DomainError(
+                "screenshot_request_duplicate",
+                ErrorCategory.RECIPE_FAILED,
+                "Screenshot requests must not be duplicated",
+            )
+        seen.add(key)
+        segment = segments.get(request.segment_id)
+        if (
+            segment is None
+            or type(request.offset_ms) is not int
+            or request.offset_ms < 0
+            or request.offset_ms >= segment.end_ms - segment.start_ms
+        ):
+            raise DomainError(
+                "screenshot_request_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Screenshot request is outside its transcript segment",
+            )
+        timestamp_ms = segment.start_ms + request.offset_ms
+        artifact_id = VideoService._derived_id(
+            job_id, "art", f"screenshot:{ordinal}"
+        )
+        plan.append(
+            ScreenshotPlanItem(
+                ordinal=ordinal,
+                segment_id=segment.segment_id,
+                segment_start_ms=segment.start_ms,
+                segment_end_ms=segment.end_ms,
+                timestamp_ms=timestamp_ms,
+                artifact_id=artifact_id,
+                relative_path=f"assets/{artifact_id}.webp",
+            )
+        )
+    return tuple(plan)
+
+
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "CHECKPOINT_STEPS",
@@ -1099,4 +1207,5 @@ __all__ = [
     "VideoRecipeOperations",
     "VideoService",
     "VideoStepExecutionContext",
+    "build_screenshot_plan",
 ]

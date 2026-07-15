@@ -526,16 +526,36 @@ def decode_screenshots(payload: bytes) -> tuple[DisplayAssetInput, ...]:
     try:
         if value["step"] != "optional_screenshots" or type(value["assets"]) is not list:
             raise TypeError
-        return tuple(
-            DisplayAssetInput(
+        fields = {
+            "artifact_id",
+            "relative_path",
+            "media_type",
+            "payload_base64",
+            "artifact_type",
+        }
+        artifacts: list[DisplayAssetInput] = []
+        artifact_ids: set[str] = set()
+        relative_paths: set[str] = set()
+        for item in value["assets"]:
+            if (
+                type(item) is not dict
+                or set(item) != fields
+                or any(type(item[field]) is not str for field in fields)
+                or item["artifact_id"] in artifact_ids
+                or item["relative_path"] in relative_paths
+            ):
+                raise TypeError
+            artifact = DisplayAssetInput(
                 artifact_id=item["artifact_id"],
                 relative_path=item["relative_path"],
                 media_type=item["media_type"],
                 payload=base64.b64decode(item["payload_base64"], validate=True),
                 artifact_type=item["artifact_type"],
             )
-            for item in value["assets"]
-        )
+            artifact_ids.add(artifact.artifact_id)
+            relative_paths.add(artifact.relative_path)
+            artifacts.append(artifact)
+        return tuple(artifacts)
     except (DomainError, KeyError, TypeError, ValueError):
         raise checkpoint_error() from None
 

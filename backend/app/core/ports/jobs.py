@@ -73,6 +73,30 @@ class JobCompletion:
     source_identity: SourceIdentityBinding
 
 
+@dataclass(frozen=True)
+class ScreenshotSourceCapability:
+    job_id: str
+    attempt_id: str
+    relative_locator: str
+    device: int
+    inode: int
+    byte_length: int
+
+
+@dataclass(frozen=True)
+class ScreenshotOutputCapability:
+    job_id: str
+    attempt_id: str
+    artifact_id: str
+    relative_locator: str
+    parent_device: int
+    parent_inode: int
+    leaf_device: int
+    leaf_inode: int
+    authority_owner_id: str
+    authority_fencing_token: int
+
+
 class JobRepositoryPort(Protocol):
     """Boundary for durable job state and execution records."""
 
@@ -219,6 +243,8 @@ class AttemptMetadataRepositoryPort(Protocol):
         job_id: str,
         attempt_id: str,
         authority: ExecutionAuthority,
+        *,
+        expected_step_id: str | None = None,
     ) -> None: ...
 
 
@@ -261,4 +287,49 @@ class AttemptStoragePort(Protocol):
         *,
         expected_job_id: str,
         expected_attempt_id: str,
+    ) -> Path: ...
+
+    def allocate_screenshot_output(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        artifact_id: str,
+        authority: ExecutionAuthority,
+    ) -> ScreenshotOutputCapability: ...
+
+    def validate_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        *,
+        authority: ExecutionAuthority,
+    ) -> Path: ...
+
+    def read_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        *,
+        job_id: str,
+        attempt_id: str,
+        artifact_id: str,
+        authority: ExecutionAuthority,
+    ) -> bytes: ...
+
+    def cleanup_screenshot_output(
+        self,
+        capability: ScreenshotOutputCapability,
+        *,
+        authority: ExecutionAuthority,
+    ) -> None: ...
+
+    def verify_screenshot_source(
+        self,
+        stored: AttemptStoredAsset,
+        *,
+        expected_job_id: str,
+        expected_attempt_id: str,
+    ) -> ScreenshotSourceCapability: ...
+
+    def validate_screenshot_source(
+        self, capability: ScreenshotSourceCapability
     ) -> Path: ...
