@@ -3,6 +3,8 @@
 优先人工字幕，其次自动生成字幕。不依赖 yt_dlp，无需下载任何文件。
 """
 
+import math
+from collections.abc import Mapping
 from typing import Optional, List
 
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -77,15 +79,36 @@ class YouTubeSubtitleFetcher:
             # 3. 获取字幕内容
             fetched = transcript.fetch()
             segments = []
+            missing = object()
             for snippet in fetched:
-                text = snippet.get("text", "").strip() if isinstance(snippet, dict) else str(snippet).strip()
+                if isinstance(snippet, Mapping):
+                    text = snippet.get("text", missing)
+                    start = snippet.get("start", missing)
+                    duration = snippet.get("duration", missing)
+                else:
+                    text = getattr(snippet, "text", missing)
+                    start = getattr(snippet, "start", missing)
+                    duration = getattr(snippet, "duration", missing)
+                if any(value is missing for value in (text, start, duration)):
+                    raise ValueError("YouTube subtitle snippet is missing a field")
+                text = text.strip() if isinstance(text, str) else ""
                 if not text:
                     continue
-                start = snippet.get("start", 0) if isinstance(snippet, dict) else 0
-                duration = snippet.get("duration", 0) if isinstance(snippet, dict) else 0
+                if isinstance(start, bool) or isinstance(duration, bool):
+                    raise ValueError("YouTube subtitle timing is invalid")
+                start = float(start)
+                duration = float(duration)
+                if (
+                    not math.isfinite(start)
+                    or not math.isfinite(duration)
+                    or start < 0
+                    or duration <= 0
+                    or not math.isfinite(start + duration)
+                ):
+                    raise ValueError("YouTube subtitle timing is invalid")
                 segments.append(TranscriptSegment(
-                    start=float(start),
-                    end=float(start) + float(duration),
+                    start=start,
+                    end=start + duration,
                     text=text,
                 ))
 

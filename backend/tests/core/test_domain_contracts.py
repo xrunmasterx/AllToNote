@@ -38,7 +38,7 @@ from app.core.ports.model import KnowledgeModelPort
 from app.core.ports.portable import PortableWorkspacePort
 from app.core.ports.screenshot import ScreenshotPort
 from app.core.ports.source import VideoSourcePort
-from app.core.ports.transcript import TranscriptPort
+from app.core.ports.transcript import MediaInput, TranscriptPort
 
 
 ALLOWED_ID_PREFIXES = {
@@ -467,9 +467,12 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     assert {
         name for name in VideoSourcePort.__dict__ if not name.startswith("_")
     } == {"resolve", "acquire"}
+    assert {
+        name for name in TranscriptPort.__dict__ if not name.startswith("_")
+    } == {"transcribe"}
     assert all(
         not {name for name in port.__dict__ if not name.startswith("_")}
-        for port in marker_ports[1:]
+        for port in marker_ports[2:]
     )
     assert {
         name
@@ -501,6 +504,23 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     event_argument, event_return = get_args(EventSink)
     assert event_argument[0].__forward_arg__ == "JobEvent"
     assert event_return is type(None)
+
+
+def test_media_input_requires_media_or_normalized_transcript(tmp_path: Path) -> None:
+    transcript = TranscriptDocument(
+        "zh",
+        (TranscriptSegment("seg_000001", 0, 1000, "subtitle"),),
+    )
+
+    assert MediaInput(media_path=tmp_path / "audio.wav").media_path == (
+        tmp_path / "audio.wav"
+    )
+    assert MediaInput(
+        media_path=None,
+        provided_transcript=transcript,
+    ).provided_transcript is transcript
+    with pytest.raises(DomainError, match="transcript_input_missing"):
+        MediaInput(media_path=None, provided_transcript=None)
 
 
 def test_video_result_commit_contracts_are_frozen_snapshots() -> None:

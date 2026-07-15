@@ -58,6 +58,13 @@ class _ExternalOperationStore(Protocol):
         summary_json: str,
     ) -> ExternalOperation: ...
 
+    def mark_external_operation_unknown(
+        self,
+        operation_id: str,
+        *,
+        summary_json: str,
+    ) -> ExternalOperation: ...
+
     def get_external_operation(self, operation_id: str) -> ExternalOperation: ...
 
     def reconcile_external_operations_after_process_loss(
@@ -124,6 +131,17 @@ class ExternalOperationGuard:
             operation_id,
             ExternalOutcome.FAILED,
             provider_request_id=None,
+            summary_json=summary_json,
+        )
+
+    def unknown(
+        self,
+        operation_id: str,
+        *,
+        summary_json: str,
+    ) -> ExternalOperation:
+        return self._store.mark_external_operation_unknown(
+            operation_id,
             summary_json=summary_json,
         )
 

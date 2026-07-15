@@ -344,6 +344,38 @@ def test_started_external_operation_becomes_unknown_and_cannot_restart(
         reconciler.start(prepared.operation_id)
 
 
+def test_started_external_operation_can_be_conservatively_marked_unknown(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, ExternalOutcome, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, attempt, authority = _running_attempt(repository)
+    guard = ExternalOperationGuard(repository, authority)
+    prepared = guard.prepare(
+        job_id=job.job_id,
+        step_id=attempt.step_id,
+        attempt_id=attempt.attempt_id,
+        provider="paid-provider",
+        request_hash=sha256_digest(b"timeout after send"),
+        summary_json='{"operation":"transcribe"}',
+    )
+    guard.start(prepared.operation_id)
+
+    unknown = guard.unknown(
+        prepared.operation_id,
+        summary_json='{"operation":"transcribe"}',
+    )
+
+    assert unknown.outcome is ExternalOutcome.UNKNOWN
+    assert guard.get(prepared.operation_id).outcome is ExternalOutcome.UNKNOWN
+    assert guard.unknown(
+        prepared.operation_id,
+        summary_json='{"operation":"transcribe"}',
+    ) == unknown
+    with pytest.raises(DomainError, match="external_outcome_unknown"):
+        guard.start(prepared.operation_id)
+
+
 def test_external_operation_binding_freezes_existing_outcome_semantics(
     tmp_path: Path,
 ) -> None:

@@ -1105,6 +1105,38 @@ class SqliteJobRepository:
         with self._transaction(immediate=False) as connection:
             return self._get_external_operation(connection, operation_id)
 
+    def mark_external_operation_unknown(
+        self,
+        operation_id: str,
+        *,
+        summary_json: str,
+    ) -> ExternalOperation:
+        with self._transaction(immediate=True) as connection:
+            current = self._get_external_operation(connection, operation_id)
+            if current.outcome is ExternalOutcome.UNKNOWN:
+                return current
+            if current.outcome is not ExternalOutcome.STARTED:
+                raise DomainError(
+                    "external_operation_not_started",
+                    ErrorCategory.CONFLICT,
+                    "Only a started external operation can become unknown",
+                )
+            connection.execute(
+                """
+                UPDATE external_operations
+                SET outcome = ?, summary_json = ?, updated_at = ?
+                WHERE operation_id = ? AND outcome = ?
+                """,
+                (
+                    ExternalOutcome.UNKNOWN.value,
+                    summary_json,
+                    utc_now_millis(),
+                    operation_id,
+                    ExternalOutcome.STARTED.value,
+                ),
+            )
+            return self._get_external_operation(connection, operation_id)
+
     def read_source_identity_candidate(
         self,
         connector_id: str,
