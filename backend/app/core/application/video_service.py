@@ -70,6 +70,9 @@ from app.core.ports.source import ResolvedVideoSource
 RUNTIME_VERSION = "0.1.0"
 CHECKPOINT_SCHEMA = "video-step.v1"
 _CANDIDATE_ASSEMBLY_BEHAVIOR = "linked-screenshot-draft-v1"
+_SCHEDULER_LEASE_TTL_SECONDS = 300
+_SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_AUTHORITY_LOSS_CODES = frozenset({"attempt_fenced", "scheduler_lease_lost"})
 PREFLIGHT_CHECKS = (
     "request_schema",
     "workspace_contract",
@@ -251,6 +254,7 @@ class VideoService:
         self._work_root = work_root
         self._local_instance_id = local_instance_id
         self._execution_lock = threading.Lock()
+        self._heartbeat_interval_seconds = _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS
 
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
         if not isinstance(request, VideoProduceRequest):
@@ -282,7 +286,7 @@ class VideoService:
         if snapshot.state is JobState.QUEUED:
             self._repository.transition_job(job_id, JobState.RUNNING)
         authority = self._repository.acquire_scheduler_lease(
-            self._owner_id, ttl_seconds=300
+            self._owner_id, ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS
         )
         _, active_attempt, _ = self._repository.get_job_details(job_id)
         try:
@@ -313,7 +317,12 @@ class VideoService:
                 resumed_attempt=active_attempt,
             )
         except DomainError as error:
-            self._fail_job(job_id, active_attempt, authority, error)
+            try:
+                self._fail_job(job_id, active_attempt, authority, error)
+            except DomainError as convergence_error:
+                if convergence_error.code in _AUTHORITY_LOSS_CODES:
+                    raise error from convergence_error
+                raise
             return self._snapshot(job_id)
         finally:
             try:
@@ -933,7 +942,7 @@ class VideoService:
                 authority=authority,
                 heartbeat=lambda: self._heartbeat(authority),
             )
-            value = action(execution)
+            value = self._run_checkpoint_action(action, execution)
             self._heartbeat(authority)
             payload = (
                 encode(value)
@@ -957,25 +966,66 @@ class VideoService:
                 authority,
             )
         except DomainError as error:
-            if error.code == "external_outcome_unknown":
-                self._repository.pause_for_external_outcome_atomic(
-                    job_id,
-                    attempt.attempt_id,
-                    authority,
-                )
-            else:
+            try:
+                if error.code == "external_outcome_unknown":
+                    self._repository.pause_for_external_outcome_atomic(
+                        job_id,
+                        attempt.attempt_id,
+                        authority,
+                    )
+                else:
+                    self._repository.transition_attempt(
+                        attempt.attempt_id, AttemptState.FAILED, authority=authority
+                    )
+            except DomainError as convergence_error:
+                if convergence_error.code not in _AUTHORITY_LOSS_CODES:
+                    raise
+            raise
+        except BaseException:
+            try:
                 self._repository.transition_attempt(
                     attempt.attempt_id, AttemptState.FAILED, authority=authority
                 )
-            raise
-        except BaseException:
-            self._repository.transition_attempt(
-                attempt.attempt_id, AttemptState.FAILED, authority=authority
-            )
+            except DomainError as convergence_error:
+                if convergence_error.code not in _AUTHORITY_LOSS_CODES:
+                    raise
             raise
         self._repository.transition_attempt(
             attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
         )
+        return value
+
+    def _run_checkpoint_action(
+        self,
+        action: Callable[[VideoStepExecutionContext], _T],
+        execution: VideoStepExecutionContext,
+    ) -> _T:
+        stop = threading.Event()
+        heartbeat_failures: list[BaseException] = []
+
+        def heartbeat_until_stopped() -> None:
+            try:
+                while not stop.wait(self._heartbeat_interval_seconds):
+                    execution.heartbeat()
+            except BaseException as error:
+                heartbeat_failures.append(error)
+                stop.set()
+
+        worker = threading.Thread(
+            target=heartbeat_until_stopped,
+            name=f"alltonote-scheduler-heartbeat-{execution.attempt_id}",
+        )
+        worker.start()
+        try:
+            value = action(execution)
+        except BaseException:
+            stop.set()
+            worker.join()
+            raise
+        stop.set()
+        worker.join()
+        if heartbeat_failures:
+            raise heartbeat_failures[0]
         return value
 
     @staticmethod
@@ -992,7 +1042,10 @@ class VideoService:
         )
 
     def _heartbeat(self, authority: ExecutionAuthority) -> None:
-        self._repository.heartbeat_scheduler_lease(authority, ttl_seconds=300)
+        self._repository.heartbeat_scheduler_lease(
+            authority,
+            ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
+        )
 
     @staticmethod
     def _finalize_draft(

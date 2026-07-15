@@ -25,6 +25,7 @@ from app.core.application.video_service import (
     VideoPreflightCapabilities,
     _CandidateCheckpoint,
 )
+from app.core.errors import DomainError
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
@@ -50,6 +51,15 @@ CHECKPOINT_STEPS = (
     "assemble_candidate_bundle",
     "quality_and_portable_validation",
 )
+_HEARTBEAT_THREAD_PREFIX = "alltonote-scheduler-heartbeat-"
+
+
+def _background_heartbeat_threads() -> tuple[threading.Thread, ...]:
+    return tuple(
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith(_HEARTBEAT_THREAD_PREFIX)
+    )
 
 
 @pytest.fixture
@@ -582,6 +592,151 @@ def test_long_external_step_renews_scheduler_lease_cooperatively(
     assert snapshot.state is JobState.SUCCEEDED
     assert calls.download == calls.transcribe == calls.model == 1
     assert calls.commit == 1
+
+
+def test_blocking_checkpoint_action_renews_scheduler_lease_in_background(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    now_ms = [1_000]
+    background_heartbeat = threading.Event()
+
+    def block_model_without_cooperative_heartbeat(
+        _heartbeat: Callable[[], None],
+    ) -> None:
+        background_heartbeat.clear()
+        now_ms[0] = 200_000
+        assert background_heartbeat.wait(timeout=2)
+        now_ms[0] = 400_000
+
+    calls = runtime_module.FakeCallCounts()
+    runtime = runtime_module.create_fake_runtime(
+        tmp_path / "background-heartbeat-machine",
+        calls=calls,
+        clock=lambda: now_ms[0],
+        operation_hooks={"model": block_model_without_cooperative_heartbeat},
+    )
+    service = runtime._sdk._video_service
+    service._heartbeat_interval_seconds = 0.01
+    repository = runtime.job_repository
+    original_heartbeat = repository.heartbeat_scheduler_lease
+
+    def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
+        renewed = original_heartbeat(authority, ttl_seconds=ttl_seconds)
+        if threading.current_thread() is not threading.main_thread():
+            background_heartbeat.set()
+        return renewed
+
+    repository.heartbeat_scheduler_lease = observe_heartbeat
+
+    snapshot = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="background-heartbeat")
+        ).job_id
+    )
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert calls.download == calls.transcribe == calls.model == 1
+    assert calls.commit == 1
+    assert _background_heartbeat_threads() == ()
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt))
+def test_checkpoint_heartbeat_worker_stops_when_action_raises(
+    tmp_path: Path,
+    workspace_root: Path,
+    failure_type: type[BaseException],
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    background_heartbeat = threading.Event()
+
+    def fail_model_after_heartbeat(_heartbeat: Callable[[], None]) -> None:
+        background_heartbeat.clear()
+        assert background_heartbeat.wait(timeout=2)
+        raise failure_type("action failed")
+
+    runtime = runtime_module.create_fake_runtime(
+        tmp_path / f"heartbeat-{failure_type.__name__}",
+        operation_hooks={"model": fail_model_after_heartbeat},
+    )
+    service = runtime._sdk._video_service
+    service._heartbeat_interval_seconds = 0.01
+    repository = runtime.job_repository
+    original_heartbeat = repository.heartbeat_scheduler_lease
+
+    def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
+        renewed = original_heartbeat(authority, ttl_seconds=ttl_seconds)
+        if threading.current_thread() is not threading.main_thread():
+            background_heartbeat.set()
+        return renewed
+
+    repository.heartbeat_scheduler_lease = observe_heartbeat
+    submitted = runtime.submit_video(
+        valid_request(
+            workspace_root,
+            client_request_id=f"heartbeat-{failure_type.__name__}",
+        )
+    )
+
+    with pytest.raises(failure_type, match="action failed"):
+        runtime.wait_job(submitted.job_id)
+
+    assert _background_heartbeat_threads() == ()
+
+
+@pytest.mark.parametrize("action_failure", (None, KeyboardInterrupt))
+def test_fenced_background_heartbeat_prevents_checkpoint_and_commit(
+    tmp_path: Path,
+    workspace_root: Path,
+    action_failure: type[BaseException] | None,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    now_ms = [1_000]
+    heartbeat_failed = threading.Event()
+
+    def fence_during_model(_heartbeat: Callable[[], None]) -> None:
+        now_ms[0] = 302_000
+        repository.acquire_scheduler_lease("replacement-owner", ttl_seconds=300)
+        assert heartbeat_failed.wait(timeout=2)
+        if action_failure is not None:
+            raise action_failure("control flow interrupted")
+
+    calls = runtime_module.FakeCallCounts()
+    runtime = runtime_module.create_fake_runtime(
+        tmp_path / "fenced-heartbeat-machine",
+        calls=calls,
+        clock=lambda: now_ms[0],
+        operation_hooks={"model": fence_during_model},
+    )
+    service = runtime._sdk._video_service
+    service._heartbeat_interval_seconds = 0.01
+    repository = runtime.job_repository
+    original_heartbeat = repository.heartbeat_scheduler_lease
+
+    def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
+        try:
+            return original_heartbeat(authority, ttl_seconds=ttl_seconds)
+        except BaseException:
+            if threading.current_thread() is not threading.main_thread():
+                heartbeat_failed.set()
+            raise
+
+    repository.heartbeat_scheduler_lease = observe_heartbeat
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="fenced-heartbeat")
+    )
+
+    if action_failure is None:
+        with pytest.raises(DomainError, match="scheduler_lease_lost"):
+            runtime.wait_job(submitted.job_id)
+    else:
+        with pytest.raises(action_failure, match="control flow interrupted"):
+            runtime.wait_job(submitted.job_id)
+
+    assert repository.latest_checkpoint(submitted.job_id, "generate_draft") is None
+    assert calls.commit == 0
+    assert _background_heartbeat_threads() == ()
 
 
 def test_takeover_of_running_generate_draft_leaves_no_running_replacement(
