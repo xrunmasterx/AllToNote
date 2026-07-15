@@ -15,7 +15,10 @@ from app.core.portable.artifacts import (
     require_revision_id,
 )
 from app.core.portable.jsonio import encode_ndjson
-from app.core.portable.markdown_safety import _backslash_escaped, _scan_markdown
+from app.core.portable.markdown_safety import (
+    is_backslash_escaped,
+    markdown_visible_mask,
+)
 
 
 _EVIDENCE_ID = re.compile(
@@ -187,16 +190,16 @@ def rewrite_segment_citations(
             "Evidence citation mapping is invalid",
         )
 
-    scan = _scan_markdown(markdown)
+    visible_mask = markdown_visible_mask(markdown)
     output: list[str] = []
     copied_until = 0
     cursor = 0
     prefix = "[^seg_"
     while cursor < len(markdown):
         if (
-            scan.visible_mask[cursor]
+            visible_mask[cursor]
             and markdown.startswith(prefix, cursor)
-            and not _backslash_escaped(markdown, cursor)
+            and not is_backslash_escaped(markdown, cursor)
         ):
             closing = cursor + len(prefix)
             while closing < len(markdown) and markdown[closing] not in "]\r\n":
@@ -209,7 +212,7 @@ def rewrite_segment_citations(
             segment_id = markdown[cursor + 2 : closing]
             if (
                 _SEGMENT_ID.fullmatch(segment_id) is None
-                or not all(scan.visible_mask[cursor : closing + 1])
+                or not all(visible_mask[cursor : closing + 1])
             ):
                 raise _evidence_error(
                     "draft_segment_citation_invalid",

@@ -872,7 +872,18 @@ class SqliteJobRepository:
         operation_idempotency_key: str | None,
         summary_json: str,
         authority: ExecutionAuthority,
+        max_attempts: int | None = None,
     ) -> ExternalOperation:
+        if max_attempts is not None and (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts < 1
+        ):
+            raise DomainError(
+                "external_attempt_budget_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "External operation attempt budget must be a positive integer",
+            )
         with self._transaction(immediate=True) as connection:
             rows = connection.execute(
                 """
@@ -927,6 +938,15 @@ class SqliteJobRepository:
                     "attempt_fenced",
                     ErrorCategory.CONFLICT,
                     "External operation step is not owned by the Attempt",
+                )
+            if (
+                max_attempts is not None
+                and len(by_outcome[ExternalOutcome.FAILED]) >= max_attempts
+            ):
+                raise DomainError(
+                    "external_attempt_budget_exhausted",
+                    ErrorCategory.CONFLICT,
+                    "External operation attempt budget is exhausted",
                 )
             prepared = by_outcome[ExternalOutcome.PREPARED]
             if prepared:

@@ -34,7 +34,7 @@ from app.core.ports.jobs import (
     SourceIdentityBinding,
     VideoResultPlan,
 )
-from app.core.ports.model import KnowledgeModelPort
+from app.core.ports.model import KnowledgeModelPort, KnowledgeModelRequest
 from app.core.ports.portable import PortableWorkspacePort
 from app.core.ports.screenshot import ScreenshotPort
 from app.core.ports.source import VideoSourcePort
@@ -470,9 +470,12 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     assert {
         name for name in TranscriptPort.__dict__ if not name.startswith("_")
     } == {"transcribe"}
+    assert {
+        name for name in KnowledgeModelPort.__dict__ if not name.startswith("_")
+    } == {"generate"}
     assert all(
         not {name for name in port.__dict__ if not name.startswith("_")}
-        for port in marker_ports[2:]
+        for port in marker_ports[3:]
     )
     assert {
         name

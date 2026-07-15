@@ -551,6 +551,55 @@ def test_citation_rewrite_ignores_escaped_and_indented_code_literals() -> None:
     assert result == source
 
 
+def test_citation_rewrite_ignores_non_rendered_markdown_controls() -> None:
+    source = (
+        "Visible[^seg_000001]\n"
+        "[link](https://example.test/[^seg_000001])\n"
+        "<!-- [^seg_000001] -->\n"
+        '<span data-proof="[^seg_000001]">text</span>\n'
+        "<code>[^seg_000001]</code>\n"
+        "<pre>[^seg_000001]</pre>\n"
+    )
+
+    result = rewrite_segment_citations(
+        source,
+        {"seg_000001": EVIDENCE_IDS[0]},
+    )
+
+    assert result == source.replace(
+        "Visible[^seg_000001]",
+        f"Visible[^{EVIDENCE_IDS[0]}]",
+    )
+
+
+def test_rewrite_then_quality_ignores_literal_hidden_segment_controls() -> None:
+    raw = (
+        "# Note\n\n"
+        "## First\nContent[^seg_000001]\n\n"
+        "## Second\nContent[^seg_000002]\n\n"
+        "[link](https://example.test/[^seg_000001])\n"
+        "<!-- [^seg_000002] -->\n"
+    )
+    rewritten = rewrite_segment_citations(
+        raw,
+        {
+            "seg_000001": EVIDENCE_IDS[0],
+            "seg_000002": EVIDENCE_IDS[1],
+        },
+    )
+    markdown = (
+        rewritten
+        + f"[^{EVIDENCE_IDS[0]}]: Transcript segment 1\n"
+        + f"[^{EVIDENCE_IDS[1]}]: Transcript segment 2\n"
+    )
+
+    outcome = _evaluate(_draft(markdown))
+
+    assert outcome.overall is QualityOverall.PASS
+    assert "https://example.test/[^seg_000001]" in markdown
+    assert "<!-- [^seg_000002] -->" in markdown
+
+
 def test_escaped_backtick_does_not_hide_active_html() -> None:
     with pytest.raises(DomainError, match="draft_markdown_unsafe"):
         validate_markdown_safety(

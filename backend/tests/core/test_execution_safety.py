@@ -625,6 +625,61 @@ def test_prepare_rejects_stale_authority_before_reuse_or_insert(
     assert tuple(map(tuple, after)) == tuple(map(tuple, before))
 
 
+def test_external_operation_failed_attempt_budget_is_durable_and_optional(
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, ExternalOutcome, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, attempt, authority = _running_attempt(repository)
+    guard = ExternalOperationGuard(repository, authority)
+    fields = {
+        "job_id": job.job_id,
+        "step_id": attempt.step_id,
+        "attempt_id": attempt.attempt_id,
+        "provider": "paid-provider",
+        "request_hash": sha256_digest(b"durable retry budget"),
+        "summary_json": "{}",
+    }
+
+    for _ in range(2):
+        prepared = guard.prepare(**fields, max_attempts=2)
+        guard.start(prepared.operation_id)
+        failed = guard.fail(prepared.operation_id, summary_json="{}")
+        assert failed.outcome is ExternalOutcome.FAILED
+
+    with pytest.raises(DomainError, match="external_attempt_budget_exhausted"):
+        guard.prepare(**fields, max_attempts=2)
+
+    assert guard.prepare(**fields).outcome is ExternalOutcome.PREPARED
+
+
+@pytest.mark.parametrize("max_attempts", [0, -1, True])
+def test_external_operation_attempt_budget_must_be_a_positive_integer(
+    max_attempts: object,
+    tmp_path: Path,
+) -> None:
+    _, ExternalOperationGuard, _, _ = _task7_api()
+    repository = _repository(tmp_path, _Clock())
+    job, attempt, authority = _running_attempt(repository)
+    guard = ExternalOperationGuard(repository, authority)
+
+    with pytest.raises(DomainError, match="external_attempt_budget_invalid"):
+        guard.prepare(
+            job_id=job.job_id,
+            step_id=attempt.step_id,
+            attempt_id=attempt.attempt_id,
+            provider="paid-provider",
+            request_hash=sha256_digest(b"invalid retry budget"),
+            summary_json="{}",
+            max_attempts=max_attempts,  # type: ignore[arg-type]
+        )
+
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM external_operations"
+        ).fetchone()[0] == 0
+
+
 def test_prepare_validates_cancellation_and_attempt_binding_before_insert(
     tmp_path: Path,
 ) -> None:

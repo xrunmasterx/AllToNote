@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.resource_lease import ExecutionAuthority
 
 
@@ -43,6 +44,7 @@ class _ExternalOperationStore(Protocol):
         operation_idempotency_key: str | None,
         summary_json: str,
         authority: ExecutionAuthority,
+        max_attempts: int | None = None,
     ) -> ExternalOperation: ...
 
     def start_external_operation(
@@ -93,7 +95,18 @@ class ExternalOperationGuard:
         request_hash: str,
         summary_json: str,
         operation_idempotency_key: str | None = None,
+        max_attempts: int | None = None,
     ) -> ExternalOperation:
+        if max_attempts is not None and (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts < 1
+        ):
+            raise DomainError(
+                "external_attempt_budget_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "External operation attempt budget must be a positive integer",
+            )
         return self._store.prepare_external_operation(
             job_id=job_id,
             step_id=step_id,
@@ -103,6 +116,7 @@ class ExternalOperationGuard:
             operation_idempotency_key=operation_idempotency_key,
             summary_json=summary_json,
             authority=self._authority,
+            max_attempts=max_attempts,
         )
 
     def start(self, operation_id: str) -> ExternalOperation:

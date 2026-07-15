@@ -48,6 +48,7 @@ _FOOTNOTE_DEFINITION = re.compile(r"^ {0,3}\[\^(ev_[0-9a-f-]+)\]:")
 _SEGMENT_CITATION = re.compile(r"\[\^seg_[^\]\r\n]*\]")
 _H2 = re.compile(r"^ {0,3}##(?!#)\s+\S")
 _SETEXT_H2_UNDERLINE = re.compile(r"^ {0,3}-+[ \t]*$")
+_HTML_LITERAL_OPEN = re.compile(r"<(code|pre)(?=[\s/>])", re.IGNORECASE)
 
 
 def _unsafe() -> DomainError:
@@ -72,6 +73,12 @@ def _backslash_escaped(text: str, index: int) -> bool:
         backslashes += 1
         cursor -= 1
     return backslashes % 2 == 1
+
+
+def is_backslash_escaped(text: str, index: int) -> bool:
+    """Return whether the character at index is escaped by backslashes."""
+
+    return _backslash_escaped(text, index)
 
 
 def _fence_run(line: str) -> tuple[int, str, int] | None:
@@ -184,8 +191,23 @@ def _scan_markdown(markdown: str) -> _MarkdownScan:
     )
 
 
-def _visible_lines(markdown: str) -> tuple[str, ...]:
-    return tuple(_scan_markdown(markdown).visible_text.splitlines())
+def markdown_visible_mask(markdown: str) -> bytes:
+    """Return a mask for rendered text, excluding code and destinations."""
+
+    mask = bytearray(_scan_markdown(markdown).visible_mask)
+    _hide_nonrendered_markdown_regions(markdown, mask)
+    return bytes(mask)
+
+
+def markdown_visible_lines(markdown: str) -> tuple[str, ...]:
+    """Return rendered Markdown lines with literal/non-rendered regions blanked."""
+
+    mask = markdown_visible_mask(markdown)
+    visible = "".join(
+        character if mask[index] else ("\n" if character == "\n" else " ")
+        for index, character in enumerate(markdown)
+    )
+    return tuple(visible.splitlines())
 
 
 def _reference_label(value: str) -> str:
@@ -205,6 +227,155 @@ def _bracket_matches(markdown: str) -> dict[int, int]:
         elif character == "]" and stack:
             matches[stack.pop()] = index
     return matches
+
+
+def _parenthesized_end(markdown: str, start: int) -> int | None:
+    depth = 0
+    quote: str | None = None
+    backslashes = 0
+    cursor = start
+    while cursor < len(markdown):
+        character = markdown[cursor]
+        if character == "\\":
+            backslashes += 1
+            cursor += 1
+            continue
+        escaped = backslashes % 2 == 1
+        backslashes = 0
+        if character in "\r\n" and quote is None and not escaped:
+            return None
+        if quote is not None:
+            if character == quote and not escaped:
+                quote = None
+        elif character in "\"'" and not escaped:
+            quote = character
+        elif character == "(" and not escaped:
+            depth += 1
+        elif character == ")" and not escaped:
+            depth -= 1
+            if depth == 0:
+                return cursor + 1
+        cursor += 1
+    return None
+
+
+def _html_tag_end(markdown: str, start: int) -> int | None:
+    if markdown.startswith("<!--", start):
+        closing = markdown.find("-->", start + 4)
+        return len(markdown) if closing < 0 else closing + 3
+    cursor = start + 1
+    if cursor >= len(markdown):
+        return None
+    if markdown[cursor] in "!?":
+        closing = markdown.find(">", cursor + 1)
+        return None if closing < 0 else closing + 1
+    if markdown[cursor] == "/":
+        cursor += 1
+    name_start = cursor
+    while cursor < len(markdown) and (
+        markdown[cursor].isalnum() or markdown[cursor] in "-:"
+    ):
+        cursor += 1
+    if cursor == name_start or (
+        cursor < len(markdown) and markdown[cursor] not in " \t\r\n/>"
+    ):
+        return None
+    quote: str | None = None
+    while cursor < len(markdown):
+        character = markdown[cursor]
+        if quote is not None:
+            if character == quote and not _backslash_escaped(markdown, cursor):
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character == ">":
+            return cursor + 1
+        cursor += 1
+    return None
+
+
+def _hide_nonrendered_markdown_regions(markdown: str, mask: bytearray) -> None:
+    bracket_matches = _bracket_matches(markdown)
+    cursor = 0
+    line_start = 0
+    while cursor < len(markdown):
+        if markdown[cursor] == "\n":
+            line_start = cursor + 1
+            cursor += 1
+            continue
+        if not mask[cursor]:
+            cursor += 1
+            continue
+        if markdown[cursor] == "<" and not _backslash_escaped(markdown, cursor):
+            literal_open = _HTML_LITERAL_OPEN.match(markdown, cursor)
+            if literal_open is not None:
+                opening_end = _html_tag_end(markdown, cursor)
+                if opening_end is not None:
+                    closing = re.search(
+                        rf"</\s*{literal_open.group(1)}\s*>",
+                        markdown[opening_end:],
+                        re.IGNORECASE,
+                    )
+                    end = (
+                        len(markdown)
+                        if closing is None
+                        else opening_end + closing.end()
+                    )
+                    _hide(mask, cursor, end)
+                    cursor = end
+                    continue
+            end = _html_tag_end(markdown, cursor)
+            if end is not None:
+                _hide(mask, cursor, end)
+                cursor = end
+                continue
+        if markdown[cursor] != "[" or _backslash_escaped(markdown, cursor):
+            cursor += 1
+            continue
+        closing = bracket_matches.get(cursor)
+        if closing is None:
+            cursor += 1
+            continue
+        label = markdown[cursor + 1 : closing]
+        after = closing + 1
+        is_definition = (
+            not label.startswith("^")
+            and after < len(markdown)
+            and markdown[after] == ":"
+            and cursor - line_start <= 3
+            and not markdown[line_start:cursor].strip(" ")
+        )
+        if is_definition:
+            line_end = markdown.find("\n", after + 1)
+            end = len(markdown) if line_end < 0 else line_end
+            _hide(mask, line_start, end)
+            cursor = end
+            continue
+        if after < len(markdown) and markdown[after] == "(":
+            end = _parenthesized_end(markdown, after)
+            if end is not None:
+                _hide(mask, after, end)
+                cursor = end
+                continue
+        if label.startswith("^"):
+            cursor = closing + 1
+            continue
+        reference_start = after
+        while (
+            reference_start < len(markdown)
+            and markdown[reference_start] in " \t"
+        ):
+            reference_start += 1
+        if (
+            reference_start < len(markdown)
+            and markdown[reference_start] == "["
+        ):
+            reference_closing = bracket_matches.get(reference_start)
+            if reference_closing is not None:
+                _hide(mask, reference_start, reference_closing + 1)
+                cursor = reference_closing + 1
+                continue
+        cursor = closing + 1
 
 
 def _destination_after(markdown: str, start: int) -> tuple[str, int] | None:
@@ -477,7 +648,7 @@ def _analyze_markdown(markdown: str) -> _MarkdownAnalysis:
         current_substantive = False
         current_citations = []
 
-    lines = _visible_lines(markdown)
+    lines = markdown_visible_lines(markdown)
     setext_h2_titles = {
         index
         for index in range(len(lines) - 1)

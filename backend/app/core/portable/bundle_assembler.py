@@ -16,6 +16,7 @@ from app.core.domain.video import TranscriptDocument
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import EvidenceSet, build_evidence_set
+from app.core.portable.identity import is_executor_identity
 from app.core.portable.jsonio import encode_json
 from app.core.portable.quality import QualityOutcome, rebuild_quality_outcome
 from app.core.ports.portable import (
@@ -40,7 +41,6 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
 _EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
-_EXECUTOR_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,127}\Z")
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
         "accesskey",
@@ -263,7 +263,7 @@ def _require_safe_url(value: str, field_name: str) -> None:
 
 
 def _require_executor_identity(value: str, field_name: str) -> None:
-    if _EXECUTOR_IDENTITY.fullmatch(value) is None:
+    if not is_executor_identity(value):
         raise _error(
             "video_bundle_sensitive_data",
             f"{field_name} is not an approved executor identity",
