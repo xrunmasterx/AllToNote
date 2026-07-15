@@ -3,7 +3,8 @@ import logging
 import shutil
 import tempfile
 from abc import ABC
-from typing import Union, Optional, List
+from contextlib import contextmanager
+from typing import Iterator, Union, Optional, List
 
 import yt_dlp
 
@@ -17,6 +18,30 @@ from app.utils.path_helper import get_data_dir
 from app.utils.url_parser import extract_video_id
 
 logger = logging.getLogger(__name__)
+
+_COOKIE_CREATION_ERROR = "Failed to create YouTube cookie file"
+_COOKIE_CREATION_CLEANUP_ERROR = "Failed to create and clean up YouTube cookie file"
+_COOKIE_CLEANUP_ERROR = "Failed to clean up YouTube cookie file"
+_COOKIE_CLEANUP_AFTER_ERROR_LOG = "Failed to clean up YouTube cookie file after download error"
+_COOKIE_CLEANUP_NOTE = "YouTube cookie file cleanup also failed"
+
+
+def _remove_cookie_file(cookiefile: str) -> None:
+    try:
+        os.remove(cookiefile)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise RuntimeError(_COOKIE_CLEANUP_ERROR) from None
+
+
+def _add_safe_note(error: BaseException, note: str) -> None:
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+    except BaseException:
+        pass
 
 
 def _apply_proxy(ydl_opts: dict) -> dict:
@@ -41,7 +66,6 @@ class YoutubeDownloader(Downloader, ABC):
         super().__init__()
         self._cookie_mgr = CookieConfigManager()
         self._cookie = self._cookie_mgr.get('youtube')
-        self._cookiefile = self._write_netscape_cookie_file()
 
     def _write_netscape_cookie_file(self) -> Optional[str]:
         if not self._cookie:
@@ -60,11 +84,76 @@ class YoutubeDownloader(Downloader, ABC):
         if len(lines) == 1:
             return None
 
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-        tmp.writelines(lines)
-        tmp.close()
-        logger.info("Created YouTube Netscape cookie file for yt-dlp: %s (entries: %d)", tmp.name, len(lines) - 1)
-        return tmp.name
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', delete=False, encoding='utf-8'
+            )
+            tmp.writelines(lines)
+            tmp.close()
+            logger.info(
+                "Created YouTube Netscape cookie file for yt-dlp (entries: %d)",
+                len(lines) - 1,
+            )
+            return tmp.name
+        except BaseException as creation_error:
+            cleanup_errors = []
+            if tmp is not None:
+                try:
+                    tmp.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                try:
+                    _remove_cookie_file(tmp.name)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
+            if not isinstance(creation_error, Exception):
+                if cleanup_errors:
+                    _add_safe_note(creation_error, _COOKIE_CLEANUP_NOTE)
+                raise
+
+            cleanup_control_error = next(
+                (
+                    cleanup_error
+                    for cleanup_error in cleanup_errors
+                    if not isinstance(cleanup_error, Exception)
+                ),
+                None,
+            )
+            if cleanup_control_error is not None:
+                if len(cleanup_errors) > 1:
+                    _add_safe_note(cleanup_control_error, _COOKIE_CLEANUP_NOTE)
+                raise cleanup_control_error from None
+
+            message = (
+                _COOKIE_CREATION_CLEANUP_ERROR
+                if cleanup_errors
+                else _COOKIE_CREATION_ERROR
+            )
+            raise RuntimeError(message) from None
+
+    @contextmanager
+    def _cookiefile_for_download(self) -> Iterator[Optional[str]]:
+        cookiefile = self._write_netscape_cookie_file()
+        try:
+            yield cookiefile
+        except BaseException as primary_error:
+            if cookiefile:
+                try:
+                    _remove_cookie_file(cookiefile)
+                except BaseException as cleanup_error:
+                    if not isinstance(cleanup_error, Exception):
+                        raise
+                    _add_safe_note(primary_error, _COOKIE_CLEANUP_NOTE)
+                    try:
+                        logger.error(_COOKIE_CLEANUP_AFTER_ERROR_LOG)
+                    except BaseException:
+                        pass
+            raise
+        else:
+            if cookiefile:
+                _remove_cookie_file(cookiefile)
 
     def download(
         self,
@@ -92,20 +181,20 @@ class YoutubeDownloader(Downloader, ABC):
         if skip_download:
             ydl_opts['skip_download'] = True
 
-        if self._cookiefile:
-            ydl_opts['cookiefile'] = self._cookiefile
+        with self._cookiefile_for_download() as cookiefile:
+            if cookiefile:
+                ydl_opts['cookiefile'] = cookiefile
 
-        _apply_youtube_challenge_support(ydl_opts)
-        _apply_proxy(ydl_opts)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=not skip_download)
-            video_id = info.get("id")
-            title = info.get("title")
-            duration = info.get("duration", 0)
-            cover_url = info.get("thumbnail")
-            ext = info.get("ext", "m4a")
-            audio_path = os.path.join(output_dir, f"{video_id}.{ext}")
-
+            _apply_youtube_challenge_support(ydl_opts)
+            _apply_proxy(ydl_opts)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=not skip_download)
+                video_id = info.get("id")
+                title = info.get("title")
+                duration = info.get("duration", 0)
+                cover_url = info.get("thumbnail")
+                ext = info.get("ext", "m4a")
+                audio_path = os.path.join(output_dir, f"{video_id}.{ext}")
         return AudioDownloadResult(
             file_path=audio_path,
             title=title,
@@ -142,16 +231,16 @@ class YoutubeDownloader(Downloader, ABC):
             'merge_output_format': 'mp4',  # 确保合并成 mp4
         }
 
-        if self._cookiefile:
-            ydl_opts['cookiefile'] = self._cookiefile
+        with self._cookiefile_for_download() as cookiefile:
+            if cookiefile:
+                ydl_opts['cookiefile'] = cookiefile
 
-        _apply_youtube_challenge_support(ydl_opts)
-        _apply_proxy(ydl_opts)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            video_id = info.get("id")
-            video_path = os.path.join(output_dir, f"{video_id}.mp4")
-
+            _apply_youtube_challenge_support(ydl_opts)
+            _apply_proxy(ydl_opts)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                video_id = info.get("id")
+                video_path = os.path.join(output_dir, f"{video_id}.mp4")
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"视频文件未找到: {video_path}")
 
