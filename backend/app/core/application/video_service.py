@@ -5,13 +5,14 @@ import os
 import shutil
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypeVar
 from uuid import UUID
 
 from app.core.application.job_service import JobService
+from app.core.application.video_acquisition import VideoAcquisition
 from app.core.application.video_checkpoints import (
     CandidateCheckpoint as _CandidateCheckpoint,
     decode_acquired as _decode_acquired,
@@ -51,7 +52,7 @@ from app.core.portable.bundle_assembler import (
     VideoBundleInput,
     VideoSourceMetadata,
 )
-from app.core.portable.evidence import build_evidence_set
+from app.core.portable.evidence import build_evidence_set, rewrite_segment_citations
 from app.core.portable.quality import evaluate_video_draft
 from app.core.ports.jobs import (
     AttemptStoragePort,
@@ -61,6 +62,7 @@ from app.core.ports.jobs import (
     VideoExecutionRepositoryPort,
 )
 from app.core.ports.portable import PortableCommitResultPort, PortableWorkspacePort
+from app.core.ports.source import ResolvedVideoSource
 
 
 RUNTIME_VERSION = "0.1.0"
@@ -133,6 +135,15 @@ class VideoPreflightCapabilities:
     required_free_bytes: int = 1
 
 
+@dataclass(frozen=True)
+class VideoStepExecutionContext:
+    job_id: str
+    step_id: str
+    attempt_id: str
+    authority: ExecutionAuthority
+    heartbeat: Callable[[], None]
+
+
 def _checkpoint_error() -> DomainError:
     return DomainError(
         "checkpoint_content_invalid",
@@ -172,33 +183,32 @@ class VideoRecipeOperations(Protocol):
         *,
         source_id: str,
         source_revision_id: str,
-    ) -> VideoSourceMetadata: ...
+    ) -> ResolvedVideoSource: ...
 
     def acquire(
         self,
-        source: VideoSourceMetadata,
+        request: VideoProduceRequest,
+        source: ResolvedVideoSource,
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
-    ) -> object: ...
+        source_id: str,
+        source_revision_id: str,
+        execution: VideoStepExecutionContext,
+    ) -> VideoAcquisition: ...
 
     def transcribe(
         self,
         request: VideoProduceRequest,
-        acquired: object,
+        acquired: VideoAcquisition,
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
+        execution: VideoStepExecutionContext,
     ) -> TranscriptDocument: ...
 
     def generate_draft(
         self,
         request: VideoProduceRequest,
         transcript: TranscriptDocument,
-        evidence_ids: dict[str, str],
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
+        execution: VideoStepExecutionContext,
     ) -> GeneratedVideoDraft: ...
 
     def screenshots(
@@ -206,8 +216,7 @@ class VideoRecipeOperations(Protocol):
         request: VideoProduceRequest,
         draft: GeneratedVideoDraft,
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
+        execution: VideoStepExecutionContext,
     ) -> tuple[DisplayAssetInput, ...]: ...
 
     def after_portable_commit(self, result: PortableCommitResultPort) -> None: ...
@@ -260,6 +269,7 @@ class VideoService:
             JobState.SUCCEEDED,
             JobState.FAILED,
             JobState.CANCELLED,
+            JobState.WAITING_FOR_INPUT,
         }:
             return snapshot
         request = self._load_request(job_id)
@@ -278,6 +288,16 @@ class VideoService:
                 active_attempt = self._repository.take_over_running_attempt(
                     job_id, active_attempt.attempt_id, authority
                 )
+                unknown = self._repository.reconcile_external_operations_after_process_loss(
+                    job_id, authority
+                )
+                if unknown:
+                    self._repository.pause_for_external_outcome_atomic(
+                        job_id,
+                        active_attempt.attempt_id,
+                        authority,
+                    )
+                    return self._snapshot(job_id)
             if active_attempt is not None and active_attempt.step_id == "commit":
                 return self._reconcile_commit(request, active_attempt, authority)
             return self._execute(
@@ -311,7 +331,7 @@ class VideoService:
             "preflight",
             request_hash,
             authority,
-            lambda: self._preflight(request),
+            lambda _execution: self._preflight(request),
             encode=lambda value: _encode_object(
                 {"step": "preflight", "policy_hash": value}
             ),
@@ -325,7 +345,7 @@ class VideoService:
             "resolve_source",
             request_hash,
             authority,
-            lambda: self._operations.resolve_source(
+            lambda _execution: self._operations.resolve_source(
                 request,
                 source_id=ids["source"],
                 source_revision_id=ids["revision"],
@@ -339,11 +359,12 @@ class VideoService:
             "acquire",
             request_hash,
             authority,
-            lambda: self._invoke_external(
-                authority,
-                lambda heartbeat: self._operations.acquire(
-                    source, external=True, heartbeat=heartbeat
-                ),
+            lambda execution: self._operations.acquire(
+                request,
+                source,
+                source_id=ids["source"],
+                source_revision_id=ids["revision"],
+                execution=execution,
             ),
             encode=_encode_acquired,
             decode=_decode_acquired,
@@ -354,14 +375,10 @@ class VideoService:
             "normalize_transcript",
             request_hash,
             authority,
-            lambda: self._invoke_external(
-                authority,
-                lambda heartbeat: self._operations.transcribe(
-                    request,
-                    acquired,
-                    external=True,
-                    heartbeat=heartbeat,
-                ),
+            lambda execution: self._operations.transcribe(
+                request,
+                acquired,
+                execution=execution,
             ),
             encode=_encode_transcript,
             decode=_decode_transcript,
@@ -372,7 +389,7 @@ class VideoService:
             "create_source_revision",
             request_hash,
             authority,
-            lambda: source.source_revision_id,
+            lambda _execution: acquired.metadata.source_revision_id,
             encode=lambda value: _encode_object(
                 {"step": "create_source_revision", "revision_id": value}
             ),
@@ -382,7 +399,7 @@ class VideoService:
         bundle_input = self._build_input(
             request,
             job_id=job_id,
-            source=source,
+            source=acquired.metadata,
             transcript=transcript,
             authority=authority,
             request_hash=request_hash,
@@ -393,7 +410,7 @@ class VideoService:
             "assemble_candidate_bundle",
             request_hash,
             authority,
-            lambda: self._assemble(bundle_input),
+            lambda _execution: self._assemble(bundle_input),
             encode=lambda value: value.encode(),
             decode=_CandidateCheckpoint.decode,
             resumed_attempt=resumed_attempt,
@@ -403,7 +420,7 @@ class VideoService:
             "quality_and_portable_validation",
             request_hash,
             authority,
-            lambda: self._validate_candidate(request, checkpoint),
+            lambda _execution: self._validate_candidate(request, checkpoint),
             encode=_encode_validation,
             decode=lambda payload: _decode_validation(payload, checkpoint),
             resumed_attempt=resumed_attempt,
@@ -459,15 +476,14 @@ class VideoService:
             "generate_draft",
             request_hash,
             authority,
-            lambda: self._invoke_external(
-                authority,
-                lambda heartbeat: self._operations.generate_draft(
+            lambda execution: self._finalize_draft(
+                self._operations.generate_draft(
                     request,
                     transcript,
-                    evidence_ids,
-                    external=True,
-                    heartbeat=heartbeat,
+                    execution=execution,
                 ),
+                transcript,
+                evidence_ids,
             ),
             encode=_encode_draft,
             decode=_decode_draft,
@@ -478,14 +494,10 @@ class VideoService:
             "optional_screenshots",
             request_hash,
             authority,
-            lambda: self._invoke_external(
-                authority,
-                lambda heartbeat: self._operations.screenshots(
-                    request,
-                    draft,
-                    external=True,
-                    heartbeat=heartbeat,
-                ),
+            lambda execution: self._operations.screenshots(
+                request,
+                draft,
+                execution=execution,
             ),
             encode=_encode_screenshots,
             decode=_decode_screenshots,
@@ -535,7 +547,7 @@ class VideoService:
                     "redaction": sha256_digest("task11-redaction-v1"),
                 },
                 model_identity=draft.model_identity,
-                transcriber_identity="fake/transcriber-v1",
+                transcriber_identity=self._transcriber_identity(source),
                 usage={
                     key: value
                     for key, value in draft.usage.items()
@@ -722,6 +734,14 @@ class VideoService:
     def _canonical_source_identity(source: VideoSourceMetadata) -> str:
         return f"{source.canonical_identity_scheme}:{source.stable_video_identity}"
 
+    @staticmethod
+    def _transcriber_identity(source: VideoSourceMetadata) -> str:
+        if source.subtitle_acquisition == "provided":
+            return "core/provided-transcript-v1"
+        if source.subtitle_acquisition == "platform":
+            return f"{source.connector_id}/platform-subtitle-v1"
+        return "fake/transcriber-v1"
+
     def _preflight(self, request: VideoProduceRequest) -> str:
         capabilities = self._operations.preflight_capabilities(request)
         if not isinstance(capabilities, VideoPreflightCapabilities):
@@ -817,7 +837,7 @@ class VideoService:
         step_id: str,
         input_hash: str,
         authority: ExecutionAuthority,
-        action: Callable[[], _T],
+        action: Callable[[VideoStepExecutionContext], _T],
         *,
         encode: Callable[[_T], bytes] | None = None,
         decode: Callable[[bytes], _T] | None = None,
@@ -860,7 +880,14 @@ class VideoService:
             attempt = self._repository.start_attempt(attempt.attempt_id, authority)
         try:
             self._heartbeat(authority)
-            value = action()
+            execution = VideoStepExecutionContext(
+                job_id=job_id,
+                step_id=step_id,
+                attempt_id=attempt.attempt_id,
+                authority=authority,
+                heartbeat=lambda: self._heartbeat(authority),
+            )
+            value = action(execution)
             self._heartbeat(authority)
             payload = (
                 encode(value)
@@ -883,6 +910,18 @@ class VideoService:
                 ),
                 authority,
             )
+        except DomainError as error:
+            if error.code == "external_outcome_unknown":
+                self._repository.pause_for_external_outcome_atomic(
+                    job_id,
+                    attempt.attempt_id,
+                    authority,
+                )
+            else:
+                self._repository.transition_attempt(
+                    attempt.attempt_id, AttemptState.FAILED, authority=authority
+                )
+            raise
         except BaseException:
             self._repository.transition_attempt(
                 attempt.attempt_id, AttemptState.FAILED, authority=authority
@@ -909,16 +948,30 @@ class VideoService:
     def _heartbeat(self, authority: ExecutionAuthority) -> None:
         self._repository.heartbeat_scheduler_lease(authority, ttl_seconds=300)
 
-    def _invoke_external(
-        self,
-        authority: ExecutionAuthority,
-        action: Callable[[Callable[[], None]], _T],
-    ) -> _T:
-        heartbeat = lambda: self._heartbeat(authority)
-        heartbeat()
-        value = action(heartbeat)
-        heartbeat()
-        return value
+    @staticmethod
+    def _finalize_draft(
+        draft: GeneratedVideoDraft,
+        transcript: TranscriptDocument,
+        evidence_ids: Mapping[str, str],
+    ) -> GeneratedVideoDraft:
+        by_segment = {segment.segment_id: segment for segment in transcript.segments}
+        markdown = rewrite_segment_citations(draft.markdown, evidence_ids)
+        definitions = []
+        for segment_id in draft.cited_segment_ids:
+            segment = by_segment[segment_id]
+            definitions.append(
+                f"[^{evidence_ids[segment_id]}]: Video "
+                f"{VideoService._timestamp(segment.start_ms)}-"
+                f"{VideoService._timestamp(segment.end_ms)}"
+            )
+        finalized = markdown.rstrip() + "\n\n" + "\n".join(definitions) + "\n"
+        return replace(draft, markdown=finalized)
+
+    @staticmethod
+    def _timestamp(milliseconds: int) -> str:
+        minutes, remainder = divmod(milliseconds, 60_000)
+        seconds, millis = divmod(remainder, 1_000)
+        return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
 
     def _fail_job(
         self,
@@ -964,6 +1017,25 @@ class VideoService:
                     "quality": request.quality_preset,
                     "style": request.style,
                     "screenshots": request.screenshot_policy.value,
+                    "provider_profile": request.provider_profile,
+                    "model_override": request.model_override,
+                    "transcriber_profile": request.transcriber_profile,
+                    "provided_transcript": (
+                        None
+                        if request.provided_transcript is None
+                        else {
+                            "language": request.provided_transcript.language,
+                            "segments": [
+                                {
+                                    "segment_id": segment.segment_id,
+                                    "start_ms": segment.start_ms,
+                                    "end_ms": segment.end_ms,
+                                    "text": segment.text,
+                                }
+                                for segment in request.provided_transcript.segments
+                            ],
+                        }
+                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -1021,4 +1093,5 @@ __all__ = [
     "RUNTIME_VERSION",
     "VideoRecipeOperations",
     "VideoService",
+    "VideoStepExecutionContext",
 ]

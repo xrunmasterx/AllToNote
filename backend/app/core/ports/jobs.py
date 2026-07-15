@@ -9,6 +9,7 @@ from app.core.domain.video import (
     VideoProduceResult,
 )
 from app.core.errors import ErrorDetail
+from app.core.jobs.external_operation import ExternalOperation
 from app.core.jobs.model import (
     Attempt,
     AttemptState,
@@ -174,6 +175,19 @@ class VideoExecutionRepositoryPort(JobRepositoryPort, Protocol):
         attempt_id: str,
         authority: ExecutionAuthority,
     ) -> Attempt: ...
+
+    def reconcile_external_operations_after_process_loss(
+        self,
+        job_id: str,
+        authority: ExecutionAuthority,
+    ) -> tuple[ExternalOperation, ...]: ...
+
+    def pause_for_external_outcome_atomic(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> Challenge: ...
 
 
 class AttemptMetadataRepositoryPort(Protocol):

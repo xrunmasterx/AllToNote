@@ -13,11 +13,27 @@ from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
+from app.adapters.models.legacy_gpt import (
+    LegacyKnowledgeModelAdapter,
+    LegacyModelBinding,
+    ModelChunkResultStore,
+    ModelExecutionBinding,
+)
+from app.adapters.transcription.legacy_transcriber import (
+    LegacyTranscriberAdapter,
+    normalize_platform_subtitle,
+)
+from app.core.application.video_acquisition import (
+    TranscriptProvenance,
+    VideoAcquisition,
+    transcript_identity,
+)
 from app.core.application.video_service import (
     CHECKPOINT_SCHEMA,
     VideoPreflightCapabilities,
     VideoRecipeOperations,
     VideoService,
+    VideoStepExecutionContext,
 )
 from app.core.domain.video import (
     GeneratedVideoDraft,
@@ -28,8 +44,18 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.cancellation import CancellationToken
+from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import CheckpointMetadata
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
+from app.core.ports.model import KnowledgeModelRequest
+from app.core.ports.source import (
+    MaterializationPolicy,
+    ResolvedVideoSource,
+    SubtitleAvailability,
+    VideoSourcePort,
+)
+from app.core.ports.transcript import MediaInput
 from app.core.sdk import AllToNoteSDK
 from iwiki.workspace import open_workspace
 
@@ -98,98 +124,119 @@ class _FakeVideoOperations(VideoRecipeOperations):
         *,
         source_id: str,
         source_revision_id: str,
-    ) -> VideoSourceMetadata:
+    ) -> ResolvedVideoSource:
+        del source_id, source_revision_id
         stable_identity = request.input_value.removeprefix("fixture://")
         if not stable_identity:
             stable_identity = "course"
-        return VideoSourceMetadata(
-            source_id=source_id,
-            source_revision_id=source_revision_id,
+        return ResolvedVideoSource(
             connector_id="fixture",
             connector_version="1.0.0",
             platform="fixture",
             canonical_identity_scheme="fixture-video",
             stable_video_identity=stable_identity,
+            canonical_identity=f"fixture-video:{stable_identity}",
             canonical_uri=f"https://fixtures.alltonote.invalid/{stable_identity}",
-            title="AllToNote Fixture Course",
-            author="AllToNote",
-            channel="AllToNote",
-            duration_ms=2_000,
-            published_at="2026-07-14T00:00:00.000Z",
-            observed_at="2026-07-14T00:00:00.000Z",
-            language="zh-CN",
-            subtitle_acquisition="generated",
-            source_link=f"https://fixtures.alltonote.invalid/{stable_identity}",
-            materialization_reason="remote_video_reference",
-            license="unknown",
-            privacy="personal",
-            freshness="point_in_time",
+            logical_reference=None,
+            materialization_policy=MaterializationPolicy.REFERENCE_ONLY,
         )
 
     def acquire(
         self,
-        source: VideoSourceMetadata,
-        *,
-        external: bool,
-        heartbeat: Callable[[], None],
-    ) -> object:
-        if external:
-            self._calls.download += 1
-            self._record("download")
-            self._crash_if_requested("download")
-            self._run_operation_hook("download", heartbeat)
-        return source.stable_video_identity
-
-    def transcribe(
-        self,
         request: VideoProduceRequest,
-        acquired: object,
+        source: ResolvedVideoSource,
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
-    ) -> TranscriptDocument:
-        del request, acquired
-        if external:
-            self._calls.transcribe += 1
-            self._record("transcribe")
-            self._crash_if_requested("transcribe")
-            self._run_operation_hook("transcribe", heartbeat)
-        return TranscriptDocument(
+        source_id: str,
+        source_revision_id: str,
+        execution: VideoStepExecutionContext,
+    ) -> VideoAcquisition:
+        transcript = request.provided_transcript or TranscriptDocument(
             language="zh-CN",
             segments=(
                 TranscriptSegment(
                     segment_id="seg_000001",
                     start_ms=0,
                     end_ms=2_000,
-                    text="知识生产工具应把来源整理为可验证的开放笔记。",
+                    text="Knowledge production preserves verifiable source notes.",
                 ),
             ),
         )
+        self._calls.download += 1
+        self._record("download")
+        self._crash_if_requested("download")
+        self._run_operation_hook("download", execution.heartbeat)
+        canonical_uri = source.canonical_uri or "https://fixtures.alltonote.invalid/course"
+        metadata = VideoSourceMetadata(
+            source_id=source_id,
+            source_revision_id=source_revision_id,
+            connector_id=source.connector_id,
+            connector_version=source.connector_version,
+            platform=source.platform,
+            canonical_identity_scheme=source.canonical_identity_scheme,
+            stable_video_identity=source.stable_video_identity,
+            canonical_uri=canonical_uri,
+            title="AllToNote Fixture Course",
+            author="AllToNote",
+            channel="AllToNote",
+            duration_ms=2_000,
+            published_at="2026-07-14T00:00:00.000Z",
+            observed_at="2026-07-14T00:00:00.000Z",
+            language=transcript.language,
+            subtitle_acquisition=(
+                "provided" if request.provided_transcript is not None else "generated"
+            ),
+            source_link=canonical_uri,
+            materialization_reason="remote_video_reference",
+            license="unknown",
+            privacy="personal",
+            freshness="point_in_time",
+        )
+        return VideoAcquisition(
+            metadata=metadata,
+            subtitle_availability=SubtitleAvailability.AVAILABLE,
+            transcript=transcript,
+            transcript_identity=transcript_identity(transcript),
+            transcript_provenance=(
+                TranscriptProvenance.PROVIDED
+                if request.provided_transcript is not None
+                else TranscriptProvenance.GENERATED
+            ),
+        )
+
+    def transcribe(
+        self,
+        request: VideoProduceRequest,
+        acquired: VideoAcquisition,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> TranscriptDocument:
+        self._calls.transcribe += 1
+        self._record("transcribe")
+        self._crash_if_requested("transcribe")
+        self._run_operation_hook("transcribe", execution.heartbeat)
+        transcript = request.provided_transcript or acquired.transcript
+        assert transcript is not None
+        return transcript
 
     def generate_draft(
         self,
         request: VideoProduceRequest,
         transcript: TranscriptDocument,
-        evidence_ids: dict[str, str],
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
+        execution: VideoStepExecutionContext,
     ) -> GeneratedVideoDraft:
         del request, transcript
-        if external:
-            self._calls.model += 1
-            self._record("model")
-            self._crash_if_requested("model")
-            self._run_operation_hook("model", heartbeat)
-        evidence_id = evidence_ids["seg_000001"]
+        self._calls.model += 1
+        self._record("model")
+        self._crash_if_requested("model")
+        self._run_operation_hook("model", execution.heartbeat)
         if self._quality_fail:
-            markdown = "# 视频笔记\n\nTODO：补充证据引用。\n"
+            markdown = "# Video note\n\nTODO: add evidence.\n"
             cited_segment_ids: tuple[str, ...] = ()
         else:
             markdown = (
-                "# 视频笔记\n\n"
-                f"知识生产应保留可验证证据。[^{evidence_id}]\n\n"
-                f"[^{evidence_id}]: 视频 00:00–00:02\n"
+                "# Video note\n\n## Evidence\n\n"
+                "Knowledge production preserves verifiable evidence.[^seg_000001]\n"
             )
             cited_segment_ids = ("seg_000001",)
         return GeneratedVideoDraft(
@@ -206,15 +253,14 @@ class _FakeVideoOperations(VideoRecipeOperations):
         request: VideoProduceRequest,
         draft: GeneratedVideoDraft,
         *,
-        external: bool,
-        heartbeat: Callable[[], None],
+        execution: VideoStepExecutionContext,
     ) -> tuple[DisplayAssetInput, ...]:
         del draft
         self._crash_if_requested("screenshots")
-        if external and request.screenshot_policy is ScreenshotPolicy.ON_DEMAND:
+        if request.screenshot_policy is ScreenshotPolicy.ON_DEMAND:
             self._calls.ffmpeg += 1
             self._record("ffmpeg")
-            self._run_operation_hook("ffmpeg", heartbeat)
+            self._run_operation_hook("ffmpeg", execution.heartbeat)
         return ()
 
     def after_portable_commit(self, result: object) -> None:
@@ -224,6 +270,222 @@ class _FakeVideoOperations(VideoRecipeOperations):
         if self._crash_after_commit_once:
             self._crash_after_commit_once = False
             raise RuntimeError("injected crash after portable rename")
+
+
+_SOURCE_METADATA_FIELDS = frozenset(
+    {
+        "author",
+        "channel",
+        "duration_ms",
+        "language",
+        "observed_at",
+        "published_at",
+        "title",
+    }
+)
+
+
+class _PlatformVideoOperations(VideoRecipeOperations):
+    def __init__(
+        self,
+        repository: SqliteJobRepository,
+        source: VideoSourcePort,
+        source_metadata: Mapping[str, Mapping[str, object]],
+        model: LegacyModelBinding,
+        result_root: Path,
+    ) -> None:
+        self._repository = repository
+        self._source = source
+        self._source_metadata = {
+            platform: dict(metadata)
+            for platform, metadata in source_metadata.items()
+        }
+        self._model = model
+        self._result_store = ModelChunkResultStore(result_root)
+        self._acquisition_root = result_root / "acquisition"
+
+    def preflight_capabilities(
+        self, request: VideoProduceRequest
+    ) -> VideoPreflightCapabilities:
+        del request
+        return VideoPreflightCapabilities()
+
+    def resolve_source(
+        self,
+        request: VideoProduceRequest,
+        *,
+        source_id: str,
+        source_revision_id: str,
+    ) -> ResolvedVideoSource:
+        del source_id, source_revision_id
+        return self._source.resolve(request.input_value)
+
+    def acquire(
+        self,
+        request: VideoProduceRequest,
+        source: ResolvedVideoSource,
+        *,
+        source_id: str,
+        source_revision_id: str,
+        execution: VideoStepExecutionContext,
+    ) -> VideoAcquisition:
+        token = CancellationToken(self._repository, execution.job_id)
+        provided = request.provided_transcript
+        acquired = self._source.acquire(
+            source,
+            need_media=False,
+            need_subtitles=provided is None,
+            output_dir=self._acquisition_root / execution.job_id,
+            token=token,
+        )
+        transcript = provided
+        provenance = (
+            TranscriptProvenance.PROVIDED
+            if provided is not None
+            else None
+        )
+        if (
+            transcript is None
+            and acquired.subtitle_availability is SubtitleAvailability.AVAILABLE
+        ):
+            transcript = normalize_platform_subtitle(
+                acquired.opaque_subtitle,
+                check_cancelled=token.raise_if_cancelled,
+            )
+            provenance = TranscriptProvenance.PLATFORM
+        fixture = self._source_metadata.get(source.platform)
+        if fixture is None or frozenset(fixture) != _SOURCE_METADATA_FIELDS:
+            raise DomainError(
+                "source_metadata_unavailable",
+                ErrorCategory.RECIPE_FAILED,
+                "Complete source metadata is required for platform composition",
+            )
+        canonical_uri = source.canonical_uri
+        if canonical_uri is None:
+            raise DomainError(
+                "source_metadata_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Platform source metadata requires a canonical URI",
+            )
+        try:
+            metadata = VideoSourceMetadata(
+                source_id=source_id,
+                source_revision_id=source_revision_id,
+                connector_id=source.connector_id,
+                connector_version=source.connector_version,
+                platform=source.platform,
+                canonical_identity_scheme=source.canonical_identity_scheme,
+                stable_video_identity=source.stable_video_identity,
+                canonical_uri=canonical_uri,
+                title=fixture["title"],
+                author=fixture["author"],
+                channel=fixture["channel"],
+                duration_ms=fixture["duration_ms"],
+                published_at=fixture["published_at"],
+                observed_at=fixture["observed_at"],
+                language=fixture["language"],
+                subtitle_acquisition=(
+                    provenance.value
+                    if provenance is not None
+                    else acquired.subtitle_availability.value
+                ),
+                source_link=canonical_uri,
+                materialization_reason="remote_video_reference",
+                license="unknown",
+                privacy="personal",
+                freshness="point_in_time",
+            )
+        except (DomainError, TypeError, ValueError):
+            raise DomainError(
+                "source_metadata_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Complete source metadata is invalid",
+            ) from None
+        return VideoAcquisition(
+            metadata=metadata,
+            subtitle_availability=(
+                SubtitleAvailability.AVAILABLE
+                if transcript is not None
+                else acquired.subtitle_availability
+            ),
+            transcript=transcript,
+            transcript_identity=(
+                transcript_identity(transcript) if transcript is not None else None
+            ),
+            transcript_provenance=provenance,
+        )
+
+    def transcribe(
+        self,
+        request: VideoProduceRequest,
+        acquired: VideoAcquisition,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> TranscriptDocument:
+        token = CancellationToken(self._repository, execution.job_id)
+        transcript = acquired.transcript
+        if transcript is None:
+            raise DomainError(
+                "platform_subtitle_unavailable",
+                ErrorCategory.RECIPE_FAILED,
+                "Platform subtitles are unavailable; media fallback is not enabled",
+            )
+        return LegacyTranscriberAdapter("fast-whisper").transcribe(
+            MediaInput(provided_transcript=transcript), token
+        )
+
+    def generate_draft(
+        self,
+        request: VideoProduceRequest,
+        transcript: TranscriptDocument,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> GeneratedVideoDraft:
+        token = CancellationToken(self._repository, execution.job_id)
+        adapter = LegacyKnowledgeModelAdapter(
+            model=self._model,
+            execution=ModelExecutionBinding(
+                guard=ExternalOperationGuard(
+                    self._repository, execution.authority
+                ),
+                result_store=self._result_store,
+                job_id=execution.job_id,
+                step_id=execution.step_id,
+                attempt_id=execution.attempt_id,
+            ),
+            max_prompt_bytes=64 * 1024,
+        )
+        return adapter.generate(
+            KnowledgeModelRequest(
+                transcript=transcript,
+                recipe_id=request.recipe_id,
+                recipe_version=request.recipe_version,
+                output_language=request.output_language,
+                style=request.style,
+                quality_preset=request.quality_preset,
+                screenshot_policy=request.screenshot_policy,
+            ),
+            token,
+        )
+
+    def screenshots(
+        self,
+        request: VideoProduceRequest,
+        draft: GeneratedVideoDraft,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> tuple[DisplayAssetInput, ...]:
+        del draft, execution
+        if request.screenshot_policy is not ScreenshotPolicy.OFF:
+            raise DomainError(
+                "screenshot_capability_unavailable",
+                ErrorCategory.POLICY_DENIED,
+                "Platform subtitle composition does not provide screenshots",
+            )
+        return ()
+
+    def after_portable_commit(self, result: object) -> None:
+        del result
 
 
 class AllToNoteRuntime:
@@ -271,6 +533,47 @@ def _read_checkpoint(
             "Candidate checkpoint path is invalid",
         )
     return (storage.root / relative).read_bytes()
+
+
+def create_platform_video_runtime(
+    machine_root: Path,
+    *,
+    source: VideoSourcePort,
+    source_metadata: Mapping[str, Mapping[str, object]],
+    model: LegacyModelBinding,
+    owner_id: str | None = None,
+    local_instance_id: str | None = None,
+    clock: Callable[[], int] | None = None,
+) -> AllToNoteRuntime:
+    resolved_machine_root = Path(machine_root).resolve()
+    resolved_machine_root.mkdir(parents=True, exist_ok=True)
+    repository = SqliteJobRepository.open(
+        resolved_machine_root / "job-store", clock=clock
+    )
+    storage = FileAttemptStorage(
+        resolved_machine_root / "attempts",
+        repository,
+        validators={CHECKPOINT_SCHEMA: _checkpoint_payload_is_valid},
+    )
+    operations = _PlatformVideoOperations(
+        repository,
+        source,
+        source_metadata,
+        model,
+        resolved_machine_root / "external-results",
+    )
+    service = VideoService(
+        repository,
+        storage,
+        IWikiPortableGateway(),
+        operations,
+        checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
+        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        work_root=storage.root,
+        local_instance_id=local_instance_id
+        or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+    )
+    return AllToNoteRuntime(AllToNoteSDK(service), repository)
 
 
 def create_fake_runtime(
@@ -359,4 +662,5 @@ __all__ = [
     "VideoPreflightCapabilities",
     "create_fake_runtime",
     "create_fake_runtime_for_workspace",
+    "create_platform_video_runtime",
 ]

@@ -15,7 +15,16 @@ from app.core.domain.video import (
     TranscriptSegment,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.application.video_acquisition import (
+    TranscriptProvenance,
+    VideoAcquisition,
+)
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
+from app.core.ports.source import (
+    MaterializationPolicy,
+    ResolvedVideoSource,
+    SubtitleAvailability,
+)
 
 
 def checkpoint_error() -> DomainError:
@@ -230,40 +239,137 @@ def decode_preflight(payload: bytes) -> str:
     return policy_hash
 
 
-def encode_source(source: VideoSourceMetadata) -> bytes:
-    value = {"step": "resolve_source"}
-    value.update(
+def encode_source(source: ResolvedVideoSource) -> bytes:
+    if not isinstance(source, ResolvedVideoSource) or source.local_binding is not None:
+        raise checkpoint_error()
+    return encode_object(
         {
-            field: dict(item) if field == "extensions" else item
-            for field, item in vars(source).items()
+            "step": "resolve_source",
+            "connector_id": source.connector_id,
+            "connector_version": source.connector_version,
+            "platform": source.platform,
+            "canonical_identity_scheme": source.canonical_identity_scheme,
+            "stable_video_identity": source.stable_video_identity,
+            "canonical_identity": source.canonical_identity,
+            "canonical_uri": source.canonical_uri,
+            "logical_reference": source.logical_reference,
+            "materialization_policy": source.materialization_policy.value,
+            "content_sha256": source.content_sha256,
         }
     )
-    return encode_object(value)
 
 
-def decode_source(payload: bytes) -> VideoSourceMetadata:
-    keys = frozenset(VideoSourceMetadata.__dataclass_fields__) | {"step"}
+def decode_source(payload: bytes) -> ResolvedVideoSource:
+    keys = frozenset(
+        {
+            "step",
+            "connector_id",
+            "connector_version",
+            "platform",
+            "canonical_identity_scheme",
+            "stable_video_identity",
+            "canonical_identity",
+            "canonical_uri",
+            "logical_reference",
+            "materialization_policy",
+            "content_sha256",
+        }
+    )
     value = decode_object(payload, keys=keys)
     try:
         if value.pop("step") != "resolve_source":
             raise TypeError
-        return VideoSourceMetadata(**value)
+        materialization_policy = MaterializationPolicy(
+            value.pop("materialization_policy")
+        )
+        return ResolvedVideoSource(
+            **value,
+            materialization_policy=materialization_policy,
+        )
     except (DomainError, TypeError, ValueError):
         raise checkpoint_error() from None
 
 
-def encode_acquired(value: object) -> bytes:
-    if type(value) is not str or not value:
+def encode_acquired(value: VideoAcquisition) -> bytes:
+    if not isinstance(value, VideoAcquisition):
         raise checkpoint_error()
-    return encode_object({"step": "acquire", "reference": value})
+    metadata = {
+        field: dict(item) if field == "extensions" else item
+        for field, item in vars(value.metadata).items()
+    }
+    transcript = None
+    if value.transcript is not None:
+        transcript = {
+            "language": value.transcript.language,
+            "segments": [
+                {
+                    "segment_id": item.segment_id,
+                    "start_ms": item.start_ms,
+                    "end_ms": item.end_ms,
+                    "text": item.text,
+                }
+                for item in value.transcript.segments
+            ],
+        }
+    return encode_object(
+        {
+            "step": "acquire",
+            "metadata": metadata,
+            "subtitle_availability": value.subtitle_availability.value,
+            "transcript": transcript,
+            "transcript_identity": value.transcript_identity,
+            "transcript_provenance": (
+                value.transcript_provenance.value
+                if value.transcript_provenance is not None
+                else None
+            ),
+        }
+    )
 
 
-def decode_acquired(payload: bytes) -> object:
-    value = decode_object(payload, keys=frozenset({"step", "reference"}))
-    reference = value["reference"]
-    if value["step"] != "acquire" or type(reference) is not str or not reference:
-        raise checkpoint_error()
-    return reference
+def decode_acquired(payload: bytes) -> VideoAcquisition:
+    value = decode_object(
+        payload,
+        keys=frozenset(
+            {
+                "step",
+                "metadata",
+                "subtitle_availability",
+                "transcript",
+                "transcript_identity",
+                "transcript_provenance",
+            }
+        ),
+    )
+    try:
+        if value["step"] != "acquire" or type(value["metadata"]) is not dict:
+            raise TypeError
+        transcript_value = value["transcript"]
+        transcript = (
+            None
+            if transcript_value is None
+            else TranscriptDocument(
+                language=transcript_value["language"],
+                segments=tuple(
+                    TranscriptSegment(**item) for item in transcript_value["segments"]
+                ),
+            )
+        )
+        return VideoAcquisition(
+            metadata=VideoSourceMetadata(**value["metadata"]),
+            subtitle_availability=SubtitleAvailability(
+                value["subtitle_availability"]
+            ),
+            transcript=transcript,
+            transcript_identity=value["transcript_identity"],
+            transcript_provenance=(
+                None
+                if value["transcript_provenance"] is None
+                else TranscriptProvenance(value["transcript_provenance"])
+            ),
+        )
+    except (DomainError, KeyError, TypeError, ValueError):
+        raise checkpoint_error() from None
 
 
 def encode_transcript(transcript: TranscriptDocument) -> bytes:

@@ -1,0 +1,15 @@
+{
+  "language": "en",
+  "segments": [
+    {
+      "end": 2.0,
+      "start": 0.0,
+      "text": "A knowledge compiler preserves verifiable sources."
+    },
+    {
+      "end": 4.0,
+      "start": 2.0,
+      "text": "The subtitle path does not download media."
+    }
+  ]
+}

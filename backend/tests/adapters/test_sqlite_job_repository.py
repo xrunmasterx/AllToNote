@@ -1408,6 +1408,90 @@ def test_take_over_running_attempt_requires_new_expired_lease_fence(
         )
 
 
+def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None:
+    now_ms = 1_000
+    repo = SqliteJobRepository.open(tmp_path / "pause-store", clock=lambda: now_ms)
+    job = repo.create_job(request_hash=HASH_A, principal="local", client_request_id=None)
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = repo.acquire_scheduler_lease("current-owner", ttl_seconds=1)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        authority,
+    )
+    operation = repo.prepare_external_operation(
+        job_id=job.job_id,
+        step_id=attempt.step_id,
+        attempt_id=attempt.attempt_id,
+        provider="fixture/provider-v1",
+        request_hash=HASH_A,
+        operation_idempotency_key=None,
+        summary_json="{}",
+        authority=authority,
+    )
+    repo.start_external_operation(operation.operation_id, authority)
+    repo.mark_external_operation_unknown(operation.operation_id, summary_json="{}")
+
+    now_ms = 2_001
+    current_authority = repo.acquire_scheduler_lease("next-owner", ttl_seconds=1)
+    replacement = repo.take_over_running_attempt(
+        job.job_id, attempt.attempt_id, current_authority
+    )
+    with pytest.raises(DomainError, match="attempt_fenced"):
+        repo.pause_for_external_outcome_atomic(
+            job.job_id,
+            attempt.attempt_id,
+            authority,
+        )
+    running_job, active_attempt, no_challenge = repo.get_job_details(job.job_id)
+    assert running_job.state is JobState.RUNNING
+    assert active_attempt == replacement
+    assert no_challenge is None
+
+    challenge = repo.pause_for_external_outcome_atomic(
+        job.job_id,
+        replacement.attempt_id,
+        current_authority,
+    )
+
+    paused_job, _, pending = repo.get_job_details(job.job_id)
+    assert paused_job.state is JobState.WAITING_FOR_INPUT
+    assert pending == challenge
+    assert json.loads(challenge.prompt_json) == {
+        "code": "external_outcome_unknown",
+        "operation_ids": [operation.operation_id],
+    }
+    with repo._connect() as connection:
+        state = connection.execute(
+            "SELECT state FROM attempts WHERE attempt_id = ?", (replacement.attempt_id,)
+        ).fetchone()[0]
+    assert state == AttemptState.NEEDS_INPUT.value
+
+
+def test_pause_for_external_outcome_rolls_back_without_unknown_operation(
+    tmp_path: Path,
+) -> None:
+    repo = SqliteJobRepository.open(tmp_path / "pause-rollback-store")
+    job = repo.create_job(request_hash=HASH_A, principal="local", client_request_id=None)
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        authority,
+    )
+
+    with pytest.raises(DomainError, match="external_outcome_unknown_required"):
+        repo.pause_for_external_outcome_atomic(
+            job.job_id,
+            attempt.attempt_id,
+            authority,
+        )
+
+    current_job, active_attempt, challenge = repo.get_job_details(job.job_id)
+    assert current_job.state is JobState.RUNNING
+    assert active_attempt == attempt
+    assert challenge is None
+
+
 def _create_needs_input_attempt(repo: SqliteJobRepository):
     job = repo.create_job(
         request_hash=HASH_A,

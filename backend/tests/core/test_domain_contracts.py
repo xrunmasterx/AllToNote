@@ -585,6 +585,8 @@ def test_task6_checkpoint_and_event_ports_have_exact_frozen_methods() -> None:
         "create_attempt",
         "latest_checkpoint",
         "heartbeat_scheduler_lease",
+        "pause_for_external_outcome_atomic",
+        "reconcile_external_operations_after_process_loss",
         "release_scheduler_lease",
         "start_attempt",
         "take_over_running_attempt",

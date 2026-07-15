@@ -347,6 +347,7 @@ class LegacyVideoSourceAdapter:
         source: ResolvedVideoSource,
         *,
         need_media: bool,
+        need_subtitles: bool = True,
         output_dir: Path,
         token: CancellationTokenPort,
     ) -> AcquiredVideoSource:
@@ -387,7 +388,8 @@ class LegacyVideoSourceAdapter:
 
         spec = _DEFAULT_SPECS[source.connector_id]
         if not need_media and not (
-            spec.supports_subtitles or spec.supports_metadata_only
+            (need_subtitles and spec.supports_subtitles)
+            or spec.supports_metadata_only
         ):
             token.raise_if_cancelled()
             return AcquiredVideoSource(
@@ -416,11 +418,15 @@ class LegacyVideoSourceAdapter:
                 raise _map_legacy_error(error, source.connector_id) from None
             token.raise_if_cancelled()
 
-        subtitle, subtitle_availability = self._acquire_subtitle(
-            downloader,
-            source,
-            output,
-            token,
+        subtitle, subtitle_availability = (
+            self._acquire_subtitle(
+                downloader,
+                source,
+                output,
+                token,
+            )
+            if need_subtitles
+            else (None, SubtitleAvailability.NOT_SUPPORTED)
         )
         return self._build_acquired(
             source,

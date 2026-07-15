@@ -657,6 +657,90 @@ class SqliteJobRepository:
             )
             return self._get_challenge(connection, challenge_id)
 
+    def pause_for_external_outcome_atomic(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+    ) -> Challenge:
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "challenge_job_not_running",
+                    ErrorCategory.CONFLICT,
+                    "External outcome pause requires a running Job",
+                )
+            attempt = self._assert_execution_authority(
+                connection, job_id, attempt_id, authority
+            )
+            unknown_rows = connection.execute(
+                """
+                SELECT operation_id FROM external_operations
+                WHERE job_id = ? AND step_id = ? AND outcome = ?
+                ORDER BY operation_id
+                """,
+                (job_id, attempt.step_id, ExternalOutcome.UNKNOWN.value),
+            ).fetchall()
+            operation_ids = [row["operation_id"] for row in unknown_rows]
+            if not operation_ids:
+                raise DomainError(
+                    "external_outcome_unknown_required",
+                    ErrorCategory.CONFLICT,
+                    "External outcome pause requires an unknown operation",
+                )
+            prompt_json = json.dumps(
+                {
+                    "code": "external_outcome_unknown",
+                    "operation_ids": operation_ids,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            pending = connection.execute(
+                """
+                SELECT 1 FROM challenges
+                WHERE job_id = ? AND state = ?
+                LIMIT 1
+                """,
+                (job_id, ChallengeState.PENDING.value),
+            ).fetchone()
+            if pending is not None:
+                raise DomainError(
+                    "challenge_pending_exists",
+                    ErrorCategory.CONFLICT,
+                    "Job already has a pending Challenge",
+                )
+            now = utc_now_millis()
+            connection.execute(
+                "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
+                (AttemptState.NEEDS_INPUT.value, now, attempt_id),
+            )
+            challenge_id = new_typed_id("chl")
+            connection.execute(
+                """
+                INSERT INTO challenges (
+                    challenge_id, job_id, attempt_id, state, prompt_json,
+                    response_json, response_hash, response_attempt_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    challenge_id,
+                    job_id,
+                    attempt_id,
+                    ChallengeState.PENDING.value,
+                    prompt_json,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
+                (JobState.WAITING_FOR_INPUT.value, now, job_id),
+            )
+            return self._get_challenge(connection, challenge_id)
+
     def respond_challenge_atomic(
         self,
         job_id: str,

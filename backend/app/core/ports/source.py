@@ -75,6 +75,7 @@ class VideoSourcePort(Protocol):
         source: ResolvedVideoSource,
         *,
         need_media: bool,
+        need_subtitles: bool = True,
         output_dir: Path,
         token: CancellationTokenPort,
     ) -> AcquiredVideoSource: ...
