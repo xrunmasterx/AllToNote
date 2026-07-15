@@ -69,7 +69,7 @@ from app.core.ports.source import ResolvedVideoSource
 
 RUNTIME_VERSION = "0.1.0"
 CHECKPOINT_SCHEMA = "video-step.v1"
-_CANDIDATE_ASSEMBLY_BEHAVIOR = "linked-screenshot-draft-v1"
+_CANDIDATE_ASSEMBLY_BEHAVIOR = "linked-screenshot-draft-v2"
 _SCHEDULER_LEASE_TTL_SECONDS = 300
 _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _AUTHORITY_LOSS_CODES = frozenset({"attempt_fenced", "scheduler_lease_lost"})
@@ -511,6 +511,10 @@ class VideoService:
             encode=_encode_draft,
             decode=_decode_draft,
             resumed_attempt=resumed_attempt,
+        )
+        draft = replace(
+            draft,
+            markdown=rewrite_segment_citations(draft.markdown, evidence_ids),
         )
         screenshots = self._checkpointed(
             job_id,

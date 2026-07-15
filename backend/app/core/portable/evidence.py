@@ -25,6 +25,10 @@ _EVIDENCE_ID = re.compile(
     r"ev_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
 _SEGMENT_ID = re.compile(r"seg_[0-9]{6,}\Z")
+_EVIDENCE_CITATION = re.compile(
+    r"\[\^(ev_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\]"
+)
 
 
 @dataclass(frozen=True)
@@ -230,5 +234,34 @@ def rewrite_segment_citations(
             cursor = closing + 1
             continue
         cursor += 1
+    output.append(markdown[copied_until:])
+    return _separate_adjacent_evidence_citations(
+        "".join(output),
+        frozenset(citation_map.values()),
+    )
+
+
+def _separate_adjacent_evidence_citations(
+    markdown: str,
+    evidence_ids: frozenset[str],
+) -> str:
+    visible_mask = markdown_visible_mask(markdown)
+    output: list[str] = []
+    copied_until = 0
+    previous_end: int | None = None
+    for match in _EVIDENCE_CITATION.finditer(markdown):
+        start, end = match.span()
+        if (
+            match.group(1) not in evidence_ids
+            or is_backslash_escaped(markdown, start)
+            or not all(visible_mask[start:end])
+        ):
+            previous_end = None
+            continue
+        if previous_end == start:
+            output.append(markdown[copied_until:start])
+            output.append(" ")
+            copied_until = start
+        previous_end = end
     output.append(markdown[copied_until:])
     return "".join(output)

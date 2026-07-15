@@ -532,6 +532,58 @@ def test_segment_citations_are_rewritten_to_trusted_evidence_ids() -> None:
     assert result == f"结论[^{EVIDENCE_IDS[0]}]"
 
 
+def test_adjacent_rewritten_evidence_citations_are_space_separated() -> None:
+    third_evidence_id = "ev_018f0000-0000-7000-8000-000000000007"
+
+    result = rewrite_segment_citations(
+        "Claim[^seg_000001][^seg_000002][^seg_000003]",
+        {
+            "seg_000001": EVIDENCE_IDS[0],
+            "seg_000002": EVIDENCE_IDS[1],
+            "seg_000003": third_evidence_id,
+        },
+    )
+
+    assert result == (
+        f"Claim[^{EVIDENCE_IDS[0]}] [^{EVIDENCE_IDS[1]}] "
+        f"[^{third_evidence_id}]"
+    )
+
+
+def test_existing_space_between_evidence_citations_is_preserved() -> None:
+    source = f"Claim[^{EVIDENCE_IDS[0]}] [^{EVIDENCE_IDS[1]}]"
+
+    result = rewrite_segment_citations(
+        source,
+        {
+            "seg_000001": EVIDENCE_IDS[0],
+            "seg_000002": EVIDENCE_IDS[1],
+        },
+    )
+
+    assert result == source
+
+
+def test_evidence_spacing_leaves_non_evidence_markdown_unchanged() -> None:
+    source = (
+        "[label][target][other]\n\n"
+        f"`[^{EVIDENCE_IDS[0]}][^{EVIDENCE_IDS[1]}]`\n\n"
+        "```markdown\n"
+        f"[^{EVIDENCE_IDS[0]}][^{EVIDENCE_IDS[1]}]\n"
+        "```\n"
+    )
+
+    result = rewrite_segment_citations(
+        source,
+        {
+            "seg_000001": EVIDENCE_IDS[0],
+            "seg_000002": EVIDENCE_IDS[1],
+        },
+    )
+
+    assert result == source
+
+
 def test_citation_rewrite_ignores_fenced_and_inline_code() -> None:
     source = (
         "正文[^seg_000001]\n\n"

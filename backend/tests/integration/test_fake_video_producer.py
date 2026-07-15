@@ -19,12 +19,17 @@ from app.core.domain.video import (
     QualityOverall,
     ScreenshotPolicy,
     ScreenshotRequest,
+    TranscriptDocument,
+    TranscriptSegment,
     VideoProduceRequest,
 )
 from app.core.application.video_service import (
+    VideoService,
     VideoPreflightCapabilities,
     _CandidateCheckpoint,
 )
+from app.core.application.video_checkpoints import decode_draft, encode_draft
+from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError
 
 
@@ -512,6 +517,146 @@ def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
     assert operations.count("download") == 1
     assert operations.count("transcribe") == 1
     assert operations.count("model") == 1
+
+
+def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "legacy-citation-spacing-machine"
+    call_log = tmp_path / "legacy-citation-spacing-calls.ndjson"
+    transcript = TranscriptDocument(
+        "zh-CN",
+        (
+            TranscriptSegment("seg_000001", 0, 1_000, "First claim"),
+            TranscriptSegment("seg_000002", 1_000, 2_000, "Second claim"),
+        ),
+    )
+    request = replace(
+        valid_request(workspace_root, client_request_id="legacy-citation-spacing"),
+        provided_transcript=transcript,
+        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        crash_operation_once="screenshots",
+        owner_id="legacy-spacing-first",
+        clock=lambda: 1_000,
+        screenshot_requests=(ScreenshotRequest("seg_000001", 0),),
+    )
+    service = first._sdk._video_service
+    delegate = service._operations
+
+    class AdjacentCitationOperations:
+        def __getattr__(self, name: str) -> object:
+            return getattr(delegate, name)
+
+        def generate_draft(
+            self,
+            request_value: VideoProduceRequest,
+            transcript_value: TranscriptDocument,
+            *,
+            execution: object,
+        ) -> GeneratedVideoDraft:
+            generated = delegate.generate_draft(
+                request_value,
+                transcript_value,
+                execution=execution,
+            )
+            return replace(
+                generated,
+                markdown=(
+                    "# Video note\n\n## Evidence\n\n"
+                    "First and second claims.[^seg_000001][^seg_000002]\n"
+                ),
+                cited_segment_ids=("seg_000001", "seg_000002"),
+            )
+
+    service._operations = AdjacentCitationOperations()
+    submitted = first.submit_video(request)
+
+    with pytest.raises(RuntimeError, match="injected screenshots crash"):
+        first.wait_job(submitted.job_id)
+
+    draft_metadata = first.job_repository.latest_checkpoint(
+        submitted.job_id, "generate_draft"
+    )
+    assert draft_metadata is not None
+    request_hash = VideoService._request_hash(request)
+    assert draft_metadata.input_hash == request_hash
+    draft_path = (
+        Path(first.job_repository.database_path).parent.parent
+        / "attempts"
+        / draft_metadata.relative_path
+    )
+    durable_draft = decode_draft(draft_path.read_bytes())
+    evidence_ids = tuple(
+        VideoService._derived_id(submitted.job_id, "ev", segment_id)
+        for segment_id in durable_draft.cited_segment_ids
+    )
+    adjacent = f"[^{evidence_ids[0]}][^{evidence_ids[1]}]"
+    spaced = f"[^{evidence_ids[0]}] [^{evidence_ids[1]}]"
+    legacy_draft = replace(
+        durable_draft,
+        markdown=durable_draft.markdown.replace(spaced, adjacent),
+    )
+    legacy_payload = encode_draft(legacy_draft)
+    assert adjacent in legacy_draft.markdown
+    draft_path.write_bytes(legacy_payload)
+    with first.job_repository._transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            UPDATE checkpoints SET output_hash = ?, byte_length = ?
+            WHERE checkpoint_id = ?
+            """,
+            (
+                sha256_digest(legacy_payload),
+                len(legacy_payload),
+                draft_metadata.checkpoint_id,
+            ),
+        )
+
+    old_candidate_hash = sha256_digest(
+        json.dumps(
+            {"behavior": "linked-screenshot-draft-v1", "request": request_hash},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    assert VideoService._candidate_assembly_input_hash(request_hash) != old_candidate_hash
+
+    del first
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        call_log_path=call_log,
+        owner_id="legacy-spacing-second",
+        clock=lambda: 302_000,
+    )
+    recovered = reopened.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    assert recovered.result is not None
+    operations = _read_call_log(call_log)
+    assert operations.count("model") == 1
+    recovered_draft_metadata = reopened.job_repository.latest_checkpoint(
+        submitted.job_id, "generate_draft"
+    )
+    assert recovered_draft_metadata is not None
+    assert recovered_draft_metadata.checkpoint_id == draft_metadata.checkpoint_id
+    assert recovered_draft_metadata.input_hash == request_hash
+    committed = workspace_root / recovered.result.workspace_relative_bundle_path
+    final_markdown = (
+        committed
+        / "drafts"
+        / f"{recovered.result.primary_draft_artifact_id}.md"
+    ).read_text(encoding="utf-8")
+    assert spaced in final_markdown
+    assert adjacent not in final_markdown
+    assert final_markdown.count(f"[^{evidence_ids[0]}]") == 2
+    assert final_markdown.count(f"[^{evidence_ids[1]}]") == 2
+    _validate_committed_bundle(workspace_root, recovered.result.bundle_id)
 
 
 def test_unsupported_recipe_version_fails_preflight_without_external_work(
