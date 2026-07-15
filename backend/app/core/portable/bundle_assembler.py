@@ -41,10 +41,15 @@ _TYPED_ID = re.compile(
 )
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EMBEDDED_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
-_EMBEDDED_UNC_PATH = re.compile(r"(?<![\\])\\\\[^\\\s]+\\[^\\\s]+")
-_EMBEDDED_POSIX_PATH = re.compile(
-    r"(?<![:/A-Za-z0-9._-])/(?!/)(?=[^\s]*[^/\\\s])[^\s]+"
+_EMBEDDED_FILE_PATH = re.compile(
+    r"(?<![A-Za-z0-9+.-])file:(?:/{1,3}|\\\\)",
+    re.IGNORECASE,
 )
+_EMBEDDED_UNC_PATH = re.compile(
+    r"(?<![:/\\])[/\\]{2}[^/\\\s]+[/\\][^/\\\s]+"
+)
+_EMBEDDED_POSIX_PATH = re.compile(r"(?<![:/A-Za-z0-9._-])/(?!/)[^\s]+")
+_PATH_TRAILING_BOUNDARIES = ")]}`'\"）】》」』，。；：！？"
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
         "accesskey",
@@ -178,6 +183,14 @@ def _is_absolute_or_local_path(value: str) -> bool:
     )
 
 
+def _contains_embedded_posix_path(value: str) -> bool:
+    for match in _EMBEDDED_POSIX_PATH.finditer(value):
+        candidate = match.group(0).rstrip(_PATH_TRAILING_BOUNDARIES)
+        if any(character not in "/\\" for character in candidate):
+            return True
+    return False
+
+
 def _validate_safe_value(value: object, field_name: str = "value") -> None:
     if value is None or type(value) in {bool, int, float}:
         return
@@ -188,8 +201,9 @@ def _validate_safe_value(value: object, field_name: str = "value") -> None:
         if (
             _is_absolute_or_local_path(value)
             or _EMBEDDED_WINDOWS_PATH.search(value)
+            or _EMBEDDED_FILE_PATH.search(value)
             or _EMBEDDED_UNC_PATH.search(value)
-            or _EMBEDDED_POSIX_PATH.search(value)
+            or _contains_embedded_posix_path(value)
         ):
             raise _error(
                 "video_bundle_sensitive_data",

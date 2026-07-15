@@ -1168,13 +1168,27 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
     assert not _candidate_path(workspace_root).exists()
 
 
-def test_assembler_allows_standalone_slash_backslash_notation(
+@pytest.mark.parametrize(
+    "notation",
+    (
+        "/\\",
+        "/",
+        "(/\\)",
+        "(/)",
+        "`/\\`",
+        "`/`",
+        "（/\\）",
+        "（/），",
+    ),
+)
+def test_assembler_allows_separator_notation_at_punctuation_boundaries(
     workspace_root: Path,
+    notation: str,
 ) -> None:
     bundle_input = _bundle_input(workspace_root)
     source = replace(
         bundle_input.source,
-        title="Path separators /\\ are shown for comparison",
+        title=f"Path separators {notation} are shown for comparison",
     )
 
     candidate = BundleAssembler().assemble(replace(bundle_input, source=source))
@@ -1183,6 +1197,54 @@ def test_assembler_allows_standalone_slash_backslash_notation(
         workspace_root,
         candidate.staging_relative_path,
     ).valid
+
+
+def test_assembler_allows_embedded_https_url_in_general_metadata(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    source = replace(
+        bundle_input.source,
+        title="Reference https://example.com/docs/path for details",
+    )
+
+    candidate = BundleAssembler().assemble(replace(bundle_input, source=source))
+
+    assert IWikiPortableGateway().validate_candidate(
+        workspace_root,
+        candidate.staging_relative_path,
+    ).valid
+
+
+@pytest.mark.parametrize(
+    "unsafe_title",
+    (
+        "diagnostic file:///home/alice/private.log failed",
+        "diagnostic //server/share/private.log failed",
+        r"diagnostic \\server/share/private.log failed",
+        r"diagnostic //server\share/private.log failed",
+        "diagnostic (/home/alice/private.log) failed",
+        "diagnostic `/etc/passwd` failed",
+        "diagnostic （/home/alice/private.log），failed",
+    ),
+)
+def test_assembler_rejects_embedded_local_paths_at_separator_and_punctuation_boundaries(
+    workspace_root: Path,
+    unsafe_title: str,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    invalid = replace(
+        bundle_input,
+        source=replace(bundle_input.source, title=unsafe_title),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        BundleAssembler().assemble(invalid)
+
+    assert raised.value.code == "video_bundle_sensitive_data"
+    assert unsafe_title not in str(raised.value)
+    assert unsafe_title not in repr(raised.value)
+    assert not _candidate_path(workspace_root).exists()
 
 
 def test_assembler_rejects_hash_route_like_posix_path_in_general_metadata(
