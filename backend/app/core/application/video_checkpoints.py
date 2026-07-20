@@ -13,6 +13,8 @@ from app.core.domain.video import (
     ScreenshotRequest,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
+    VideoProducedDocument,
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.application.video_acquisition import (
@@ -76,6 +78,7 @@ class CandidateCheckpoint:
     publish_eligible: bool
     usage: Mapping[str, int]
     warnings: tuple[str, ...]
+    documents: tuple[VideoProducedDocument, ...] = ()
 
     _KEYS = frozenset(
         {
@@ -99,11 +102,38 @@ class CandidateCheckpoint:
             "warnings",
         }
     )
+    _V2_KEYS = _KEYS | {"documents"}
     _USAGE_KEYS = frozenset({"input_tokens", "output_tokens"})
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "display_asset_ids", tuple(self.display_asset_ids))
+        object.__setattr__(self, "usage", dict(self.usage))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        documents = tuple(self.documents)
+        if (
+            any(not isinstance(document, VideoProducedDocument) for document in documents)
+            or len({document.document_kind for document in documents}) != len(documents)
+            or len({document.draft_artifact_id for document in documents}) != len(documents)
+            or len({document.quality_report_artifact_id for document in documents})
+            != len(documents)
+            or (
+                bool(documents)
+                and not any(
+                    document.draft_artifact_id
+                    == self.primary_draft_artifact_id
+                    and document.quality_report_artifact_id
+                    == self.quality_report_artifact_id
+                    and document.quality_overall is self.quality_overall
+                    and document.publish_eligible is self.publish_eligible
+                    for document in documents
+                )
+            )
+        ):
+            raise checkpoint_error()
+        object.__setattr__(self, "documents", documents)
+
     def encode(self) -> bytes:
-        return encode_object(
-            {
+        value: dict[str, object] = {
                 "step": "assemble_candidate_bundle",
                 "staging_relative_path": self.staging_relative_path,
                 "bundle_id": self.bundle_id,
@@ -123,7 +153,20 @@ class CandidateCheckpoint:
                 "usage": dict(self.usage),
                 "warnings": list(self.warnings),
             }
-        )
+        if self.documents:
+            value["documents"] = [
+                {
+                    "document_kind": document.document_kind.value,
+                    "draft_artifact_id": document.draft_artifact_id,
+                    "quality_report_artifact_id": (
+                        document.quality_report_artifact_id
+                    ),
+                    "quality_overall": document.quality_overall.value,
+                    "publish_eligible": document.publish_eligible,
+                }
+                for document in self.documents
+            ]
+        return encode_object(value)
 
     @classmethod
     def decode(cls, payload: bytes) -> CandidateCheckpoint:
@@ -131,7 +174,7 @@ class CandidateCheckpoint:
             value = json.loads(payload)
             if (
                 type(value) is not dict
-                or frozenset(value) != cls._KEYS
+                or frozenset(value) not in {cls._KEYS, cls._V2_KEYS}
                 or value["step"] != "assemble_candidate_bundle"
             ):
                 raise TypeError
@@ -144,12 +187,14 @@ class CandidateCheckpoint:
                 raise TypeError
             display_asset_ids = value["display_asset_ids"]
             warnings = value["warnings"]
+            document_values = value.get("documents", [])
             if (
                 type(display_asset_ids) is not list
                 or any(not _typed_id_is_valid(item, "art") for item in display_asset_ids)
                 or len(set(display_asset_ids)) != len(display_asset_ids)
                 or type(warnings) is not list
                 or any(type(item) is not str for item in warnings)
+                or type(document_values) is not list
                 or type(value["publish_eligible"]) is not bool
                 or not _staging_path_is_valid(value["staging_relative_path"])
             ):
@@ -196,6 +241,18 @@ class CandidateCheckpoint:
                 publish_eligible=value["publish_eligible"],
                 usage=usage,
                 warnings=tuple(warnings),
+                documents=tuple(
+                    VideoProducedDocument(
+                        document_kind=VideoDocumentKind(item["document_kind"]),
+                        draft_artifact_id=item["draft_artifact_id"],
+                        quality_report_artifact_id=item[
+                            "quality_report_artifact_id"
+                        ],
+                        quality_overall=QualityOverall(item["quality_overall"]),
+                        publish_eligible=item["publish_eligible"],
+                    )
+                    for item in document_values
+                ),
             )
         except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             raise DomainError(

@@ -102,7 +102,12 @@ class JobService:
     def __init__(self, repository: JobRepositoryPort) -> None:
         self._repository = repository
 
-    def submit(self, request: object) -> JobSnapshot:
+    def submit(
+        self,
+        request: object,
+        *,
+        initial_events: tuple[tuple[str, object], ...] = (),
+    ) -> JobSnapshot:
         principal = _request_field(request, "principal")
         client_request_id = _request_field(request, "client_request_id")
         if type(principal) is not str or not principal.strip():
@@ -122,11 +127,16 @@ class JobService:
         request_json = _canonical_json(
             request, excluded_fields=_IDEMPOTENCY_FIELDS
         )
+        serialized_events = tuple(
+            (event_type, _canonical_json(payload))
+            for event_type, payload in initial_events
+        )
         job = self._repository.create_job(
             request_hash=_sha256_json(request_json),
             request_json=request_json,
             principal=principal,
             client_request_id=client_request_id,
+            initial_events=serialized_events,
         )
         return self.get(job.job_id)
 
@@ -174,6 +184,8 @@ class JobService:
         self,
         original_job_id: str,
         retry_request: object,
+        *,
+        initial_events: tuple[tuple[str, object], ...] = (),
     ) -> JobSnapshot:
         if type(retry_request) is not RetryJobRequest:
             raise DomainError(
@@ -215,11 +227,16 @@ class JobService:
                 ErrorCategory.INVALID_REQUEST,
                 "Unknown operation confirmations must be unique IDs",
             )
+        serialized_events = tuple(
+            (event_type, _canonical_json(payload))
+            for event_type, payload in initial_events
+        )
         job = self._repository.create_retry_job_atomic(
             original_job_id,
             expected_original_state=retry_request.expected_original_job_state,
             confirmed_unknown_operation_ids=confirmed,
             client_request_id=retry_request.client_request_id,
+            initial_events=serialized_events,
         )
         return self.get(job.job_id)
 

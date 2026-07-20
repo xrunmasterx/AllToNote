@@ -115,7 +115,7 @@ def test_cli_overrides_are_strict_and_cannot_contain_secrets(tmp_path: Path) -> 
         )
 
 
-def test_default_path_uses_platformdirs_user_config_path(
+def test_default_path_uses_shared_runtime_path_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "config.toml"
@@ -124,7 +124,8 @@ def test_default_path_uses_platformdirs_user_config_path(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "app.core.config.loader.user_config_path", lambda app_name: tmp_path
+        "app.core.config.loader.resolve_runtime_paths",
+        lambda: type("Paths", (), {"config_file": path})(),
     )
 
     config = load_runtime_config(None, {})

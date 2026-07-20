@@ -1,0 +1,27 @@
+{
+  "alltonote_cli_protocol_version": 1,
+  "ok": false,
+  "command": "produce video",
+  "correlation_id": "corr_018cc251-f400-7000-8000-000000000000",
+  "data": {},
+  "error": {
+    "code": "video_feature_pack_unavailable",
+    "category": "workspace_incompatible",
+    "message": "Video capability is unavailable",
+    "retryable": false,
+    "next_actions": [
+      "Install or enable the required compatible capability"
+    ],
+    "details": {
+      "capability": "recipe.video"
+    }
+  },
+  "warnings": [],
+  "job": null,
+  "artifacts": [],
+  "capabilities": [],
+  "versions": {
+    "runtime_version": "0.1.0",
+    "cli_protocol_version": 1
+  }
+}

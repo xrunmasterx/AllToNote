@@ -20,5 +20,8 @@ class AllToNoteSDK:
     def get_job(self, job_id: str) -> JobSnapshot:
         return self._video_service.get_job(job_id)
 
+    def cancel_job(self, job_id: str) -> JobSnapshot:
+        return self._video_service.cancel_job(job_id)
+
 
 __all__ = ["AllToNoteSDK"]

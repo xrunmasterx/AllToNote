@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -91,7 +92,33 @@ class CodexAppServerClient:
             state.done = True
             state.error = CodexAppServerClient._extract_error_message(params.get("error") or params)
 
-    def run_markdown_turn(self, prompt: str, model: str, cwd: Optional[str] = None) -> str:
+    def run_markdown_turn(
+        self,
+        prompt: str,
+        model: str,
+        cwd: Optional[str] = None,
+        *,
+        timeout_seconds: int | float | None = None,
+        output_schema: dict[str, object] | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str:
+        resolved_timeout = (
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
+        if (
+            type(resolved_timeout) not in (int, float)
+            or not math.isfinite(resolved_timeout)
+            or resolved_timeout <= 0
+            or (output_schema is not None and type(output_schema) is not dict)
+            or (
+                reasoning_effort is not None
+                and (
+                    type(reasoning_effort) is not str
+                    or not reasoning_effort.strip()
+                )
+            )
+        ):
+            raise CodexAppServerError("Codex app-server turn options are invalid")
         try:
             CodexAppServerStatusService.assert_ready()
         except RuntimeError as exc:
@@ -124,15 +151,15 @@ class CodexAppServerClient:
         stderr_thread.start()
 
         state = CodexTurnState()
-        deadline = time.monotonic() + self.timeout_seconds
+        deadline = time.monotonic() + resolved_timeout
         try:
             self._send_request(
                 process,
                 "initialize",
                 {
                     "clientInfo": {
-                        "name": "bilinote",
-                        "title": "BiliNote",
+                        "name": "alltonote",
+                        "title": "AllToNote",
                         "version": "0.0.0",
                     },
                     "capabilities": {
@@ -151,8 +178,8 @@ class CodexAppServerClient:
                 "sandbox": "read-only",
                 "ephemeral": True,
                 "baseInstructions": (
-                    "You are BiliNote's Markdown note generation backend. "
-                    "Only output the requested Markdown. Do not call tools, "
+                    "You are AllToNote's single-request model backend. "
+                    "Return only the exact format requested by the prompt. Do not call tools, "
                     "run commands, inspect files, or modify files."
                 ),
             }
@@ -168,6 +195,10 @@ class CodexAppServerClient:
                 "model": model,
                 "threadId": thread_id,
             }
+            if output_schema is not None:
+                turn_params["outputSchema"] = output_schema
+            if reasoning_effort is not None:
+                turn_params["effort"] = reasoning_effort
             self._send_request(process, "turn/start", turn_params)
             self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
 

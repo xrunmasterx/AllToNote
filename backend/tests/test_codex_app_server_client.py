@@ -341,12 +341,17 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
         "make note",
         "gpt-5",
         cwd="E:\\VideoToNote",
+        timeout_seconds=0.75,
+        output_schema={"type": "object"},
+        reasoning_effort="medium",
     )
 
     assert result == "# Note"
     turn_start = fake_processes[0].stdin.messages[3]
     assert turn_start["method"] == "turn/start"
     assert turn_start["params"]["threadId"] == "thread-123"
+    assert turn_start["params"]["outputSchema"] == {"type": "object"}
+    assert turn_start["params"]["effort"] == "medium"
 
 
 def test_run_markdown_turn_sends_initialized_notification_after_initialize(monkeypatch):

@@ -1,0 +1,26 @@
+{
+  "alltonote_cli_protocol_version": 1,
+  "ok": true,
+  "command": "produce video",
+  "correlation_id": "corr_018cc251-f400-7000-8000-000000000000",
+  "data": {
+    "job_id": "job_018cc251-f400-7000-8000-000000000001",
+    "state": "queued"
+  },
+  "error": null,
+  "warnings": [],
+  "job": {
+    "job_id": "job_018cc251-f400-7000-8000-000000000001",
+    "state": "queued",
+    "cancellation_requested": false,
+    "active_attempt_id": null,
+    "challenge_id": null,
+    "retry_of_job_id": null
+  },
+  "artifacts": [],
+  "capabilities": [],
+  "versions": {
+    "runtime_version": "0.1.0",
+    "cli_protocol_version": 1
+  }
+}

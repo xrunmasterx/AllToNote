@@ -12,7 +12,7 @@ from typing import TypeVar
 from urllib.parse import parse_qsl, urlsplit
 
 from app.core.domain.ids import sha256_digest
-from app.core.domain.video import TranscriptDocument
+from app.core.domain.video import QualityOverall, TranscriptDocument, VideoDocumentKind
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import EvidenceSet, build_evidence_set
@@ -85,6 +85,25 @@ _VALIDATED_SOURCE_URL_FIELDS = frozenset(
     }
 )
 _USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
+_VIDEO_OUTPUT_PROFILE_V2 = "urn:alltonote:video-producer:output-profile:v2"
+_TRANSCRIPT_BASES = frozenset(
+    {
+        "uploader-caption",
+        "platform-caption",
+        "human-transcript",
+        "asr-transcript",
+        "unknown",
+    }
+)
+_LANGUAGE_POLICIES = frozenset(
+    {"output-language", "preserve-source", "translate-to-output"}
+)
+_QUALITY_STATUSES = frozenset({"pass", "warn", "fail", "skipped"})
+_QUALITY_OVERALL_RANK = {
+    QualityOverall.PASS: 0,
+    QualityOverall.PASS_WITH_WARNINGS: 1,
+    QualityOverall.FAIL: 2,
+}
 _REDACTION_FIELDS = frozenset({"secrets", "prompts", "provider_payloads"})
 _REDACTION_VALUES = {
     "secrets": frozenset({"omitted"}),
@@ -352,6 +371,187 @@ class VideoArtifactIds:
 
 
 @dataclass(frozen=True)
+class VideoDraftBundleInput:
+    document_kind: VideoDocumentKind
+    draft_artifact_id: str
+    quality_report_artifact_id: str
+    quality: QualityOutcome
+    recipe_id: str
+    recipe_version: int
+    quality_profile: str
+    transcript_basis: str
+    source_language: str
+    language_policy: str
+    target_language: str | None
+    model_binding_sha256: str
+    model_operation_count: int
+    sequential_model_waves: int
+    repair_operation_count: int
+    usage: Mapping[str, object]
+    warnings: tuple[str, ...]
+    quality_summary: Mapping[str, object]
+    faithful_summary: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document_kind, VideoDocumentKind):
+            raise _error("video_bundle_input_invalid", "document_kind is invalid")
+        _require_id(self.draft_artifact_id, "art", "draft_artifact_id")
+        _require_id(
+            self.quality_report_artifact_id,
+            "art",
+            "quality_report_artifact_id",
+        )
+        if self.draft_artifact_id == self.quality_report_artifact_id:
+            raise _reference_invalid()
+        if not isinstance(self.quality, QualityOutcome):
+            raise _error("video_bundle_input_invalid", "quality is invalid")
+        _require_text(self.recipe_id, "recipe_id")
+        if type(self.recipe_version) is not int or self.recipe_version < 1:
+            raise _error("video_bundle_input_invalid", "recipe_version must be positive")
+        _require_text(self.quality_profile, "quality_profile")
+        if self.transcript_basis not in _TRANSCRIPT_BASES:
+            raise _error("video_bundle_input_invalid", "transcript_basis is invalid")
+        _require_text(self.source_language, "source_language")
+        if self.language_policy not in _LANGUAGE_POLICIES:
+            raise _error("video_bundle_input_invalid", "language_policy is invalid")
+        if self.language_policy == "translate-to-output":
+            _require_text(self.target_language, "target_language")
+        elif self.language_policy == "preserve-source" and self.target_language is not None:
+            raise _error(
+                "video_bundle_input_invalid",
+                "preserve-source drafts cannot declare a target language",
+            )
+        elif self.language_policy == "output-language":
+            _require_text(self.target_language, "target_language")
+        _require_digest(self.model_binding_sha256, "model_binding_sha256")
+        for field_name in (
+            "model_operation_count",
+            "sequential_model_waves",
+            "repair_operation_count",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise _error("video_bundle_input_invalid", f"{field_name} is invalid")
+        if (
+            self.model_operation_count < 1
+            or not 1 <= self.sequential_model_waves <= self.model_operation_count
+            or self.repair_operation_count > self.model_operation_count
+        ):
+            raise _error("video_bundle_input_invalid", "Draft execution summary is invalid")
+        usage = _snapshot_mapping(self.usage, "draft.usage")
+        if frozenset(usage) != _USAGE_FIELDS or any(
+            type(value) is not int or value < 0 for value in usage.values()
+        ):
+            raise _error("video_bundle_input_invalid", "Draft usage is invalid")
+        warnings = _snapshot_tuple(self.warnings, "draft.warnings")
+        if (
+            len(warnings) > 128
+            or len(warnings) != len(set(warnings))
+            or any(type(value) is not str or not value for value in warnings)
+        ):
+            raise _error("video_bundle_input_invalid", "Draft warnings are invalid")
+        quality_summary = _snapshot_mapping(
+            self.quality_summary,
+            "draft.quality_summary",
+        )
+        self._validate_quality_summary(quality_summary)
+        faithful_summary = (
+            None
+            if self.faithful_summary is None
+            else _snapshot_mapping(self.faithful_summary, "draft.faithful_summary")
+        )
+        if self.document_kind is VideoDocumentKind.FAITHFUL_EDITION:
+            self._validate_faithful_summary(faithful_summary)
+        elif faithful_summary is not None:
+            raise _error(
+                "video_bundle_input_invalid",
+                "Knowledge-note drafts cannot carry a faithful summary",
+            )
+        object.__setattr__(self, "usage", usage)
+        object.__setattr__(self, "warnings", warnings)
+        object.__setattr__(self, "quality_summary", quality_summary)
+        object.__setattr__(self, "faithful_summary", faithful_summary)
+
+    @staticmethod
+    def _validate_quality_summary(summary: Mapping[str, object]) -> None:
+        if frozenset(summary) != {
+            "overall",
+            "checks",
+            "method_summary",
+            "metrics",
+        }:
+            raise _error("video_bundle_input_invalid", "Draft quality summary is invalid")
+        if summary["overall"] not in {value.value for value in QualityOverall}:
+            raise _error("video_bundle_input_invalid", "Draft quality overall is invalid")
+        checks = summary["checks"]
+        if type(checks) is not list or not checks or len(checks) > 64:
+            raise _error("video_bundle_input_invalid", "Draft quality checks are invalid")
+        check_ids: list[str] = []
+        for check in checks:
+            if not isinstance(check, Mapping) or frozenset(check) - {
+                "id",
+                "status",
+                "reason",
+            }:
+                raise _error("video_bundle_input_invalid", "Draft quality check is invalid")
+            if frozenset(check) < {"id", "status"}:
+                raise _error("video_bundle_input_invalid", "Draft quality check is incomplete")
+            check_id = check["id"]
+            status = check["status"]
+            if (
+                type(check_id) is not str
+                or not check_id
+                or status not in _QUALITY_STATUSES
+                or (
+                    "reason" in check
+                    and (type(check["reason"]) is not str or not check["reason"])
+                )
+                or (status == "skipped" and "reason" not in check)
+            ):
+                raise _error("video_bundle_input_invalid", "Draft quality check is invalid")
+            check_ids.append(check_id)
+        if len(check_ids) != len(set(check_ids)):
+            raise _error("video_bundle_input_invalid", "Draft quality checks are duplicated")
+        method_summary = summary["method_summary"]
+        metrics = summary["metrics"]
+        if not isinstance(method_summary, Mapping) or not isinstance(metrics, Mapping):
+            raise _error("video_bundle_input_invalid", "Draft quality summary is invalid")
+        _validate_safe_value(method_summary, "draft.quality_summary.method_summary")
+        _validate_safe_value(metrics, "draft.quality_summary.metrics")
+
+    @staticmethod
+    def _validate_faithful_summary(summary: Mapping[str, object] | None) -> None:
+        fields = {
+            "section_count",
+            "uncertainty_count",
+            "anchor_warning_count",
+            "body_segment_reference_coverage_ratio",
+        }
+        if summary is None or frozenset(summary) != fields:
+            raise _error("video_bundle_input_invalid", "Faithful summary is invalid")
+        if any(
+            type(summary[field_name]) is not int or summary[field_name] < 0
+            for field_name in fields - {"body_segment_reference_coverage_ratio"}
+        ):
+            raise _error("video_bundle_input_invalid", "Faithful summary is invalid")
+        coverage = summary["body_segment_reference_coverage_ratio"]
+        if type(coverage) is not float or not 0.0 <= coverage <= 1.0:
+            raise _error("video_bundle_input_invalid", "Faithful coverage is invalid")
+
+    @property
+    def portable_overall(self) -> QualityOverall:
+        compiler_overall = QualityOverall(self.quality_summary["overall"])
+        return max(
+            (self.quality.overall, compiler_overall),
+            key=_QUALITY_OVERALL_RANK.__getitem__,
+        )
+
+    @property
+    def portable_publish_eligible(self) -> bool:
+        return self.quality.publish_eligible and self.portable_overall is not QualityOverall.FAIL
+
+
+@dataclass(frozen=True)
 class VideoSourceMetadata:
     source_id: str
     source_revision_id: str
@@ -579,6 +779,8 @@ class VideoBundleInput:
     quality: QualityOutcome
     receipt: ReceiptProvenance
     display_assets: tuple[DisplayAssetInput, ...] = ()
+    drafts: tuple[VideoDraftBundleInput, ...] = ()
+    primary_draft_artifact_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_id(self.bundle_id, "bnd", "bundle_id")
@@ -604,6 +806,69 @@ class VideoBundleInput:
         )
         if any(not isinstance(asset, DisplayAssetInput) for asset in self.display_assets):
             raise _error("video_bundle_input_invalid", "display_assets are invalid")
+        object.__setattr__(self, "drafts", _snapshot_tuple(self.drafts, "drafts"))
+        if any(not isinstance(draft, VideoDraftBundleInput) for draft in self.drafts):
+            raise _error("video_bundle_input_invalid", "drafts are invalid")
+        if self.drafts:
+            self._validate_v2_drafts()
+        elif self.primary_draft_artifact_id is not None:
+            raise _error(
+                "video_bundle_input_invalid",
+                "primary_draft_artifact_id requires v2 drafts",
+            )
+
+    def _validate_v2_drafts(self) -> None:
+        if (
+            self.receipt.recipe_id != "alltonote.video-producer"
+            or self.receipt.recipe_version != 2
+        ):
+            raise _error(
+                "video_bundle_input_invalid",
+                "v2 drafts require the alltonote.video-producer@2 recipe",
+            )
+        primary_id = _require_id(
+            self.primary_draft_artifact_id,
+            "art",
+            "primary_draft_artifact_id",
+        )
+        draft_ids = [draft.draft_artifact_id for draft in self.drafts]
+        quality_ids = [draft.quality_report_artifact_id for draft in self.drafts]
+        kinds = [draft.document_kind for draft in self.drafts]
+        if (
+            primary_id not in draft_ids
+            or len(draft_ids) != len(set(draft_ids))
+            or len(quality_ids) != len(set(quality_ids))
+            or len(kinds) != len(set(kinds))
+            or set(draft_ids) & set(quality_ids)
+        ):
+            raise _reference_invalid()
+        primary = next(
+            draft for draft in self.drafts if draft.draft_artifact_id == primary_id
+        )
+        expected_recipes = {
+            VideoDocumentKind.KNOWLEDGE_NOTE: (
+                "alltonote.video-course-note",
+                2,
+            ),
+            VideoDocumentKind.FAITHFUL_EDITION: (
+                "alltonote.video-faithful-edition",
+                1,
+            ),
+        }
+        if (
+            self.artifact_ids.primary_draft != primary.draft_artifact_id
+            or self.artifact_ids.quality_report != primary.quality_report_artifact_id
+            or self.quality != primary.quality
+            or any(
+                (draft.recipe_id, draft.recipe_version)
+                != expected_recipes[draft.document_kind]
+                for draft in self.drafts
+            )
+        ):
+            raise _error(
+                "video_bundle_reference_mismatch",
+                "v2 draft bindings or primary compatibility projection are inconsistent",
+            )
 
 
 @dataclass(frozen=True)
@@ -672,14 +937,20 @@ class BundleAssembler:
         _validate_safe_value(receipt_document, "receipt")
         for segment in bundle_input.transcript.segments:
             _validate_safe_value(segment.text, "transcript.text")
-        try:
-            draft_text = bundle_input.quality.final_draft.decode("utf-8")
-        except UnicodeError:
-            raise _error(
-                "video_bundle_input_invalid",
-                "Final draft must be UTF-8 text",
-            ) from None
-        _validate_safe_value(draft_text, "draft")
+        qualities = (
+            tuple(draft.quality for draft in bundle_input.drafts)
+            if bundle_input.drafts
+            else (bundle_input.quality,)
+        )
+        for quality in qualities:
+            try:
+                draft_text = quality.final_draft.decode("utf-8")
+            except UnicodeError:
+                raise _error(
+                    "video_bundle_input_invalid",
+                    "Final draft must be UTF-8 text",
+                ) from None
+            _validate_safe_value(draft_text, "draft")
 
         receipt_bytes = encode_json(receipt_document)
         manifest_document = self._build_manifest(
@@ -818,23 +1089,50 @@ class BundleAssembler:
                 bundle_input.evidence_set.payload,
                 "utf-8",
             ),
-            _ArtifactPayload(
-                artifact_ids.primary_draft,
-                "knowledge.draft.markdown.v1",
-                f"drafts/{artifact_ids.primary_draft}.md",
-                "text/markdown",
-                bundle_input.quality.final_draft,
-                "utf-8",
-            ),
-            _ArtifactPayload(
-                artifact_ids.quality_report,
-                "quality.report.v1",
-                f"quality/{artifact_ids.quality_report}.json",
-                "application/json",
-                bundle_input.quality.report.payload,
-                "utf-8",
-            ),
         ]
+        if bundle_input.drafts:
+            for draft in bundle_input.drafts:
+                payloads.extend(
+                    (
+                        _ArtifactPayload(
+                            draft.draft_artifact_id,
+                            "knowledge.draft.markdown.v1",
+                            f"drafts/{draft.draft_artifact_id}.md",
+                            "text/markdown",
+                            draft.quality.final_draft,
+                            "utf-8",
+                        ),
+                        _ArtifactPayload(
+                            draft.quality_report_artifact_id,
+                            "quality.report.v1",
+                            f"quality/{draft.quality_report_artifact_id}.json",
+                            "application/json",
+                            BundleAssembler._build_v2_quality_payload(draft),
+                            "utf-8",
+                        ),
+                    )
+                )
+        else:
+            payloads.extend(
+                (
+                    _ArtifactPayload(
+                        artifact_ids.primary_draft,
+                        "knowledge.draft.markdown.v1",
+                        f"drafts/{artifact_ids.primary_draft}.md",
+                        "text/markdown",
+                        bundle_input.quality.final_draft,
+                        "utf-8",
+                    ),
+                    _ArtifactPayload(
+                        artifact_ids.quality_report,
+                        "quality.report.v1",
+                        f"quality/{artifact_ids.quality_report}.json",
+                        "application/json",
+                        bundle_input.quality.report.payload,
+                        "utf-8",
+                    ),
+                )
+            )
         payloads.extend(
             _ArtifactPayload(
                 asset.artifact_id,
@@ -852,6 +1150,49 @@ class BundleAssembler:
         if len(paths) != len(set(paths)) or len(ids) != len(set(ids)):
             raise _error("video_bundle_reference_invalid", "Artifact paths and IDs must be unique")
         return tuple(sorted(payloads, key=lambda payload: payload.path))
+
+    @staticmethod
+    def _build_v2_quality_payload(draft: VideoDraftBundleInput) -> bytes:
+        try:
+            document = json.loads(draft.quality.report.payload)
+        except (UnicodeError, ValueError):
+            raise _error(
+                "video_bundle_quality_invalid",
+                "Quality report payload is invalid",
+            ) from None
+        if not isinstance(document, dict):
+            raise _error(
+                "video_bundle_quality_invalid",
+                "Quality report payload is invalid",
+            )
+        compiler_checks = [
+            {
+                **dict(check),
+                "id": f"compiler.{check['id']}",
+            }
+            for check in draft.quality_summary["checks"]
+        ]
+        document["profile"] = {
+            "id": draft.recipe_id,
+            "version": draft.recipe_version,
+        }
+        document["overall"] = draft.portable_overall.value
+        document["checks"] = [*document["checks"], *compiler_checks]
+        document["metrics"] = {
+            **document["metrics"],
+            "compiler_quality": {
+                "overall": draft.quality_summary["overall"],
+                "method_summary": dict(draft.quality_summary["method_summary"]),
+                "metrics": dict(draft.quality_summary["metrics"]),
+            },
+        }
+        compiler_messages = [
+            check["id"]
+            for check in compiler_checks
+            if check["status"] in {"warn", "fail"}
+        ]
+        document["messages"] = [*document["messages"], *compiler_messages]
+        return encode_json(document)
 
     @staticmethod
     def _validate_input_bindings(
@@ -885,39 +1226,56 @@ class BundleAssembler:
         )
         if rebuilt_evidence.payload != evidence.payload:
             raise _error("video_bundle_reference_mismatch", "Evidence payload is inconsistent")
-        quality = bundle_input.quality
-        if quality.execution_error is not None:
-            raise _error(
-                "video_bundle_quality_execution_failed",
-                "Quality evaluation did not complete successfully",
+        draft_bindings = (
+            tuple(
+                (
+                    draft.draft_artifact_id,
+                    draft.quality,
+                )
+                for draft in bundle_input.drafts
             )
-        try:
-            expected_quality = rebuild_quality_outcome(
-                quality.final_draft,
-                evidence,
-                draft_bundle_id=bundle_input.bundle_id,
-                draft_artifact_id=ids.primary_draft,
-                repair_attempts=quality.repair_attempts,
-            )
-        except MemoryError:
-            raise
-        except DomainError:
-            raise _error(
-                "video_bundle_quality_invalid",
-                "Quality outcome is inconsistent",
-            ) from None
-        if quality != expected_quality:
-            raise _error("video_bundle_quality_invalid", "Quality outcome is inconsistent")
-        draft_payload = by_id[ids.primary_draft]
-        try:
-            image_paths = rendered_image_bundle_paths(
-                draft_payload.data.decode("utf-8"),
-                bundle_relative_path=draft_payload.path,
-            )
-        except MemoryError:
-            raise
-        except (DomainError, UnicodeError):
-            raise _reference_invalid() from None
+            if bundle_input.drafts
+            else ((ids.primary_draft, bundle_input.quality),)
+        )
+        image_paths: set[str] = set()
+        for draft_id, quality in draft_bindings:
+            if quality.execution_error is not None:
+                raise _error(
+                    "video_bundle_quality_execution_failed",
+                    "Quality evaluation did not complete successfully",
+                )
+            try:
+                expected_quality = rebuild_quality_outcome(
+                    quality.final_draft,
+                    evidence,
+                    draft_bundle_id=bundle_input.bundle_id,
+                    draft_artifact_id=draft_id,
+                    repair_attempts=quality.repair_attempts,
+                )
+            except MemoryError:
+                raise
+            except DomainError:
+                raise _error(
+                    "video_bundle_quality_invalid",
+                    "Quality outcome is inconsistent",
+                ) from None
+            if quality != expected_quality:
+                raise _error(
+                    "video_bundle_quality_invalid",
+                    "Quality outcome is inconsistent",
+                )
+            draft_payload = by_id[draft_id]
+            try:
+                image_paths.update(
+                    rendered_image_bundle_paths(
+                        draft_payload.data.decode("utf-8"),
+                        bundle_relative_path=draft_payload.path,
+                    )
+                )
+            except MemoryError:
+                raise
+            except (DomainError, UnicodeError):
+                raise _reference_invalid() from None
         declared_paths = {
             asset.relative_path for asset in bundle_input.display_assets
         }
@@ -1013,15 +1371,34 @@ class BundleAssembler:
             "source_revision_id": bundle_input.source.source_revision_id,
         }
         transcript_ref = _artifact_ref(bundle_input.bundle_id, by_id[ids.transcript])
-        draft_ref = _artifact_ref(bundle_input.bundle_id, by_id[ids.primary_draft])
-        quality_ref = _artifact_ref(bundle_input.bundle_id, by_id[ids.quality_report])
         parents: dict[str, list[dict[str, str]]] = {
             ids.evidence_set: [transcript_ref],
-            ids.quality_report: [draft_ref],
         }
-        quality_refs: dict[str, list[dict[str, str]]] = {
-            ids.primary_draft: [quality_ref],
-        }
+        quality_refs: dict[str, list[dict[str, str]]] = {}
+        draft_recipes: dict[str, tuple[str, int]] = {}
+        draft_profiles: dict[str, VideoDraftBundleInput] = {}
+        if bundle_input.drafts:
+            for draft in bundle_input.drafts:
+                draft_ref = _artifact_ref(
+                    bundle_input.bundle_id,
+                    by_id[draft.draft_artifact_id],
+                )
+                quality_ref = _artifact_ref(
+                    bundle_input.bundle_id,
+                    by_id[draft.quality_report_artifact_id],
+                )
+                parents[draft.quality_report_artifact_id] = [draft_ref]
+                quality_refs[draft.draft_artifact_id] = [quality_ref]
+                draft_recipes[draft.draft_artifact_id] = (
+                    draft.recipe_id,
+                    draft.recipe_version,
+                )
+                draft_profiles[draft.draft_artifact_id] = draft
+        else:
+            draft_ref = _artifact_ref(bundle_input.bundle_id, by_id[ids.primary_draft])
+            quality_ref = _artifact_ref(bundle_input.bundle_id, by_id[ids.quality_report])
+            parents[ids.quality_report] = [draft_ref]
+            quality_refs[ids.primary_draft] = [quality_ref]
         capability = (
             f"{bundle_input.receipt.capability_id}@"
             f"{bundle_input.receipt.capability_version}"
@@ -1037,6 +1414,24 @@ class BundleAssembler:
             }
             if payload.charset is not None:
                 descriptor["charset"] = payload.charset
+            recipe_id, recipe_version = draft_recipes.get(
+                payload.artifact_id,
+                (
+                    bundle_input.receipt.recipe_id,
+                    bundle_input.receipt.recipe_version,
+                ),
+            )
+            artifact_extensions: dict[str, object] = {}
+            draft_profile = draft_profiles.get(payload.artifact_id)
+            if draft_profile is not None:
+                artifact_extensions["alltonote.video:draft"] = {
+                    "schema_version": 1,
+                    "document_kind": draft_profile.document_kind.value,
+                    "transcript_basis": draft_profile.transcript_basis,
+                    "source_language": draft_profile.source_language,
+                    "language_policy": draft_profile.language_policy,
+                    "target_language": draft_profile.target_language,
+                }
             documents.append(
                 {
                     "artifact_schema_version": 1,
@@ -1049,13 +1444,13 @@ class BundleAssembler:
                     "generated_by": {"run_id": bundle_input.receipt.run_id},
                     "generation": {
                         "recipe": {
-                            "id": bundle_input.receipt.recipe_id,
-                            "version": bundle_input.receipt.recipe_version,
+                            "id": recipe_id,
+                            "version": recipe_version,
                         },
                         "capability": capability,
                     },
                     "quality_report_refs": quality_refs.get(payload.artifact_id, []),
-                    "extensions": {},
+                    "extensions": artifact_extensions,
                 }
             )
         return documents
@@ -1066,6 +1461,7 @@ class BundleAssembler:
         payloads: tuple[_ArtifactPayload, ...],
     ) -> dict[str, object]:
         provenance = bundle_input.receipt
+        payload_by_id = {payload.artifact_id: payload for payload in payloads}
         summary = {
             "job_id": provenance.job_id,
             "attempt_id": provenance.attempt_id,
@@ -1084,7 +1480,58 @@ class BundleAssembler:
             "parent_run_id": provenance.parent_run_id,
             "warnings": list(provenance.warnings),
         }
+        if bundle_input.drafts:
+            document_outputs: list[dict[str, object]] = []
+            for draft in bundle_input.drafts:
+                draft_payload = payload_by_id[draft.draft_artifact_id]
+                quality_payload = payload_by_id[draft.quality_report_artifact_id]
+                output: dict[str, object] = {
+                    "document_kind": draft.document_kind.value,
+                    "draft_artifact_id": draft.draft_artifact_id,
+                    "draft_sha256": sha256_digest(draft_payload.data),
+                    "quality_report_artifact_id": draft.quality_report_artifact_id,
+                    "quality_report_sha256": sha256_digest(quality_payload.data),
+                    "quality_overall": draft.portable_overall.value,
+                    "publish_eligible": draft.portable_publish_eligible,
+                    "recipe": {
+                        "id": draft.recipe_id,
+                        "version": draft.recipe_version,
+                    },
+                    "profile": draft.quality_profile,
+                    "transcript_basis": draft.transcript_basis,
+                    "source_language": draft.source_language,
+                    "language_policy": draft.language_policy,
+                    "target_language": draft.target_language,
+                    "model_binding": {"sha256": draft.model_binding_sha256},
+                    "execution": {
+                        "model_calls": draft.model_operation_count,
+                        "sequential_waves": draft.sequential_model_waves,
+                        "repair_operations": draft.repair_operation_count,
+                    },
+                    "usage": dict(draft.usage),
+                    "warnings": list(draft.warnings),
+                    "quality": {
+                        "check_count": len(draft.quality_summary["checks"]),
+                        "method_summary": dict(
+                            draft.quality_summary["method_summary"]
+                        ),
+                    },
+                }
+                if draft.faithful_summary is not None:
+                    output["faithful"] = dict(draft.faithful_summary)
+                document_outputs.append(output)
+            summary["document_outputs"] = document_outputs
         capability = f"{provenance.capability_id}@{provenance.capability_version}"
+        primary_quality = (
+            next(
+                draft
+                for draft in bundle_input.drafts
+                if draft.draft_artifact_id
+                == bundle_input.primary_draft_artifact_id
+            )
+            if bundle_input.drafts
+            else None
+        )
         return {
             "receipt_schema_version": 1,
             "run_id": provenance.run_id,
@@ -1124,9 +1571,21 @@ class BundleAssembler:
             ],
             "usage": dict(provenance.usage),
             "quality": {
-                "overall": bundle_input.quality.overall.value,
-                "publish_eligible": bundle_input.quality.publish_eligible,
-                "repair_attempts": bundle_input.quality.repair_attempts,
+                "overall": (
+                    primary_quality.portable_overall.value
+                    if primary_quality is not None
+                    else bundle_input.quality.overall.value
+                ),
+                "publish_eligible": (
+                    primary_quality.portable_publish_eligible
+                    if primary_quality is not None
+                    else bundle_input.quality.publish_eligible
+                ),
+                "repair_attempts": (
+                    primary_quality.repair_operation_count
+                    if primary_quality is not None
+                    else bundle_input.quality.repair_attempts
+                ),
             },
             "redactions": dict(provenance.redactions),
         }
@@ -1143,6 +1602,45 @@ class BundleAssembler:
         provenance = bundle_input.receipt
         ids = bundle_input.artifact_ids
         capability = f"{provenance.capability_id}@{provenance.capability_version}"
+        outputs: dict[str, object] = {
+            "primary_draft": ids.primary_draft,
+            "transcript": ids.transcript,
+            "evidence_set": ids.evidence_set,
+            "quality_reports": (
+                [draft.quality_report_artifact_id for draft in bundle_input.drafts]
+                if bundle_input.drafts
+                else [ids.quality_report]
+            ),
+            "source_snapshots": [ids.source_metadata],
+            "display_assets": [
+                asset.artifact_id for asset in bundle_input.display_assets
+            ],
+        }
+        required_contracts: list[str] = []
+        extensions: dict[str, object] = {
+            "alltonote.video:bundle": {"video_bundle_schema_version": 1},
+        }
+        if bundle_input.drafts:
+            outputs["drafts"] = [
+                draft.draft_artifact_id for draft in bundle_input.drafts
+            ]
+            required_contracts.append(_VIDEO_OUTPUT_PROFILE_V2)
+            extensions["alltonote.video:bundle"] = {
+                "video_bundle_schema_version": 2,
+            }
+            extensions["alltonote.video:output-profile"] = {
+                "schema_version": 2,
+                "documents": [
+                    {
+                        "document_kind": draft.document_kind.value,
+                        "draft_artifact_id": draft.draft_artifact_id,
+                        "quality_report_artifact_id": (
+                            draft.quality_report_artifact_id
+                        ),
+                    }
+                    for draft in bundle_input.drafts
+                ],
+            }
         return {
             "$schema": "urn:iwiki:portable:bundle:v1",
             "bundle_schema_version": 1,
@@ -1162,23 +1660,12 @@ class BundleAssembler:
             "source_revisions": [revision_document],
             "dependencies": [],
             "artifacts": artifact_documents,
-            "outputs": {
-                "primary_draft": ids.primary_draft,
-                "transcript": ids.transcript,
-                "evidence_set": ids.evidence_set,
-                "quality_reports": [ids.quality_report],
-                "source_snapshots": [ids.source_metadata],
-                "display_assets": [
-                    asset.artifact_id for asset in bundle_input.display_assets
-                ],
-            },
+            "outputs": outputs,
             "receipt": {
                 "path": "receipt.json",
                 "byte_length": len(receipt_bytes),
                 "sha256": sha256_digest(receipt_bytes),
             },
-            "required_contracts": [],
-            "extensions": {
-                "alltonote.video:bundle": {"video_bundle_schema_version": 1},
-            },
+            "required_contracts": required_contracts,
+            "extensions": extensions,
         }

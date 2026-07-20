@@ -1,4 +1,5 @@
 import logging
+import json
 from pathlib import Path
 
 import pytest
@@ -659,6 +660,150 @@ def test_cleanup_control_error_replaces_ordinary_primary_error(monkeypatch, tmp_
         assert caught.value is cleanup_control_error
         assert not hasattr(primary_error, "__notes__")
         assert error_logs == []
+    finally:
+        if _FakeYoutubeDL.captured_opts:
+            Path(_FakeYoutubeDL.captured_opts[0]["cookiefile"]).unlink(missing_ok=True)
+
+
+def test_subtitle_fallback_uses_authenticated_ytdlp_json3(monkeypatch):
+    class EmptyTranscriptFetcher:
+        def fetch_subtitles(self, video_id, langs):
+            assert video_id == "video123ABC"
+            assert langs == ["zh", "en"]
+            return None
+
+    class Response:
+        closed = False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "events": [
+                        {
+                            "tStartMs": 1000,
+                            "dDurationMs": 2500,
+                            "segs": [{"utf8": "第一段\n字幕"}],
+                        },
+                        {
+                            "tStartMs": 3500,
+                            "dDurationMs": 1500,
+                            "segs": [{"utf8": "第二段"}],
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+
+    class SubtitleYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, video_url, download):
+            assert download is False
+            cookiefile = self.opts.get("cookiefile")
+            self.cookie_contents.append(
+                Path(cookiefile).read_text(encoding="utf-8")
+            )
+            return {
+                "subtitles": {
+                    "de": [
+                        {"ext": "json3", "url": "https://caption/manual-de"}
+                    ]
+                },
+                "automatic_captions": {
+                    "zh": [
+                        {"ext": "json3", "url": "https://caption/auto-zh"}
+                    ]
+                },
+            }
+
+        def urlopen(self, url):
+            assert url == "https://caption/auto-zh"
+            return response
+
+    _configure_downloader(monkeypatch, SubtitleYoutubeDL)
+    monkeypatch.setattr(
+        module,
+        "YouTubeSubtitleFetcher",
+        EmptyTranscriptFetcher,
+    )
+
+    transcript = module.YoutubeDownloader().download_subtitles(
+        "https://www.youtube.com/watch?v=video123ABC",
+        langs=["zh", "en"],
+    )
+
+    assert transcript is not None
+    assert transcript.language == "zh"
+    assert transcript.full_text == "第一段 字幕 第二段"
+    assert [(item.start, item.end, item.text) for item in transcript.segments] == [
+        (1.0, 3.5, "第一段 字幕"),
+        (3.5, 5.0, "第二段"),
+    ]
+    assert transcript.raw == {
+        "source": "yt_dlp_json3",
+        "language_code": "zh",
+        "is_generated": True,
+    }
+    assert response.closed is True
+    cookiefile = Path(_FakeYoutubeDL.captured_opts[0]["cookiefile"])
+    assert not cookiefile.exists()
+
+
+def test_subtitle_fallback_propagates_cookie_cleanup_failure(monkeypatch):
+    class Response:
+        def read(self):
+            return json.dumps(
+                {
+                    "events": [
+                        {
+                            "tStartMs": 0,
+                            "dDurationMs": 1000,
+                            "segs": [{"utf8": "caption"}],
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+        def close(self):
+            return None
+
+    class SubtitleYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, video_url, download):
+            assert download is False
+            return {
+                "subtitles": {
+                    "en": [
+                        {"ext": "json3", "url": "https://caption/manual-en"}
+                    ]
+                }
+            }
+
+        def urlopen(self, url):
+            assert url == "https://caption/manual-en"
+            return Response()
+
+    _configure_downloader(monkeypatch, SubtitleYoutubeDL)
+    downloader = module.YoutubeDownloader()
+
+    def fail_remove(path):
+        raise PermissionError(f"cannot remove {path}: SID=abc")
+
+    monkeypatch.setattr(module.os, "remove", fail_remove)
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            downloader._download_subtitles_with_ytdlp(
+                "https://www.youtube.com/watch?v=video123ABC",
+                ["en"],
+            )
+
+        cookiefile = _FakeYoutubeDL.captured_opts[0]["cookiefile"]
+        assert str(caught.value) == "Failed to clean up YouTube cookie file"
+        assert cookiefile not in str(caught.value)
+        assert "SID=abc" not in str(caught.value)
     finally:
         if _FakeYoutubeDL.captured_opts:
             Path(_FakeYoutubeDL.captured_opts[0]["cookiefile"]).unlink(missing_ok=True)

@@ -174,6 +174,33 @@ def test_parser_preserves_repeated_citation_uses_but_projects_unique_ids() -> No
     assert parsed.cited_segment_ids == ("seg_000001",)
 
 
+def test_parser_removes_h2_heading_citations_from_the_frozen_evidence_set() -> None:
+    output = (
+        "# Note\n\n"
+        "## First [^seg_000002]\n\n"
+        "Body claim.[^seg_000001]\n"
+    )
+
+    parsed = parse_model_output(
+        output,
+        known_segment_ids=("seg_000001", "seg_000002"),
+        allow_screenshots=False,
+    )
+
+    assert "[^seg_000002]" not in parsed.markdown
+    assert parsed.markdown.count("[^seg_000001]") == 1
+    assert parsed.cited_segment_ids == ("seg_000001",)
+
+
+def test_parser_does_not_accept_an_h2_heading_as_the_only_citation() -> None:
+    with pytest.raises(DomainError, match="model_citation_missing"):
+        parse_model_output(
+            "# Note\n\n## Unsupported [^seg_000001]\n\nBody without evidence.",
+            known_segment_ids=("seg_000001",),
+            allow_screenshots=False,
+        )
+
+
 def test_parser_extracts_visible_citations_and_screenshot_actions() -> None:
     output = (
         "# Note\n\nFact[^seg_000001].\n\n"

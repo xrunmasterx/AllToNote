@@ -4,12 +4,18 @@ import importlib
 import json
 import shutil
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 from app.cli.main import main
-from app.core.domain.video import JobSnapshot, JobState
+from app.core.domain.video import (
+    FaithfulLanguagePolicy,
+    JobSnapshot,
+    JobState,
+    VideoDocumentKind,
+    VideoProduceRequest,
+)
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 
 
@@ -56,6 +62,7 @@ def _run_fake_cli(runtime: object, workspace_root: Path) -> int:
         [
             "produce",
             "video",
+            "--input",
             "fixture://course",
             "--workspace",
             str(workspace_root),
@@ -116,6 +123,73 @@ def test_quality_fail_cli_is_successful_and_not_publish_eligible(
     assert captured.out.count("\n") == 1
 
 
+def test_human_mode_uses_the_same_result_without_json_protocol_noise(
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, calls = runtime_factory()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--wait",
+        ],
+        runtime=runtime,
+    )
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+
+    assert code == 0
+    assert len(lines) == 4
+    assert lines[0].startswith("Job: job_")
+    assert lines[1] == "State: succeeded"
+    assert lines[2].startswith("Bundle: bnd_")
+    assert lines[3].startswith("Draft: art_")
+    assert "{" not in captured.out
+    assert captured.err == ""
+    assert calls.commit == 1
+
+
+def test_json_usage_error_is_one_safe_protocol_envelope(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["produce", "video", "--json"])
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+
+    assert code == 2
+    assert envelope["ok"] is False
+    assert envelope["command"] == "produce video"
+    assert envelope["error"] == {
+        "code": "cli_usage_invalid",
+        "category": "invalid_request",
+        "message": "Command arguments are invalid",
+        "retryable": False,
+        "next_actions": ["Correct the request and run the command again"],
+        "details": {},
+    }
+    assert captured.out.count("\n") == 1
+    assert captured.err == ""
+
+
+def test_human_usage_error_uses_stderr_only(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["produce", "video"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert "Error [cli_usage_invalid]" in captured.err
+    assert "Action:" in captured.err
+
+
 def test_preflight_failure_is_one_safe_envelope_and_nonzero_exit(
     runtime_factory,
     workspace_root: Path,
@@ -152,6 +226,7 @@ def test_invalid_video_request_is_one_safe_envelope(
         [
             "produce",
             "video",
+            "--input",
             "",
             "--workspace",
             str(workspace_root),
@@ -171,6 +246,250 @@ def test_invalid_video_request_is_one_safe_envelope(
     assert captured.out.count("\n") == 1
 
 
+class _RequestCaptureRuntime:
+    def __init__(self) -> None:
+        self.request: VideoProduceRequest | None = None
+
+    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
+        self.request = request
+        return JobSnapshot(
+            job_id="job_captured",
+            state=JobState.QUEUED,
+            cancellation_requested=False,
+            active_attempt_id=None,
+            challenge_id=None,
+            retry_of_job_id=None,
+            result=None,
+            error=None,
+        )
+
+
+def test_canonical_input_and_positional_alias_keep_request_hash_compatible(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "app.cli.main.new_typed_id",
+        lambda prefix: "corr_018f0000-0000-7000-8000-000000000001",
+    )
+    canonical = _RequestCaptureRuntime()
+    alias = _RequestCaptureRuntime()
+
+    canonical_code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=canonical,
+    )
+    canonical_envelope = json.loads(capsys.readouterr().out)
+    alias_code = main(
+        [
+            "produce",
+            "video",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=alias,
+    )
+    alias_envelope = json.loads(capsys.readouterr().out)
+
+    assert canonical_code == alias_code == 0
+    assert canonical_envelope["warnings"] == []
+    assert alias_envelope["warnings"] == [
+        "Positional video input is deprecated; use --input"
+    ]
+    assert canonical.request == alias.request
+    assert canonical.request is not None
+    assert alias.request is not None
+    from app.core.application.video_service import VideoService
+
+    assert VideoService._request_hash(canonical.request) == VideoService._request_hash(
+        alias.request
+    )
+
+
+def test_cli_rejects_conflicting_canonical_and_legacy_inputs_before_submit(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _RequestCaptureRuntime()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "legacy://input",
+            "--input",
+            "canonical://input",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=runtime,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert envelope["error"]["code"] == "cli_usage_invalid"
+    assert runtime.request is None
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "schema", "recipe_id", "recipe_version"),
+    (
+        ((), 1, "alltonote.video-course-note", 1),
+        (
+            ("--recipe-version", "2", "--quality", "balanced"),
+            2,
+            "alltonote.video-producer",
+            2,
+        ),
+    ),
+)
+def test_cli_freezes_explicit_recipe_selection_without_changing_default(
+    extra_args: tuple[str, ...],
+    schema: int,
+    recipe_id: str,
+    recipe_version: int,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _RequestCaptureRuntime()
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+            *extra_args,
+        ],
+        runtime=runtime,
+    )
+
+    envelope = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert envelope["data"] == {"job_id": "job_captured", "state": "queued"}
+    assert runtime.request is not None
+    assert runtime.request.request_schema_version == schema
+    assert runtime.request.recipe_id == recipe_id
+    assert runtime.request.recipe_version == recipe_version
+    assert runtime.request.quality_preset == "balanced"
+    assert runtime.request.requested_outputs == (VideoDocumentKind.KNOWLEDGE_NOTE,)
+
+
+def test_cli_freezes_dual_output_and_translation_policy(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _RequestCaptureRuntime()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--output",
+            "knowledge-note",
+            "--output",
+            "faithful-edition",
+            "--faithful-language",
+            "translate-to-output",
+            "--output-language",
+            "zh-CN",
+            "--json",
+        ],
+        runtime=runtime,
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert runtime.request is not None
+    assert runtime.request.request_schema_version == 2
+    assert runtime.request.recipe_id == "alltonote.video-producer"
+    assert runtime.request.recipe_version == 2
+    assert runtime.request.requested_outputs == (
+        VideoDocumentKind.KNOWLEDGE_NOTE,
+        VideoDocumentKind.FAITHFUL_EDITION,
+    )
+    assert runtime.request.faithful_language_policy is (
+        FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT
+    )
+
+
+def test_cli_freezes_provider_model_and_transcriber_profile_references(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _RequestCaptureRuntime()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--provider-profile",
+            "provider-main",
+            "--model",
+            "model-stable",
+            "--transcriber-profile",
+            "transcriber-local",
+            "--json",
+        ],
+        runtime=runtime,
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["warnings"] == []
+    assert runtime.request is not None
+    assert runtime.request.provider_profile == "provider-main"
+    assert runtime.request.model_override == "model-stable"
+    assert runtime.request.transcriber_profile == "transcriber-local"
+
+
+def test_cli_rejects_v2_output_with_explicit_recipe_v1(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--recipe-version",
+            "1",
+            "--output",
+            "faithful-edition",
+            "--json",
+        ],
+        runtime=_RequestCaptureRuntime(),
+    )
+
+    envelope = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert envelope["error"]["code"] == "recipe_version_conflict"
+
+
 class _UnexpectedRuntime:
     def submit_video(self, request: object) -> object:
         del request
@@ -183,9 +502,96 @@ class _InterruptedRuntime:
         raise KeyboardInterrupt
 
 
+class _WaitInterruptedRuntime:
+    def __init__(self) -> None:
+        self.cancelled_job_ids: list[str] = []
+
+    def submit_video(self, request: object) -> JobSnapshot:
+        del request
+        return JobSnapshot(
+            job_id="job_wait_interrupted",
+            state=JobState.QUEUED,
+            cancellation_requested=False,
+            active_attempt_id=None,
+            challenge_id=None,
+            retry_of_job_id=None,
+            result=None,
+            error=None,
+        )
+
+    def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del job_id, event_sink
+        raise KeyboardInterrupt
+
+    def cancel_job(self, job_id: str) -> JobSnapshot:
+        self.cancelled_job_ids.append(job_id)
+        return JobSnapshot(
+            job_id=job_id,
+            state=JobState.CANCELLED,
+            cancellation_requested=True,
+            active_attempt_id=None,
+            challenge_id=None,
+            retry_of_job_id=None,
+            result=None,
+            error=None,
+        )
+
+
+def test_foreground_produce_interrupt_requests_structured_job_cancellation(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _WaitInterruptedRuntime()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--wait",
+            "--json",
+        ],
+        runtime=runtime,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 130
+    assert envelope["error"]["code"] == "interrupted"
+    assert runtime.cancelled_job_ids == ["job_wait_interrupted"]
+
+
+def test_runtime_cancel_api_cancels_queued_video_without_external_work(
+    runtime_factory,
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+    submitted = runtime.submit_video(
+        VideoProduceRequest(
+            request_schema_version=1,
+            workspace_root=workspace_root,
+            input_value="fixture://course",
+            client_request_id="runtime-cancel-api",
+        )
+    )
+
+    cancelled = runtime.cancel_job(submitted.job_id)
+    observed = runtime.wait_job(submitted.job_id)
+
+    assert cancelled.state is JobState.CANCELLED
+    assert cancelled.cancellation_requested is True
+    assert observed == cancelled
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+
+
 def _unsafe_error_details(secret: str) -> dict[str, object]:
     return {
         "X-Auth-Token": secret,
+        "prompt": secret,
+        "provider_raw": {"response": secret},
+        "credential_path": r"C:\Users\private\credential.json",
         "outer": MappingProxyType(
             {
                 "clientSecret": secret,
@@ -263,6 +669,43 @@ class _CancelledRuntime:
         return self._snapshot
 
 
+class _InconsistentTerminalRuntime:
+    def __init__(self, state: JobState) -> None:
+        self._snapshot = JobSnapshot(
+            job_id="job_inconsistent",
+            state=state,
+            cancellation_requested=False,
+            active_attempt_id=None,
+            challenge_id=None,
+            retry_of_job_id=None,
+            result=None,
+            error=None,
+        )
+
+    def submit_video(self, request: object) -> JobSnapshot:
+        del request
+        return self._snapshot
+
+    def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del job_id, event_sink
+        return self._snapshot
+
+
+@pytest.mark.parametrize("state", (JobState.SUCCEEDED, JobState.FAILED))
+def test_inconsistent_terminal_projection_fails_closed(
+    state: JobState,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = _run_fake_cli(_InconsistentTerminalRuntime(state), workspace_root)
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 70
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "job_projection_invalid"
+    assert envelope["job"]["job_id"] == "job_inconsistent"
+
+
 def test_cancelled_job_is_a_structured_failure_with_cancelled_exit(
     workspace_root: Path,
     capsys: pytest.CaptureFixture[str],
@@ -282,9 +725,27 @@ def test_cancelled_job_is_a_structured_failure_with_cancelled_exit(
             "code": "job_cancelled",
             "category": "cancelled",
             "message": "Job was cancelled",
+            "retryable": False,
+            "next_actions": [
+                "Submit a new Job or explicitly retry the terminal Job"
+            ],
             "details": {},
         },
         "warnings": [],
+        "job": {
+            "job_id": "job_cancelled",
+            "state": "cancelled",
+            "cancellation_requested": True,
+            "active_attempt_id": None,
+            "challenge_id": None,
+            "retry_of_job_id": None,
+        },
+        "artifacts": [],
+        "capabilities": [],
+        "versions": {
+            "runtime_version": "0.1.0",
+            "cli_protocol_version": 1,
+        },
     }
     assert envelope["correlation_id"].startswith("corr_")
     assert captured.err == ""
@@ -335,6 +796,9 @@ def test_error_details_are_redacted_and_always_json_safe(
         {"ok": True},
     ]
     assert envelope["error"]["details"]["X-Auth-Token"] == "[REDACTED]"
+    assert envelope["error"]["details"]["prompt"] == "[REDACTED]"
+    assert envelope["error"]["details"]["provider_raw"] == "[REDACTED]"
+    assert envelope["error"]["details"]["credential_path"] == "[REDACTED]"
     assert envelope["error"]["details"]["outer"]["clientSecret"] == "[REDACTED]"
     assert envelope["error"]["details"]["outer"]["nested"]["api_key"] == "[REDACTED]"
     assert "binary" not in envelope["error"]["details"]
@@ -351,13 +815,13 @@ def test_error_detail_projection_failure_falls_back_to_empty_details(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    cli_module = importlib.import_module("app.cli.main")
+    render_module = importlib.import_module("app.cli.render")
 
     def fail_projection(identifier: str) -> bool:
         del identifier
         raise RuntimeError("projection failed")
 
-    monkeypatch.setattr(cli_module, "is_sensitive_identifier", fail_projection)
+    monkeypatch.setattr(render_module, "is_sensitive_identifier", fail_projection)
 
     code = _run_fake_cli(
         _ImmediateDomainErrorRuntime("fallback-secret-value"), workspace_root
@@ -370,6 +834,10 @@ def test_error_detail_projection_failure_falls_back_to_empty_details(
         "code": "provider_policy_denied",
         "category": "policy_denied",
         "message": "Provider policy denied the request",
+        "retryable": False,
+        "next_actions": [
+            "Satisfy the required policy, capability, grant, or credential"
+        ],
         "details": {},
     }
     assert "fallback-secret-value" not in captured.out
@@ -403,23 +871,39 @@ def test_unexpected_failures_are_one_safe_json_envelope(
     assert captured.out.count("\n") == 1
 
 
-def test_default_runtime_uses_workspace_instance_machine_root(
-    tmp_path: Path,
+def test_default_runtime_uses_real_codex_factory_and_never_fake(
+    runtime_factory,
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    local_app_data = tmp_path / "local-app-data"
-    local_app_data.mkdir()
-    user_profile = tmp_path / "user-profile"
-    user_profile.mkdir()
-    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
-    monkeypatch.setenv("USERPROFILE", str(user_profile))
+    runtime, calls = runtime_factory()
+    runtime_module = importlib.import_module("app.runtime")
+    requested_workspaces: list[Path] = []
+
+    def create_real_runtime(workspace: Path, **options: object):
+        requested_workspaces.append(workspace)
+        assert options["current_config_snapshot"].snapshot_version == 1
+        return runtime
+
+    monkeypatch.setattr(
+        runtime_module,
+        "create_codex_app_server_runtime_for_workspace",
+        create_real_runtime,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "create_fake_runtime_for_workspace",
+        lambda workspace: pytest.fail(
+            f"The production CLI attempted to use Fake Runtime for {workspace}"
+        ),
+    )
 
     code = main(
         [
             "produce",
             "video",
+            "--input",
             "fixture://course",
             "--workspace",
             str(workspace_root),
@@ -431,25 +915,62 @@ def test_default_runtime_uses_workspace_instance_machine_root(
 
     assert code == 0
     assert json.loads(captured.out)["data"]["state"] == "succeeded"
-    registry_path = local_app_data / "AllToNote" / "workspace-instances.json"
-    registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    instance_id = registry["instances"][0]["instance_id"]
-    machine_root = local_app_data / "AllToNote" / "workspaces" / instance_id
-    assert (machine_root / "job-store" / "jobs.sqlite").is_file()
-    assert not (user_profile / ".alltonote" / "runtime").exists()
+    assert requested_workspaces == [workspace_root.resolve()]
+    assert calls.commit == 1
 
-    second_code = main(
-        [
-            "produce",
-            "video",
-            "fixture://second-course",
-            "--workspace",
-            str(workspace_root),
-            "--wait",
-            "--json",
-        ]
+
+def test_codex_runtime_factory_uses_workspace_instance_machine_root(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    local_app_data = tmp_path / "local-app-data"
+    local_app_data.mkdir()
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    monkeypatch.setattr(
+        runtime_module.CodexAppServerStatusService,
+        "get_status",
+        staticmethod(
+            lambda: SimpleNamespace(ready=True, default_model="codex-test-model")
+        ),
     )
-    second = json.loads(capsys.readouterr().out)
 
-    assert second_code == 0
-    assert second["data"]["state"] == "succeeded"
+    def capture_runtime(machine_root: Path, **options: object):
+        captured["machine_root"] = machine_root
+        captured.update(options)
+        return sentinel
+
+    monkeypatch.setattr(
+        runtime_module, "create_platform_video_runtime", capture_runtime
+    )
+
+    created = runtime_module.create_codex_app_server_runtime_for_workspace(
+        workspace_root,
+        local_app_data=local_app_data,
+    )
+
+    registry = json.loads(
+        (local_app_data / "AllToNote" / "workspace-instances.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    instance_id = registry["instances"][0]["instance_id"]
+    expected_machine_root = (
+        local_app_data / "AllToNote" / "workspaces" / instance_id
+    )
+    binding = captured["model_execution_binding"]
+    model = captured["model"]
+
+    assert created is sentinel
+    assert captured["machine_root"] == expected_machine_root
+    assert captured["local_instance_id"] == instance_id
+    assert captured["source_metadata"] == {}
+    assert captured["model_execution_profile"] == "default"
+    assert model.provider_kind == "codex-app-server"
+    assert model.model_identity == "codex-test-model"
+    assert binding.provider_type == "codex-app-server"
+    assert binding.model_identity == "codex-test-model"
+    assert binding.credential_profile_ref == "codex/local-login"

@@ -1,0 +1,64 @@
+{
+  "alltonote_cli_protocol_version": 1,
+  "ok": true,
+  "command": "produce video",
+  "correlation_id": "corr_018cc251-f400-7000-8000-000000000000",
+  "data": {
+    "job_id": "job_018cc251-f400-7000-8000-000000000001",
+    "state": "succeeded",
+    "run_id": "run_018cc251-f400-7000-8000-000000000004",
+    "bundle_id": "bnd_018cc251-f400-7000-8000-000000000005",
+    "manifest_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "commit_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "workspace_relative_bundle_path": "raw/personal/bundles/bnd_018cc251-f400-7000-8000-000000000005",
+    "primary_draft_artifact_id": "art_018cc251-f400-7000-8000-000000000002",
+    "quality": {
+      "overall": "pass_with_warnings",
+      "publish_eligible": true
+    },
+    "documents": [
+      {
+        "document_kind": "knowledge-note",
+        "draft_artifact_id": "art_018cc251-f400-7000-8000-000000000002",
+        "quality_report_artifact_id": "art_018cc251-f400-7000-8000-000000000003",
+        "quality_overall": "pass_with_warnings",
+        "publish_eligible": true
+      }
+    ]
+  },
+  "error": null,
+  "warnings": [
+    "transcript-language-detected"
+  ],
+  "job": {
+    "job_id": "job_018cc251-f400-7000-8000-000000000001",
+    "state": "succeeded",
+    "cancellation_requested": false,
+    "active_attempt_id": null,
+    "challenge_id": null,
+    "retry_of_job_id": null
+  },
+  "artifacts": [
+    {
+      "artifact_id": "art_018cc251-f400-7000-8000-000000000002",
+      "role": "primary_draft"
+    },
+    {
+      "artifact_id": "art_018cc251-f400-7000-8000-000000000008",
+      "role": "transcript"
+    },
+    {
+      "artifact_id": "art_018cc251-f400-7000-8000-000000000009",
+      "role": "evidence_set"
+    },
+    {
+      "artifact_id": "art_018cc251-f400-7000-8000-000000000003",
+      "role": "quality_report"
+    }
+  ],
+  "capabilities": [],
+  "versions": {
+    "runtime_version": "0.1.0",
+    "cli_protocol_version": 1
+  }
+}

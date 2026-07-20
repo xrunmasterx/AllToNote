@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping
 
+from app.core.config.model import JobConfigSnapshot
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 
 
@@ -25,6 +26,16 @@ class QualityOverall(StrEnum):
     PASS = "pass"
     PASS_WITH_WARNINGS = "pass_with_warnings"
     FAIL = "fail"
+
+
+class VideoDocumentKind(StrEnum):
+    KNOWLEDGE_NOTE = "knowledge-note"
+    FAITHFUL_EDITION = "faithful-edition"
+
+
+class FaithfulLanguagePolicy(StrEnum):
+    PRESERVE_SOURCE = "preserve-source"
+    TRANSLATE_TO_OUTPUT = "translate-to-output"
 
 
 class JobState(StrEnum):
@@ -200,6 +211,38 @@ class GeneratedVideoDraft:
 
 
 @dataclass(frozen=True)
+class ResolvedVideoOutput:
+    document_kind: VideoDocumentKind
+    recipe_id: str
+    recipe_version: int
+    quality_preset: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document_kind, VideoDocumentKind):
+            raise DomainError(
+                "output_binding_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Output binding must use a supported document kind",
+            )
+        _require_text(self.recipe_id, "output_binding_invalid", "recipe_id")
+        _require_text(
+            self.quality_preset,
+            "output_binding_invalid",
+            "quality_preset",
+        )
+        if (
+            isinstance(self.recipe_version, bool)
+            or not isinstance(self.recipe_version, int)
+            or self.recipe_version < 1
+        ):
+            raise DomainError(
+                "output_binding_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Output binding recipe version must be a positive integer",
+            )
+
+
+@dataclass(frozen=True)
 class VideoProduceRequest:
     request_schema_version: int
     workspace_root: Path
@@ -211,11 +254,23 @@ class VideoProduceRequest:
     transcriber_profile: str = "default"
     output_language: str = "zh-CN"
     quality_preset: str = "balanced"
+    requested_outputs: tuple[VideoDocumentKind, ...] = (
+        VideoDocumentKind.KNOWLEDGE_NOTE,
+    )
+    resolved_outputs: tuple[ResolvedVideoOutput, ...] | None = None
+    faithful_language_policy: FaithfulLanguagePolicy = (
+        FaithfulLanguagePolicy.PRESERVE_SOURCE
+    )
     style: str = "structured"
     screenshot_policy: ScreenshotPolicy = ScreenshotPolicy.OFF
     client_request_id: str | None = None
     principal: str = "local-user"
     provided_transcript: TranscriptDocument | None = None
+    config_snapshot: JobConfigSnapshot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -250,6 +305,59 @@ class VideoProduceRequest:
                 ErrorCategory.INVALID_REQUEST,
                 "Screenshot policy must be a supported policy",
             )
+        if self.config_snapshot is not None and not isinstance(
+            self.config_snapshot, JobConfigSnapshot
+        ):
+            raise DomainError(
+                "config_snapshot_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job configuration snapshot is invalid",
+            )
+        try:
+            requested_outputs = tuple(
+                VideoDocumentKind(value) for value in self.requested_outputs
+            )
+        except (TypeError, ValueError):
+            raise DomainError(
+                "output_kind_unsupported",
+                ErrorCategory.INVALID_REQUEST,
+                "Requested outputs contain an unsupported document kind",
+            ) from None
+        if not requested_outputs:
+            raise DomainError(
+                "requested_outputs_empty",
+                ErrorCategory.INVALID_REQUEST,
+                "Requested outputs must contain at least one document kind",
+            )
+        requested_output_set = frozenset(requested_outputs)
+        requested_outputs = tuple(
+            kind for kind in VideoDocumentKind if kind in requested_output_set
+        )
+        if self.request_schema_version == 1 and requested_outputs != (
+            VideoDocumentKind.KNOWLEDGE_NOTE,
+        ):
+            raise DomainError(
+                "requested_outputs_requires_v2",
+                ErrorCategory.INVALID_REQUEST,
+                "Request schema v1 only supports the knowledge note output",
+            )
+        if not isinstance(self.faithful_language_policy, FaithfulLanguagePolicy):
+            raise DomainError(
+                "faithful_language_policy_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Faithful language policy must be a supported policy",
+            )
+        if (
+            self.faithful_language_policy
+            is FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT
+            and VideoDocumentKind.FAITHFUL_EDITION not in requested_output_set
+        ):
+            raise DomainError(
+                "faithful_language_policy_requires_faithful_output",
+                ErrorCategory.INVALID_REQUEST,
+                "Translation policy requires the faithful edition output",
+            )
+        object.__setattr__(self, "requested_outputs", requested_outputs)
         for field_name in (
             "input_value",
             "recipe_id",
@@ -262,6 +370,92 @@ class VideoProduceRequest:
         ):
             _require_text(
                 getattr(self, field_name), "video_produce_request_invalid", field_name
+            )
+        if self.resolved_outputs is None:
+            recipe_bindings = {
+                VideoDocumentKind.KNOWLEDGE_NOTE: (
+                    "alltonote.video-course-note",
+                    2,
+                ),
+                VideoDocumentKind.FAITHFUL_EDITION: (
+                    "alltonote.video-faithful-edition",
+                    1,
+                ),
+            }
+            resolved_outputs = tuple(
+                ResolvedVideoOutput(
+                    document_kind,
+                    (
+                        self.recipe_id
+                        if self.request_schema_version == 1
+                        else recipe_bindings[document_kind][0]
+                    ),
+                    (
+                        self.recipe_version
+                        if self.request_schema_version == 1
+                        else recipe_bindings[document_kind][1]
+                    ),
+                    self.quality_preset,
+                )
+                for document_kind in requested_outputs
+            )
+        else:
+            resolved_outputs = tuple(self.resolved_outputs)
+        if any(
+            not isinstance(output, ResolvedVideoOutput)
+            for output in resolved_outputs
+        ):
+            raise DomainError(
+                "output_binding_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Output bindings must use the resolved output contract",
+            )
+        if (
+            tuple(output.document_kind for output in resolved_outputs)
+            != requested_outputs
+            or any(
+                output.quality_preset != self.quality_preset
+                for output in resolved_outputs
+            )
+            or (
+                self.request_schema_version == 1
+                and (
+                    resolved_outputs[0].recipe_id != self.recipe_id
+                    or resolved_outputs[0].recipe_version != self.recipe_version
+                )
+            )
+        ):
+            raise DomainError(
+                "output_binding_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Output bindings must match the normalized request outputs",
+            )
+        object.__setattr__(self, "resolved_outputs", resolved_outputs)
+
+
+@dataclass(frozen=True)
+class VideoProducedDocument:
+    document_kind: VideoDocumentKind
+    draft_artifact_id: str
+    quality_report_artifact_id: str
+    quality_overall: QualityOverall
+    publish_eligible: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.document_kind, VideoDocumentKind)
+            or type(self.draft_artifact_id) is not str
+            or _ARTIFACT_ID_PATTERN.fullmatch(self.draft_artifact_id) is None
+            or type(self.quality_report_artifact_id) is not str
+            or _ARTIFACT_ID_PATTERN.fullmatch(self.quality_report_artifact_id) is None
+            or self.draft_artifact_id == self.quality_report_artifact_id
+            or not isinstance(self.quality_overall, QualityOverall)
+            or type(self.publish_eligible) is not bool
+        ):
+            raise DomainError(
+                "video_result_document_invalid",
+                ErrorCategory.INTERNAL,
+                "Video result document is invalid",
             )
 
 
@@ -285,11 +479,48 @@ class VideoProduceResult:
     usage: Mapping[str, int | float | str]
     warnings: tuple[str, ...]
     idempotent: bool
+    documents: tuple[VideoProducedDocument, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "display_asset_ids", tuple(self.display_asset_ids))
         object.__setattr__(self, "usage", _snapshot_mapping(self.usage))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        documents = tuple(self.documents)
+        if (
+            any(not isinstance(document, VideoProducedDocument) for document in documents)
+            or len({document.document_kind for document in documents}) != len(documents)
+            or len({document.draft_artifact_id for document in documents}) != len(documents)
+            or len({document.quality_report_artifact_id for document in documents})
+            != len(documents)
+        ):
+            raise DomainError(
+                "video_result_document_invalid",
+                ErrorCategory.INTERNAL,
+                "Video result documents are invalid",
+            )
+        if documents:
+            primary = next(
+                (
+                    document
+                    for document in documents
+                    if document.draft_artifact_id
+                    == self.primary_draft_artifact_id
+                ),
+                None,
+            )
+            if (
+                primary is None
+                or primary.quality_report_artifact_id
+                != self.quality_report_artifact_id
+                or primary.quality_overall is not self.quality_overall
+                or primary.publish_eligible is not self.publish_eligible
+            ):
+                raise DomainError(
+                    "video_result_document_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Primary result projection is inconsistent",
+                )
+        object.__setattr__(self, "documents", documents)
 
 
 @dataclass(frozen=True)

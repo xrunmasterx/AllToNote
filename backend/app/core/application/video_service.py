@@ -8,9 +8,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 from uuid import UUID
 
+from app.core.application.checkpoint_runner import (
+    CheckpointedStepExecutionContext,
+    CheckpointedStepRunner,
+)
 from app.core.application.job_service import JobService
 from app.core.application.video_acquisition import VideoAcquisition
 from app.core.application.video_checkpoints import (
@@ -30,19 +34,26 @@ from app.core.application.video_checkpoints import (
     encode_transcript as _encode_transcript,
     encode_validation as _encode_validation,
 )
+from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
+from app.core.config.model import JobConfigSnapshot
 from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.video import (
+    FaithfulLanguagePolicy,
     GeneratedVideoDraft,
     JobSnapshot,
     JobState,
+    QualityOverall,
+    ResolvedVideoOutput,
     ScreenshotPlanItem,
     ScreenshotPolicy,
     ScreenshotRequest,
     TranscriptDocument,
+    VideoDocumentKind,
+    VideoProducedDocument,
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
-from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata, CheckpointRecord
+from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata
 from app.core.jobs.resource_lease import ExecutionAuthority
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.bundle_assembler import (
@@ -52,11 +63,22 @@ from app.core.portable.bundle_assembler import (
     StepAttemptSummary,
     VideoArtifactIds,
     VideoBundleInput,
+    VideoDraftBundleInput,
     VideoSourceMetadata,
 )
-from app.core.portable.evidence import build_evidence_set, rewrite_segment_citations
+from app.core.portable.evidence import (
+    EvidenceSet,
+    build_evidence_set,
+    rewrite_segment_citations,
+)
 from app.core.portable.quality import evaluate_video_draft
+from app.core.recipes.video.compilation.quality import (
+    CoverageOmissionV1 as TextCoverageOmissionV1,
+    KnowledgeNoteCandidateV1,
+    assess_knowledge_note,
+)
 from app.core.ports.jobs import (
+    AttemptMetadataRepositoryPort,
     AttemptStoragePort,
     PortableCommitReceipt,
     SourceIdentityBinding,
@@ -66,11 +88,23 @@ from app.core.ports.jobs import (
 from app.core.ports.portable import PortableCommitResultPort, PortableWorkspacePort
 from app.core.ports.source import ResolvedVideoSource
 
+if TYPE_CHECKING:
+    from app.core.application.faithful_edition_compiler import (
+        FaithfulCompiledVideoDocument,
+    )
+    from app.core.application.video_compiler import CompiledVideoDocument
+
 
 RUNTIME_VERSION = "0.1.0"
 CHECKPOINT_SCHEMA = "video-step.v1"
-_CANDIDATE_ASSEMBLY_BEHAVIOR = "linked-screenshot-draft-v2"
-_HISTORICAL_COMMIT_CANDIDATE_BEHAVIOR = "linked-screenshot-draft-v1"
+_CANDIDATE_ASSEMBLY_BEHAVIOR = "portable-output-profile-v2"
+_DOCUMENT_COMPILATION_BEHAVIOR = (
+    "projection-v2/finalization-v1/citation-format-v1"
+)
+_HISTORICAL_COMMIT_CANDIDATE_BEHAVIORS_V1 = (
+    "linked-screenshot-draft-v1",
+    "linked-screenshot-draft-v2",
+)
 _SCHEDULER_LEASE_TTL_SECONDS = 300
 _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _AUTHORITY_LOSS_CODES = frozenset({"attempt_fenced", "scheduler_lease_lost"})
@@ -106,7 +140,7 @@ CHECKPOINT_STEPS = (
     "quality_and_portable_validation",
 )
 _T = TypeVar("_T")
-_REQUEST_KEYS = frozenset(
+_REQUEST_KEYS_V1 = frozenset(
     {
         "request_schema_version",
         "workspace_root",
@@ -122,6 +156,9 @@ _REQUEST_KEYS = frozenset(
         "screenshot_policy",
         "provided_transcript",
     }
+)
+_REQUEST_KEYS_V2 = _REQUEST_KEYS_V1 | frozenset(
+    {"requested_outputs", "faithful_language_policy", "output_bindings"}
 )
 
 
@@ -142,13 +179,7 @@ class VideoPreflightCapabilities:
     required_free_bytes: int = 1
 
 
-@dataclass(frozen=True)
-class VideoStepExecutionContext:
-    job_id: str
-    step_id: str
-    attempt_id: str
-    authority: ExecutionAuthority
-    heartbeat: Callable[[], None]
+VideoStepExecutionContext = CheckpointedStepExecutionContext
 
 
 def _checkpoint_error() -> DomainError:
@@ -159,16 +190,6 @@ def _checkpoint_error() -> DomainError:
     )
 
 
-def _decode_object(payload: bytes, *, keys: frozenset[str]) -> dict[str, object]:
-    try:
-        value = json.loads(payload)
-    except (UnicodeError, ValueError, RecursionError):
-        raise _checkpoint_error() from None
-    if type(value) is not dict or frozenset(value) != keys:
-        raise _checkpoint_error()
-    return value
-
-
 def _encode_object(value: Mapping[str, object]) -> bytes:
     return json.dumps(
         dict(value),
@@ -177,6 +198,30 @@ def _encode_object(value: Mapping[str, object]) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _decode_compilation_identity(payload: bytes, step_id: str) -> str:
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, ValueError, RecursionError):
+        raise _checkpoint_error() from None
+    if (
+        type(value) is not dict
+        or frozenset(value) != frozenset({"identity", "step"})
+        or value.get("step") != step_id
+        or not _is_sha256_digest(value.get("identity"))
+    ):
+        raise _checkpoint_error()
+    return value["identity"]
 
 
 class VideoRecipeOperations(Protocol):
@@ -232,10 +277,75 @@ class VideoRecipeOperations(Protocol):
     def after_portable_commit(self, result: PortableCommitResultPort) -> None: ...
 
 
+@dataclass(frozen=True)
+class VideoKnowledgeCompilationInput:
+    output: ResolvedVideoOutput
+    source_id: str
+    source_revision_id: str
+    source_title: str
+    source_language: str
+    source_duration_ms: int
+    transcript_basis: str
+    transcript: TranscriptDocument
+    output_language: str
+    style: str
+    screenshot_policy: ScreenshotPolicy
+    provider_profile: str
+    model_override: str | None
+
+
+class VideoKnowledgeCompilerPort(Protocol):
+    """Narrow service boundary for the v2 knowledge-note compiler."""
+
+    def compilation_identity(self) -> str: ...
+
+    def compile(
+        self,
+        request: VideoKnowledgeCompilationInput,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> CompiledVideoDocument: ...
+
+
+@dataclass(frozen=True)
+class VideoFaithfulCompilationInput:
+    output: ResolvedVideoOutput
+    source_title: str
+    source_language: str
+    source_duration_ms: int
+    transcript_basis: str
+    transcript: TranscriptDocument
+    language_policy: FaithfulLanguagePolicy
+    output_language: str
+    provider_profile: str
+    model_override: str | None
+
+
+class VideoFaithfulCompilerPort(Protocol):
+    """Narrow service boundary for the v2 faithful-edition compiler."""
+
+    def compilation_identity(self) -> str: ...
+
+    def compile(
+        self,
+        request: VideoFaithfulCompilationInput,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> FaithfulCompiledVideoDocument: ...
+
+
+class _VideoServiceRepositoryPort(
+    VideoExecutionRepositoryPort,
+    AttemptMetadataRepositoryPort,
+    Protocol,
+):
+    pass
+
+
 class VideoService:
     def __init__(
         self,
-        repository: VideoExecutionRepositoryPort,
+        repository: _VideoServiceRepositoryPort,
         attempt_storage: AttemptStoragePort,
         portable: PortableWorkspacePort,
         operations: VideoRecipeOperations,
@@ -244,6 +354,9 @@ class VideoService:
         owner_id: str,
         work_root: Path,
         local_instance_id: str,
+        knowledge_compiler: VideoKnowledgeCompilerPort | None = None,
+        faithful_compiler: VideoFaithfulCompilerPort | None = None,
+        current_config_snapshot: JobConfigSnapshot | None = None,
     ) -> None:
         self._repository = repository
         self._job_service = JobService(repository)
@@ -254,8 +367,19 @@ class VideoService:
         self._owner_id = owner_id
         self._work_root = work_root
         self._local_instance_id = local_instance_id
+        self._knowledge_compiler = knowledge_compiler
+        self._faithful_compiler = faithful_compiler
+        self._current_config_snapshot = current_config_snapshot
+        self._submitted_config_snapshots: dict[str, JobConfigSnapshot] = {}
         self._execution_lock = threading.Lock()
-        self._heartbeat_interval_seconds = _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS
+        self._checkpoint_runner = CheckpointedStepRunner(
+            repository,
+            attempt_storage,
+            checkpoint_reader=lambda metadata: self._checkpoint_reader(metadata),
+            checkpoint_schema=CHECKPOINT_SCHEMA,
+            scheduler_lease_ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
+            heartbeat_interval_seconds=_SCHEDULER_HEARTBEAT_INTERVAL_SECONDS,
+        )
 
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
         if not isinstance(request, VideoProduceRequest):
@@ -264,11 +388,25 @@ class VideoService:
                 ErrorCategory.INVALID_REQUEST,
                 "Video production requires a versioned request",
             )
-        snapshot = self._job_service.submit(request)
+        config_snapshot = request.config_snapshot or self._current_config_snapshot
+        initial_events = (
+            ((JOB_CONFIG_SNAPSHOT_EVENT, config_snapshot),)
+            if config_snapshot is not None
+            else ()
+        )
+        snapshot = self._job_service.submit(
+            self._job_request_payload(request),
+            initial_events=initial_events,
+        )
+        if config_snapshot is not None:
+            self._submitted_config_snapshots[snapshot.job_id] = config_snapshot
         return snapshot
 
     def get_job(self, job_id: str) -> JobSnapshot:
         return self._snapshot(job_id)
+
+    def cancel_job(self, job_id: str) -> JobSnapshot:
+        return self._job_service.cancel(job_id)
 
     def wait_job(self, job_id: str) -> JobSnapshot:
         with self._execution_lock:
@@ -283,6 +421,7 @@ class VideoService:
             JobState.WAITING_FOR_INPUT,
         }:
             return snapshot
+        self._assert_config_compatible(job_id)
         request = self._load_request(job_id)
         if snapshot.state is JobState.QUEUED:
             self._repository.transition_job(job_id, JobState.RUNNING)
@@ -460,7 +599,7 @@ class VideoService:
         authority: ExecutionAuthority,
     ) -> JobSnapshot:
         checkpoint = self._load_commit_candidate_checkpoint(
-            attempt.job_id, self._request_hash(request)
+            attempt.job_id, request
         )
         return self._commit(request, checkpoint, attempt, authority)
 
@@ -495,14 +634,28 @@ class VideoService:
             transcript,
             evidence_ids,
         )
+        if request.request_schema_version == 2:
+            return self._build_v2_input(
+                request,
+                job_id=job_id,
+                acquired=acquired,
+                acquisition_checkpoint=acquisition_checkpoint,
+                transcript=transcript,
+                evidence=evidence,
+                evidence_ids=evidence_ids,
+                authority=authority,
+                request_hash=request_hash,
+                resumed_attempt=resumed_attempt,
+            )
         draft = self._checkpointed(
             job_id,
             "generate_draft",
             request_hash,
             authority,
             lambda execution: self._finalize_draft(
-                self._operations.generate_draft(
+                self._generate_draft(
                     request,
+                    source,
                     transcript,
                     execution=execution,
                 ),
@@ -548,7 +701,9 @@ class VideoService:
             draft_bundle_id=ids["bundle"],
             draft_artifact_id=ids["draft"],
         )
-        started, completed, created = self._timestamps(job_id)
+        started, completed, created = self._timestamps(
+            job_id, source.observed_at
+        )
         return VideoBundleInput(
             bundle_id=ids["bundle"],
             created_at=created,
@@ -613,6 +768,553 @@ class VideoService:
             display_assets=screenshots,
         )
 
+    def _build_v2_input(
+        self,
+        request: VideoProduceRequest,
+        *,
+        job_id: str,
+        acquired: VideoAcquisition,
+        acquisition_checkpoint: CheckpointMetadata,
+        transcript: TranscriptDocument,
+        evidence: EvidenceSet,
+        evidence_ids: Mapping[str, str],
+        authority: ExecutionAuthority,
+        request_hash: str,
+        resumed_attempt: Attempt | None,
+    ) -> VideoBundleInput:
+        outputs = request.resolved_outputs or ()
+        if not outputs:
+            raise DomainError(
+                "output_binding_unsupported",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Video output bindings are unavailable",
+            )
+        source = acquired.metadata
+        ids = self._ids(job_id)
+        portable_drafts: list[VideoDraftBundleInput] = []
+        generated_drafts: list[GeneratedVideoDraft] = []
+        screenshots: tuple[DisplayAssetInput, ...] = ()
+        for ordinal, output in enumerate(outputs):
+            step_id = (
+                "generate_draft"
+                if ordinal == 0
+                else f"generate_{output.document_kind.value.replace('-', '_')}_draft"
+            )
+            compiler_identity = self._compilation_identity(output)
+            freeze_step_id = (
+                f"freeze_{output.document_kind.value.replace('-', '_')}_compilation"
+            )
+            freeze_input_hash = self._compilation_freeze_input_hash(
+                request_hash,
+                transcript,
+                output,
+            )
+            frozen_identity = self._checkpointed(
+                job_id,
+                freeze_step_id,
+                freeze_input_hash,
+                authority,
+                lambda _execution, identity=compiler_identity: identity,
+                encode=lambda value, frozen_step=freeze_step_id: _encode_object(
+                    {"identity": value, "step": frozen_step}
+                ),
+                decode=lambda payload, frozen_step=freeze_step_id: (
+                    _decode_compilation_identity(payload, frozen_step)
+                ),
+                resumed_attempt=resumed_attempt,
+            )
+            if frozen_identity != compiler_identity:
+                raise DomainError(
+                    "compilation_binding_drift",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "The frozen document compiler identity changed during recovery",
+                    {"document_kind": output.document_kind.value},
+                )
+            draft_input_hash = self._document_compilation_input_hash(
+                freeze_input_hash,
+                frozen_identity,
+            )
+            draft = self._checkpointed(
+                job_id,
+                step_id,
+                draft_input_hash,
+                authority,
+                lambda execution, selected=output: self._finalize_draft(
+                    self._generate_output_draft(
+                        request,
+                        selected,
+                        source,
+                        transcript,
+                        execution=execution,
+                    ),
+                    transcript,
+                    evidence_ids,
+                ),
+                encode=_encode_draft,
+                decode=_decode_draft,
+                resumed_attempt=resumed_attempt,
+            )
+            draft = replace(
+                draft,
+                markdown=rewrite_segment_citations(draft.markdown, evidence_ids),
+            )
+            if output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE:
+                screenshots = self._checkpointed(
+                    job_id,
+                    "optional_screenshots",
+                    request_hash,
+                    authority,
+                    lambda execution: self._capture_screenshots(
+                        job_id,
+                        request.screenshot_policy,
+                        draft,
+                        transcript,
+                        acquired,
+                        acquisition_checkpoint,
+                        execution,
+                    ),
+                    encode=_encode_screenshots,
+                    decode=_decode_screenshots,
+                    resumed_attempt=resumed_attempt,
+                )
+                screenshot_plan = build_screenshot_plan(
+                    job_id,
+                    request.screenshot_policy,
+                    draft,
+                    transcript,
+                )
+                draft = bind_screenshot_assets(draft, screenshot_plan, screenshots)
+            draft_artifact_id = (
+                ids["draft"] if ordinal == 0 else ids["faithful_draft"]
+            )
+            quality_artifact_id = (
+                ids["quality"] if ordinal == 0 else ids["faithful_quality"]
+            )
+            quality = evaluate_video_draft(
+                draft,
+                evidence,
+                draft_bundle_id=ids["bundle"],
+                draft_artifact_id=draft_artifact_id,
+            )
+            try:
+                quality_summary = json.loads(
+                    str(draft.usage["compiler_quality_summary"])
+                )
+                model_operation_count = int(
+                    draft.usage["model_operation_count"]
+                )
+                sequential_model_waves = int(
+                    draft.usage["sequential_model_waves"]
+                )
+                repair_operation_count = int(
+                    draft.usage["repair_operation_count"]
+                )
+                model_binding_sha256 = str(
+                    draft.usage["model_binding_sha256"]
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise DomainError(
+                    "video_compilation_result_invalid",
+                    ErrorCategory.RECIPE_FAILED,
+                    "Video compiler omitted required Portable provenance",
+                ) from None
+            transcript_basis = {
+                "provided": "human-transcript",
+                "platform": "platform-caption",
+                "generated": "asr-transcript",
+            }.get(source.subtitle_acquisition, "unknown")
+            language_policy = (
+                request.faithful_language_policy.value
+                if output.document_kind is VideoDocumentKind.FAITHFUL_EDITION
+                else "output-language"
+            )
+            target_language = (
+                None
+                if language_policy == "preserve-source"
+                else request.output_language
+            )
+            faithful_summary = (
+                {
+                    "section_count": int(draft.usage["section_count"]),
+                    "uncertainty_count": int(draft.usage["uncertainty_count"]),
+                    "anchor_warning_count": int(
+                        draft.usage["anchor_warning_count"]
+                    ),
+                    "body_segment_reference_coverage_ratio": float(
+                        draft.usage[
+                            "body_segment_reference_coverage_ratio"
+                        ]
+                    ),
+                }
+                if output.document_kind is VideoDocumentKind.FAITHFUL_EDITION
+                else None
+            )
+            portable_drafts.append(
+                VideoDraftBundleInput(
+                    document_kind=output.document_kind,
+                    draft_artifact_id=draft_artifact_id,
+                    quality_report_artifact_id=quality_artifact_id,
+                    quality=quality,
+                    recipe_id=output.recipe_id,
+                    recipe_version=output.recipe_version,
+                    quality_profile=output.quality_preset,
+                    transcript_basis=transcript_basis,
+                    source_language=source.language,
+                    language_policy=language_policy,
+                    target_language=target_language,
+                    model_binding_sha256=model_binding_sha256,
+                    model_operation_count=model_operation_count,
+                    sequential_model_waves=sequential_model_waves,
+                    repair_operation_count=repair_operation_count,
+                    usage={
+                        "input_tokens": int(draft.usage["input_tokens"]),
+                        "output_tokens": int(draft.usage["output_tokens"]),
+                    },
+                    warnings=draft.warnings,
+                    quality_summary=quality_summary,
+                    faithful_summary=faithful_summary,
+                )
+            )
+            generated_drafts.append(draft)
+        if VideoDocumentKind.KNOWLEDGE_NOTE not in {
+            output.document_kind for output in outputs
+        }:
+            screenshots = self._checkpointed(
+                job_id,
+                "optional_screenshots",
+                request_hash,
+                authority,
+                lambda _execution: (),
+                encode=_encode_screenshots,
+                decode=_decode_screenshots,
+                resumed_attempt=resumed_attempt,
+            )
+        model_identities = {draft.model_identity for draft in generated_drafts}
+        if len(model_identities) != 1:
+            raise DomainError(
+                "model_execution_binding_mismatch",
+                ErrorCategory.RECIPE_FAILED,
+                "Video outputs used inconsistent model bindings",
+            )
+        primary = portable_drafts[0]
+        started, completed, created = self._timestamps(
+            job_id, source.observed_at
+        )
+        receipt_steps = list(CHECKPOINT_STEPS)
+        assembly_index = receipt_steps.index("assemble_candidate_bundle")
+        receipt_steps[assembly_index:assembly_index] = [
+            f"generate_{output.document_kind.value.replace('-', '_')}_draft"
+            for output in outputs[1:]
+        ]
+        usage = {
+            key: sum(
+                int(draft.usage.get(key, 0))
+                for draft in generated_drafts
+                if type(draft.usage.get(key, 0)) is int
+            )
+            for key in ("input_tokens", "output_tokens")
+        }
+        return VideoBundleInput(
+            bundle_id=ids["bundle"],
+            created_at=created,
+            location=self._portable.candidate_location(
+                request.workspace_root,
+                local_instance_id=self._local_instance_id,
+                nonce=self._candidate_location_nonce(job_id),
+            ),
+            source=source,
+            artifact_ids=VideoArtifactIds(
+                source_metadata=ids["metadata"],
+                transcript=ids["transcript"],
+                evidence_set=ids["evidence"],
+                primary_draft=primary.draft_artifact_id,
+                quality_report=primary.quality_report_artifact_id,
+            ),
+            transcript=transcript,
+            evidence_set=evidence,
+            quality=primary.quality,
+            receipt=ReceiptProvenance(
+                run_id=ids["run"],
+                job_id=job_id,
+                attempt_id=self._derived_id(job_id, "att", "receipt"),
+                started_at=started,
+                completed_at=completed,
+                recipe_id=request.recipe_id,
+                recipe_version=request.recipe_version,
+                capability_id="alltonote.video-source-bundle",
+                capability_version="1.0.0",
+                runtime_version=RUNTIME_VERSION,
+                portable_contract_id="iwiki-portable-contract-v1",
+                effective_policy_hashes={
+                    "preflight": self._preflight_policy_hash(request),
+                    "generation": request_hash,
+                    "redaction": sha256_digest("task11-redaction-v1"),
+                },
+                model_identity=next(iter(model_identities)),
+                transcriber_identity=self._transcriber_identity(source),
+                usage=usage,
+                warnings=(),
+                redactions={
+                    "secrets": "omitted",
+                    "prompts": "hash_only",
+                    "provider_payloads": "omitted",
+                },
+                steps=tuple(
+                    StepAttemptSummary(
+                        step_id=step,
+                        attempt=1,
+                        state="succeeded",
+                        started_at=started,
+                        completed_at=completed,
+                    )
+                    for step in receipt_steps
+                ),
+            ),
+            display_assets=screenshots,
+            drafts=tuple(portable_drafts),
+            primary_draft_artifact_id=primary.draft_artifact_id,
+        )
+
+    def _generate_output_draft(
+        self,
+        request: VideoProduceRequest,
+        output: ResolvedVideoOutput,
+        source: VideoSourceMetadata,
+        transcript: TranscriptDocument,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> GeneratedVideoDraft:
+        if output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE:
+            return self._generate_draft(
+                request,
+                source,
+                transcript,
+                execution=execution,
+                output=output,
+            )
+        compiler = self._faithful_compiler
+        if compiler is None:
+            raise DomainError(
+                "faithful_compiler_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Faithful edition compiler is unavailable",
+            )
+        compiled = compiler.compile(
+            VideoFaithfulCompilationInput(
+                output=output,
+                source_title=source.title,
+                source_language=source.language,
+                source_duration_ms=source.duration_ms,
+                transcript_basis=source.subtitle_acquisition,
+                transcript=transcript,
+                language_policy=request.faithful_language_policy,
+                output_language=request.output_language,
+                provider_profile=request.provider_profile,
+                model_override=request.model_override,
+            ),
+            execution=execution,
+        )
+        return self._project_compiled_faithful_draft(compiled, transcript=transcript)
+
+    def _generate_draft(
+        self,
+        request: VideoProduceRequest,
+        source: VideoSourceMetadata,
+        transcript: TranscriptDocument,
+        *,
+        execution: VideoStepExecutionContext,
+        output: ResolvedVideoOutput | None = None,
+    ) -> GeneratedVideoDraft:
+        if request.request_schema_version == 1:
+            return self._operations.generate_draft(
+                request,
+                transcript,
+                execution=execution,
+            )
+        compiler = self._knowledge_compiler
+        if compiler is None:
+            raise DomainError(
+                "knowledge_compiler_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Knowledge note compiler is unavailable",
+            )
+        output = output or (
+            request.resolved_outputs[0] if request.resolved_outputs else None
+        )
+        if output is None:
+            raise DomainError(
+                "output_binding_unsupported",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Knowledge note output binding is unavailable",
+            )
+        compiled = compiler.compile(
+            VideoKnowledgeCompilationInput(
+                output=output,
+                source_id=source.source_id,
+                source_revision_id=source.source_revision_id,
+                source_title=source.title,
+                source_language=source.language,
+                source_duration_ms=source.duration_ms,
+                transcript_basis=source.subtitle_acquisition,
+                transcript=transcript,
+                output_language=request.output_language,
+                style=request.style,
+                screenshot_policy=request.screenshot_policy,
+                provider_profile=request.provider_profile,
+                model_override=request.model_override,
+            ),
+            execution=execution,
+        )
+        return self._project_compiled_knowledge_draft(
+            compiled,
+            transcript=transcript,
+        )
+
+    @staticmethod
+    def _project_compiled_knowledge_draft(
+        compiled: object,
+        *,
+        transcript: TranscriptDocument,
+    ) -> GeneratedVideoDraft:
+        try:
+            document_kind = compiled.document_kind  # type: ignore[attr-defined]
+            model_identity = compiled.model_identity  # type: ignore[attr-defined]
+            markdown = compiled.markdown  # type: ignore[attr-defined]
+            cited_segment_ids = tuple(  # type: ignore[attr-defined]
+                compiled.cited_segment_ids
+            )
+            screenshot_requests = tuple(  # type: ignore[attr-defined]
+                compiled.screenshot_requests
+            )
+            compiled_usage = compiled.usage  # type: ignore[attr-defined]
+            summary = compiled.execution_summary  # type: ignore[attr-defined]
+            plan = compiled.plan  # type: ignore[attr-defined]
+            coverage = compiled.coverage  # type: ignore[attr-defined]
+            warnings = tuple(compiled.warnings)  # type: ignore[attr-defined]
+            required_coverage_ids = tuple(
+                (*coverage.covered_input_ids, *(item.input_id for item in coverage.omissions))
+            )
+            quality_assessment = assess_knowledge_note(
+                KnowledgeNoteCandidateV1(
+                    markdown=markdown,
+                    allowed_segment_ids=tuple(
+                        segment.segment_id for segment in transcript.segments
+                    ),
+                    required_coverage_input_ids=required_coverage_ids,
+                    covered_coverage_input_ids=coverage.covered_input_ids,
+                    omissions=tuple(
+                        TextCoverageOmissionV1(item.input_id, item.reason)
+                        for item in coverage.omissions
+                    ),
+                )
+            )
+            quality_summary = {
+                "overall": quality_assessment.overall.value,
+                "checks": [
+                    {
+                        **({"reason": check.reason} if check.reason is not None else {}),
+                        "id": check.check_id,
+                        "status": check.status,
+                    }
+                    for check in quality_assessment.checks
+                ],
+                "method_summary": {
+                    "deterministic": len(quality_assessment.checks),
+                    "model": 0,
+                    "human": 0,
+                },
+                "metrics": {
+                    "cited_segment_count": len(
+                        quality_assessment.cited_segment_ids
+                    ),
+                    "coverage_input_count": len(required_coverage_ids),
+                },
+            }
+            usage = {
+                "input_tokens": compiled_usage.input_tokens,
+                "output_tokens": compiled_usage.output_tokens,
+                "token_counts_complete": str(
+                    compiled_usage.token_counts_complete
+                ).lower(),
+                "compilation_topology": summary.topology.value,
+                "chunk_count": summary.chunk_count,
+                "knowledge_item_count": summary.knowledge_item_count,
+                "model_operation_count": summary.model_operation_count,
+                "sequential_model_waves": summary.sequential_model_waves,
+                "repair_operation_count": int(
+                    summary.sequential_model_waves
+                    > plan.expected_sequential_model_waves
+                ),
+                "model_binding_sha256": plan.model_binding_sha256,
+                "compiler_quality_summary": json.dumps(
+                    quality_summary,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            }
+            known_segment_ids = {
+                segment.segment_id for segment in transcript.segments
+            }
+            citations_known = set(cited_segment_ids).issubset(known_segment_ids)
+        except (AttributeError, TypeError, ValueError):
+            raise DomainError(
+                "knowledge_compilation_result_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Knowledge compiler returned an invalid document",
+            ) from None
+        if (
+            document_kind is not VideoDocumentKind.KNOWLEDGE_NOTE
+            or type(model_identity) is not str
+            or not model_identity.strip()
+            or not citations_known
+            or type(compiled_usage.input_tokens) is not int
+            or compiled_usage.input_tokens < 0
+            or type(compiled_usage.output_tokens) is not int
+            or compiled_usage.output_tokens < 0
+            or type(compiled_usage.token_counts_complete) is not bool
+            or type(summary.chunk_count) is not int
+            or summary.chunk_count < 1
+            or type(summary.knowledge_item_count) is not int
+            or summary.knowledge_item_count < 0
+            or type(summary.model_operation_count) is not int
+            or summary.model_operation_count < 1
+            or type(summary.sequential_model_waves) is not int
+            or not 1
+            <= summary.sequential_model_waves
+            <= summary.model_operation_count
+            or type(summary.topology.value) is not str
+            or not summary.topology.value
+            or quality_assessment.overall is QualityOverall.FAIL
+            or type(plan.model_binding_sha256) is not str
+            or not plan.model_binding_sha256.startswith("sha256:")
+            or len(plan.model_binding_sha256) != 71
+            or any(type(warning) is not str or not warning for warning in warnings)
+            or len(warnings) != len(set(warnings))
+        ):
+            raise DomainError(
+                "knowledge_compilation_result_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Knowledge compiler returned an invalid document",
+            )
+        if compiled_usage.token_counts_complete is False:
+            warnings = tuple(dict.fromkeys((*warnings, "model_token_usage_incomplete")))
+        try:
+            return GeneratedVideoDraft(
+                markdown=markdown,
+                cited_segment_ids=cited_segment_ids,
+                screenshot_requests=screenshot_requests,
+                model_identity=model_identity,
+                usage=usage,
+                warnings=warnings,
+            )
+        except DomainError as error:
+            raise DomainError(
+                "knowledge_compilation_result_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Knowledge compiler returned an invalid document",
+            ) from error
+
     def _capture_screenshots(
         self,
         job_id: str,
@@ -634,9 +1336,174 @@ class VideoService:
             execution=execution,
         )
 
+    @staticmethod
+    def _project_compiled_faithful_draft(
+        compiled: object,
+        *,
+        transcript: TranscriptDocument,
+    ) -> GeneratedVideoDraft:
+        try:
+            document_kind = compiled.document_kind  # type: ignore[attr-defined]
+            model_identity = compiled.model_identity  # type: ignore[attr-defined]
+            markdown = compiled.markdown  # type: ignore[attr-defined]
+            cited_segment_ids = tuple(  # type: ignore[attr-defined]
+                compiled.cited_segment_ids
+            )
+            screenshot_requests = tuple(  # type: ignore[attr-defined]
+                compiled.screenshot_requests
+            )
+            compiled_usage = compiled.usage  # type: ignore[attr-defined]
+            summary = compiled.execution_summary  # type: ignore[attr-defined]
+            assessment = compiled.text_assessment  # type: ignore[attr-defined]
+            plan = compiled.plan  # type: ignore[attr-defined]
+            warnings = tuple(compiled.warnings)  # type: ignore[attr-defined]
+            status_map = {
+                "pass": "pass",
+                "warning": "warn",
+                "fail": "fail",
+                "not_applicable": "skipped",
+            }
+            method_summary = {"deterministic": 0, "model": 0, "human": 0}
+            compiler_checks: list[dict[str, str]] = []
+            for check in assessment.checks:
+                method_summary[check.method.value] += 1
+                check_document = {
+                    "id": check.check_id,
+                    "status": status_map[check.status.value],
+                }
+                if check.status.value != "pass":
+                    check_document["reason"] = check.safe_details
+                compiler_checks.append(check_document)
+            metrics = assessment.metrics
+            quality_summary = {
+                "overall": assessment.overall.value,
+                "checks": compiler_checks,
+                "method_summary": method_summary,
+                "metrics": {
+                    "body_segment_reference_coverage_ratio": (
+                        metrics.body_segment_reference_coverage_ratio
+                    ),
+                    "order_violation_count": metrics.order_violation_count,
+                    "unknown_reference_count": metrics.unknown_reference_count,
+                    "duplicate_assignment_count": metrics.duplicate_assignment_count,
+                    "source_character_count": metrics.source_character_count,
+                    "target_character_count": metrics.target_character_count,
+                    "length_ratio": metrics.length_ratio,
+                    "number_mismatch_count": metrics.number_mismatch_count,
+                    "technical_token_mismatch_count": (
+                        metrics.technical_token_mismatch_count
+                    ),
+                    "qualifier_warning_count": metrics.qualifier_warning_count,
+                    "uncertainty_count": metrics.uncertainty_count,
+                    "anchor_warning_count": metrics.anchor_warning_count,
+                },
+            }
+            usage = {
+                "input_tokens": compiled_usage.input_tokens,
+                "output_tokens": compiled_usage.output_tokens,
+                "token_counts_complete": str(
+                    compiled_usage.token_counts_complete
+                ).lower(),
+                "section_count": summary.section_count,
+                "model_operation_count": summary.model_operation_count,
+                "sequential_model_waves": summary.sequential_model_waves,
+                "repair_operation_count": summary.repair_operation_count,
+                "uncertainty_count": summary.uncertainty_count,
+                "anchor_warning_count": summary.anchor_warning_count,
+                "body_segment_reference_coverage_ratio": (
+                    summary.body_segment_reference_coverage_ratio
+                ),
+                "model_binding_sha256": plan.model_binding_sha256,
+                "compiler_quality_summary": json.dumps(
+                    quality_summary,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            }
+            known_segment_ids = {
+                segment.segment_id for segment in transcript.segments
+            }
+        except (AttributeError, TypeError, ValueError):
+            raise DomainError(
+                "faithful_compilation_result_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Faithful compiler returned an invalid document",
+            ) from None
+        if (
+            document_kind is not VideoDocumentKind.FAITHFUL_EDITION
+            or type(model_identity) is not str
+            or not model_identity.strip()
+            or not set(cited_segment_ids).issubset(known_segment_ids)
+            or len(cited_segment_ids) != len(set(cited_segment_ids))
+            or screenshot_requests
+            or assessment.overall is QualityOverall.FAIL
+            or type(compiled_usage.input_tokens) is not int
+            or compiled_usage.input_tokens < 0
+            or type(compiled_usage.output_tokens) is not int
+            or compiled_usage.output_tokens < 0
+            or type(compiled_usage.token_counts_complete) is not bool
+            or type(summary.section_count) is not int
+            or summary.section_count < 1
+            or type(summary.model_operation_count) is not int
+            or summary.model_operation_count < summary.section_count
+            or type(summary.sequential_model_waves) is not int
+            or not 1 <= summary.sequential_model_waves <= 2
+            or type(summary.repair_operation_count) is not int
+            or summary.repair_operation_count < 0
+            or type(summary.body_segment_reference_coverage_ratio) is not float
+            or summary.body_segment_reference_coverage_ratio != 1.0
+            or type(plan.model_binding_sha256) is not str
+            or not plan.model_binding_sha256.startswith("sha256:")
+            or len(plan.model_binding_sha256) != 71
+            or any(type(warning) is not str or not warning for warning in warnings)
+            or len(warnings) != len(set(warnings))
+        ):
+            raise DomainError(
+                "faithful_compilation_quality_failed",
+                ErrorCategory.RECIPE_FAILED,
+                "Faithful edition did not pass the required quality gates",
+            )
+        if compiled_usage.token_counts_complete is False:
+            warnings = tuple(dict.fromkeys((*warnings, "model_token_usage_incomplete")))
+        try:
+            return GeneratedVideoDraft(
+                markdown=markdown,
+                cited_segment_ids=cited_segment_ids,
+                screenshot_requests=(),
+                model_identity=model_identity,
+                usage=usage,
+                warnings=warnings,
+            )
+        except DomainError as error:
+            raise DomainError(
+                "faithful_compilation_result_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Faithful compiler returned an invalid document",
+            ) from error
+
     def _assemble(self, bundle_input: VideoBundleInput) -> _CandidateCheckpoint:
         candidate = BundleAssembler().assemble(bundle_input)
         ids = bundle_input.artifact_ids
+        primary_draft = (
+            next(
+                draft
+                for draft in bundle_input.drafts
+                if draft.draft_artifact_id == ids.primary_draft
+            )
+            if bundle_input.drafts
+            else None
+        )
+        documents = tuple(
+            VideoProducedDocument(
+                document_kind=draft.document_kind,
+                draft_artifact_id=draft.draft_artifact_id,
+                quality_report_artifact_id=draft.quality_report_artifact_id,
+                quality_overall=draft.portable_overall,
+                publish_eligible=draft.portable_publish_eligible,
+            )
+            for draft in bundle_input.drafts
+        )
         return _CandidateCheckpoint(
             staging_relative_path=candidate.staging_relative_path,
             bundle_id=candidate.bundle_id,
@@ -653,14 +1520,23 @@ class VideoService:
             display_asset_ids=tuple(
                 asset.artifact_id for asset in bundle_input.display_assets
             ),
-            quality_overall=bundle_input.quality.overall,
-            publish_eligible=bundle_input.quality.publish_eligible,
+            quality_overall=(
+                primary_draft.portable_overall
+                if primary_draft is not None
+                else bundle_input.quality.overall
+            ),
+            publish_eligible=(
+                primary_draft.portable_publish_eligible
+                if primary_draft is not None
+                else bundle_input.quality.publish_eligible
+            ),
             usage={
                 key: value
                 for key, value in bundle_input.receipt.usage.items()
                 if type(value) is int
             },
             warnings=bundle_input.receipt.warnings,
+            documents=documents,
         )
 
     def _commit(
@@ -694,6 +1570,7 @@ class VideoService:
             publish_eligible=checkpoint.publish_eligible,
             usage=checkpoint.usage,
             warnings=checkpoint.warnings,
+            documents=checkpoint.documents,
         )
         source_identity = SourceIdentityBinding(
             connector_id=checkpoint.connector_id,
@@ -732,18 +1609,21 @@ class VideoService:
         return self._snapshot(attempt.job_id)
 
     def _load_commit_candidate_checkpoint(
-        self, job_id: str, request_hash: str
+        self, job_id: str, request: VideoProduceRequest
     ) -> _CandidateCheckpoint:
         metadata = self._repository.latest_checkpoint(
             job_id, "assemble_candidate_bundle"
         )
-        accepted_hashes = (
-            self._candidate_assembly_input_hash(request_hash),
-            self._candidate_assembly_input_hash_for_behavior(
-                request_hash,
-                _HISTORICAL_COMMIT_CANDIDATE_BEHAVIOR,
-            ),
-        )
+        request_hash = self._request_hash(request)
+        accepted_hashes = [self._candidate_assembly_input_hash(request_hash)]
+        if request.request_schema_version == 1:
+            accepted_hashes.extend(
+                self._candidate_assembly_input_hash_for_behavior(
+                    request_hash,
+                    behavior,
+                )
+                for behavior in _HISTORICAL_COMMIT_CANDIDATE_BEHAVIORS_V1
+            )
         if metadata is None or not any(
             self._attempt_storage.validate_checkpoint(
                 metadata,
@@ -763,8 +1643,17 @@ class VideoService:
         job, _, _ = self._repository.get_job_details(job_id)
         payload = self._repository.get_job_request(job_id)
         try:
+            if payload is None or sha256_digest(payload) != job.request_hash:
+                raise TypeError
             value = json.loads(payload) if payload is not None else None
-            if type(value) is not dict or frozenset(value) != _REQUEST_KEYS:
+            if type(value) is not dict:
+                raise TypeError
+            schema_version = value.get("request_schema_version")
+            expected_keys = {
+                1: _REQUEST_KEYS_V1,
+                2: _REQUEST_KEYS_V2,
+            }.get(schema_version)
+            if expected_keys is None or frozenset(value) != expected_keys:
                 raise TypeError
             provided = value["provided_transcript"]
             transcript = (
@@ -776,7 +1665,7 @@ class VideoService:
                     )
                 )
             )
-            return VideoProduceRequest(
+            request = VideoProduceRequest(
                 request_schema_version=value["request_schema_version"],
                 workspace_root=Path(value["workspace_root"]),
                 input_value=value["input_value"],
@@ -787,12 +1676,40 @@ class VideoService:
                 transcriber_profile=value["transcriber_profile"],
                 output_language=value["output_language"],
                 quality_preset=value["quality_preset"],
+                requested_outputs=(
+                    (VideoDocumentKind.KNOWLEDGE_NOTE,)
+                    if schema_version == 1
+                    else tuple(
+                        VideoDocumentKind(item) for item in value["requested_outputs"]
+                    )
+                ),
+                resolved_outputs=(
+                    None
+                    if schema_version == 1
+                    else tuple(
+                        ResolvedVideoOutput(
+                            document_kind=VideoDocumentKind(
+                                binding["document_kind"]
+                            ),
+                            recipe_id=binding["recipe_id"],
+                            recipe_version=binding["recipe_version"],
+                            quality_preset=binding["quality_preset"],
+                        )
+                        for binding in value["output_bindings"]
+                    )
+                ),
+                faithful_language_policy=(
+                    FaithfulLanguagePolicy.PRESERVE_SOURCE
+                    if schema_version == 1
+                    else FaithfulLanguagePolicy(value["faithful_language_policy"])
+                ),
                 style=value["style"],
                 screenshot_policy=ScreenshotPolicy(value["screenshot_policy"]),
                 client_request_id=job.client_request_id,
                 principal=job.principal,
                 provided_transcript=transcript,
             )
+            return request
         except (DomainError, KeyError, TypeError, ValueError, UnicodeError):
             raise DomainError(
                 "job_request_invalid",
@@ -820,13 +1737,87 @@ class VideoService:
                 ErrorCategory.WORKSPACE_INCOMPATIBLE,
                 "Video preflight capabilities are invalid",
             )
-        checks = (
-            (request.request_schema_version == 1, "request_schema_unsupported"),
-            (
+        if request.request_schema_version not in {1, 2}:
+            raise DomainError(
+                "request_schema_unsupported",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Video preflight check failed",
+            )
+        if request.request_schema_version == 1:
+            recipe_supported = (
                 request.recipe_id == "alltonote.video-course-note"
-                and request.recipe_version == 1,
+                and request.recipe_version == 1
+            )
+        else:
+            recipe_supported = (
+                request.recipe_id == "alltonote.video-producer"
+                and request.recipe_version == 2
+            )
+        if not recipe_supported:
+            raise DomainError(
                 "recipe_version_unsupported",
-            ),
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Video preflight check failed",
+            )
+        if request.request_schema_version == 2:
+            supported_outputs = {
+                VideoDocumentKind.KNOWLEDGE_NOTE: ResolvedVideoOutput(
+                    document_kind=VideoDocumentKind.KNOWLEDGE_NOTE,
+                    recipe_id="alltonote.video-course-note",
+                    recipe_version=2,
+                    quality_preset="balanced",
+                ),
+                VideoDocumentKind.FAITHFUL_EDITION: ResolvedVideoOutput(
+                    document_kind=VideoDocumentKind.FAITHFUL_EDITION,
+                    recipe_id="alltonote.video-faithful-edition",
+                    recipe_version=1,
+                    quality_preset="balanced",
+                ),
+            }
+            expected_outputs = tuple(
+                supported_outputs[kind] for kind in request.requested_outputs
+            )
+            if request.quality_preset != "balanced":
+                raise DomainError(
+                    "output_quality_unsupported",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Video preflight check failed",
+                )
+            if request.resolved_outputs != expected_outputs:
+                raise DomainError(
+                    "output_binding_unsupported",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Video preflight check failed",
+                )
+            if (
+                VideoDocumentKind.KNOWLEDGE_NOTE in request.requested_outputs
+                and self._knowledge_compiler is None
+            ):
+                raise DomainError(
+                    "knowledge_compiler_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Video preflight check failed",
+                )
+            if (
+                VideoDocumentKind.FAITHFUL_EDITION in request.requested_outputs
+                and self._faithful_compiler is None
+            ):
+                raise DomainError(
+                    "faithful_compiler_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Video preflight check failed",
+                )
+            if (
+                request.screenshot_policy is not ScreenshotPolicy.OFF
+                and VideoDocumentKind.KNOWLEDGE_NOTE
+                not in request.requested_outputs
+            ):
+                raise DomainError(
+                    "screenshot_requires_knowledge_note",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Video preflight check failed",
+                )
+        checks = (
             (capabilities.runtime_version == RUNTIME_VERSION, "runtime_version_unsupported"),
             (capabilities.video_feature_pack, "video_feature_pack_unavailable"),
             (capabilities.source_capability, "source_capability_unavailable"),
@@ -914,153 +1905,25 @@ class VideoService:
         reuse: bool = True,
         resumed_attempt: Attempt | None = None,
     ) -> _T:
-        self._heartbeat(authority)
-        existing = self._repository.latest_checkpoint(job_id, step_id)
-        if reuse and existing is not None and self._attempt_storage.validate_checkpoint(
-            existing,
-            expected_schema_id=CHECKPOINT_SCHEMA,
-            expected_input_hash=input_hash,
-        ):
-            try:
-                payload = self._checkpoint_reader(existing)
-                if decode is not None:
-                    value = decode(payload)
-                else:
-                    marker = _decode_object(
-                        payload, keys=frozenset({"state", "step"})
-                    )
-                    if marker != {"state": "succeeded", "step": step_id}:
-                        raise _checkpoint_error()
-                    value = None  # type: ignore[assignment]
-            except (DomainError, OSError, RuntimeError, TypeError, ValueError):
-                pass
-            else:
-                if self._is_resumed_step(resumed_attempt, job_id, step_id):
-                    self._repository.transition_attempt(
-                        resumed_attempt.attempt_id,
-                        AttemptState.SUCCEEDED,
-                        authority=authority,
-                    )
-                self._heartbeat(authority)
-                return value
-        if self._is_resumed_step(resumed_attempt, job_id, step_id):
-            attempt = resumed_attempt
-        else:
-            attempt = self._repository.create_attempt(job_id, step_id)
-            attempt = self._repository.start_attempt(attempt.attempt_id, authority)
-        try:
-            self._heartbeat(authority)
-            execution = VideoStepExecutionContext(
-                job_id=job_id,
-                step_id=step_id,
-                attempt_id=attempt.attempt_id,
-                authority=authority,
-                heartbeat=lambda: self._heartbeat(authority),
-            )
-            value = self._run_checkpoint_action(action, execution)
-            self._heartbeat(authority)
-            payload = (
-                encode(value)
-                if encode is not None
-                else json.dumps(
-                    {"step": step_id, "state": "succeeded"},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
-            self._attempt_storage.save_checkpoint(
-                CheckpointRecord(
-                    job_id=job_id,
-                    step_id=step_id,
-                    attempt_id=attempt.attempt_id,
-                    schema_id=CHECKPOINT_SCHEMA,
-                    input_hash=input_hash,
-                    payload=payload,
-                    metadata_json="{}",
-                ),
-                authority,
-            )
-        except DomainError as error:
-            try:
-                if error.code == "external_outcome_unknown":
-                    self._repository.pause_for_external_outcome_atomic(
-                        job_id,
-                        attempt.attempt_id,
-                        authority,
-                    )
-                else:
-                    self._repository.transition_attempt(
-                        attempt.attempt_id, AttemptState.FAILED, authority=authority
-                    )
-            except DomainError as convergence_error:
-                if convergence_error.code not in _AUTHORITY_LOSS_CODES:
-                    raise
-            raise
-        except BaseException:
-            try:
-                self._repository.transition_attempt(
-                    attempt.attempt_id, AttemptState.FAILED, authority=authority
-                )
-            except DomainError as convergence_error:
-                if convergence_error.code not in _AUTHORITY_LOSS_CODES:
-                    raise
-            raise
-        self._repository.transition_attempt(
-            attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
-        )
-        return value
-
-    def _run_checkpoint_action(
-        self,
-        action: Callable[[VideoStepExecutionContext], _T],
-        execution: VideoStepExecutionContext,
-    ) -> _T:
-        stop = threading.Event()
-        heartbeat_failures: list[BaseException] = []
-
-        def heartbeat_until_stopped() -> None:
-            try:
-                while not stop.wait(self._heartbeat_interval_seconds):
-                    execution.heartbeat()
-            except BaseException as error:
-                heartbeat_failures.append(error)
-                stop.set()
-
-        worker = threading.Thread(
-            target=heartbeat_until_stopped,
-            name=f"alltonote-scheduler-heartbeat-{execution.attempt_id}",
-        )
-        worker.start()
-        try:
-            value = action(execution)
-        except BaseException:
-            stop.set()
-            worker.join()
-            raise
-        stop.set()
-        worker.join()
-        if heartbeat_failures:
-            raise heartbeat_failures[0]
-        return value
-
-    @staticmethod
-    def _is_resumed_step(
-        attempt: Attempt | None,
-        job_id: str,
-        step_id: str,
-    ) -> bool:
-        return (
-            attempt is not None
-            and attempt.job_id == job_id
-            and attempt.step_id == step_id
-            and attempt.state is AttemptState.RUNNING
-        )
-
-    def _heartbeat(self, authority: ExecutionAuthority) -> None:
-        self._repository.heartbeat_scheduler_lease(
+        return self._checkpoint_runner.run(
+            job_id,
+            step_id,
+            input_hash,
             authority,
-            ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
+            action,
+            encode=encode,
+            decode=decode,
+            reuse=reuse,
+            resumed_attempt=resumed_attempt,
         )
+
+    @property
+    def _heartbeat_interval_seconds(self) -> float:
+        return self._checkpoint_runner.heartbeat_interval_seconds
+
+    @_heartbeat_interval_seconds.setter
+    def _heartbeat_interval_seconds(self, value: float) -> None:
+        self._checkpoint_runner.heartbeat_interval_seconds = value
 
     @staticmethod
     def _finalize_draft(
@@ -1117,40 +1980,145 @@ class VideoService:
     def _snapshot(self, job_id: str) -> JobSnapshot:
         return self._job_service.get(job_id)
 
+    def _assert_config_compatible(self, job_id: str) -> None:
+        events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == JOB_CONFIG_SNAPSHOT_EVENT
+        )
+        if not events:
+            return
+        if len(events) != 1:
+            raise DomainError(
+                "config_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job configuration snapshot is invalid",
+            )
+        current = self._submitted_config_snapshots.get(
+            job_id, self._current_config_snapshot
+        )
+        if current is None:
+            raise DomainError(
+                "effective_config_unavailable",
+                ErrorCategory.CONFLICT,
+                "Current effective configuration is unavailable for Job recovery",
+            )
+        try:
+            payload = json.loads(events[0].payload_json)
+            stored = JobConfigSnapshot(
+                snapshot_version=payload["snapshot_version"],
+                values=payload["values"],
+                digest=payload["digest"],
+                semantic_digest=payload["semantic_digest"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DomainError(
+                "config_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job configuration snapshot is invalid",
+            ) from error
+        if stored.semantic_digest != current.semantic_digest:
+            raise DomainError(
+                "effective_config_drift",
+                ErrorCategory.CONFLICT,
+                "Result-affecting configuration changed; create a new Job",
+                {
+                    "submitted_semantic_digest": stored.semantic_digest,
+                    "current_semantic_digest": current.semantic_digest,
+                },
+            )
+
     @staticmethod
-    def _request_hash(request: VideoProduceRequest) -> str:
+    def _resolved_output_bindings(
+        request: VideoProduceRequest,
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                "document_kind": output.document_kind.value,
+                "recipe_id": output.recipe_id,
+                "recipe_version": output.recipe_version,
+                "quality_preset": output.quality_preset,
+            }
+            for output in request.resolved_outputs or ()
+        )
+
+    @classmethod
+    def _job_request_payload(cls, request: VideoProduceRequest) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "request_schema_version": request.request_schema_version,
+            "workspace_root": request.workspace_root,
+            "input_value": request.input_value,
+            "recipe_id": request.recipe_id,
+            "recipe_version": request.recipe_version,
+            "provider_profile": request.provider_profile,
+            "model_override": request.model_override,
+            "transcriber_profile": request.transcriber_profile,
+            "output_language": request.output_language,
+            "quality_preset": request.quality_preset,
+            "style": request.style,
+            "screenshot_policy": request.screenshot_policy,
+            "client_request_id": request.client_request_id,
+            "principal": request.principal,
+            "provided_transcript": request.provided_transcript,
+        }
+        if request.request_schema_version >= 2:
+            payload.update(
+                {
+                    "requested_outputs": request.requested_outputs,
+                    "faithful_language_policy": request.faithful_language_policy,
+                    "output_bindings": cls._resolved_output_bindings(request),
+                }
+            )
+        return payload
+
+    @classmethod
+    def _request_hash(cls, request: VideoProduceRequest) -> str:
+        payload: dict[str, object] = {
+            "schema": request.request_schema_version,
+            "workspace": str(request.workspace_root),
+            "input": request.input_value,
+            "recipe": request.recipe_id,
+            "recipe_version": request.recipe_version,
+            "language": request.output_language,
+            "quality": request.quality_preset,
+            "style": request.style,
+            "screenshots": request.screenshot_policy.value,
+            "provider_profile": request.provider_profile,
+            "model_override": request.model_override,
+            "transcriber_profile": request.transcriber_profile,
+            "provided_transcript": (
+                None
+                if request.provided_transcript is None
+                else {
+                    "language": request.provided_transcript.language,
+                    "segments": [
+                        {
+                            "segment_id": segment.segment_id,
+                            "start_ms": segment.start_ms,
+                            "end_ms": segment.end_ms,
+                            "text": segment.text,
+                        }
+                        for segment in request.provided_transcript.segments
+                    ],
+                }
+            ),
+        }
+        if request.request_schema_version >= 2:
+            payload.update(
+                {
+                    "requested_outputs": [
+                        document_kind.value
+                        for document_kind in request.requested_outputs
+                    ],
+                    "faithful_language_policy": (
+                        request.faithful_language_policy.value
+                    ),
+                    "output_bindings": cls._resolved_output_bindings(request),
+                }
+            )
         return sha256_digest(
             json.dumps(
-                {
-                    "schema": request.request_schema_version,
-                    "workspace": str(request.workspace_root),
-                    "input": request.input_value,
-                    "recipe": request.recipe_id,
-                    "recipe_version": request.recipe_version,
-                    "language": request.output_language,
-                    "quality": request.quality_preset,
-                    "style": request.style,
-                    "screenshots": request.screenshot_policy.value,
-                    "provider_profile": request.provider_profile,
-                    "model_override": request.model_override,
-                    "transcriber_profile": request.transcriber_profile,
-                    "provided_transcript": (
-                        None
-                        if request.provided_transcript is None
-                        else {
-                            "language": request.provided_transcript.language,
-                            "segments": [
-                                {
-                                    "segment_id": segment.segment_id,
-                                    "start_ms": segment.start_ms,
-                                    "end_ms": segment.end_ms,
-                                    "text": segment.text,
-                                }
-                                for segment in request.provided_transcript.segments
-                            ],
-                        }
-                    ),
-                },
+                payload,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -1161,6 +2129,79 @@ class VideoService:
         return sha256_digest(
             json.dumps(
                 {"checks": PREFLIGHT_CHECKS, "request": cls._request_hash(request)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    def _compilation_identity(self, output: ResolvedVideoOutput) -> str:
+        compiler: object | None = (
+            self._knowledge_compiler
+            if output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE
+            else self._faithful_compiler
+        )
+        identity_provider = getattr(compiler, "compilation_identity", None)
+        if not callable(identity_provider):
+            raise DomainError(
+                "compiler_identity_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The document compiler does not expose a frozen execution identity",
+                {"document_kind": output.document_kind.value},
+            )
+        identity = identity_provider()
+        if not _is_sha256_digest(identity):
+            raise DomainError(
+                "compiler_identity_invalid",
+                ErrorCategory.INTERNAL,
+                "The document compiler returned an invalid execution identity",
+                {"document_kind": output.document_kind.value},
+            )
+        return sha256_digest(
+            json.dumps(
+                {
+                    "compiler_identity": identity,
+                    "document_behavior": _DOCUMENT_COMPILATION_BEHAVIOR,
+                    "document_kind": output.document_kind.value,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    @staticmethod
+    def _compilation_freeze_input_hash(
+        request_hash: str,
+        transcript: TranscriptDocument,
+        output: ResolvedVideoOutput,
+    ) -> str:
+        return sha256_digest(
+            json.dumps(
+                {
+                    "output": {
+                        "document_kind": output.document_kind.value,
+                        "quality_preset": output.quality_preset,
+                        "recipe_id": output.recipe_id,
+                        "recipe_version": output.recipe_version,
+                    },
+                    "request": request_hash,
+                    "transcript": sha256_digest(_encode_transcript(transcript)),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    @staticmethod
+    def _document_compilation_input_hash(
+        freeze_input_hash: str,
+        compiler_identity: str,
+    ) -> str:
+        return sha256_digest(
+            json.dumps(
+                {
+                    "compiler_identity": compiler_identity,
+                    "freeze_input": freeze_input_hash,
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -1214,12 +2255,32 @@ class VideoService:
             "evidence": cls._derived_id(job_id, "art", "evidence"),
             "draft": cls._derived_id(job_id, "art", "draft"),
             "quality": cls._derived_id(job_id, "art", "quality"),
+            "faithful_draft": cls._derived_id(
+                job_id, "art", "faithful-edition-draft"
+            ),
+            "faithful_quality": cls._derived_id(
+                job_id, "art", "faithful-edition-quality"
+            ),
         }
 
     @staticmethod
-    def _timestamps(job_id: str) -> tuple[str, str, str]:
+    def _timestamps(
+        job_id: str,
+        source_observed_at: str,
+    ) -> tuple[str, str, str]:
         now_ms = int(UUID(job_id.removeprefix("job_")).hex[:12], 16)
-        base = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+        job_created = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+        try:
+            observed = datetime.fromisoformat(
+                source_observed_at.removesuffix("Z") + "+00:00"
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise DomainError(
+                "source_metadata_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Source observation timestamp is invalid",
+            ) from None
+        base = max(job_created, observed + timedelta(seconds=1))
 
         def render(value: datetime) -> str:
             return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
@@ -1357,6 +2418,8 @@ __all__ = [
     "CHECKPOINT_STEPS",
     "PREFLIGHT_CHECKS",
     "RUNTIME_VERSION",
+    "VideoKnowledgeCompilationInput",
+    "VideoKnowledgeCompilerPort",
     "VideoRecipeOperations",
     "VideoService",
     "VideoStepExecutionContext",

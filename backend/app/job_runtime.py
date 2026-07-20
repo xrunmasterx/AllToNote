@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+import math
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Protocol
+
+from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
+from app.core.application.job_query_service import (
+    JobEventPage,
+    JobPage,
+    JobQueryService,
+    JobView,
+)
+from app.core.application.job_service import JobService
+from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
+from app.core.config.model import JobConfigSnapshot
+from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
+from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.state_machine import TERMINAL_JOB_STATES
+from app.runtime_paths import resolve_runtime_paths
+
+
+LOCAL_CLI_PRINCIPAL = "local-user"
+
+
+class JobExecutionRuntime(Protocol):
+    job_repository: SqliteJobRepository
+
+    def wait_job(
+        self,
+        job_id: str,
+        event_sink: object | None = None,
+    ) -> JobSnapshot: ...
+
+
+class JobRuntime:
+    """Headless Job query/control facade shared by CLI adapters."""
+
+    def __init__(
+        self,
+        repository: SqliteJobRepository,
+        *,
+        wait_job: Callable[[str], JobSnapshot] | None,
+        current_config_snapshot: JobConfigSnapshot | None,
+        principal: str = LOCAL_CLI_PRINCIPAL,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._query = JobQueryService(repository)
+        self._jobs = JobService(repository)
+        self._wait_job = wait_job
+        self._current_config_snapshot = current_config_snapshot
+        self._principal = principal
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    def get_job(self, job_id: str) -> JobView:
+        return self._query.get(job_id, principal=self._principal)
+
+    def list_jobs(
+        self,
+        *,
+        states: tuple[JobState, ...] = (),
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> JobPage:
+        return self._query.list(
+            principal=self._principal,
+            states=states,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def get_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> JobEventPage:
+        return self._query.events(
+            job_id,
+            principal=self._principal,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    def wait_for_job(
+        self,
+        job_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> JobView:
+        current = self.get_job(job_id)
+        if _is_wait_boundary(current.snapshot.state):
+            return current
+        if timeout_seconds is not None:
+            if (
+                type(timeout_seconds) not in {int, float}
+                or isinstance(timeout_seconds, bool)
+                or not math.isfinite(float(timeout_seconds))
+                or timeout_seconds <= 0
+                or timeout_seconds > 86_400
+            ):
+                raise DomainError(
+                    "job_wait_timeout_invalid",
+                    ErrorCategory.INVALID_REQUEST,
+                    "Job wait timeout must be greater than zero and at most one day",
+                )
+            deadline = self._monotonic() + float(timeout_seconds)
+            while not _is_wait_boundary(current.snapshot.state):
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise DomainError(
+                        "job_wait_timeout",
+                        ErrorCategory.RETRYABLE_RUNTIME,
+                        "Timed out while waiting for the durable Job state",
+                        {
+                            "job_id": job_id,
+                            "timeout_seconds": timeout_seconds,
+                        },
+                    )
+                self._sleep(min(0.05, remaining))
+                current = self.get_job(job_id)
+            return current
+        if self._wait_job is None:
+            raise DomainError(
+                "job_execution_owner_unavailable",
+                ErrorCategory.POLICY_DENIED,
+                "No compatible execution owner is available for this Job",
+            )
+        self._wait_job(job_id)
+        return self.get_job(job_id)
+
+    def cancel_job(self, job_id: str) -> JobView:
+        self.get_job(job_id)
+        self._jobs.cancel(job_id)
+        return self.get_job(job_id)
+
+    def respond_job(
+        self,
+        job_id: str,
+        challenge_id: str,
+        response: Mapping[str, object],
+    ) -> JobView:
+        self.require_respondable(job_id, challenge_id)
+        if not isinstance(response, Mapping):
+            raise DomainError(
+                "challenge_response_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Challenge response must be a JSON object",
+            )
+        self._jobs.respond(job_id, challenge_id, response)
+        return self.get_job(job_id)
+
+    def require_respondable(
+        self,
+        job_id: str,
+        challenge_id: str,
+    ) -> JobView:
+        current = self.get_job(job_id)
+        challenge = current.pending_challenge
+        if (
+            current.snapshot.state is not JobState.WAITING_FOR_INPUT
+            or challenge is None
+            or challenge.challenge_id != challenge_id
+        ):
+            raise DomainError(
+                "challenge_not_pending",
+                ErrorCategory.CONFLICT,
+                "Job does not have the specified pending Challenge",
+            )
+        if challenge.code == "external_outcome_unknown":
+            raise DomainError(
+                "external_outcome_unknown",
+                ErrorCategory.CONFLICT,
+                "Unknown external operations require manual reconciliation before retry",
+                {"operation_ids": current.unknown_operation_ids},
+            )
+        if challenge.kind is None:
+            raise DomainError(
+                "challenge_schema_unsupported",
+                ErrorCategory.CONFLICT,
+                "Pending Challenge does not declare a supported response kind",
+            )
+        return current
+
+    def retry_job(
+        self,
+        job_id: str,
+        request: RetryJobRequest,
+    ) -> JobView:
+        self.get_job(job_id)
+        initial_events = (
+            ((JOB_CONFIG_SNAPSHOT_EVENT, self._current_config_snapshot),)
+            if self._current_config_snapshot is not None
+            else ()
+        )
+        retried = self._jobs.retry(
+            job_id,
+            request,
+            initial_events=initial_events,
+        )
+        return self.get_job(retried.job_id)
+
+
+def create_job_runtime_for_execution_runtime(
+    runtime: JobExecutionRuntime,
+    *,
+    current_config_snapshot: JobConfigSnapshot | None,
+) -> JobRuntime:
+    return JobRuntime(
+        runtime.job_repository,
+        wait_job=lambda job_id: runtime.wait_job(job_id),
+        current_config_snapshot=current_config_snapshot,
+    )
+
+
+def create_job_runtime_for_workspace(
+    workspace_root: Path,
+    *,
+    local_app_data: Path | None = None,
+    current_config_snapshot: JobConfigSnapshot | None,
+) -> JobRuntime:
+    from iwiki.workspace import open_workspace
+
+    trusted_root = local_app_data or resolve_runtime_paths().workspace_registry_parent
+    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    paths.assert_outside_workspace(workspace_root)
+    trusted_root.mkdir(parents=True, exist_ok=True)
+    registry = WorkspaceInstanceRegistry(
+        trusted_root,
+        inspect_workspace=lambda root: open_workspace(
+            root, writable=False
+        ).manifest.workspace_id,
+    )
+    instance = registry.resolve(workspace_root)
+    repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+
+    def execute(job_id: str) -> JobSnapshot:
+        from app.runtime import create_codex_app_server_runtime_for_workspace
+
+        runtime = create_codex_app_server_runtime_for_workspace(
+            workspace_root,
+            local_app_data=trusted_root,
+            current_config_snapshot=current_config_snapshot,
+        )
+        return runtime.wait_job(job_id)
+
+    return JobRuntime(
+        repository,
+        wait_job=execute,
+        current_config_snapshot=current_config_snapshot,
+    )
+
+
+def _is_wait_boundary(state: JobState) -> bool:
+    return state in TERMINAL_JOB_STATES or state is JobState.WAITING_FOR_INPUT
+
+
+__all__ = [
+    "JobExecutionRuntime",
+    "JobRuntime",
+    "LOCAL_CLI_PRINCIPAL",
+    "create_job_runtime_for_execution_runtime",
+    "create_job_runtime_for_workspace",
+]

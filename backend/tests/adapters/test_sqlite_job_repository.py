@@ -12,6 +12,8 @@ from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.video import (
     JobState,
     QualityOverall,
+    VideoDocumentKind,
+    VideoProducedDocument,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.cancellation import CancellationToken
@@ -44,6 +46,8 @@ TRANSCRIPT_ID = new_typed_id("art", now_ms=1, randomness=b"\x08" * 10)
 EVIDENCE_SET_ID = new_typed_id("art", now_ms=1, randomness=b"\x09" * 10)
 QUALITY_REPORT_ID = new_typed_id("art", now_ms=1, randomness=b"\x0a" * 10)
 DISPLAY_ASSET_ID = new_typed_id("art", now_ms=1, randomness=b"\x0b" * 10)
+FAITHFUL_DRAFT_ID = new_typed_id("art", now_ms=1, randomness=b"\x0c" * 10)
+FAITHFUL_QUALITY_ID = new_typed_id("art", now_ms=1, randomness=b"\x0d" * 10)
 EXPECTED_TABLES = {
     "attempts",
     "challenges",
@@ -184,6 +188,84 @@ def _video_commit_inputs(
 @pytest.fixture
 def repo(tmp_path: Path) -> SqliteJobRepository:
     yield SqliteJobRepository.open(tmp_path / "machine-root")
+
+
+def test_initial_job_event_is_atomic_with_job_creation(
+    repo: SqliteJobRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_json = "{}"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            repo,
+            "_insert_event",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.IntegrityError("injected event failure")
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected event failure"):
+            repo.create_job(
+                request_hash=sha256_digest(request_json),
+                request_json=request_json,
+                principal="local",
+                client_request_id="atomic-initial-event",
+                initial_events=(("configuration.snapshot.v1", "{}"),),
+            )
+
+    created = repo.create_job(
+        request_hash=sha256_digest(request_json),
+        request_json=request_json,
+        principal="local",
+        client_request_id="atomic-initial-event",
+        initial_events=(("configuration.snapshot.v1", "{}"),),
+    )
+    assert [event.event_type for event in repo.list_events(created.job_id)] == [
+        "configuration.snapshot.v1"
+    ]
+
+
+def test_idempotent_job_replay_rejects_changed_initial_snapshot(
+    repo: SqliteJobRepository,
+) -> None:
+    request_json = "{}"
+    created = repo.create_job(
+        request_hash=sha256_digest(request_json),
+        request_json=request_json,
+        principal="local",
+        client_request_id="snapshot-idempotency",
+        initial_events=(("configuration.snapshot.v1", '{"digest":"first"}'),),
+    )
+
+    with pytest.raises(DomainError, match="idempotency_conflict"):
+        repo.create_job(
+            request_hash=sha256_digest(request_json),
+            request_json=request_json,
+            principal="local",
+            client_request_id="snapshot-idempotency",
+            initial_events=(
+                ("configuration.snapshot.v1", '{"digest":"second"}'),
+            ),
+        )
+
+    assert [event.payload_json for event in repo.list_events(created.job_id)] == [
+        '{"digest":"first"}'
+    ]
+
+
+def test_initial_job_event_rejects_sensitive_fields_before_creation(
+    repo: SqliteJobRepository,
+) -> None:
+    request_json = "{}"
+
+    with pytest.raises(DomainError, match="job_event_invalid"):
+        repo.create_job(
+            request_hash=sha256_digest(request_json),
+            request_json=request_json,
+            principal="local",
+            client_request_id="sensitive-initial-event",
+            initial_events=(
+                ("configuration.snapshot.v1", '{"api_key":"secret-canary"}'),
+            ),
+        )
 
 
 def _authority(repo: SqliteJobRepository):
@@ -893,6 +975,51 @@ def test_commit_video_result_atomic_persists_result_identity_and_success(
     assert identity["owning_bundle_id"] == plan.bundle_id
 
 
+def test_commit_video_result_round_trips_v2_documents(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "commit").attempt_id,
+        authority,
+    )
+    plan, binding, receipt = _video_commit_inputs(job.job_id)
+    documents = (
+        VideoProducedDocument(
+            VideoDocumentKind.KNOWLEDGE_NOTE,
+            PRIMARY_DRAFT_ID,
+            QUALITY_REPORT_ID,
+            QualityOverall.PASS,
+            True,
+        ),
+        VideoProducedDocument(
+            VideoDocumentKind.FAITHFUL_EDITION,
+            FAITHFUL_DRAFT_ID,
+            FAITHFUL_QUALITY_ID,
+            QualityOverall.PASS_WITH_WARNINGS,
+            True,
+        ),
+    )
+
+    returned = repo.commit_video_result_atomic(
+        job.job_id,
+        attempt.attempt_id,
+        authority,
+        result_plan=replace(plan, documents=documents),
+        source_identity=binding,
+        commit=lambda: receipt,
+    )
+
+    assert returned.result.documents == documents
+    assert repo.get_job_result(job.job_id).documents == documents
+
+
 def test_commit_video_result_atomic_rolls_back_when_callback_fails(
     repo: SqliteJobRepository,
 ) -> None:
@@ -1429,7 +1556,11 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
         authority=authority,
     )
     repo.start_external_operation(operation.operation_id, authority)
-    repo.mark_external_operation_unknown(operation.operation_id, summary_json="{}")
+    repo.mark_external_operation_unknown(
+        operation.operation_id,
+        summary_json="{}",
+        authority=authority,
+    )
 
     now_ms = 2_001
     current_authority = repo.acquire_scheduler_lease("next-owner", ttl_seconds=1)

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from iwiki.portable import PortableBundleRef, ValidationLevel, validate_bundle
@@ -15,6 +16,7 @@ from iwiki.workspace import open_workspace
 
 import app.core.application.video_service as video_service_module
 from app.core.domain.video import (
+    FaithfulLanguagePolicy,
     GeneratedVideoDraft,
     JobState,
     QualityOverall,
@@ -22,9 +24,12 @@ from app.core.domain.video import (
     ScreenshotRequest,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
     VideoProduceRequest,
 )
 from app.core.application.video_service import (
+    VideoFaithfulCompilationInput,
+    VideoKnowledgeCompilationInput,
     VideoService,
     VideoPreflightCapabilities,
     _CandidateCheckpoint,
@@ -118,6 +123,125 @@ def valid_request(
     )
 
 
+class _FakeV2KnowledgeCompiler:
+    def __init__(self, identity: str = "sha256:" + "a" * 64) -> None:
+        self.calls: list[tuple[VideoKnowledgeCompilationInput, object]] = []
+        self.identity = identity
+
+    def compilation_identity(self) -> str:
+        return self.identity
+
+    def compile(
+        self,
+        request: VideoKnowledgeCompilationInput,
+        *,
+        execution: object,
+    ) -> object:
+        self.calls.append((request, execution))
+        return SimpleNamespace(
+            document_kind=VideoDocumentKind.KNOWLEDGE_NOTE,
+            model_identity="fixture/model-v2",
+            markdown=(
+                "# Compiled video note\n\n"
+                "## Main lesson\n\nA coherent article.[^seg_000001]"
+            ),
+            cited_segment_ids=("seg_000001",),
+            screenshot_requests=(),
+            usage=SimpleNamespace(
+                input_tokens=321,
+                output_tokens=123,
+                token_counts_complete=False,
+            ),
+            execution_summary=SimpleNamespace(
+                topology=SimpleNamespace(value="direct"),
+                chunk_count=1,
+                knowledge_item_count=0,
+                model_operation_count=1,
+                sequential_model_waves=1,
+            ),
+            coverage=SimpleNamespace(
+                covered_input_ids=("seg_000001",),
+                omissions=(),
+            ),
+            plan=SimpleNamespace(
+                model_binding_sha256="sha256:" + "a" * 64,
+                expected_sequential_model_waves=1,
+            ),
+            warnings=("compiler_fixture_warning",),
+        )
+
+
+class _FakeV2FaithfulCompiler:
+    def __init__(self, identity: str = "sha256:" + "b" * 64) -> None:
+        self.calls: list[tuple[VideoFaithfulCompilationInput, object]] = []
+        self.identity = identity
+
+    def compilation_identity(self) -> str:
+        return self.identity
+
+    def compile(
+        self,
+        request: VideoFaithfulCompilationInput,
+        *,
+        execution: object,
+    ) -> object:
+        self.calls.append((request, execution))
+        return SimpleNamespace(
+            document_kind=VideoDocumentKind.FAITHFUL_EDITION,
+            model_identity="fixture/model-v2",
+            markdown=(
+                "# Faithful edition\n\n"
+                "## Faithful body\n\nThe source stays complete.[^seg_000001]\n\n"
+                "## AI summary\n\nA separate summary.[^seg_000001]"
+            ),
+            cited_segment_ids=("seg_000001",),
+            screenshot_requests=(),
+            usage=SimpleNamespace(
+                input_tokens=222,
+                output_tokens=111,
+                token_counts_complete=True,
+            ),
+            execution_summary=SimpleNamespace(
+                section_count=1,
+                model_operation_count=1,
+                sequential_model_waves=1,
+                repair_operation_count=0,
+                uncertainty_count=0,
+                anchor_warning_count=0,
+                body_segment_reference_coverage_ratio=1.0,
+            ),
+            text_assessment=SimpleNamespace(
+                overall=QualityOverall.PASS,
+                checks=(
+                    SimpleNamespace(
+                        check_id="body_segment_mapping",
+                        method=SimpleNamespace(value="deterministic"),
+                        status=SimpleNamespace(value="pass"),
+                        safe_details="Body segment mapping is complete",
+                    ),
+                ),
+                metrics=SimpleNamespace(
+                    body_segment_reference_coverage_ratio=1.0,
+                    order_violation_count=0,
+                    unknown_reference_count=0,
+                    duplicate_assignment_count=0,
+                    source_character_count=24,
+                    target_character_count=24,
+                    length_ratio=1.0,
+                    number_mismatch_count=0,
+                    technical_token_mismatch_count=0,
+                    qualifier_warning_count=0,
+                    uncertainty_count=0,
+                    anchor_warning_count=0,
+                ),
+            ),
+            plan=SimpleNamespace(
+                model_binding_sha256="sha256:" + "a" * 64,
+            ),
+            warnings=(),
+        )
+
+
 def _validate_committed_bundle(workspace_root: Path, bundle_id: str) -> None:
     workspace = open_workspace(workspace_root, writable=True)
     report = validate_bundle(
@@ -165,6 +289,280 @@ def test_fake_recipe_commits_once_and_returns_bundle(
             submitted.job_id,
             step_id,
         ) is not None
+
+
+def test_v2_single_knowledge_note_uses_injected_compiler_and_draft_checkpoint(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+    service = runtime._sdk._video_service
+    compiler = _FakeV2KnowledgeCompiler()
+    service._knowledge_compiler = compiler
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value="fixture://course",
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        client_request_id="v2-knowledge-compiler",
+    )
+
+    submitted = runtime.submit_video(request)
+    snapshot = runtime.wait_job(submitted.job_id)
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert snapshot.result is not None
+    assert snapshot.result.usage == {"input_tokens": 321, "output_tokens": 123}
+    assert snapshot.result.warnings == ()
+    assert calls.model == 0
+    assert len(compiler.calls) == 1
+    compiled_request, execution = compiler.calls[0]
+    assert compiled_request.output == request.resolved_outputs[0]
+    assert compiled_request.source_title
+    assert compiled_request.transcript.segments[0].segment_id == "seg_000001"
+    assert not hasattr(compiled_request, "workspace_root")
+    assert not hasattr(compiled_request, "input_value")
+    assert execution.job_id == submitted.job_id
+    assert execution.step_id == "generate_draft"
+    assert execution.authority.fencing_token > 0
+    draft_checkpoint = runtime.job_repository.latest_checkpoint(
+        submitted.job_id,
+        "generate_draft",
+    )
+    assert draft_checkpoint is not None
+    draft = decode_draft(service._checkpoint_reader(draft_checkpoint))
+    expected_usage = {
+        "chunk_count": 1,
+        "compilation_topology": "direct",
+        "input_tokens": 321,
+        "knowledge_item_count": 0,
+        "model_operation_count": 1,
+        "output_tokens": 123,
+        "sequential_model_waves": 1,
+        "token_counts_complete": "false",
+    }
+    assert {key: draft.usage[key] for key in expected_usage} == expected_usage
+    assert draft.usage["model_binding_sha256"] == "sha256:" + "a" * 64
+    assert draft.usage["repair_operation_count"] == 0
+    quality_summary = json.loads(draft.usage["compiler_quality_summary"])
+    assert quality_summary["overall"] == "pass"
+    assert len(quality_summary["checks"]) == 8
+    assert draft.warnings == (
+        "compiler_fixture_warning",
+        "model_token_usage_incomplete",
+    )
+
+
+def test_v2_recovery_rejects_compiler_binding_drift_before_replay(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+    service = runtime._sdk._video_service
+
+    class InterruptedCompiler(_FakeV2KnowledgeCompiler):
+        def compile(
+            self,
+            request: VideoKnowledgeCompilationInput,
+            *,
+            execution: object,
+        ) -> object:
+            self.calls.append((request, execution))
+            raise RuntimeError("injected after the frozen compiler identity")
+
+    first_compiler = InterruptedCompiler("sha256:" + "1" * 64)
+    service._knowledge_compiler = first_compiler
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value="fixture://course",
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        client_request_id="v2-binding-drift",
+    )
+    submitted = runtime.submit_video(request)
+
+    with pytest.raises(
+        RuntimeError, match="injected after the frozen compiler identity"
+    ):
+        runtime.wait_job(submitted.job_id)
+
+    freeze_checkpoint = runtime.job_repository.latest_checkpoint(
+        submitted.job_id,
+        "freeze_knowledge_note_compilation",
+    )
+    assert freeze_checkpoint is not None
+    replacement = _FakeV2KnowledgeCompiler("sha256:" + "2" * 64)
+    service._knowledge_compiler = replacement
+
+    recovered = runtime.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.FAILED
+    assert recovered.error is not None
+    assert recovered.error.code == "compilation_binding_drift"
+    assert len(first_compiler.calls) == 1
+    assert replacement.calls == []
+    assert calls.download == calls.transcribe == 1
+    assert calls.model == calls.commit == 0
+
+
+def test_v2_recovery_rejects_document_behavior_drift_before_replay(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, calls = runtime_factory()
+    service = runtime._sdk._video_service
+    compiler = _FakeV2KnowledgeCompiler()
+    service._knowledge_compiler = compiler
+    original_assemble = service._assemble
+
+    def interrupt_after_draft(_bundle_input: object) -> object:
+        raise RuntimeError("injected after the draft checkpoint")
+
+    service._assemble = interrupt_after_draft
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value="fixture://course",
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        client_request_id="v2-document-behavior-drift",
+    )
+    submitted = runtime.submit_video(request)
+
+    with pytest.raises(RuntimeError, match="after the draft checkpoint"):
+        runtime.wait_job(submitted.job_id)
+
+    assert runtime.job_repository.latest_checkpoint(
+        submitted.job_id,
+        "generate_draft",
+    ) is not None
+    assert len(compiler.calls) == 1
+    monkeypatch.setattr(
+        video_service_module,
+        "_DOCUMENT_COMPILATION_BEHAVIOR",
+        "projection-v999/finalization-v999/citation-format-v999",
+    )
+    service._assemble = original_assemble
+
+    recovered = runtime.wait_job(submitted.job_id)
+
+    assert recovered.state is JobState.FAILED
+    assert recovered.error is not None
+    assert recovered.error.code == "compilation_binding_drift"
+    assert len(compiler.calls) == 1
+    assert calls.model == calls.commit == 0
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_v2_faithful_and_dual_outputs_commit_one_atomic_bundle(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+    dual: bool,
+) -> None:
+    runtime, calls = runtime_factory()
+    service = runtime._sdk._video_service
+    knowledge = _FakeV2KnowledgeCompiler()
+    faithful = _FakeV2FaithfulCompiler()
+    service._knowledge_compiler = knowledge
+    service._faithful_compiler = faithful
+    requested = (
+        (VideoDocumentKind.KNOWLEDGE_NOTE, VideoDocumentKind.FAITHFUL_EDITION)
+        if dual
+        else (VideoDocumentKind.FAITHFUL_EDITION,)
+    )
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value="fixture://course",
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        requested_outputs=requested,
+        faithful_language_policy=FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT,
+        output_language="zh-CN",
+        client_request_id=f"v2-faithful-{dual}",
+    )
+
+    submitted = runtime.submit_video(request)
+    snapshot = runtime.wait_job(submitted.job_id)
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert snapshot.result is not None
+    assert calls.commit == 1
+    assert calls.model == 0
+    assert [document.document_kind for document in snapshot.result.documents] == list(
+        requested
+    )
+    assert len(faithful.calls) == 1
+    assert faithful.calls[0][0].language_policy is (
+        FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT
+    )
+    assert faithful.calls[0][0].output_language == "zh-CN"
+    assert len(knowledge.calls) == (1 if dual else 0)
+    faithful_step = "generate_faithful_edition_draft" if dual else "generate_draft"
+    assert runtime.job_repository.latest_checkpoint(
+        submitted.job_id, faithful_step
+    ) is not None
+    _validate_committed_bundle(workspace_root, snapshot.result.bundle_id)
+
+
+@pytest.mark.parametrize(
+    ("request_factory", "expected_code"),
+    (
+        (
+            lambda root: VideoProduceRequest(
+                request_schema_version=2,
+                workspace_root=root,
+                input_value="fixture://course",
+                recipe_id="alltonote.video-course-note",
+                recipe_version=1,
+            ),
+            "recipe_version_unsupported",
+        ),
+        (
+            lambda root: VideoProduceRequest(
+                request_schema_version=2,
+                workspace_root=root,
+                input_value="fixture://course",
+                recipe_id="alltonote.video-producer",
+                recipe_version=2,
+                quality_preset="fast",
+            ),
+            "output_quality_unsupported",
+        ),
+        (
+            lambda root: VideoProduceRequest(
+                request_schema_version=2,
+                workspace_root=root,
+                input_value="fixture://course",
+                recipe_id="alltonote.video-producer",
+                recipe_version=2,
+                requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+            ),
+            "faithful_compiler_unavailable",
+        ),
+    ),
+)
+def test_v2_preflight_fails_closed_before_external_work(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+    request_factory: Callable[[Path], VideoProduceRequest],
+    expected_code: str,
+) -> None:
+    runtime, calls = runtime_factory()
+    runtime._sdk._video_service._knowledge_compiler = _FakeV2KnowledgeCompiler()
+
+    submitted = runtime.submit_video(request_factory(workspace_root))
+    snapshot = runtime.wait_job(submitted.job_id)
+
+    assert snapshot.state is JobState.FAILED
+    assert snapshot.error is not None
+    assert snapshot.error.code == expected_code
+    assert calls.download == 0
+    assert calls.transcribe == 0
+    assert calls.model == 0
 
 
 def test_repeated_segment_citations_keep_two_uses_and_one_definition(
@@ -506,10 +904,15 @@ def test_crash_after_rename_recovers_after_runtime_reopen_and_new_fence(
     assert assembly_attempts == 1
 
 
-def test_v2_reconciles_v1_candidate_after_portable_rename(
+@pytest.mark.parametrize(
+    "historical_behavior",
+    ("linked-screenshot-draft-v1", "linked-screenshot-draft-v2"),
+)
+def test_current_runtime_reconciles_historical_v1_candidate_after_portable_rename(
     tmp_path: Path,
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
+    historical_behavior: str,
 ) -> None:
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "v1-commit-recovery-machine"
@@ -517,7 +920,7 @@ def test_v2_reconciles_v1_candidate_after_portable_rename(
     monkeypatch.setattr(
         video_service_module,
         "_CANDIDATE_ASSEMBLY_BEHAVIOR",
-        "linked-screenshot-draft-v1",
+        historical_behavior,
     )
     first = runtime_module.create_fake_runtime(
         machine_root,
@@ -557,7 +960,7 @@ def test_v2_reconciles_v1_candidate_after_portable_rename(
     monkeypatch.setattr(
         video_service_module,
         "_CANDIDATE_ASSEMBLY_BEHAVIOR",
-        "linked-screenshot-draft-v2",
+        "portable-output-profile-v2",
     )
     del first
     reopened = runtime_module.create_fake_runtime(

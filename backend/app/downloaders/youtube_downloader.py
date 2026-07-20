@@ -1,5 +1,7 @@
-import os
+import json
 import logging
+import math
+import os
 import shutil
 import tempfile
 from abc import ABC
@@ -11,7 +13,7 @@ import yt_dlp
 from app.downloaders.base import Downloader, DownloadQuality
 from app.downloaders.youtube_subtitle import YouTubeSubtitleFetcher
 from app.models.notes_model import AudioDownloadResult
-from app.models.transcriber_model import TranscriptResult
+from app.models.transcriber_model import TranscriptResult, TranscriptSegment
 from app.services.cookie_manager import CookieConfigManager
 from app.services.proxy_config_manager import ProxyConfigManager
 from app.utils.path_helper import get_data_dir
@@ -265,4 +267,141 @@ class YoutubeDownloader(Downloader, ABC):
         print(
             f"尝试获取字幕，video_id={video_id}, langs={langs}"
         )
-        return fetcher.fetch_subtitles(video_id, langs)
+        transcript = fetcher.fetch_subtitles(video_id, langs)
+        if transcript is not None:
+            return transcript
+        return self._download_subtitles_with_ytdlp(video_url, langs)
+
+    def _download_subtitles_with_ytdlp(
+        self,
+        video_url: str,
+        langs: List[str],
+    ) -> Optional[TranscriptResult]:
+        """Fallback to yt-dlp's authenticated caption metadata and JSON3 URL."""
+
+        ydl_opts = {
+            'skip_download': True,
+            'quiet': True,
+            'noplaylist': True,
+        }
+        with self._cookiefile_for_download() as cookiefile:
+            try:
+                if cookiefile:
+                    ydl_opts['cookiefile'] = cookiefile
+                _apply_youtube_challenge_support(ydl_opts)
+                _apply_proxy(ydl_opts)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=False)
+                    selected = self._select_json3_caption(info, langs)
+                    if selected is None:
+                        return None
+                    language_code, is_generated, caption_url = selected
+                    response = ydl.urlopen(caption_url)
+                    try:
+                        payload = response.read()
+                    finally:
+                        close = getattr(response, "close", None)
+                        if callable(close):
+                            close()
+                return self._parse_json3_caption(
+                    payload,
+                    language_code=language_code,
+                    is_generated=is_generated,
+                )
+            except Exception as error:
+                logger.warning(
+                    "YouTube yt-dlp subtitle fallback failed: %s",
+                    type(error).__name__,
+                )
+                return None
+
+    @staticmethod
+    def _select_json3_caption(
+        info: object,
+        langs: List[str],
+    ) -> Optional[tuple[str, bool, str]]:
+        if not isinstance(info, dict):
+            return None
+        sources = (
+            (info.get("subtitles"), False),
+            (info.get("automatic_captions"), True),
+        )
+        for preferred_only in (True, False):
+            for tracks, is_generated in sources:
+                if not isinstance(tracks, dict):
+                    continue
+                languages = (
+                    [language for language in langs if language in tracks]
+                    if preferred_only
+                    else [language for language in tracks if language not in langs]
+                )
+                for language in languages:
+                    formats = tracks.get(language)
+                    if not isinstance(formats, list):
+                        continue
+                    for item in formats:
+                        if (
+                            isinstance(item, dict)
+                            and item.get("ext") == "json3"
+                            and isinstance(item.get("url"), str)
+                            and item["url"]
+                        ):
+                            return language, is_generated, item["url"]
+        return None
+
+    @staticmethod
+    def _parse_json3_caption(
+        payload: object,
+        *,
+        language_code: str,
+        is_generated: bool,
+    ) -> Optional[TranscriptResult]:
+        try:
+            document = json.loads(payload)
+        except (TypeError, UnicodeError, ValueError, RecursionError):
+            return None
+        events = document.get("events") if isinstance(document, dict) else None
+        if not isinstance(events, list):
+            return None
+        segments: list[TranscriptSegment] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            start_ms = event.get("tStartMs")
+            duration_ms = event.get("dDurationMs")
+            text_parts = event.get("segs")
+            if (
+                isinstance(start_ms, bool)
+                or not isinstance(start_ms, (int, float))
+                or isinstance(duration_ms, bool)
+                or not isinstance(duration_ms, (int, float))
+                or start_ms < 0
+                or duration_ms <= 0
+                or not isinstance(text_parts, list)
+            ):
+                continue
+            text = "".join(
+                item.get("utf8", "")
+                for item in text_parts
+                if isinstance(item, dict) and isinstance(item.get("utf8"), str)
+            )
+            text = " ".join(text.split())
+            if not text:
+                continue
+            start = float(start_ms) / 1000
+            end = float(start_ms + duration_ms) / 1000
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                continue
+            segments.append(TranscriptSegment(start=start, end=end, text=text))
+        if not segments:
+            return None
+        return TranscriptResult(
+            language=language_code,
+            full_text=" ".join(segment.text for segment in segments),
+            segments=segments,
+            raw={
+                "source": "yt_dlp_json3",
+                "language_code": language_code,
+                "is_generated": is_generated,
+            },
+        )

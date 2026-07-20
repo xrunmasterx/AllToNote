@@ -47,6 +47,7 @@ class LegacyModelResponse:
     input_tokens: int | None = None
     output_tokens: int | None = None
     actual_model: str | None = None
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.markdown, str) or not self.markdown.strip():
@@ -80,6 +81,19 @@ class LegacyModelResponse:
                 "model_response_invalid",
                 ErrorCategory.RECIPE_FAILED,
                 "Actual model identity is invalid",
+            )
+        if (
+            not isinstance(self.warnings, tuple)
+            or any(
+                type(warning) is not str or not warning.strip()
+                for warning in self.warnings
+            )
+            or len(self.warnings) != len(set(self.warnings))
+        ):
+            raise _model_error(
+                "model_response_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Model response warnings are invalid",
             )
 
 

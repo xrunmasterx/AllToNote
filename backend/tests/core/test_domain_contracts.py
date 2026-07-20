@@ -12,6 +12,7 @@ import pytest
 
 from app.core.domain.ids import new_typed_id, sha256_digest, utc_now_millis
 from app.core.domain.video import (
+    FaithfulLanguagePolicy,
     GeneratedVideoDraft,
     JobSnapshot,
     JobState,
@@ -21,6 +22,7 @@ from app.core.domain.video import (
     ScreenshotRequest,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
     VideoProduceRequest,
     VideoProduceResult,
 )
@@ -394,12 +396,141 @@ def test_request_and_generated_draft_are_frozen_and_own_collection_snapshots(
     usage["input_tokens"] = 20
 
     assert request.screenshot_policy is ScreenshotPolicy.OFF
+    assert request.requested_outputs == (VideoDocumentKind.KNOWLEDGE_NOTE,)
+    assert (
+        request.faithful_language_policy
+        is FaithfulLanguagePolicy.PRESERVE_SOURCE
+    )
     assert draft.usage == {"input_tokens": 10}
     assert isinstance(draft.usage, MappingProxyType)
     with pytest.raises(FrozenInstanceError):
         request.input_value = "changed"  # type: ignore[misc]
     with pytest.raises(TypeError):
         draft.usage["input_tokens"] = 20  # type: ignore[index]
+
+
+def test_v2_request_defaults_to_one_knowledge_note(tmp_path: Path) -> None:
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=tmp_path,
+        input_value="https://example.test/video",
+    )
+
+    assert request.requested_outputs == (VideoDocumentKind.KNOWLEDGE_NOTE,)
+    assert (
+        request.faithful_language_policy
+        is FaithfulLanguagePolicy.PRESERVE_SOURCE
+    )
+
+
+def test_v2_request_normalizes_multiple_outputs_to_fixed_unique_order(
+    tmp_path: Path,
+) -> None:
+    supplied_outputs = [
+        "faithful-edition",
+        VideoDocumentKind.KNOWLEDGE_NOTE,
+        "faithful-edition",
+    ]
+
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=tmp_path,
+        input_value="https://example.test/video",
+        requested_outputs=supplied_outputs,  # type: ignore[arg-type]
+    )
+    supplied_outputs.clear()
+
+    assert request.requested_outputs == (
+        VideoDocumentKind.KNOWLEDGE_NOTE,
+        VideoDocumentKind.FAITHFUL_EDITION,
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested_outputs", "code"),
+    [
+        ((), "requested_outputs_empty"),
+        (("study-guide",), "output_kind_unsupported"),
+        (None, "output_kind_unsupported"),
+    ],
+)
+def test_v2_request_rejects_invalid_output_selections(
+    tmp_path: Path,
+    requested_outputs: object,
+    code: str,
+) -> None:
+    with pytest.raises(DomainError, match=code):
+        VideoProduceRequest(
+            request_schema_version=2,
+            workspace_root=tmp_path,
+            input_value="https://example.test/video",
+            requested_outputs=requested_outputs,  # type: ignore[arg-type]
+        )
+
+
+def test_v1_request_rejects_v2_only_output_selection(tmp_path: Path) -> None:
+    with pytest.raises(DomainError, match="requested_outputs_requires_v2"):
+        VideoProduceRequest(
+            request_schema_version=1,
+            workspace_root=tmp_path,
+            input_value="https://example.test/video",
+            requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+        )
+
+
+def test_v2_request_accepts_explicit_faithful_translation_target(
+    tmp_path: Path,
+) -> None:
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=tmp_path,
+        input_value="https://example.test/video",
+        requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+        faithful_language_policy=FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT,
+        output_language="zh-CN",
+    )
+
+    assert request.requested_outputs == (VideoDocumentKind.FAITHFUL_EDITION,)
+    assert (
+        request.faithful_language_policy
+        is FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT
+    )
+
+
+def test_translation_policy_requires_faithful_output(tmp_path: Path) -> None:
+    with pytest.raises(
+        DomainError,
+        match="faithful_language_policy_requires_faithful_output",
+    ):
+        VideoProduceRequest(
+            request_schema_version=2,
+            workspace_root=tmp_path,
+            input_value="https://example.test/video",
+            faithful_language_policy=FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT,
+        )
+
+
+def test_request_rejects_unknown_faithful_language_policy(tmp_path: Path) -> None:
+    with pytest.raises(DomainError, match="faithful_language_policy_invalid"):
+        VideoProduceRequest(
+            request_schema_version=2,
+            workspace_root=tmp_path,
+            input_value="https://example.test/video",
+            requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+            faithful_language_policy="translate",  # type: ignore[arg-type]
+        )
+
+
+def test_translation_policy_requires_nonempty_target_language(tmp_path: Path) -> None:
+    with pytest.raises(DomainError, match="video_produce_request_invalid"):
+        VideoProduceRequest(
+            request_schema_version=2,
+            workspace_root=tmp_path,
+            input_value="https://example.test/video",
+            requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+            faithful_language_policy=FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT,
+            output_language=" ",
+        )
 
 
 def test_result_job_snapshot_and_retry_request_keep_frozen_contract() -> None:

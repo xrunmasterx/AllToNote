@@ -7,6 +7,7 @@ from typing import Mapping, Protocol
 from app.core.domain.video import (
     JobState,
     QualityOverall,
+    VideoProducedDocument,
     VideoProduceResult,
 )
 from app.core.application.video_acquisition import AttemptStoredAsset, StoredAssetRole
@@ -51,11 +52,13 @@ class VideoResultPlan:
     publish_eligible: bool
     usage: Mapping[str, int | float | str]
     warnings: tuple[str, ...]
+    documents: tuple[VideoProducedDocument, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "display_asset_ids", tuple(self.display_asset_ids))
         object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "documents", tuple(self.documents))
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,7 @@ class JobRepositoryPort(Protocol):
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None = None,
+        initial_events: tuple[tuple[str, str], ...] = (),
     ) -> Job: ...
 
     def get_job_details(
@@ -158,6 +162,7 @@ class JobRepositoryPort(Protocol):
         expected_original_state: JobState,
         confirmed_unknown_operation_ids: tuple[str, ...],
         client_request_id: str,
+        initial_events: tuple[tuple[str, str], ...] = (),
     ) -> Job: ...
 
 

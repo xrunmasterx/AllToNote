@@ -492,6 +492,52 @@ def test_retry_creates_new_job_preserves_lineage_and_replays(
     assert service.get(original.job_id).state is JobState.FAILED
 
 
+def test_retry_persists_config_snapshot_atomically_and_replay_checks_it(
+    repo: SqliteJobRepository,
+) -> None:
+    service = _new_service(repo)
+    original = _failed_job(repo)
+    request = RetryJobRequest(1, "retry-config", JobState.FAILED)
+    first_snapshot = {
+        "snapshot_version": 1,
+        "values": {"quality": "balanced"},
+        "digest": "sha256:" + "1" * 64,
+        "semantic_digest": "sha256:" + "2" * 64,
+    }
+
+    retried = service.retry(
+        original.job_id,
+        request,
+        initial_events=(("configuration.snapshot.v1", first_snapshot),),
+    )
+    replay = service.retry(
+        original.job_id,
+        request,
+        initial_events=(("configuration.snapshot.v1", first_snapshot),),
+    )
+
+    assert replay.job_id == retried.job_id
+    events = repo.list_events(retried.job_id)
+    assert [event.event_type for event in events] == [
+        "configuration.snapshot.v1"
+    ]
+    with pytest.raises(DomainError, match="idempotency_conflict"):
+        service.retry(
+            original.job_id,
+            request,
+            initial_events=(
+                (
+                    "configuration.snapshot.v1",
+                    {
+                        **first_snapshot,
+                        "semantic_digest": "sha256:" + "3" * 64,
+                    },
+                ),
+            ),
+        )
+    assert len(repo.list_events(retried.job_id)) == 1
+
+
 @pytest.mark.parametrize(
     ("retry_request", "error_code"),
     (

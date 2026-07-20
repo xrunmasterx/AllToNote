@@ -13,6 +13,8 @@ from app.core.portable.markdown_safety import (
 
 _SEGMENT_ID = re.compile(r"seg_[0-9]{6,}\Z")
 _FOOTNOTE_DEFINITION = re.compile(r"(?m)^ {0,3}\[\^[^\]\r\n]*\]:")
+_ATX_H2 = re.compile(r"^ {0,3}##(?!#)(?:[ \t]+|$)")
+_SETEXT_H2_UNDERLINE = re.compile(r"^ {0,3}-+[ \t]*$")
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,37 @@ def _visible_control_end(
     return closing
 
 
+def _h2_title_ranges(visible_text: str) -> tuple[tuple[int, int], ...]:
+    lines = visible_text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    ranges: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        is_atx_h2 = _ATX_H2.match(content) is not None
+        is_setext_h2 = (
+            index + 1 < len(lines)
+            and bool(content.strip())
+            and _SETEXT_H2_UNDERLINE.match(
+                lines[index + 1].rstrip("\r\n")
+            )
+            is not None
+        )
+        if is_atx_h2 or is_setext_h2:
+            ranges.append((offsets[index], offsets[index] + len(content)))
+    return tuple(ranges)
+
+
+def _inside_ranges(
+    position: int,
+    ranges: tuple[tuple[int, int], ...],
+) -> bool:
+    return any(start <= position < end for start, end in ranges)
+
+
 def parse_model_output(
     markdown: str,
     *,
@@ -66,6 +99,7 @@ def parse_model_output(
             "model_citation_definition_forbidden",
             "Model output must not define transcript footnotes",
         )
+    h2_title_ranges = _h2_title_ranges(visible_text)
 
     citations: list[str] = []
     citation_set: set[str] = set()
@@ -97,6 +131,10 @@ def parse_model_output(
                     "model_citation_unknown",
                     "Model output cites a segment outside this chunk",
                 )
+            if _inside_ranges(cursor, h2_title_ranges):
+                removals.append((cursor, closing + 1))
+                cursor = closing + 1
+                continue
             if segment_id not in citation_set:
                 citation_set.add(segment_id)
                 citations.append(segment_id)

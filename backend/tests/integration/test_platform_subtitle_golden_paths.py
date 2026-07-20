@@ -4,7 +4,7 @@ import json
 import multiprocessing
 import os
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -30,14 +30,22 @@ from app.core.application.video_checkpoints import (
 from app.core.application.video_service import VideoService
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
+    FaithfulLanguagePolicy,
     JobState,
     QualityOverall,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
     VideoProduceRequest,
 )
+from app.core.errors import DomainError
 from app.core.jobs.model import AttemptState
+from app.core.ports.model_executor import (
+    ModelExecutionBinding,
+    ModelExecutionRequest,
+)
 import app.runtime as runtime_module
+import app.adapters.iwiki.portable_gateway as portable_gateway_module
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures"
@@ -69,6 +77,8 @@ class Calls:
     ffmpeg: int = 0
     transcriber: int = 0
     model: int = 0
+    model_prompts: list[str] = field(default_factory=list)
+    model_stages: list[str] = field(default_factory=list)
 
 
 class _FixtureDownloader:
@@ -134,6 +144,110 @@ class _Completion:
         )
 
 
+class _V2Completion:
+    def __init__(self, calls: Calls, failure: str | None = None) -> None:
+        self._calls = calls
+        self._failure = failure
+
+    def complete_once(self, prompt: str) -> LegacyModelResponse:
+        self._calls.model_prompts.append(prompt)
+        user_content = prompt.split("<user_content>\n", 1)[1].split(
+            "\n</user_content>", 1
+        )[0]
+        payload = json.loads(user_content)
+        self._calls.model += 1
+        self._calls.model_stages.append(
+            "faithful-edit" if "section" in payload else "global-compose"
+        )
+        if self._failure == "unknown":
+            raise TimeoutError("provider response was lost")
+        if "section" in payload:
+            section = payload["section"]
+            segments = section["segments"]
+            return LegacyModelResponse(
+                markdown=json.dumps(
+                    {
+                        "schema_version": 1,
+                        "section_id": section["section_id"],
+                        "section_ordinal": section["section_ordinal"],
+                        "title": "Chronological source",
+                        "paragraphs": [
+                            {
+                                "paragraph_ordinal": 0,
+                                "text": " ".join(value["text"] for value in segments),
+                                "source_segment_ids": [
+                                    value["segment_id"] for value in segments
+                                ],
+                            }
+                        ],
+                        "summary": {
+                            "text": "Faithful section summary",
+                            "source_segment_ids": [segments[0]["segment_id"]],
+                        },
+                        "key_points": [],
+                        "uncertainties": [],
+                        "warnings": [],
+                    }
+                ),
+                provider_request_id=f"fixture-faithful-{self._calls.model}",
+                input_tokens=40,
+                output_tokens=20,
+                actual_model="fixture/model-v2",
+            )
+        assert payload["coverage_input_kind"] == "segment"
+        segment_ids = [value["segment_id"] for value in payload["segments"]]
+        return LegacyModelResponse(
+            markdown=json.dumps(
+                {
+                    "schema_version": 1,
+                    "markdown": (
+                        "# One coherent article\n\n"
+                        "## Main lesson\n\n"
+                        f"The source remains verifiable.[^{segment_ids[0]}]"
+                    ),
+                    "covered_input_ids": payload["coverage_input_ids"],
+                    "omissions": [],
+                    "warnings": [],
+                }
+            ),
+            provider_request_id="fixture-v2-request-1",
+            input_tokens=40,
+            output_tokens=20,
+            actual_model="fixture/model-v2",
+        )
+
+    def complete_request(
+        self,
+        prompt: str,
+        request: ModelExecutionRequest,
+    ) -> LegacyModelResponse:
+        assert request.max_output_tokens > 0
+        assert request.timeout_seconds > 0
+        return self.complete_once(prompt)
+
+
+def _v2_model_binding() -> ModelExecutionBinding:
+    return ModelExecutionBinding(
+        schema_version=1,
+        provider_type="fixture/provider-v2",
+        model_identity="fixture/model-v2",
+        credential_profile_ref="default",
+        context_window_tokens=16_384,
+        max_output_tokens=2_048,
+        max_concurrency=2,
+        supports_structured_output=True,
+        supports_temperature=True,
+        timeout_seconds=60,
+    )
+
+
+def _use_source_tree_iwiki_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    locked = json.loads(
+        (Path(runtime_module.__file__).parent / "runtime-lock.json").read_text("utf-8")
+    )["iwiki_package"].split("==", 1)[1]
+    monkeypatch.setattr(portable_gateway_module.metadata, "version", lambda _name: locked)
+
+
 class _TerminateBeforeModel:
     def __init__(self, delegate: object) -> None:
         self._delegate = delegate
@@ -184,6 +298,35 @@ def _create_runtime(
     )
 
 
+def _create_v2_runtime(
+    machine_root: Path,
+    calls: Calls,
+    *,
+    model_binding: ModelExecutionBinding | None = None,
+    model_profile: str | None = "default",
+    failure: str | None = None,
+) -> object:
+    downloader = _FixtureDownloader("youtube", calls)
+    source = LegacyVideoSourceAdapter(
+        local_machine_id="fixture-machine",
+        factories={"youtube": lambda: downloader},
+    )
+    legacy_model = LegacyModelBinding(
+        provider_kind="fixture/provider-v2",
+        model_identity="fixture/model-v2",
+        bridge=_V2Completion(calls, failure),
+        capabilities=LegacyModelCapabilities(),
+    )
+    return runtime_module.create_platform_video_runtime(
+        machine_root,
+        source=source,
+        source_metadata={"youtube": _fixture("youtube", "metadata.json")},
+        model=legacy_model,
+        model_execution_binding=model_binding,
+        model_execution_profile=model_profile,
+    )
+
+
 def _terminate_job_before_model(machine_root: str, job_id: str) -> None:
     runtime = _create_runtime(
         Path(machine_root),
@@ -212,6 +355,424 @@ def workspace_root(tmp_path: Path) -> Path:
     ):
         (root / relative).mkdir(parents=True, exist_ok=True)
     return root
+
+
+def test_platform_runtime_rejects_mismatched_explicit_v2_binding(
+    tmp_path: Path,
+) -> None:
+    binding = replace(_v2_model_binding(), model_identity="fixture/other-model")
+
+    with pytest.raises(DomainError) as caught:
+        _create_v2_runtime(tmp_path / "machine", Calls(), model_binding=binding)
+
+    assert caught.value.code == "model_execution_binding_mismatch"
+
+
+def test_platform_runtime_requires_explicit_profile_for_v2_binding(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(DomainError) as caught:
+        _create_v2_runtime(
+            tmp_path / "machine",
+            Calls(),
+            model_binding=_v2_model_binding(),
+            model_profile=None,
+        )
+
+    assert caught.value.code == "model_execution_profile_required"
+
+
+def test_platform_runtime_v2_uses_explicit_binding_and_restart_does_not_replay(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    machine_root = tmp_path / "machine"
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        client_request_id="platform-runtime-v2",
+    )
+
+    runtime = _create_v2_runtime(
+        machine_root,
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    submitted = runtime.submit_video(request)
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert calls.model == 1
+
+    restarted = _create_v2_runtime(
+        machine_root,
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    recovered = restarted.submit_video(request)
+    recovered = restarted.wait_job(recovered.job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    assert recovered.result is not None
+    assert recovered.job_id == submitted.job_id
+    assert calls.model == 1
+
+
+def test_platform_runtime_v2_rejects_request_model_drift_before_paid_call(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    runtime = _create_v2_runtime(
+        tmp_path / "machine",
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        model_override="fixture/unfrozen-model",
+    )
+
+    submitted = runtime.submit_video(request)
+    failed = runtime.wait_job(submitted.job_id)
+
+    assert failed.state is JobState.FAILED
+    assert failed.error is not None
+    assert failed.error.code == "model_execution_binding_mismatch"
+    assert calls.model == 0
+
+
+def test_platform_runtime_shares_one_coordinator_between_v2_compilers(
+    tmp_path: Path,
+) -> None:
+    runtime = _create_v2_runtime(
+        tmp_path / "machine",
+        Calls(),
+        model_binding=_v2_model_binding(),
+    )
+    service = runtime._sdk._video_service
+
+    assert (
+        service._knowledge_compiler._compiler._coordinator
+        is service._faithful_compiler._compiler._coordinator
+    )
+
+
+def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    machine_root = tmp_path / "machine"
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        requested_outputs=(
+            VideoDocumentKind.KNOWLEDGE_NOTE,
+            VideoDocumentKind.FAITHFUL_EDITION,
+        ),
+        client_request_id="platform-runtime-dual-output",
+    )
+    runtime = _create_v2_runtime(
+        machine_root,
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+
+    submitted = runtime.submit_video(request)
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    result = completed.result
+    assert [document.document_kind for document in result.documents] == [
+        VideoDocumentKind.KNOWLEDGE_NOTE,
+        VideoDocumentKind.FAITHFUL_EDITION,
+    ]
+    assert result.primary_draft_artifact_id == result.documents[0].draft_artifact_id
+    assert (
+        result.quality_report_artifact_id
+        == result.documents[0].quality_report_artifact_id
+    )
+    assert all(
+        document.quality_overall is QualityOverall.PASS
+        and document.publish_eligible
+        for document in result.documents
+    )
+    assert calls.model_stages == ["global-compose", "faithful-edit"]
+
+    bundle = workspace_root / result.workspace_relative_bundle_path
+    manifest = json.loads((bundle / "bundle.json").read_bytes())
+    document_profile = manifest["extensions"][
+        "alltonote.video:output-profile"
+    ]["documents"]
+    assert document_profile == [
+        {
+            "document_kind": document.document_kind.value,
+            "draft_artifact_id": document.draft_artifact_id,
+            "quality_report_artifact_id": document.quality_report_artifact_id,
+        }
+        for document in result.documents
+    ]
+    assert manifest["outputs"]["primary_draft"] == result.primary_draft_artifact_id
+    assert manifest["outputs"]["drafts"] == [
+        document.draft_artifact_id for document in result.documents
+    ]
+    assert manifest["outputs"]["quality_reports"] == [
+        document.quality_report_artifact_id for document in result.documents
+    ]
+    assert manifest["required_contracts"] == [
+        "urn:alltonote:video-producer:output-profile:v2"
+    ]
+    artifacts = {
+        artifact["artifact_id"]: artifact for artifact in manifest["artifacts"]
+    }
+    receipt = json.loads((bundle / "receipt.json").read_bytes())
+    model_executor = next(
+        item for item in receipt["executors"] if item["kind"] == "model"
+    )
+    assert model_executor["identity"] == "fixture/model-v2"
+    receipt_outputs = receipt["parameters"]["summary"]["document_outputs"]
+    assert len(receipt_outputs) == 2
+    for document in result.documents:
+        draft = bundle / "drafts" / f"{document.draft_artifact_id}.md"
+        quality_path = (
+            bundle
+            / "quality"
+            / f"{document.quality_report_artifact_id}.json"
+        )
+        quality = json.loads(quality_path.read_bytes())
+        assert quality["subject"] == {
+            "artifact_id": document.draft_artifact_id,
+            "bundle_id": result.bundle_id,
+            "sha256": sha256_digest(draft.read_bytes()),
+        }
+        assert quality["overall"] == QualityOverall.PASS.value
+        draft_profile = artifacts[document.draft_artifact_id]["extensions"][
+            "alltonote.video:draft"
+        ]
+        assert draft_profile["transcript_basis"] == "platform-caption"
+        assert draft_profile["source_language"] == "en"
+        expected_policy = (
+            "output-language"
+            if document.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE
+            else "preserve-source"
+        )
+        assert draft_profile["language_policy"] == expected_policy
+        assert draft_profile["target_language"] == (
+            "zh-CN" if expected_policy == "output-language" else None
+        )
+        compiler_checks = [
+            check
+            for check in quality["checks"]
+            if check["id"].startswith("compiler.")
+        ]
+        compiler_quality = quality["metrics"]["compiler_quality"]
+        assert compiler_checks
+        assert len(compiler_checks) == sum(
+            compiler_quality["method_summary"].values()
+        )
+        receipt_output = next(
+            item
+            for item in receipt_outputs
+            if item["draft_artifact_id"] == document.draft_artifact_id
+        )
+        assert receipt_output["quality_report_artifact_id"] == (
+            document.quality_report_artifact_id
+        )
+        assert receipt_output["draft_sha256"] == sha256_digest(draft.read_bytes())
+        assert receipt_output["quality_report_sha256"] == sha256_digest(
+            quality_path.read_bytes()
+        )
+        assert receipt_output["model_binding"]["sha256"].startswith("sha256:")
+        assert receipt_output["execution"]["model_calls"] == 1
+        assert "legacy_finish_reason_unavailable" in receipt_output["warnings"]
+        assert receipt_output["quality"]["check_count"] == len(
+            compiler_checks
+        )
+        if document.document_kind is VideoDocumentKind.FAITHFUL_EDITION:
+            assert receipt_output["faithful"] == {
+                "section_count": 1,
+                "uncertainty_count": 0,
+                "anchor_warning_count": 0,
+                "body_segment_reference_coverage_ratio": 1.0,
+            }
+    assert list((workspace_root / "raw" / "personal" / "bundles").iterdir()) == [
+        bundle
+    ]
+
+    restarted = _create_v2_runtime(
+        machine_root,
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    recovered = restarted.wait_job(restarted.submit_video(request).job_id)
+
+    assert recovered.state is JobState.SUCCEEDED
+    assert recovered.job_id == submitted.job_id
+    assert recovered.result is not None
+    assert recovered.result.bundle_id == result.bundle_id
+    assert calls.model == 2
+    assert calls.model_stages == ["global-compose", "faithful-edit"]
+
+
+def test_platform_runtime_v2_unknown_model_outcome_is_not_resent(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    runtime = _create_v2_runtime(
+        tmp_path / "machine",
+        calls,
+        model_binding=_v2_model_binding(),
+        failure="unknown",
+    )
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        client_request_id="platform-runtime-v2-unknown",
+    )
+    submitted = runtime.submit_video(request)
+
+    first = runtime.wait_job(submitted.job_id)
+    second = runtime.wait_job(submitted.job_id)
+
+    assert first.state is second.state is JobState.WAITING_FOR_INPUT
+    assert first.challenge_id is not None
+    assert second.challenge_id == first.challenge_id
+    assert calls.model == 1
+    assert calls.model_stages == ["global-compose"]
+    _assert_challenge_matches_unknown_operations(runtime, submitted.job_id)
+
+
+def test_platform_runtime_v2_produces_single_faithful_edition(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    runtime = _create_v2_runtime(
+        tmp_path / "machine",
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+        client_request_id="platform-runtime-faithful",
+    )
+
+    completed = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert len(completed.result.documents) == 1
+    assert (
+        completed.result.documents[0].document_kind
+        is VideoDocumentKind.FAITHFUL_EDITION
+    )
+    assert calls.model == 1
+    assert "Keep the edited body in the source language en." in calls.model_prompts[0]
+
+
+def test_platform_runtime_passes_explicit_faithful_translation_target(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    runtime = _create_v2_runtime(
+        tmp_path / "machine",
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+        faithful_language_policy=FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT,
+        output_language="zh-CN",
+        client_request_id="platform-runtime-faithful-translation",
+    )
+
+    completed = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert calls.model == 1
+    assert (
+        "Translate conservatively from en to zh-CN;"
+        in calls.model_prompts[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "request_override",
+    (
+        {"provider_profile": "other-profile"},
+        {"model_override": "fixture/other-model"},
+    ),
+)
+def test_platform_runtime_faithful_rejects_binding_profile_drift_before_paid_call(
+    request_override: dict[str, str],
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_source_tree_iwiki_version(monkeypatch)
+    calls = Calls()
+    runtime = _create_v2_runtime(
+        tmp_path / "machine",
+        calls,
+        model_binding=_v2_model_binding(),
+    )
+    request = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace_root,
+        input_value=PLATFORM_URLS["youtube"],
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+        **request_override,
+    )
+
+    failed = runtime.wait_job(runtime.submit_video(request).job_id)
+
+    assert failed.state is JobState.FAILED
+    assert failed.error is not None
+    assert failed.error.code == "model_execution_binding_mismatch"
+    assert calls.model == 0
 
 
 @pytest.fixture

@@ -32,7 +32,7 @@ class ExternalOperation:
     updated_at: str
 
 
-class _ExternalOperationStore(Protocol):
+class ExternalOperationStorePort(Protocol):
     def prepare_external_operation(
         self,
         *,
@@ -58,6 +58,7 @@ class _ExternalOperationStore(Protocol):
         *,
         provider_request_id: str | None,
         summary_json: str,
+        authority: ExecutionAuthority,
     ) -> ExternalOperation: ...
 
     def mark_external_operation_unknown(
@@ -65,6 +66,7 @@ class _ExternalOperationStore(Protocol):
         operation_id: str,
         *,
         summary_json: str,
+        authority: ExecutionAuthority,
     ) -> ExternalOperation: ...
 
     def get_external_operation(self, operation_id: str) -> ExternalOperation: ...
@@ -79,7 +81,7 @@ class _ExternalOperationStore(Protocol):
 class ExternalOperationGuard:
     def __init__(
         self,
-        store: _ExternalOperationStore,
+        store: ExternalOperationStorePort,
         authority: ExecutionAuthority,
     ) -> None:
         self._store = store
@@ -136,6 +138,7 @@ class ExternalOperationGuard:
             ExternalOutcome.SUCCEEDED,
             provider_request_id=provider_request_id,
             summary_json=summary_json,
+            authority=self._authority,
         )
 
     def fail(
@@ -146,6 +149,7 @@ class ExternalOperationGuard:
             ExternalOutcome.FAILED,
             provider_request_id=None,
             summary_json=summary_json,
+            authority=self._authority,
         )
 
     def unknown(
@@ -157,6 +161,7 @@ class ExternalOperationGuard:
         return self._store.mark_external_operation_unknown(
             operation_id,
             summary_json=summary_json,
+            authority=self._authority,
         )
 
     def get(self, operation_id: str) -> ExternalOperation:
@@ -170,4 +175,9 @@ class ExternalOperationGuard:
         )
 
 
-__all__ = ["ExternalOperation", "ExternalOperationGuard", "ExternalOutcome"]
+__all__ = [
+    "ExternalOperation",
+    "ExternalOperationGuard",
+    "ExternalOperationStorePort",
+    "ExternalOutcome",
+]

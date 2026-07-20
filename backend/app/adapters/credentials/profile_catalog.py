@@ -11,9 +11,8 @@ from uuid import uuid4
 
 import tomli_w
 from filelock import FileLock
-from platformdirs import user_config_path
-
 from app.core.errors import DomainError, ErrorCategory
+from app.runtime_paths import resolve_runtime_paths
 
 
 _CATALOG_VERSION = 1
@@ -79,7 +78,7 @@ class CredentialProfileCatalog:
         self.path = (
             Path(path)
             if path is not None
-            else Path(user_config_path("AllToNote")) / _CATALOG_FILENAME
+            else resolve_runtime_paths().credential_catalog_file
         )
         self._clock = clock
         self._lock = FileLock(f"{self.path}.lock")

@@ -5,21 +5,26 @@ from pathlib import Path
 
 import pytest
 import tomli_w
+from keyring.errors import KeyringLocked
 
 from app.adapters.credentials.keyring_broker import CredentialBroker, SecretValue
 from app.adapters.credentials.profile_catalog import CredentialProfileCatalog
 from app.core.errors import DomainError, ErrorCategory
+from app.runtime_paths import resolve_runtime_paths
 
 
 class FakeKeyring:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str], str] = {}
         self.calls: list[tuple[str, str, str | None]] = []
+        self.get_error: Exception | None = None
         self.set_error: Exception | None = None
         self.delete_error: Exception | None = None
 
     def get_password(self, service: str, profile: str) -> str | None:
         self.calls.append(("get", profile, None))
+        if self.get_error is not None:
+            raise self.get_error
         return self.values.get((service, profile))
 
     def set_password(self, service: str, profile: str, secret: str) -> None:
@@ -63,6 +68,20 @@ def _write_catalog(
             },
             stream,
         )
+
+
+def test_default_catalog_path_uses_shared_runtime_path_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "machine-state")
+    monkeypatch.setattr(
+        "app.adapters.credentials.profile_catalog.resolve_runtime_paths",
+        lambda: paths,
+    )
+
+    catalog = CredentialProfileCatalog()
+
+    assert catalog.path == paths.credential_catalog_file
 
 
 def test_environment_secret_wins_and_repr_is_redacted(
@@ -177,6 +196,74 @@ def test_missing_credential_has_stable_safe_domain_error(tmp_path: Path) -> None
     assert exc_info.value.details == {"profile": "providers/missing"}
 
 
+def test_ephemeral_status_is_present_without_persistence_or_keyring_access(
+    tmp_path: Path,
+) -> None:
+    keyring_backend = FakeKeyring()
+    catalog = _catalog(tmp_path)
+    broker = CredentialBroker(
+        keyring_backend=keyring_backend,
+        catalog=catalog,
+        environ={"ALLTONOTE_CREDENTIAL_OPENAI_MAIN": "ephemeral-secret"},
+        clock=lambda: "2026-07-18T12:00:00.000Z",
+    )
+
+    status = broker.status("providers/openai-main")
+
+    assert status.present is True
+    assert status.validated is None
+    assert status.last_checked_at == "2026-07-18T12:00:00.000Z"
+    assert keyring_backend.calls == []
+    assert not catalog.path.exists()
+
+
+def test_empty_ephemeral_credential_is_invalid_and_never_persisted(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    broker = CredentialBroker(
+        keyring_backend=FakeKeyring(),
+        catalog=catalog,
+        environ={"ALLTONOTE_CREDENTIAL_OPENAI_MAIN": ""},
+    )
+
+    with pytest.raises(DomainError, match="credential_invalid"):
+        broker.resolve("providers/openai-main")
+
+    assert not catalog.path.exists()
+
+
+@pytest.mark.parametrize("operation", ("resolve", "set", "delete"))
+def test_locked_backend_has_one_stable_safe_error(
+    tmp_path: Path, operation: str
+) -> None:
+    keyring_backend = FakeKeyring()
+    locked = KeyringLocked("backend detail must stay private")
+    if operation == "resolve":
+        keyring_backend.get_error = locked
+    elif operation == "set":
+        keyring_backend.set_error = locked
+    else:
+        keyring_backend.delete_error = locked
+    broker = CredentialBroker(
+        keyring_backend=keyring_backend,
+        catalog=_catalog(tmp_path),
+        environ={},
+    )
+
+    with pytest.raises(DomainError, match="credential_backend_locked") as caught:
+        if operation == "resolve":
+            broker.resolve("providers/openai-main")
+        elif operation == "set":
+            broker.set("providers/openai-main", "secret-canary")
+        else:
+            broker.delete("providers/openai-main")
+
+    assert caught.value.category is ErrorCategory.POLICY_DENIED
+    assert "backend detail" not in str(caught.value)
+    assert "secret-canary" not in str(caught.value)
+
+
 def test_set_updates_non_secret_catalog_only_after_keyring_success(
     tmp_path: Path,
 ) -> None:
@@ -205,9 +292,12 @@ def test_failed_keyring_set_does_not_update_catalog(tmp_path: Path) -> None:
         keyring_backend=keyring_backend, catalog=catalog, environ={}
     )
 
-    with pytest.raises(RuntimeError, match="keyring unavailable"):
+    with pytest.raises(DomainError, match="credential_backend_unavailable") as caught:
         broker.set("providers/openai-main", "super-secret")
 
+    assert caught.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert "super-secret" not in str(caught.value)
+    assert "keyring unavailable" not in str(caught.value)
     assert catalog.list_profiles() == ()
 
 
@@ -224,9 +314,11 @@ def test_failed_keyring_delete_preserves_catalog(tmp_path: Path) -> None:
     broker.set("providers/openai-main", "super-secret")
     keyring_backend.delete_error = RuntimeError("keyring unavailable")
 
-    with pytest.raises(RuntimeError, match="keyring unavailable"):
+    with pytest.raises(DomainError, match="credential_backend_unavailable") as caught:
         broker.delete("providers/openai-main")
 
+    assert caught.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert "keyring unavailable" not in str(caught.value)
     assert [item.profile_id for item in catalog.list_profiles()] == [
         "providers/openai-main"
     ]

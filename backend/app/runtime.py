@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,9 +17,16 @@ from app.adapters.screenshots.ffmpeg import FFmpegScreenshotAdapter
 from app.adapters.models.legacy_gpt import (
     LegacyKnowledgeModelAdapter,
     LegacyModelBinding,
+    LegacyModelCapabilities,
     ModelChunkResultStore,
-    ModelExecutionBinding,
+    ModelExecutionBinding as LegacyModelExecutionBinding,
 )
+from app.adapters.models.codex_app_server_bridge import (
+    CodexAppServerCompletionBridge,
+)
+from app.adapters.models.legacy_model_executor import LegacyModelExecutor
+from app.adapters.models.model_result_store import ModelOperationResultStore
+from app.adapters.sources.legacy_video import LegacyVideoSourceAdapter
 from app.adapters.transcription.legacy_transcriber import (
     LegacyTranscriberAdapter,
     normalize_platform_subtitle,
@@ -35,9 +42,28 @@ from app.core.application.video_service import (
     VideoPreflightCapabilities,
     VideoRecipeOperations,
     VideoService,
+    VideoFaithfulCompilationInput,
+    VideoKnowledgeCompilationInput,
     VideoStepExecutionContext,
 )
+from app.core.application.faithful_edition_compiler import (
+    FaithfulCompiledVideoDocument,
+    FaithfulEditionCompiler,
+)
+from app.core.application.model_call_coordinator import (
+    ModelCallCoordinator,
+    ModelCallExecution,
+)
+from app.core.application.video_compiler import (
+    CompiledVideoDocument,
+    KnowledgeCompilationRequestV1,
+    VideoCompilationContext,
+    VideoKnowledgeCompiler,
+)
+from app.core.config.model import JobConfigSnapshot
+from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
+    FaithfulLanguagePolicy,
     GeneratedVideoDraft,
     JobSnapshot,
     ScreenshotPlanItem,
@@ -45,6 +71,7 @@ from app.core.domain.video import (
     ScreenshotRequest,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory
@@ -53,6 +80,7 @@ from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import CheckpointMetadata
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
 from app.core.ports.model import KnowledgeModelRequest
+from app.core.ports.model_executor import ModelExecutionBinding
 from app.core.ports.screenshot import ScreenshotPort
 from app.core.ports.source import (
     MaterializationPolicy,
@@ -62,7 +90,22 @@ from app.core.ports.source import (
 )
 from app.core.ports.transcript import MediaInput
 from app.core.ports.transcript import TranscriptPort
+from app.core.recipes.video.compilation.contracts import (
+    CompilationQualityProfile,
+    ComposerParserLimitsV1,
+    KnowledgeMapParserLimitsV1,
+    TranscriptBasis,
+    TranscriptQualityInputV1,
+    VideoCompilationPlanningRequestV1,
+)
+from app.core.recipes.video.compilation.pipeline import assess_transcript_quality
+from app.core.recipes.video.faithful_edition.contracts import (
+    FaithfulEditionParserLimitsV1,
+    FaithfulEditionRequestV1,
+)
 from app.core.sdk import AllToNoteSDK
+from app.services.codex_app_server import CodexAppServerStatusService
+from app.runtime_paths import resolve_runtime_paths
 from iwiki.workspace import open_workspace
 
 
@@ -379,11 +422,11 @@ class _PlatformVideoOperations(VideoRecipeOperations):
             )
             provenance = TranscriptProvenance.PLATFORM
         fixture = self._source_metadata.get(source.platform)
-        if fixture is None or frozenset(fixture) != _SOURCE_METADATA_FIELDS:
+        if fixture is not None and frozenset(fixture) != _SOURCE_METADATA_FIELDS:
             raise DomainError(
-                "source_metadata_unavailable",
+                "source_metadata_invalid",
                 ErrorCategory.RECIPE_FAILED,
-                "Complete source metadata is required for platform composition",
+                "Configured source metadata is invalid for platform composition",
             )
         canonical_uri = source.canonical_uri
         if canonical_uri is None:
@@ -392,6 +435,24 @@ class _PlatformVideoOperations(VideoRecipeOperations):
                 ErrorCategory.RECIPE_FAILED,
                 "Platform source metadata requires a canonical URI",
             )
+        if fixture is None:
+            duration_ms = acquired.duration_ms or (
+                transcript.segments[-1].end_ms if transcript is not None else 0
+            )
+            language = transcript.language if transcript is not None else "und"
+            metadata_values: Mapping[str, object] = {
+                "title": acquired.title or source.stable_video_identity,
+                "author": "unknown",
+                "channel": "unknown",
+                "duration_ms": duration_ms,
+                "published_at": None,
+                "observed_at": datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                ).replace("+00:00", "Z"),
+                "language": language,
+            }
+        else:
+            metadata_values = fixture
         try:
             metadata = VideoSourceMetadata(
                 source_id=source_id,
@@ -402,13 +463,13 @@ class _PlatformVideoOperations(VideoRecipeOperations):
                 canonical_identity_scheme=source.canonical_identity_scheme,
                 stable_video_identity=source.stable_video_identity,
                 canonical_uri=canonical_uri,
-                title=fixture["title"],
-                author=fixture["author"],
-                channel=fixture["channel"],
-                duration_ms=fixture["duration_ms"],
-                published_at=fixture["published_at"],
-                observed_at=fixture["observed_at"],
-                language=fixture["language"],
+                title=metadata_values["title"],
+                author=metadata_values["author"],
+                channel=metadata_values["channel"],
+                duration_ms=metadata_values["duration_ms"],
+                published_at=metadata_values["published_at"],
+                observed_at=metadata_values["observed_at"],
+                language=metadata_values["language"],
                 subtitle_acquisition=(
                     provenance.value
                     if provenance is not None
@@ -471,7 +532,7 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         token = CancellationToken(self._repository, execution.job_id)
         adapter = LegacyKnowledgeModelAdapter(
             model=self._model,
-            execution=ModelExecutionBinding(
+            execution=LegacyModelExecutionBinding(
                 guard=ExternalOperationGuard(
                     self._repository, execution.authority
                 ),
@@ -705,6 +766,428 @@ class _LocalVideoOperations(_PlatformVideoOperations):
         )
 
 
+@dataclass(frozen=True)
+class _RuntimeCompilationProfile:
+    repository: SqliteJobRepository
+    binding: ModelExecutionBinding
+    provider_profile: str
+    provider_execution_policy: str
+
+    def validate_selection(
+        self,
+        *,
+        provider_profile: str,
+        model_override: str | None,
+    ) -> None:
+        if (
+            provider_profile != self.provider_profile
+            or (
+                model_override is not None
+                and model_override != self.binding.model_identity
+            )
+        ):
+            raise DomainError(
+                "model_execution_binding_mismatch",
+                ErrorCategory.INVALID_REQUEST,
+                "The request does not match the frozen model execution binding",
+            )
+
+    def compilation_context(
+        self,
+        execution: VideoStepExecutionContext,
+    ) -> VideoCompilationContext:
+        return VideoCompilationContext(
+            execution=ModelCallExecution(
+                job_id=execution.job_id,
+                step_id=execution.step_id,
+                attempt_id=execution.attempt_id,
+                authority=execution.authority,
+                heartbeat=execution.heartbeat,
+            ),
+            cancellation_token=CancellationToken(
+                self.repository, execution.job_id
+            ),
+        )
+
+    @staticmethod
+    def transcript_basis(value: str) -> TranscriptBasis:
+        mapping = {
+            TranscriptProvenance.PROVIDED.value: TranscriptBasis.HUMAN_TRANSCRIPT,
+            TranscriptProvenance.PLATFORM.value: TranscriptBasis.PLATFORM_CAPTION,
+            TranscriptProvenance.GENERATED.value: TranscriptBasis.ASR_TRANSCRIPT,
+        }
+        return mapping.get(value, TranscriptBasis.UNKNOWN)
+
+    def compiler_identity(
+        self,
+        *,
+        document_kind: VideoDocumentKind,
+        behavior: Mapping[str, object],
+    ) -> str:
+        binding = self.binding
+        payload = {
+            "behavior": dict(behavior),
+            "binding": {
+                "context_window_tokens": binding.context_window_tokens,
+                "credential_profile_ref": binding.credential_profile_ref,
+                "max_concurrency": binding.max_concurrency,
+                "max_output_tokens": binding.max_output_tokens,
+                "model_identity": binding.model_identity,
+                "provider_type": binding.provider_type,
+                "schema_version": binding.schema_version,
+                "supports_structured_output": binding.supports_structured_output,
+                "supports_temperature": binding.supports_temperature,
+                "timeout_seconds": binding.timeout_seconds,
+            },
+            "document_kind": document_kind.value,
+            "provider_profile": self.provider_profile,
+            "provider_execution_policy": self.provider_execution_policy,
+            "schema_version": 1,
+        }
+        return sha256_digest(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+
+
+class _RuntimeVideoKnowledgeCompiler:
+    """Builds the frozen Core request around the shared knowledge compiler."""
+
+    _MAX_CHUNK_DURATION_MS = 10 * 60 * 1_000
+    _MAP_OUTPUT_TOKENS = 2_048
+    _MAP_OUTPUT_BYTES_PER_TOKEN = 8
+    _MAP_ITEM_LIMIT = 12
+    _MAP_TITLE_CHARACTERS = 160
+    _MAP_STATEMENT_CHARACTERS = 500
+    _MAP_SEGMENT_REFS_PER_ITEM = 64
+    _MAP_TERM_CANDIDATES = 32
+    _MAP_WARNINGS = 16
+
+    def __init__(
+        self,
+        *,
+        profile: _RuntimeCompilationProfile,
+        compiler: VideoKnowledgeCompiler,
+    ) -> None:
+        self._profile = profile
+        self._compiler = compiler
+
+    def compilation_identity(self) -> str:
+        return self._profile.compiler_identity(
+            document_kind=VideoDocumentKind.KNOWLEDGE_NOTE,
+            behavior={
+                "balanced_profile": {
+                    "map_item_limit": self._MAP_ITEM_LIMIT,
+                    "map_output_bytes_per_token": self._MAP_OUTPUT_BYTES_PER_TOKEN,
+                    "map_output_tokens": self._MAP_OUTPUT_TOKENS,
+                    "max_chunk_duration_ms": self._MAX_CHUNK_DURATION_MS,
+                },
+                "compiler_behavior": self._compiler.behavior_identity(),
+                "knowledge_map_parser": 2,
+                "knowledge_map_prompt": 2,
+                "knowledge_map_stage": 2,
+                "planner": 2,
+            },
+        )
+
+    def compile(
+        self,
+        request: VideoKnowledgeCompilationInput,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> CompiledVideoDocument:
+        self._profile.validate_selection(
+            provider_profile=request.provider_profile,
+            model_override=request.model_override,
+        )
+        transcript_quality = assess_transcript_quality(
+            TranscriptQualityInputV1(
+                schema_version=1,
+                transcript=request.transcript,
+                transcript_basis=self._profile.transcript_basis(
+                    request.transcript_basis
+                ),
+                source_duration_ms=request.source_duration_ms,
+                detected_languages=tuple(
+                    dict.fromkeys(
+                        (request.source_language, request.transcript.language)
+                    )
+                ),
+            )
+        )
+        binding = self._profile.binding
+        map_output_tokens = min(self._MAP_OUTPUT_TOKENS, binding.max_output_tokens)
+        max_request_bytes = binding.context_window_tokens
+        map_output_bytes = min(
+            map_output_tokens * self._MAP_OUTPUT_BYTES_PER_TOKEN,
+            max_request_bytes // 4,
+        )
+        if map_output_bytes < 1:
+            raise DomainError(
+                "model_context_insufficient",
+                ErrorCategory.INVALID_REQUEST,
+                "The frozen model binding has no safe compilation budget",
+            )
+        map_item_limit = max(
+            1,
+            min(self._MAP_ITEM_LIMIT, map_output_tokens // 128),
+        )
+        planning_request = VideoCompilationPlanningRequestV1(
+            schema_version=1,
+            recipe_id=request.output.recipe_id,
+            recipe_version=request.output.recipe_version,
+            quality_profile=CompilationQualityProfile.BALANCED,
+            transcript=request.transcript,
+            transcript_quality=transcript_quality,
+            model_binding=binding,
+            stage_id="knowledge-map",
+            stage_version=2,
+            prompt_id="knowledge-map-balanced",
+            prompt_version=2,
+            prompt_overhead_tokens=1_400,
+            prompt_overhead_bytes=1_400,
+            reserved_output_tokens=binding.max_output_tokens,
+            max_request_bytes=max_request_bytes,
+            max_chunk_duration_ms=self._MAX_CHUNK_DURATION_MS,
+            estimated_map_output_tokens_per_chunk=map_output_tokens,
+            map_output_byte_budget_per_chunk=map_output_bytes,
+            max_repair_attempts=1,
+        )
+        compilation_request = KnowledgeCompilationRequestV1(
+            schema_version=1,
+            planning_request=planning_request,
+            source_title=request.source_title,
+            output_language=request.output_language,
+            style=request.style,
+            screenshot_policy=request.screenshot_policy,
+            map_parser_limits=KnowledgeMapParserLimitsV1(
+                max_response_bytes=map_output_bytes,
+                max_items=map_item_limit,
+                max_title_characters=self._MAP_TITLE_CHARACTERS,
+                max_statement_characters=self._MAP_STATEMENT_CHARACTERS,
+                max_segment_refs_per_item=self._MAP_SEGMENT_REFS_PER_ITEM,
+                max_term_candidates=self._MAP_TERM_CANDIDATES,
+                max_term_characters=200,
+                max_warnings=self._MAP_WARNINGS,
+                max_warning_characters=500,
+            ),
+            composer_parser_limits=ComposerParserLimitsV1(
+                max_response_bytes=min(
+                    binding.max_output_tokens * 4,
+                    128 * 1024,
+                ),
+                max_markdown_characters=min(
+                    binding.max_output_tokens * 4,
+                    128 * 1024,
+                ),
+                max_coverage_items=8_192,
+                max_omissions=8_192,
+                max_omission_reason_characters=500,
+                max_warnings=128,
+                max_warning_characters=500,
+            ),
+        )
+        return self._compiler.compile(
+            compilation_request,
+            self._profile.compilation_context(execution),
+        )
+
+
+class _RuntimeFaithfulEditionCompiler:
+    """Builds the frozen Core request around the faithful compiler."""
+
+    def __init__(
+        self,
+        *,
+        profile: _RuntimeCompilationProfile,
+        compiler: FaithfulEditionCompiler,
+    ) -> None:
+        self._profile = profile
+        self._compiler = compiler
+
+    def compilation_identity(self) -> str:
+        return self._profile.compiler_identity(
+            document_kind=VideoDocumentKind.FAITHFUL_EDITION,
+            behavior={
+                "parser": 1,
+                "planner": 1,
+                "prompt": 1,
+                "quality": 1,
+                "repair_prompt": 1,
+                "repair_stage": 1,
+                "section_stage": 1,
+            },
+        )
+
+    def compile(
+        self,
+        request: VideoFaithfulCompilationInput,
+        *,
+        execution: VideoStepExecutionContext,
+    ) -> FaithfulCompiledVideoDocument:
+        self._profile.validate_selection(
+            provider_profile=request.provider_profile,
+            model_override=request.model_override,
+        )
+        basis = self._profile.transcript_basis(request.transcript_basis)
+        transcript_quality = assess_transcript_quality(
+            TranscriptQualityInputV1(
+                schema_version=1,
+                transcript=request.transcript,
+                transcript_basis=basis,
+                source_duration_ms=request.source_duration_ms,
+                detected_languages=tuple(
+                    dict.fromkeys(
+                        (request.source_language, request.transcript.language)
+                    )
+                ),
+            )
+        )
+        binding = self._profile.binding
+        max_request_bytes = (
+            binding.context_window_tokens - binding.max_output_tokens
+        )
+        section_input_byte_budget = max_request_bytes // 2
+        max_response_bytes = min(
+            binding.max_output_tokens * 4,
+            max_request_bytes,
+            128 * 1024,
+        )
+        if section_input_byte_budget < 1 or max_response_bytes < 1:
+            raise DomainError(
+                "model_context_insufficient",
+                ErrorCategory.INVALID_REQUEST,
+                "The frozen model binding has no safe faithful editing budget",
+            )
+        target_language = (
+            request.output_language
+            if request.language_policy
+            is FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT
+            else None
+        )
+        faithful_request = FaithfulEditionRequestV1(
+            schema_version=1,
+            recipe_id=request.output.recipe_id,
+            recipe_version=request.output.recipe_version,
+            quality_profile=CompilationQualityProfile.BALANCED,
+            transcript=request.transcript,
+            transcript_quality=transcript_quality,
+            transcript_basis=basis,
+            source_title=request.source_title,
+            source_language=request.source_language,
+            language_policy=request.language_policy,
+            target_language=target_language,
+            model_binding=binding,
+            max_request_bytes=max_request_bytes,
+            section_input_byte_budget=section_input_byte_budget,
+            reserved_output_tokens=binding.max_output_tokens,
+            parser_limits=FaithfulEditionParserLimitsV1(
+                max_response_bytes=max_response_bytes,
+                max_title_characters=200,
+                max_paragraphs=64,
+                max_paragraph_characters=min(max_response_bytes, 32 * 1024),
+                max_segment_refs_per_paragraph=256,
+                max_key_points=64,
+                max_uncertainties=64,
+                max_auxiliary_text_characters=min(
+                    max_response_bytes, 8 * 1024
+                ),
+                max_warnings=64,
+            ),
+            max_repair_attempts=1,
+        )
+        return self._compiler.compile(
+            faithful_request,
+            self._profile.compilation_context(execution),
+        )
+
+
+def _create_runtime_compilers(
+    *,
+    repository: SqliteJobRepository,
+    model: LegacyModelBinding,
+    binding: ModelExecutionBinding | None,
+    provider_profile: str | None,
+    result_root: Path,
+) -> tuple[
+    _RuntimeVideoKnowledgeCompiler | None,
+    _RuntimeFaithfulEditionCompiler | None,
+]:
+    if binding is None:
+        if provider_profile is not None:
+            raise DomainError(
+                "model_execution_profile_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "A v2 provider profile requires a frozen Core binding",
+            )
+        return None, None
+    if type(provider_profile) is not str or not provider_profile.strip():
+        raise DomainError(
+            "model_execution_profile_required",
+            ErrorCategory.INVALID_REQUEST,
+            "A v2 provider profile must be explicitly bound",
+        )
+    if (
+        not isinstance(binding, ModelExecutionBinding)
+        or binding.provider_type != model.provider_kind
+        or binding.model_identity != model.model_identity
+    ):
+        raise DomainError(
+            "model_execution_binding_mismatch",
+            ErrorCategory.INVALID_REQUEST,
+            "The frozen Core binding does not match the legacy provider binding",
+        )
+    bridge = model.bridge
+    if bridge is None or not callable(getattr(bridge, "complete_request", None)):
+        raise DomainError(
+            "model_bridge_required",
+            ErrorCategory.POLICY_DENIED,
+            "A frozen-request model bridge is required for v2 compilation",
+        )
+    execution_policy = getattr(bridge, "execution_policy_identity", None)
+    provider_execution_policy = (
+        execution_policy()
+        if callable(execution_policy)
+        else "provider-controlled-v1"
+    )
+    if (
+        type(provider_execution_policy) is not str
+        or not provider_execution_policy.strip()
+    ):
+        raise DomainError(
+            "model_bridge_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The model bridge execution policy identity must not be empty",
+        )
+    executor = LegacyModelExecutor(binding=binding, bridge=bridge)
+    coordinator = ModelCallCoordinator(
+        operation_store=repository,
+        result_store=ModelOperationResultStore(result_root / "model-operations"),
+        executor=executor,
+    )
+    profile = _RuntimeCompilationProfile(
+        repository=repository,
+        binding=binding,
+        provider_profile=provider_profile,
+        provider_execution_policy=provider_execution_policy,
+    )
+    return (
+        _RuntimeVideoKnowledgeCompiler(
+            profile=profile,
+            compiler=VideoKnowledgeCompiler(coordinator),
+        ),
+        _RuntimeFaithfulEditionCompiler(
+            profile=profile,
+            compiler=FaithfulEditionCompiler(coordinator),
+        ),
+    )
+
+
 class AllToNoteRuntime:
     def __init__(
         self,
@@ -722,6 +1205,9 @@ class AllToNoteRuntime:
 
     def get_job(self, job_id: str) -> JobSnapshot:
         return self._sdk.get_job(job_id)
+
+    def cancel_job(self, job_id: str) -> JobSnapshot:
+        return self._sdk.cancel_job(job_id)
 
 
 def _checkpoint_payload_is_valid(payload: bytes) -> bool:
@@ -758,6 +1244,9 @@ def create_platform_video_runtime(
     source: VideoSourcePort,
     source_metadata: Mapping[str, Mapping[str, object]],
     model: LegacyModelBinding,
+    model_execution_binding: ModelExecutionBinding | None = None,
+    model_execution_profile: str | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
@@ -772,12 +1261,20 @@ def create_platform_video_runtime(
         repository,
         validators={CHECKPOINT_SCHEMA: _checkpoint_payload_is_valid},
     )
+    result_root = resolved_machine_root / "external-results"
     operations = _PlatformVideoOperations(
         repository,
         source,
         source_metadata,
         model,
-        resolved_machine_root / "external-results",
+        result_root,
+    )
+    knowledge_compiler, faithful_compiler = _create_runtime_compilers(
+        repository=repository,
+        model=model,
+        binding=model_execution_binding,
+        provider_profile=model_execution_profile,
+        result_root=result_root,
     )
     service = VideoService(
         repository,
@@ -789,6 +1286,9 @@ def create_platform_video_runtime(
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+        knowledge_compiler=knowledge_compiler,
+        faithful_compiler=faithful_compiler,
+        current_config_snapshot=current_config_snapshot,
     )
     return AllToNoteRuntime(AllToNoteSDK(service), repository)
 
@@ -800,6 +1300,9 @@ def create_local_video_runtime(
     source_metadata: Mapping[str, Mapping[str, object]],
     transcriber: TranscriptPort,
     model: LegacyModelBinding,
+    model_execution_binding: ModelExecutionBinding | None = None,
+    model_execution_profile: str | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
@@ -818,6 +1321,7 @@ def create_local_video_runtime(
         repository,
         validators={CHECKPOINT_SCHEMA: _checkpoint_payload_is_valid},
     )
+    result_root = resolved_machine_root / "external-results"
     operations = _LocalVideoOperations(
         repository,
         storage,
@@ -825,12 +1329,19 @@ def create_local_video_runtime(
         source_metadata,
         transcriber,
         model,
-        resolved_machine_root / "external-results",
+        result_root,
         (
             screenshot_adapter_factory(storage, repository)
             if screenshot_adapter_factory is not None
             else FFmpegScreenshotAdapter(storage, repository)
         ),
+    )
+    knowledge_compiler, faithful_compiler = _create_runtime_compilers(
+        repository=repository,
+        model=model,
+        binding=model_execution_binding,
+        provider_profile=model_execution_profile,
+        result_root=result_root,
     )
     service = VideoService(
         repository,
@@ -842,6 +1353,9 @@ def create_local_video_runtime(
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+        knowledge_compiler=knowledge_compiler,
+        faithful_compiler=faithful_compiler,
+        current_config_snapshot=current_config_snapshot,
     )
     return AllToNoteRuntime(AllToNoteSDK(service), repository)
 
@@ -860,6 +1374,7 @@ def create_fake_runtime(
     clock: Callable[[], int] | None = None,
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
     screenshot_requests: tuple[ScreenshotRequest, ...] = (),
+    current_config_snapshot: JobConfigSnapshot | None = None,
 ) -> AllToNoteRuntime:
     call_counts = calls or FakeCallCounts()
     resolved_machine_root = Path(machine_root).resolve()
@@ -895,6 +1410,7 @@ def create_fake_runtime(
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+        current_config_snapshot=current_config_snapshot,
     )
     return AllToNoteRuntime(AllToNoteSDK(service), repository)
 
@@ -903,8 +1419,11 @@ def create_fake_runtime_for_workspace(
     workspace_root: Path,
     *,
     local_app_data: Path | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
 ) -> AllToNoteRuntime:
     trusted_root = local_app_data or _default_local_app_data()
+    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    paths.assert_outside_workspace(workspace_root)
     trusted_root.mkdir(parents=True, exist_ok=True)
     registry = WorkspaceInstanceRegistry(
         trusted_root,
@@ -916,16 +1435,71 @@ def create_fake_runtime_for_workspace(
     return create_fake_runtime(
         instance.machine_root,
         local_instance_id=instance.instance_id,
+        current_config_snapshot=current_config_snapshot,
+    )
+
+
+def create_codex_app_server_runtime_for_workspace(
+    workspace_root: Path,
+    *,
+    local_app_data: Path | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
+) -> AllToNoteRuntime:
+    """Create the real URL producer using the locally authenticated Codex CLI."""
+
+    status = CodexAppServerStatusService.get_status()
+    if not status.ready or not status.default_model:
+        raise DomainError(
+            "codex_app_server_unavailable",
+            ErrorCategory.POLICY_DENIED,
+            "The local Codex CLI must be installed, signed in, and have a default model",
+    )
+    trusted_root = local_app_data or _default_local_app_data()
+    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    paths.assert_outside_workspace(workspace_root)
+    trusted_root.mkdir(parents=True, exist_ok=True)
+    registry = WorkspaceInstanceRegistry(
+        trusted_root,
+        inspect_workspace=lambda root: open_workspace(
+            root, writable=False
+        ).manifest.workspace_id,
+    )
+    instance = registry.resolve(workspace_root)
+    model_identity = status.default_model
+    bridge = CodexAppServerCompletionBridge(model_identity=model_identity)
+    model = LegacyModelBinding(
+        provider_kind="codex-app-server",
+        model_identity=model_identity,
+        bridge=bridge,
+        capabilities=LegacyModelCapabilities(),
+    )
+    binding = ModelExecutionBinding(
+        schema_version=1,
+        provider_type="codex-app-server",
+        model_identity=model_identity,
+        credential_profile_ref="codex/local-login",
+        context_window_tokens=128_000,
+        max_output_tokens=16_000,
+        max_concurrency=2,
+        supports_structured_output=True,
+        supports_temperature=False,
+        timeout_seconds=600,
+    )
+    source = LegacyVideoSourceAdapter(local_machine_id=instance.instance_id)
+    return create_platform_video_runtime(
+        instance.machine_root,
+        source=source,
+        source_metadata={},
+        model=model,
+        model_execution_binding=binding,
+        model_execution_profile="default",
+        local_instance_id=instance.instance_id,
+        current_config_snapshot=current_config_snapshot,
     )
 
 
 def _default_local_app_data() -> Path:
-    configured = os.environ.get("LOCALAPPDATA")
-    if configured:
-        return Path(configured)
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support"
-    return Path.home() / ".local" / "share"
+    return resolve_runtime_paths().workspace_registry_parent
 
 
 __all__ = [
@@ -934,6 +1508,7 @@ __all__ = [
     "VideoPreflightCapabilities",
     "create_fake_runtime",
     "create_fake_runtime_for_workspace",
+    "create_codex_app_server_runtime_for_workspace",
     "create_local_video_runtime",
     "create_platform_video_runtime",
 ]

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
 
-from app.core.domain.ids import sha256_digest
+from app.core.domain.transcript import transcript_sha256
 from app.core.domain.video import TranscriptDocument
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.bundle_assembler import VideoSourceMetadata
@@ -65,31 +64,7 @@ class AttemptStoredAsset:
 
 
 def transcript_identity(transcript: TranscriptDocument) -> str:
-    if not isinstance(transcript, TranscriptDocument):
-        raise DomainError(
-            "video_acquisition_invalid",
-            ErrorCategory.INVALID_REQUEST,
-            "Acquisition transcript must use the Core transcript contract",
-        )
-    return sha256_digest(
-        json.dumps(
-            {
-                "language": transcript.language,
-                "segments": [
-                    {
-                        "end_ms": segment.end_ms,
-                        "segment_id": segment.segment_id,
-                        "start_ms": segment.start_ms,
-                        "text": segment.text,
-                    }
-                    for segment in transcript.segments
-                ],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
+    return transcript_sha256(transcript)
 
 
 @dataclass(frozen=True)

@@ -10,8 +10,6 @@ from uuid import uuid4
 
 import tomli_w
 from filelock import FileLock
-from platformdirs import user_config_path
-
 from app.core.config.model import (
     ProviderProfileConfig,
     RecipeDefaults,
@@ -19,6 +17,7 @@ from app.core.config.model import (
     TranscriberProfileConfig,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.runtime_paths import resolve_runtime_paths
 
 
 CONFIG_VERSION = 1
@@ -69,10 +68,13 @@ _RECIPE_ENVIRONMENT_FIELDS = {
     "ALLTONOTE_RECIPE_STYLE": "style",
     "ALLTONOTE_RECIPE_SCREENSHOT_POLICY": "screenshot_policy",
 }
+_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
+_QUALITY_PRESETS = frozenset({"balanced"})
+_SCREENSHOT_POLICIES = frozenset({"off", "on_demand"})
 
 
 def runtime_config_path() -> Path:
-    return Path(user_config_path("AllToNote")) / _CONFIG_FILENAME
+    return resolve_runtime_paths().config_file
 
 
 def _config_error(code: str, message: str, **details: object) -> DomainError:
@@ -126,6 +128,17 @@ def _require_string(value: object, field: str) -> str:
     return value
 
 
+def _require_nonempty_string(value: object, field: str) -> str:
+    text = _require_string(value, field)
+    if not text.strip():
+        raise _config_error(
+            "config_value_invalid",
+            "Runtime configuration field has an invalid value",
+            field=field,
+        )
+    return text
+
+
 def _validate_partial_config(
     data: Mapping[object, object], *, require_profile_type: bool = False
 ) -> None:
@@ -164,7 +177,14 @@ def _validate_partial_config(
     )
     for field in string_fields:
         if field in data:
-            _require_string(data[field], field)
+            _require_nonempty_string(data[field], field)
+
+    if "log_level" in data and data["log_level"] not in _LOG_LEVELS:
+        raise _config_error(
+            "config_value_invalid",
+            "Runtime configuration field has an invalid value",
+            field="log_level",
+        )
 
     if "providers" in data:
         providers = _require_mapping(data["providers"], "providers")
@@ -180,7 +200,7 @@ def _validate_partial_config(
                     field=f"{profile_path}.type",
                 )
             for key, item in profile.items():
-                _require_string(item, f"{profile_path}.{key}")
+                _require_nonempty_string(item, f"{profile_path}.{key}")
 
     if "transcribers" in data:
         transcribers = _require_mapping(data["transcribers"], "transcribers")
@@ -196,13 +216,31 @@ def _validate_partial_config(
                     field=f"{profile_path}.type",
                 )
             for key, item in profile.items():
-                _require_string(item, f"{profile_path}.{key}")
+                _require_nonempty_string(item, f"{profile_path}.{key}")
 
     if "recipe_defaults" in data:
         recipe = _require_mapping(data["recipe_defaults"], "recipe_defaults")
         _reject_unknown_keys(recipe, _RECIPE_KEYS, "recipe_defaults")
         for key, item in recipe.items():
-            _require_string(item, f"recipe_defaults.{key}")
+            _require_nonempty_string(item, f"recipe_defaults.{key}")
+        if (
+            "quality_preset" in recipe
+            and recipe["quality_preset"] not in _QUALITY_PRESETS
+        ):
+            raise _config_error(
+                "config_value_invalid",
+                "Runtime configuration field has an invalid value",
+                field="recipe_defaults.quality_preset",
+            )
+        if (
+            "screenshot_policy" in recipe
+            and recipe["screenshot_policy"] not in _SCREENSHOT_POLICIES
+        ):
+            raise _config_error(
+                "config_value_invalid",
+                "Runtime configuration field has an invalid value",
+                field="recipe_defaults.screenshot_policy",
+            )
 
 
 def _recipe_v1_defaults() -> dict[str, object]:
@@ -315,6 +353,7 @@ def load_runtime_config(
     environ: Mapping[str, str],
     *,
     cli_overrides: Mapping[str, object] | None = None,
+    profile_path: Path | None = None,
 ) -> RuntimeConfig:
     resolved_path = Path(path) if path is not None else runtime_config_path()
     config_exists = resolved_path.exists()
@@ -326,12 +365,24 @@ def load_runtime_config(
         )
     _validate_partial_config(runtime_values, require_profile_type=True)
 
+    profile_values: Mapping[object, object] = {}
+    if profile_path is not None:
+        resolved_profile_path = Path(profile_path)
+        if not resolved_profile_path.is_file():
+            raise _config_error(
+                "config_profile_not_found",
+                "Runtime configuration profile was not found",
+            )
+        profile_values = _read_toml(resolved_profile_path)
+        _validate_partial_config(profile_values)
+
     environment_values = _environment_overrides(environ)
     command_line_values = cli_overrides or {}
     _validate_partial_config(command_line_values)
 
     effective = _recipe_v1_defaults()
     _deep_merge(effective, runtime_values)
+    _deep_merge(effective, profile_values)
     _deep_merge(effective, environment_values)
     _deep_merge(effective, command_line_values)
     _validate_partial_config(effective, require_profile_type=True)
@@ -387,23 +438,35 @@ def _runtime_config_to_mapping(config: RuntimeConfig) -> dict[str, object]:
     return values
 
 
+def runtime_config_mapping(config: RuntimeConfig) -> dict[str, object]:
+    values = _runtime_config_to_mapping(config)
+    _validate_partial_config(values, require_profile_type=True)
+    return values
+
+
 def write_runtime_config(config: RuntimeConfig, path: Path | None = None) -> Path:
     resolved_path = Path(path) if path is not None else runtime_config_path()
     values = _runtime_config_to_mapping(config)
     _validate_partial_config(values, require_profile_type=True)
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-
-    lock = FileLock(f"{resolved_path}.lock")
-    with lock:
-        temporary_path = resolved_path.with_name(
-            f".{resolved_path.name}.{uuid4().hex}.tmp"
-        )
-        try:
-            with temporary_path.open("wb") as stream:
-                tomli_w.dump(values, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, resolved_path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
+    try:
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(f"{resolved_path}.lock")
+        with lock:
+            temporary_path = resolved_path.with_name(
+                f".{resolved_path.name}.{uuid4().hex}.tmp"
+            )
+            try:
+                with temporary_path.open("wb") as stream:
+                    tomli_w.dump(values, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, resolved_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+    except OSError as error:
+        raise DomainError(
+            "config_write_failed",
+            ErrorCategory.POLICY_DENIED,
+            "Runtime configuration could not be written",
+        ) from error
     return resolved_path

@@ -21,6 +21,7 @@ from app.core.domain.video import (
     QualityOverall,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
@@ -33,6 +34,7 @@ from app.core.portable.bundle_assembler import (
     StepAttemptSummary,
     VideoArtifactIds,
     VideoBundleInput,
+    VideoDraftBundleInput,
     VideoSourceMetadata,
 )
 from app.core.portable.evidence import build_evidence_set
@@ -53,6 +55,8 @@ TRANSCRIPT_ARTIFACT_ID = "art_018f0000-0000-7000-8000-000000000105"
 EVIDENCE_ARTIFACT_ID = "art_018f0000-0000-7000-8000-000000000106"
 DRAFT_ARTIFACT_ID = "art_018f0000-0000-7000-8000-000000000107"
 QUALITY_ARTIFACT_ID = "art_018f0000-0000-7000-8000-000000000108"
+FAITHFUL_DRAFT_ARTIFACT_ID = "art_018f0000-0000-7000-8000-00000000010d"
+FAITHFUL_QUALITY_ARTIFACT_ID = "art_018f0000-0000-7000-8000-00000000010e"
 EVIDENCE_ID = "ev_018f0000-0000-7000-8000-000000000109"
 RUN_ID = "run_018f0000-0000-7000-8000-00000000010a"
 JOB_ID = "job_018f0000-0000-7000-8000-00000000010b"
@@ -264,6 +268,90 @@ def _bundle_input(workspace_root: Path) -> VideoBundleInput:
     )
 
 
+def _v2_bundle_input(workspace_root: Path, *, dual: bool = True) -> VideoBundleInput:
+    legacy = _bundle_input(workspace_root)
+    common_provenance = {
+        "quality_profile": "balanced",
+        "transcript_basis": "human-transcript",
+        "source_language": "zh-CN",
+        "model_binding_sha256": "sha256:" + "3" * 64,
+        "model_operation_count": 2,
+        "sequential_model_waves": 2,
+        "repair_operation_count": 0,
+        "usage": {"input_tokens": 120, "output_tokens": 40},
+        "warnings": (),
+        "quality_summary": {
+            "overall": "pass",
+            "checks": [{"id": "text_gate", "status": "pass"}],
+            "method_summary": {"deterministic": 1, "model": 0, "human": 0},
+            "metrics": {"coverage_ratio": 1.0},
+        },
+    }
+    primary = VideoDraftBundleInput(
+        document_kind=VideoDocumentKind.KNOWLEDGE_NOTE,
+        draft_artifact_id=DRAFT_ARTIFACT_ID,
+        quality_report_artifact_id=QUALITY_ARTIFACT_ID,
+        quality=legacy.quality,
+        recipe_id="alltonote.video-course-note",
+        recipe_version=2,
+        language_policy="output-language",
+        target_language="zh-CN",
+        **common_provenance,
+    )
+    drafts = (primary,)
+    if dual:
+        faithful_draft = GeneratedVideoDraft(
+            markdown=legacy.quality.final_draft.decode("utf-8").replace(
+                "# ", "# 高保真精编稿：", 1
+            ),
+            cited_segment_ids=("seg_000001",),
+            screenshot_requests=(),
+            model_identity="openai/gpt-4.1-mini",
+            usage={"input_tokens": 80, "output_tokens": 30},
+            warnings=(),
+        )
+        faithful_quality = evaluate_video_draft(
+            faithful_draft,
+            legacy.evidence_set,
+            draft_bundle_id=BUNDLE_ID,
+            draft_artifact_id=FAITHFUL_DRAFT_ARTIFACT_ID,
+        )
+        drafts = (
+            primary,
+            VideoDraftBundleInput(
+                document_kind=VideoDocumentKind.FAITHFUL_EDITION,
+                draft_artifact_id=FAITHFUL_DRAFT_ARTIFACT_ID,
+                quality_report_artifact_id=FAITHFUL_QUALITY_ARTIFACT_ID,
+                quality=faithful_quality,
+                recipe_id="alltonote.video-faithful-edition",
+                recipe_version=1,
+                language_policy="preserve-source",
+                target_language=None,
+                faithful_summary={
+                    "section_count": 2,
+                    "uncertainty_count": 1,
+                    "anchor_warning_count": 0,
+                    "body_segment_reference_coverage_ratio": 1.0,
+                },
+                **common_provenance,
+            ),
+        )
+    return replace(
+        legacy,
+        receipt=replace(
+            legacy.receipt,
+            recipe_id="alltonote.video-producer",
+            recipe_version=2,
+            usage={
+                "input_tokens": 200 if dual else 120,
+                "output_tokens": 70 if dual else 40,
+            },
+        ),
+        drafts=drafts,
+        primary_draft_artifact_id=DRAFT_ARTIFACT_ID,
+    )
+
+
 def _with_markdown_and_assets(
     bundle_input: VideoBundleInput,
     markdown_suffix: str,
@@ -339,6 +427,49 @@ def test_assembled_candidate_passes_real_semantic_validation(
     assert report.bundle_id == BUNDLE_ID
     assert report.manifest_sha256 == candidate.manifest_sha256
     assert report.issues == ()
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_v2_document_profile_passes_real_semantic_validation(
+    workspace_root: Path,
+    dual: bool,
+) -> None:
+    candidate = BundleAssembler().assemble(_v2_bundle_input(workspace_root, dual=dual))
+
+    report = IWikiPortableGateway().validate_candidate(
+        workspace_root,
+        candidate.location.staging_relative_path,
+    )
+
+    assert report.valid
+    manifest = _read_json(candidate.absolute_path / "bundle.json")
+    expected_drafts = [DRAFT_ARTIFACT_ID]
+    expected_quality = [QUALITY_ARTIFACT_ID]
+    if dual:
+        expected_drafts.append(FAITHFUL_DRAFT_ARTIFACT_ID)
+        expected_quality.append(FAITHFUL_QUALITY_ARTIFACT_ID)
+    assert manifest["outputs"]["drafts"] == expected_drafts
+    assert manifest["outputs"]["quality_reports"] == expected_quality
+    assert manifest["required_contracts"] == [
+        "urn:alltonote:video-producer:output-profile:v2"
+    ]
+
+
+def test_v2_rejects_quality_bound_to_a_different_draft(workspace_root: Path) -> None:
+    bundle_input = _v2_bundle_input(workspace_root)
+    faithful = bundle_input.drafts[1]
+    invalid = replace(
+        bundle_input,
+        drafts=(
+            bundle_input.drafts[0],
+            replace(faithful, quality=bundle_input.quality),
+        ),
+    )
+
+    with pytest.raises(DomainError) as captured:
+        BundleAssembler().assemble(invalid)
+
+    assert captured.value.code == "video_bundle_quality_invalid"
 
 
 def _read_json(path: Path) -> dict[str, object]:

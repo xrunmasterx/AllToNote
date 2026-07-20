@@ -35,20 +35,16 @@ from app.core.ports.portable import (
     CandidateBundleWriterPort,
     CandidateLocationCapabilityPort,
 )
-
-
-_RUNTIME_LOCK_KEYS = frozenset(
-    {
-        "iwiki_package",
-        "portable_api_version",
-        "portable_contract_id",
-        "schema_set_id",
-        "schema_sha256",
-        "source_commit",
-    }
+from app.core.ports.portable_queries import (
+    PortableArtifactQueryRecord,
+    PortableBundleQueryRecord,
+    PortableInspectionRecord,
+    PortableQualityQueryRecord,
+    PortableSourceQueryRecord,
 )
+from app.runtime_lock import load_runtime_lock
 
-_TRUSTED_IWIKI_DISTRIBUTION = "llm-iwiki"
+
 _CONSUMED_TOMBSTONE_LIMIT = 128
 _CLAIM_ACQUIRED = 1
 _CLAIM_IN_PROGRESS = 2
@@ -85,8 +81,15 @@ _SOURCE_ID = re.compile(
     r"src_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
+_ARTIFACT_ID = re.compile(
+    r"art_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
 _MANIFEST_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+_MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+_MAX_QUERY_BUNDLES = 10_000
+_MAX_QUERY_ARTIFACTS = 200
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -187,61 +190,21 @@ def _prepared_bundle_invalid() -> DomainError:
     )
 
 
-def _canonical_distribution_name(name: str) -> str:
-    if not name.isascii():
-        return ""
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
 def _load_runtime_lock() -> dict[str, object]:
-    try:
-        payload = json.loads(
-            resources.files("app")
-            .joinpath("runtime-lock.json")
-            .read_text(encoding="utf-8")
-        )
-        if type(payload) is not dict or frozenset(payload) != _RUNTIME_LOCK_KEYS:
-            raise _contract_incompatible()
-
-        package_spec = payload["iwiki_package"]
-        api_version = payload["portable_api_version"]
-        string_fields = (
-            payload["portable_contract_id"],
-            payload["schema_set_id"],
-            payload["schema_sha256"],
-            payload["source_commit"],
-        )
-        if (
-            type(package_spec) is not str
-            or package_spec.count("==") != 1
-            or type(api_version) is not int
-            or any(
-                type(value) is not str or not value for value in string_fields
-            )
-        ):
-            raise _contract_incompatible()
-
-        package_name, expected_version = package_spec.split("==", 1)
-        if (
-            _canonical_distribution_name(package_name)
-            != _TRUSTED_IWIKI_DISTRIBUTION
-            or not expected_version
-        ):
-            raise _contract_incompatible()
-        installed_version = metadata.version(_TRUSTED_IWIKI_DISTRIBUTION)
-    except _COMPATIBILITY_ERRORS:
-        raise _contract_incompatible() from None
-    if installed_version != expected_version:
-        raise _contract_incompatible()
-    return payload
+    return load_runtime_lock(
+        resource_files=resources.files,
+        distribution_version=metadata.version,
+    ).payload()
 
 
 def _open_locked_workspace(
     workspace_root: Path,
+    *,
+    writable: bool = True,
 ) -> tuple[Workspace, PortableContractInfo]:
     runtime_lock = _load_runtime_lock()
     try:
-        workspace = open_workspace(workspace_root, writable=True)
+        workspace = open_workspace(workspace_root, writable=writable)
         info = inspect_portable_contract(workspace)
         if (
             info.iwiki_sdk_api_version != runtime_lock["portable_api_version"]
@@ -349,6 +312,527 @@ def _read_verified_source_bindings(
             )
         )
     return tuple(bindings)
+
+
+def _query_error(
+    code: str,
+    category: ErrorCategory,
+    message: str,
+) -> DomainError:
+    return DomainError(code, category, message)
+
+
+def _query_stale(code: str = "portable_bundle_stale") -> DomainError:
+    return _query_error(
+        code,
+        ErrorCategory.CONFLICT,
+        "Committed Portable content no longer matches its validated manifest",
+    )
+
+
+def _map_iwiki_query_error(error: IWikiError) -> DomainError:
+    if error.code is ErrorCode.PERMISSION_DENIED:
+        return _query_error(
+            "workspace_read_denied",
+            ErrorCategory.POLICY_DENIED,
+            "iwiki denied read access to the Workspace",
+        )
+    return _map_iwiki_error(error)
+
+
+def _query_path_parts(relative_path: str) -> tuple[str, ...]:
+    if (
+        type(relative_path) is not str
+        or not relative_path
+        or "\\" in relative_path
+        or "\0" in relative_path
+    ):
+        raise _query_stale()
+    path = PurePosixPath(relative_path)
+    if (
+        path.is_absolute()
+        or str(path) != relative_path
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise _query_stale()
+    for part in path.parts:
+        try:
+            part.encode("utf-8", errors="strict")
+        except UnicodeError:
+            raise _query_stale() from None
+        stem = part.rstrip(" .").split(".", 1)[0].casefold()
+        if (
+            unicodedata.normalize("NFC", part) != part
+            or part.endswith((" ", "."))
+            or any(character in part for character in ("/", "\\", ":", "\0"))
+            or stem in _WINDOWS_DEVICE_STEMS
+        ):
+            raise _query_stale()
+    return path.parts
+
+
+def _committed_file_path(
+    workspace: Workspace,
+    bundle_id: str,
+    relative_path: str,
+) -> Path:
+    if _BUNDLE_ID.fullmatch(bundle_id) is None:
+        raise _query_stale()
+    parts = _query_path_parts(relative_path)
+    bundles_root = workspace.resolve_contract_path("raw_personal") / "bundles"
+    bundle_root = bundles_root / bundle_id
+    target = bundle_root.joinpath(*parts)
+    try:
+        current = bundles_root
+        for part in (bundle_id, *parts):
+            if _path_is_reparse_point(current):
+                raise _query_stale()
+            current = current / part
+        if _path_is_reparse_point(current):
+            raise _query_stale()
+        resolved_root = bundle_root.resolve(strict=True)
+        resolved_target = target.resolve(strict=True)
+        if not resolved_target.is_relative_to(resolved_root):
+            raise _query_stale()
+    except DomainError:
+        raise
+    except OSError:
+        raise _query_stale() from None
+    return target
+
+
+def _read_committed_file(
+    workspace: Workspace,
+    bundle_id: str,
+    relative_path: str,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    path = _committed_file_path(workspace, bundle_id, relative_path)
+    try:
+        size = path.stat().st_size
+        if size < 0 or size > maximum_bytes or not path.is_file():
+            raise _query_stale()
+        data = path.read_bytes()
+    except DomainError:
+        raise
+    except OSError:
+        raise _query_stale() from None
+    if len(data) != size:
+        raise _query_stale()
+    return data
+
+
+def _manifest_document(
+    workspace: Workspace,
+    bundle_id: str,
+    manifest_sha256: str,
+) -> dict[str, object]:
+    data = _read_committed_file(
+        workspace,
+        bundle_id,
+        "bundle.json",
+        maximum_bytes=_MAX_MANIFEST_BYTES,
+    )
+    if f"sha256:{hashlib.sha256(data).hexdigest()}" != manifest_sha256:
+        raise _query_stale()
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _query_stale() from None
+    if type(document) is not dict or document.get("bundle_id") != bundle_id:
+        raise _query_stale()
+    return document
+
+
+def _manifest_mentions_artifact(
+    workspace: Workspace,
+    bundle_id: str,
+    artifact_id: str,
+) -> bool:
+    try:
+        data = _read_committed_file(
+            workspace,
+            bundle_id,
+            "bundle.json",
+            maximum_bytes=_MAX_MANIFEST_BYTES,
+        )
+        document = json.loads(data)
+    except (DomainError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if type(document) is not dict or type(document.get("artifacts")) is not list:
+        return False
+    return any(
+        type(artifact) is dict and artifact.get("artifact_id") == artifact_id
+        for artifact in document["artifacts"]
+    )
+
+
+def _require_query_mapping(value: object) -> dict[str, object]:
+    if type(value) is not dict:
+        raise _query_stale()
+    return value
+
+
+def _require_query_list(value: object) -> list[object]:
+    if type(value) is not list:
+        raise _query_stale()
+    return value
+
+
+def _require_query_string(value: object) -> str:
+    if type(value) is not str or not value:
+        raise _query_stale()
+    return value
+
+
+def _require_query_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise _query_stale()
+    return value
+
+
+def _artifact_ref_ids(value: object) -> tuple[str, ...]:
+    refs = _require_query_list(value)
+    result: list[str] = []
+    for ref_value in refs:
+        ref = _require_query_mapping(ref_value)
+        artifact_id = _require_query_string(ref.get("artifact_id"))
+        if _ARTIFACT_ID.fullmatch(artifact_id) is None:
+            raise _query_stale()
+        result.append(artifact_id)
+    return tuple(result)
+
+
+def _source_revision_ref_ids(value: object) -> tuple[str, ...]:
+    refs = _require_query_list(value)
+    return tuple(
+        _require_query_string(_require_query_mapping(ref).get("source_revision_id"))
+        for ref in refs
+    )
+
+
+def _artifact_record(
+    document: dict[str, object],
+    *,
+    primary_draft_artifact_id: str | None,
+) -> PortableArtifactQueryRecord:
+    artifact_id = _require_query_string(document.get("artifact_id"))
+    if _ARTIFACT_ID.fullmatch(artifact_id) is None:
+        raise _query_stale()
+    payload = _require_query_mapping(document.get("payload"))
+    generation = _require_query_mapping(document.get("generation"))
+    recipe = _require_query_mapping(generation.get("recipe"))
+    extensions = _require_query_mapping(document.get("extensions"))
+    draft_extension = extensions.get("alltonote.video:draft")
+    document_kind: str | None = None
+    if type(draft_extension) is dict:
+        value = draft_extension.get("document_kind")
+        if type(value) is str and value:
+            document_kind = value
+    kind = _require_query_string(document.get("artifact_type"))
+    if (
+        document_kind is None
+        and artifact_id == primary_draft_artifact_id
+        and kind.startswith("knowledge.draft.")
+    ):
+        document_kind = "knowledge-note"
+    return PortableArtifactQueryRecord(
+        artifact_id=artifact_id,
+        kind=kind,
+        media_type=_require_query_string(payload.get("media_type")),
+        charset=(
+            payload.get("charset")
+            if type(payload.get("charset")) is str
+            else None
+        ),
+        size_bytes=_require_query_int(payload.get("byte_length")),
+        sha256=_require_query_string(payload.get("sha256")),
+        created_at=_require_query_string(document.get("created_at")),
+        source_revision_ids=_source_revision_ref_ids(
+            document.get("source_revision_refs")
+        ),
+        parent_artifact_ids=_artifact_ref_ids(document.get("parents")),
+        quality_report_ids=_artifact_ref_ids(document.get("quality_report_refs")),
+        recipe_id=_require_query_string(recipe.get("id")),
+        recipe_version=_require_query_int(recipe.get("version")),
+        compiler_identity=_require_query_string(generation.get("capability")),
+        document_kind=document_kind,
+        primary=artifact_id == primary_draft_artifact_id,
+    )
+
+
+def _source_records(
+    manifest: dict[str, object],
+) -> tuple[PortableSourceQueryRecord, ...]:
+    records: list[PortableSourceQueryRecord] = []
+    for value in _require_query_list(manifest.get("sources")):
+        source = _require_query_mapping(value)
+        source_id = _require_query_string(source.get("source_id"))
+        extensions = _require_query_mapping(source.get("extensions"))
+        video = extensions.get("alltonote.video:source")
+        connector_id: str | None = None
+        platform: str | None = None
+        if type(video) is dict:
+            connector_value = video.get("connector_id")
+            platform_value = video.get("platform")
+            connector_id = connector_value if type(connector_value) is str else None
+            platform = platform_value if type(platform_value) is str else None
+        records.append(
+            PortableSourceQueryRecord(
+                source_id=source_id,
+                kind=_require_query_string(source.get("source_kind")),
+                connector_id=connector_id,
+                platform=platform,
+            )
+        )
+    return tuple(records)
+
+
+def _source_revision_ids(manifest: dict[str, object]) -> tuple[str, ...]:
+    return tuple(
+        _require_query_string(
+            _require_query_mapping(value).get("source_revision_id")
+        )
+        for value in _require_query_list(manifest.get("source_revisions"))
+    )
+
+
+def _receipt_quality(
+    workspace: Workspace,
+    bundle_id: str,
+    manifest: dict[str, object],
+    target_artifact_id: str | None,
+) -> PortableQualityQueryRecord:
+    receipt_ref = _require_query_mapping(manifest.get("receipt"))
+    if receipt_ref.get("path") != "receipt.json":
+        raise _query_stale()
+    expected_size = _require_query_int(receipt_ref.get("byte_length"))
+    expected_sha256 = _require_query_string(receipt_ref.get("sha256"))
+    data = _read_committed_file(
+        workspace,
+        bundle_id,
+        "receipt.json",
+        maximum_bytes=_MAX_RECEIPT_BYTES,
+    )
+    if (
+        len(data) != expected_size
+        or f"sha256:{hashlib.sha256(data).hexdigest()}" != expected_sha256
+    ):
+        raise _query_stale()
+    try:
+        receipt = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _query_stale() from None
+    receipt = _require_query_mapping(receipt)
+    quality = _require_query_mapping(receipt.get("quality"))
+    overall = _require_query_string(quality.get("overall"))
+    publish_eligible = quality.get("publish_eligible")
+    repair_attempts = _require_query_int(quality.get("repair_attempts"))
+    if type(publish_eligible) is not bool:
+        raise _query_stale()
+
+    if target_artifact_id is not None:
+        parameters = _require_query_mapping(receipt.get("parameters"))
+        summary = _require_query_mapping(parameters.get("summary"))
+        outputs = summary.get("document_outputs", [])
+        for value in _require_query_list(outputs):
+            output = _require_query_mapping(value)
+            if output.get("draft_artifact_id") != target_artifact_id:
+                continue
+            overall = _require_query_string(output.get("quality_overall"))
+            publish_eligible = output.get("publish_eligible")
+            execution = _require_query_mapping(output.get("execution"))
+            repair_attempts = _require_query_int(
+                execution.get("repair_operations")
+            )
+            if type(publish_eligible) is not bool:
+                raise _query_stale()
+            break
+    return PortableQualityQueryRecord(
+        overall=overall,
+        publish_eligible=publish_eligible,
+        repair_attempts=repair_attempts,
+    )
+
+
+def _read_artifact_payload(
+    workspace: Workspace,
+    bundle_id: str,
+    artifact: dict[str, object],
+    capture_limit: int,
+) -> tuple[bytes, bool]:
+    payload = _require_query_mapping(artifact.get("payload"))
+    relative_path = _require_query_string(payload.get("path"))
+    expected_size = _require_query_int(payload.get("byte_length"))
+    expected_sha256 = _require_query_string(payload.get("sha256"))
+    path = _committed_file_path(workspace, bundle_id, relative_path)
+    captured = bytearray()
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                remaining = capture_limit - len(captured)
+                if remaining > 0:
+                    captured.extend(chunk[:remaining])
+    except OSError:
+        raise _query_stale("portable_artifact_stale") from None
+    if (
+        size != expected_size
+        or f"sha256:{digest.hexdigest()}" != expected_sha256
+    ):
+        raise _query_stale("portable_artifact_stale")
+    return bytes(captured), size > len(captured)
+
+
+def _validated_report(
+    workspace: Workspace,
+    bundle_id: str,
+) -> PortableValidationReport:
+    try:
+        return validate_bundle(
+            workspace,
+            PortableBundleRef.committed(bundle_id),
+            ValidationLevel.SEMANTIC,
+        )
+    except IWikiError as error:
+        raise _map_iwiki_query_error(error) from None
+    except _COMPATIBILITY_ERRORS:
+        raise _contract_incompatible() from None
+
+
+def _bundle_ids(workspace: Workspace) -> tuple[str, ...]:
+    bundles_root = workspace.resolve_contract_path("raw_personal") / "bundles"
+    try:
+        if not bundles_root.exists():
+            return ()
+        if _path_is_reparse_point(bundles_root) or not bundles_root.is_dir():
+            raise _query_error(
+                "workspace_invalid",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Committed Portable storage is not a safe Workspace directory",
+            )
+        result = tuple(
+            sorted(
+                path.name
+                for path in bundles_root.iterdir()
+                if _BUNDLE_ID.fullmatch(path.name) is not None
+                and not _path_is_reparse_point(path)
+                and path.is_dir()
+            )
+        )
+    except DomainError:
+        raise
+    except OSError:
+        raise _query_error(
+            "portable_query_unavailable",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "Committed Portable storage is temporarily unavailable",
+        ) from None
+    if len(result) > _MAX_QUERY_BUNDLES:
+        raise _query_error(
+            "portable_query_limit_exceeded",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "Committed Portable storage exceeds the bounded inspection limit",
+        )
+    return result
+
+
+def _inspect_validated_bundle(
+    workspace: Workspace,
+    bundle_id: str,
+    manifest_sha256: str,
+    *,
+    artifact_id: str | None,
+    payload_limit: int | None,
+) -> PortableInspectionRecord | None:
+    manifest = _manifest_document(workspace, bundle_id, manifest_sha256)
+    outputs = _require_query_mapping(manifest.get("outputs"))
+    primary_value = outputs.get("primary_draft")
+    primary_draft_id = primary_value if type(primary_value) is str else None
+    artifact_documents = tuple(
+        _require_query_mapping(value)
+        for value in _require_query_list(manifest.get("artifacts"))
+    )
+    target_document = next(
+        (
+            document
+            for document in artifact_documents
+            if document.get("artifact_id") == artifact_id
+        ),
+        None,
+    )
+    if artifact_id is not None and target_document is None:
+        return None
+
+    all_artifacts = tuple(
+        _artifact_record(
+            document,
+            primary_draft_artifact_id=primary_draft_id,
+        )
+        for document in artifact_documents
+    )
+    by_id = {artifact.artifact_id: artifact for artifact in all_artifacts}
+    target_artifact = by_id.get(artifact_id) if artifact_id is not None else None
+    draft_values = outputs.get("drafts")
+    if type(draft_values) is list:
+        draft_ids = tuple(_require_query_string(value) for value in draft_values)
+    elif primary_draft_id is not None:
+        draft_ids = (primary_draft_id,)
+    else:
+        draft_ids = ()
+    producer = _require_query_mapping(manifest.get("producer"))
+    recipe = _require_query_mapping(producer.get("recipe"))
+    transcript_value = outputs.get("transcript")
+    evidence_value = outputs.get("evidence_set")
+    bundle = PortableBundleQueryRecord(
+        bundle_id=bundle_id,
+        manifest_sha256=manifest_sha256,
+        created_at=_require_query_string(manifest.get("created_at")),
+        producer_product=_require_query_string(producer.get("product")),
+        runtime_version=_require_query_string(producer.get("runtime_version")),
+        recipe_id=_require_query_string(recipe.get("id")),
+        recipe_version=_require_query_int(recipe.get("version")),
+        capability=_require_query_string(producer.get("capability")),
+        portable_contract_id=_require_query_string(
+            producer.get("portable_contract_id")
+        ),
+        artifact_count=len(all_artifacts),
+        primary_draft_artifact_id=primary_draft_id,
+        draft_artifact_ids=draft_ids,
+        transcript_artifact_id=(
+            transcript_value if type(transcript_value) is str else None
+        ),
+        evidence_set_artifact_id=(
+            evidence_value if type(evidence_value) is str else None
+        ),
+    )
+    payload_bytes: bytes | None = None
+    payload_truncated = False
+    if payload_limit is not None and target_document is not None:
+        payload_bytes, payload_truncated = _read_artifact_payload(
+            workspace,
+            bundle_id,
+            target_document,
+            payload_limit,
+        )
+    return PortableInspectionRecord(
+        bundle=bundle,
+        artifacts=all_artifacts[:_MAX_QUERY_ARTIFACTS],
+        artifacts_truncated=len(all_artifacts) > _MAX_QUERY_ARTIFACTS,
+        target_artifact=target_artifact,
+        sources=_source_records(manifest),
+        source_revision_ids=_source_revision_ids(manifest),
+        quality=_receipt_quality(workspace, bundle_id, manifest, artifact_id),
+        payload=payload_bytes,
+        payload_truncated=payload_truncated,
+    )
 
 
 def _candidate_error(
@@ -963,6 +1447,89 @@ class IWikiPortableGateway:
     def inspect(self, workspace_root: Path) -> PortableContractInfo:
         _, info = _open_locked_workspace(workspace_root)
         return info
+
+    def inspect_committed(
+        self,
+        workspace_root: Path,
+        target_id: str,
+        *,
+        payload_limit: int | None = None,
+    ) -> PortableInspectionRecord:
+        if (
+            not isinstance(workspace_root, Path)
+            or type(target_id) is not str
+            or (
+                _BUNDLE_ID.fullmatch(target_id) is None
+                and _ARTIFACT_ID.fullmatch(target_id) is None
+            )
+            or (
+                payload_limit is not None
+                and (
+                    type(payload_limit) is not int
+                    or payload_limit <= 0
+                )
+            )
+        ):
+            raise _query_error(
+                "portable_query_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Portable inspection requires a typed ID and bounded payload limit",
+            )
+        workspace, _ = _open_locked_workspace(workspace_root, writable=False)
+        if _BUNDLE_ID.fullmatch(target_id) is not None:
+            if target_id not in _bundle_ids(workspace):
+                raise _query_error(
+                    "portable_bundle_not_found",
+                    ErrorCategory.INVALID_REQUEST,
+                    "The requested Portable bundle was not found",
+                )
+            report = _validated_report(workspace, target_id)
+            if (
+                not report.valid
+                or report.bundle_id != target_id
+                or type(report.manifest_sha256) is not str
+            ):
+                raise _query_stale("portable_bundle_stale")
+            inspected = _inspect_validated_bundle(
+                workspace,
+                target_id,
+                report.manifest_sha256,
+                artifact_id=None,
+                payload_limit=None,
+            )
+            assert inspected is not None
+            return inspected
+
+        stale = False
+        for bundle_id in _bundle_ids(workspace):
+            report = _validated_report(workspace, bundle_id)
+            if (
+                not report.valid
+                or report.bundle_id != bundle_id
+                or type(report.manifest_sha256) is not str
+            ):
+                stale = stale or _manifest_mentions_artifact(
+                    workspace,
+                    bundle_id,
+                    target_id,
+                )
+                continue
+            inspected = _inspect_validated_bundle(
+                workspace,
+                bundle_id,
+                report.manifest_sha256,
+                artifact_id=target_id,
+                payload_limit=payload_limit,
+            )
+            if inspected is not None:
+                return inspected
+        if stale:
+            raise _query_stale("portable_artifact_stale")
+        raise _query_error(
+            "portable_artifact_not_found",
+            ErrorCategory.INVALID_REQUEST,
+            "The requested Portable artifact was not found",
+        )
 
     def verify_committed_source_binding(
         self,

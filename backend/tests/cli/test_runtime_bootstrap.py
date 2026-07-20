@@ -10,19 +10,13 @@ import sys
 HELPER = Path(__file__).resolve().parents[1] / "helpers" / "report_cli_imports.py"
 
 EXPECTED_LOCK = {
-    "iwiki_package": "llm-iwiki==0.1.0",
+    "iwiki_package": "llm-iwiki==0.1.2",
     "portable_api_version": 1,
     "portable_contract_id": "iwiki-portable-contract-v1",
     "schema_set_id": "2026-07-portable-v1",
     "schema_sha256": "sha256:f8ded2d23197685dc0046e3949e573097fa4ae13e12cfbba240ff0544ca2c9d9",
     "source_commit": "8701ace4f65ffd7ee46fbcf3edcc2ce2bcfc47e1",
 }
-
-EXPECTED_VERSION_OUTPUT = (
-    '{"alltonote_cli_protocol_version":1,"ok":true,'
-    '"data":{"runtime_version":"0.1.0"}}\n'
-)
-
 
 def test_cli_version_does_not_import_web_or_video_modules():
     result = subprocess.run(
@@ -33,9 +27,27 @@ def test_cli_version_does_not_import_web_or_video_modules():
     )
 
     report = json.loads(result.stdout)
+    envelope = json.loads(report["stdout"])
 
     assert report["exit_code"] == 0
-    assert report["stdout"] == EXPECTED_VERSION_OUTPUT
+    assert envelope == {
+        "alltonote_cli_protocol_version": 1,
+        "ok": True,
+        "command": "version",
+        "correlation_id": envelope["correlation_id"],
+        "data": {"runtime_version": "0.1.0"},
+        "error": None,
+        "warnings": [],
+        "job": None,
+        "artifacts": [],
+        "capabilities": [],
+        "versions": {
+            "runtime_version": "0.1.0",
+            "cli_protocol_version": 1,
+        },
+    }
+    assert envelope["correlation_id"].startswith("corr_")
+    assert report["stdout"].count("\n") == 1
     assert not {
         "fastapi",
         "torch",

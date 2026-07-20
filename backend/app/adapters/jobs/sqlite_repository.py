@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -9,7 +10,13 @@ from pathlib import Path
 from uuid import RFC_4122, UUID
 
 from app.core.domain.ids import new_typed_id, sha256_digest, utc_now_millis
-from app.core.domain.video import JobState, QualityOverall, VideoProduceResult
+from app.core.domain.video import (
+    JobState,
+    QualityOverall,
+    VideoDocumentKind,
+    VideoProducedDocument,
+    VideoProduceResult,
+)
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.model import (
     Attempt,
@@ -33,6 +40,7 @@ from app.core.ports.jobs import (
     SourceIdentityBinding,
     VideoResultPlan,
 )
+from app.core.ports.job_queries import JobListRecord, JobQueryRecord
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
@@ -286,10 +294,12 @@ class SqliteJobRepository:
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None = None,
+        initial_events: tuple[tuple[str, str], ...] = (),
     ) -> Job:
         self._validate_request_json(request_hash, request_json)
+        self._validate_initial_events(initial_events)
         with self._transaction(immediate=True) as connection:
-            return self._create_job(
+            job, created = self._create_job(
                 connection,
                 request_hash=request_hash,
                 request_json=request_json,
@@ -297,10 +307,196 @@ class SqliteJobRepository:
                 client_request_id=client_request_id,
                 retry_of_job_id=retry_of_job_id,
             )
+            if created:
+                for event_type, payload_json in initial_events:
+                    self._insert_event(
+                        connection,
+                        job.job_id,
+                        event_type,
+                        payload_json,
+                    )
+            elif initial_events:
+                stored = connection.execute(
+                    """
+                    SELECT event_type, payload_json FROM events
+                    WHERE job_id = ? ORDER BY sequence LIMIT ?
+                    """,
+                    (job.job_id, len(initial_events)),
+                ).fetchall()
+                if tuple(
+                    (row["event_type"], row["payload_json"]) for row in stored
+                ) != initial_events:
+                    raise DomainError(
+                        "idempotency_conflict",
+                        ErrorCategory.CONFLICT,
+                        "Idempotency key is already bound to another request",
+                    )
+            return job
 
     def get_job(self, job_id: str) -> Job:
         with self._transaction(immediate=False) as connection:
             return self._get_job(connection, job_id)
+
+    def query_job(self, job_id: str, *, principal: str) -> JobQueryRecord:
+        with self._transaction(immediate=False) as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE job_id = ? AND principal = ?",
+                (job_id, principal),
+            ).fetchone()
+            if row is None:
+                self._raise_scoped_job_not_found()
+            job = self._job_from_row(row)
+            attempt_row = connection.execute(
+                """
+                SELECT * FROM attempts
+                WHERE job_id = ? AND state IN (?, ?)
+                ORDER BY created_at DESC, attempt_id DESC
+                LIMIT 1
+                """,
+                (
+                    job_id,
+                    AttemptState.PENDING.value,
+                    AttemptState.RUNNING.value,
+                ),
+            ).fetchone()
+            challenge_row = connection.execute(
+                """
+                SELECT * FROM challenges
+                WHERE job_id = ? AND state = ?
+                ORDER BY created_at DESC, challenge_id DESC
+                LIMIT 1
+                """,
+                (job_id, ChallengeState.PENDING.value),
+            ).fetchone()
+            unknown_rows = connection.execute(
+                """
+                SELECT operation_id FROM external_operations
+                WHERE job_id = ? AND outcome = ?
+                ORDER BY operation_id
+                """,
+                (job_id, ExternalOutcome.UNKNOWN.value),
+            ).fetchall()
+            return JobQueryRecord(
+                job=job,
+                active_attempt=(
+                    self._attempt_from_row(attempt_row)
+                    if attempt_row is not None
+                    else None
+                ),
+                pending_challenge=(
+                    self._challenge_from_row(challenge_row)
+                    if challenge_row is not None
+                    else None
+                ),
+                result=(
+                    self._decode_video_result(row["result_json"])
+                    if row["result_json"] is not None
+                    else None
+                ),
+                error=(
+                    self._decode_error(row["error_json"])
+                    if row["error_json"] is not None
+                    else None
+                ),
+                unknown_operation_ids=tuple(
+                    unknown["operation_id"] for unknown in unknown_rows
+                ),
+            )
+
+    def query_jobs(
+        self,
+        *,
+        principal: str,
+        states: tuple[JobState, ...],
+        before_created_at: str | None,
+        before_job_id: str | None,
+        limit: int,
+    ) -> tuple[JobListRecord, ...]:
+        if (
+            type(principal) is not str
+            or not principal
+            or type(states) is not tuple
+            or any(type(state) is not JobState for state in states)
+            or type(limit) is not int
+            or limit < 1
+            or (before_created_at is None) != (before_job_id is None)
+        ):
+            raise DomainError(
+                "job_query_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job query is invalid",
+            )
+        clauses = ["principal = ?"]
+        parameters: list[object] = [principal]
+        if states:
+            clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
+            parameters.extend(state.value for state in states)
+        if before_created_at is not None and before_job_id is not None:
+            clauses.append("(created_at < ? OR (created_at = ? AND job_id < ?))")
+            parameters.extend(
+                (before_created_at, before_created_at, before_job_id)
+            )
+        parameters.append(limit)
+        statement = (
+            "SELECT * FROM jobs WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC, job_id DESC LIMIT ?"
+        )
+        with self._transaction(immediate=False) as connection:
+            rows = connection.execute(statement, parameters).fetchall()
+            return tuple(
+                JobListRecord(
+                    job=self._job_from_row(row),
+                    result=(
+                        self._decode_video_result(row["result_json"])
+                        if row["result_json"] is not None
+                        else None
+                    ),
+                    error=(
+                        self._decode_error(row["error_json"])
+                        if row["error_json"] is not None
+                        else None
+                    ),
+                )
+                for row in rows
+            )
+
+    def query_job_events(
+        self,
+        job_id: str,
+        *,
+        principal: str,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[JobEvent, ...]:
+        if (
+            type(after_sequence) is not int
+            or after_sequence < 0
+            or type(limit) is not int
+            or limit < 1
+        ):
+            raise DomainError(
+                "job_event_query_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job event query is invalid",
+            )
+        with self._transaction(immediate=False) as connection:
+            authorized = connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ? AND principal = ?",
+                (job_id, principal),
+            ).fetchone()
+            if authorized is None:
+                self._raise_scoped_job_not_found()
+            rows = connection.execute(
+                """
+                SELECT * FROM events
+                WHERE job_id = ? AND sequence > ?
+                ORDER BY sequence
+                LIMIT ?
+                """,
+                (job_id, after_sequence, limit),
+            ).fetchall()
+            return tuple(self._event_from_row(row) for row in rows)
 
     def get_job_details(
         self, job_id: str
@@ -815,7 +1011,9 @@ class SqliteJobRepository:
         expected_original_state: JobState,
         confirmed_unknown_operation_ids: tuple[str, ...],
         client_request_id: str,
+        initial_events: tuple[tuple[str, str], ...] = (),
     ) -> Job:
+        self._validate_initial_events(initial_events)
         with self._transaction(immediate=True) as connection:
             original = self._get_job(connection, original_job_id)
             if original.state not in TERMINAL_JOB_STATES:
@@ -861,7 +1059,7 @@ class SqliteJobRepository:
                 "SELECT request_json FROM jobs WHERE job_id = ?",
                 (original_job_id,),
             ).fetchone()[0]
-            return self._create_job(
+            job, created = self._create_job(
                 connection,
                 request_hash=original.request_hash,
                 request_json=request_json,
@@ -869,6 +1067,31 @@ class SqliteJobRepository:
                 client_request_id=client_request_id,
                 retry_of_job_id=original.job_id,
             )
+            if created:
+                for event_type, payload_json in initial_events:
+                    self._insert_event(
+                        connection,
+                        job.job_id,
+                        event_type,
+                        payload_json,
+                    )
+            elif initial_events:
+                stored = connection.execute(
+                    """
+                    SELECT event_type, payload_json FROM events
+                    WHERE job_id = ? ORDER BY sequence LIMIT ?
+                    """,
+                    (job.job_id, len(initial_events)),
+                ).fetchall()
+                if tuple(
+                    (row["event_type"], row["payload_json"]) for row in stored
+                ) != initial_events:
+                    raise DomainError(
+                        "idempotency_conflict",
+                        ErrorCategory.CONFLICT,
+                        "Idempotency key is already bound to another request",
+                    )
+            return job
 
     def record_checkpoint(
         self,
@@ -1194,6 +1417,7 @@ class SqliteJobRepository:
         *,
         provider_request_id: str | None,
         summary_json: str,
+        authority: ExecutionAuthority,
     ) -> ExternalOperation:
         if outcome not in (ExternalOutcome.SUCCEEDED, ExternalOutcome.FAILED):
             raise DomainError(
@@ -1208,6 +1432,27 @@ class SqliteJobRepository:
                     "external_operation_not_started",
                     ErrorCategory.CONFLICT,
                     "Only a started external operation can finish",
+                )
+            if (
+                outcome is ExternalOutcome.SUCCEEDED
+                and self._get_job(connection, current.job_id).cancellation_requested
+            ):
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
+            attempt = self._assert_execution_authority(
+                connection,
+                current.job_id,
+                current.attempt_id,
+                authority,
+            )
+            if attempt.step_id != current.step_id:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "External operation step is not owned by the Attempt",
                 )
             connection.execute(
                 """
@@ -1236,6 +1481,7 @@ class SqliteJobRepository:
         operation_id: str,
         *,
         summary_json: str,
+        authority: ExecutionAuthority,
     ) -> ExternalOperation:
         with self._transaction(immediate=True) as connection:
             current = self._get_external_operation(connection, operation_id)
@@ -1246,6 +1492,18 @@ class SqliteJobRepository:
                     "external_operation_not_started",
                     ErrorCategory.CONFLICT,
                     "Only a started external operation can become unknown",
+                )
+            attempt = self._assert_execution_authority(
+                connection,
+                current.job_id,
+                current.attempt_id,
+                authority,
+            )
+            if attempt.step_id != current.step_id:
+                raise DomainError(
+                    "attempt_fenced",
+                    ErrorCategory.CONFLICT,
+                    "External operation step is not owned by the Attempt",
                 )
             connection.execute(
                 """
@@ -1447,29 +1705,14 @@ class SqliteJobRepository:
     def append_event(
         self, job_id: str, event_type: str, payload_json: str
     ) -> JobEvent:
+        self._validate_initial_events(((event_type, payload_json),))
         with self._transaction(immediate=True) as connection:
             self._get_job(connection, job_id)
-            sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()[0]
-            event_id = new_typed_id("evt")
-            created_at = utc_now_millis()
-            connection.execute(
-                """
-                INSERT INTO events (
-                    event_id, job_id, sequence, event_type, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (event_id, job_id, sequence, event_type, payload_json, created_at),
-            )
-            return JobEvent(
-                event_id=event_id,
-                job_id=job_id,
-                sequence=sequence,
-                event_type=event_type,
-                payload_json=payload_json,
-                created_at=created_at,
+            return self._insert_event(
+                connection,
+                job_id,
+                event_type,
+                payload_json,
             )
 
     def list_events(
@@ -1486,6 +1729,36 @@ class SqliteJobRepository:
                 (job_id, after_sequence),
             ).fetchall()
             return tuple(self._event_from_row(row) for row in rows)
+
+    @staticmethod
+    def _insert_event(
+        connection: sqlite3.Connection,
+        job_id: str,
+        event_type: str,
+        payload_json: str,
+    ) -> JobEvent:
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
+        event_id = new_typed_id("evt")
+        created_at = utc_now_millis()
+        connection.execute(
+            """
+            INSERT INTO events (
+                event_id, job_id, sequence, event_type, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, job_id, sequence, event_type, payload_json, created_at),
+        )
+        return JobEvent(
+            event_id=event_id,
+            job_id=job_id,
+            sequence=sequence,
+            event_type=event_type,
+            payload_json=payload_json,
+            created_at=created_at,
+        )
 
     def transition_job(self, job_id: str, state: JobState) -> Job:
         with self._transaction(immediate=True) as connection:
@@ -1773,6 +2046,24 @@ class SqliteJobRepository:
                 )
             )
             or len(plan.display_asset_ids) != len(set(plan.display_asset_ids))
+            or any(
+                not isinstance(document, VideoProducedDocument)
+                for document in plan.documents
+            )
+            or len({document.document_kind for document in plan.documents})
+            != len(plan.documents)
+            or (
+                bool(plan.documents)
+                and not any(
+                    document.draft_artifact_id
+                    == plan.primary_draft_artifact_id
+                    and document.quality_report_artifact_id
+                    == plan.quality_report_artifact_id
+                    and document.quality_overall is plan.quality_overall
+                    and document.publish_eligible is plan.publish_eligible
+                    for document in plan.documents
+                )
+            )
             or type(plan.quality_overall) is not QualityOverall
             or type(plan.publish_eligible) is not bool
             or any(
@@ -1883,14 +2174,14 @@ class SqliteJobRepository:
             usage=plan.usage,
             warnings=plan.warnings,
             idempotent=receipt.idempotent,
+            documents=plan.documents,
         )
         cls._encode_video_result(result)
         return result
 
     @staticmethod
     def _encode_video_result(result: VideoProduceResult) -> str:
-        return json.dumps(
-            {
+        document = {
                 "job_id": result.job_id,
                 "run_id": result.run_id,
                 "bundle_id": result.bundle_id,
@@ -1909,7 +2200,20 @@ class SqliteJobRepository:
                 "usage": dict(result.usage),
                 "warnings": list(result.warnings),
                 "idempotent": result.idempotent,
-            },
+            }
+        if result.documents:
+            document["documents"] = [
+                {
+                    "document_kind": item.document_kind.value,
+                    "draft_artifact_id": item.draft_artifact_id,
+                    "quality_report_artifact_id": item.quality_report_artifact_id,
+                    "quality_overall": item.quality_overall.value,
+                    "publish_eligible": item.publish_eligible,
+                }
+                for item in result.documents
+            ]
+        return json.dumps(
+            document,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -1945,6 +2249,18 @@ class SqliteJobRepository:
                 usage=value["usage"],
                 warnings=tuple(value["warnings"]),
                 idempotent=value["idempotent"],
+                documents=tuple(
+                    VideoProducedDocument(
+                        document_kind=VideoDocumentKind(item["document_kind"]),
+                        draft_artifact_id=item["draft_artifact_id"],
+                        quality_report_artifact_id=item[
+                            "quality_report_artifact_id"
+                        ],
+                        quality_overall=QualityOverall(item["quality_overall"]),
+                        publish_eligible=item["publish_eligible"],
+                    )
+                    for item in value.get("documents", ())
+                ),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise DomainError(
@@ -1998,6 +2314,55 @@ class SqliteJobRepository:
                 ErrorCategory.INVALID_REQUEST,
                 "Stored Job request must match its canonical hash",
             )
+
+    @classmethod
+    def _validate_initial_events(
+        cls, initial_events: tuple[tuple[str, str], ...]
+    ) -> None:
+        for event in initial_events:
+            if (
+                type(event) is not tuple
+                or len(event) != 2
+                or type(event[0]) is not str
+                or re.fullmatch(
+                    r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*",
+                    event[0],
+                )
+                is None
+                or type(event[1]) is not str
+            ):
+                raise DomainError(
+                    "job_event_invalid",
+                    ErrorCategory.INVALID_REQUEST,
+                    "Job event is invalid",
+                )
+            try:
+                value = json.loads(
+                    event[1],
+                    parse_constant=lambda _value: (_ for _ in ()).throw(
+                        ValueError()
+                    ),
+                )
+                cls._assert_safe_json_fields(value)
+                canonical = json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise DomainError(
+                    "job_event_invalid",
+                    ErrorCategory.INVALID_REQUEST,
+                    "Job event is invalid",
+                ) from None
+            if canonical != event[1]:
+                raise DomainError(
+                    "job_event_invalid",
+                    ErrorCategory.INVALID_REQUEST,
+                    "Job event is invalid",
+                )
 
     @classmethod
     def _assert_safe_json_fields(cls, value: object) -> None:
@@ -2091,6 +2456,14 @@ class SqliteJobRepository:
             )
         return self._job_from_row(row)
 
+    @staticmethod
+    def _raise_scoped_job_not_found() -> None:
+        raise DomainError(
+            "job_not_found",
+            ErrorCategory.INVALID_REQUEST,
+            "Job does not exist",
+        )
+
     def _create_job(
         self,
         connection: sqlite3.Connection,
@@ -2100,7 +2473,7 @@ class SqliteJobRepository:
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None,
-    ) -> Job:
+    ) -> tuple[Job, bool]:
         if client_request_id is not None:
             existing = connection.execute(
                 """
@@ -2119,7 +2492,7 @@ class SqliteJobRepository:
                         ErrorCategory.CONFLICT,
                         "Idempotency key is already bound to another request",
                     )
-                return self._job_from_row(existing)
+                return self._job_from_row(existing), False
 
         now = utc_now_millis()
         job_id = new_typed_id("job")
@@ -2144,7 +2517,7 @@ class SqliteJobRepository:
                 now,
             ),
         )
-        return self._get_job(connection, job_id)
+        return self._get_job(connection, job_id), True
 
     def _create_attempt(
         self,

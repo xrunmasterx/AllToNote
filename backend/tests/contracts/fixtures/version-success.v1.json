@@ -1,0 +1,18 @@
+{
+  "alltonote_cli_protocol_version": 1,
+  "ok": true,
+  "command": "version",
+  "correlation_id": "corr_018cc251-f400-7000-8000-000000000000",
+  "data": {
+    "runtime_version": "0.1.0"
+  },
+  "error": null,
+  "warnings": [],
+  "job": null,
+  "artifacts": [],
+  "capabilities": [],
+  "versions": {
+    "runtime_version": "0.1.0",
+    "cli_protocol_version": 1
+  }
+}
