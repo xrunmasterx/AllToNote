@@ -127,7 +127,7 @@ Stop condition：
 - 开始设计 capability/resource/publisher/detach 大而全 descriptor；
 - 开始设计通用 stage、DAG 或完整 Agent plan。
 
-## Task 4: [ ] 实现静态 Registry 与薄 ProduceService
+## Task 4: [x] 实现静态 Registry 与薄 ProduceService
 
 - 风险：中
 - 预计生产代码：150 至 220 行
@@ -139,24 +139,24 @@ Stop condition：
 
 Registry 验收：
 
-- [ ] 组合根显式注册；
-- [ ] 构建后只读；
-- [ ] list 顺序稳定；
-- [ ] describe/resolve 对非法 selector、未知版本、重复 key 返回稳定错误；
-- [ ] 不扫描目录或 entry point；
-- [ ] 不动态下载或导入远端代码；
-- [ ] descriptor 查询不实例化 VideoService 或重型 Pack；
-- [ ] 不为几个官方 Recipe 编写无价值微基准。
+- [x] 组合根显式注册；
+- [x] 构建后只读；
+- [x] list 顺序稳定；
+- [x] describe/resolve 对非法 selector、未知版本、重复 key 返回稳定错误；
+- [x] 不扫描目录或 entry point；
+- [x] 不动态下载或导入远端代码；
+- [x] descriptor 查询不实例化 VideoService 或重型 Pack；
+- [x] 不为几个官方 Recipe 编写无价值微基准。
 
 ProduceService 验收：
 
-- [ ] 只做通用 envelope 校验、Recipe 固定、resolve、submit 和 submission 返回；
-- [ ] 不导入 Video；
-- [ ] 不保存当前活动 Job、Workspace 或 Recipe 的全局可变状态；
-- [ ] submit 不执行下载、模型、转写、Agent 或 wait；
-- [ ] submit 不创建后台线程；
-- [ ] 不实现 preflight-plan-output-result 编排；
-- [ ] 不包装第二套 Video-specific 错误层。
+- [x] 只做通用 envelope 校验、Recipe 固定、resolve、submit 和 submission 返回；
+- [x] 不导入 Video；
+- [x] 不保存当前活动 Job、Workspace 或 Recipe 的全局可变状态；
+- [x] submit 不执行下载、模型、转写、Agent 或 wait；
+- [x] submit 不创建后台线程；
+- [x] 不实现 preflight-plan-output-result 编排；
+- [x] 不包装第二套 Video-specific 错误层。
 
 Stop condition：
 
