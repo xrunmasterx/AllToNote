@@ -92,7 +92,7 @@ Stop condition：
 - 必须同时重构 result_json、JobSnapshot 或 Repository 才能完成；
 - 迁移造成状态 wire 变化。
 
-## Task 3: [ ] 建立最小 Recipe submission 合同
+## Task 3: [x] 建立最小 Recipe submission 合同
 
 - 风险：中
 - 预计生产代码：100 至 180 行
@@ -103,23 +103,23 @@ Stop condition：
 
 只允许实现：
 
-- [ ] RecipeKey；
-- [ ] RecipeDescriptor；
-- [ ] InputDescriptor；
-- [ ] ProduceRequest；
-- [ ] ProduceSubmission；
-- [ ] RecipeEndpoint.submit Protocol；
-- [ ] 最小 JSON-safe、不可变和版本校验。
+- [x] RecipeKey；
+- [x] RecipeDescriptor；
+- [x] InputDescriptor；
+- [x] ProduceRequest；
+- [x] ProduceSubmission；
+- [x] RecipeEndpoint.submit Protocol；
+- [x] 最小 JSON-safe、不可变和版本校验。
 
 验收：
 
-- [ ] 合同模块不导入 Video、Document、Web 或 Codebase 类型；
-- [ ] 不包含 Transcript、timeline、page、bbox、provider、transcriber 等单 Recipe 必填字段；
-- [ ] parameters 由 Recipe 拥有并以不可变 JSON-safe mapping 表达；
-- [ ] durable request 只接受 secret reference，不以字符串启发式猜测 Secret；
-- [ ] 未知 contract version、空 Recipe key 和非法 input fail closed；
-- [ ] 没有 PreflightReport、RecipePlan、RecipeOutput 或 ProduceResult；
-- [ ] 合同明确标记 internal、可演进，不承诺第三方 ABI。
+- [x] 合同模块不导入 Video、Document、Web 或 Codebase 类型；
+- [x] 不包含 Transcript、timeline、page、bbox、provider、transcriber 等单 Recipe 必填字段；
+- [x] parameters 由 Recipe 拥有并以不可变 JSON-safe mapping 表达；
+- [x] durable request 只接受 secret reference，不以字符串启发式猜测 Secret；
+- [x] 未知 contract version、空 Recipe key 和非法 input fail closed；
+- [x] 没有 PreflightReport、RecipePlan、RecipeOutput 或 ProduceResult；
+- [x] 合同明确标记 internal、可演进，不承诺第三方 ABI。
 
 Stop condition：
 
