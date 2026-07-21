@@ -190,9 +190,9 @@ flowchart TD
 | Model execution | `implemented foundation` | ModelExecution/Coordinator/ExternalOperation/Codex Bridge |
 | Video Knowledge/Faithful compiler | `implemented core` | 65 分钟真实 transcript E2E、quality/pass/restart zero replay |
 | Video 正式支持矩阵 | `pending` | Bilibili、本地 clean-machine/Pack/发布证据待闭合；YouTube外部阻塞 |
-| Wave 0 权威/基线收敛 | `partial; closure in progress` | G0-1/G0-2 证据 PASS；G0-3/G0-4/G0-5/G0-6 正在收口；Dm、M、tests 未全闭合，不得宣称 Wave 0 PASS |
+| Wave 0 权威/基线收敛 | `complete` | 2026-07-21：权威基线 `3a75d0e` 已集成到实现提交 `066884d`；full backend、Windows smoke 与 `git diff --check` 通过 |
 | Runtime CLI Wave 1A | `complete` | RCP-00..07 与 VREL-00/01 已验收；后续 Pack/Desktop/分发不属于 Wave 1A 完成定义 |
-| ProduceService / Multi-Recipe Registry X0-A | `pending` | 只建立 submission/control-plane、静态 Registry、薄 ProduceService 与 Video adapter；单一 `produce` 主入口 |
+| ProduceService / Multi-Recipe Registry X0-A | `in progress: Task 1` | 当前只冻结兼容与执行能力基线；后续只建立 submission/control-plane、静态 Registry、薄 ProduceService 与 Video adapter |
 | Multi-Recipe 数据面 X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同证明 Result/Artifact/Repository/atomic commit、迁移与恢复边界 |
 | Vault Core/CLI | `mostly not implemented` | foundation plan/部分 gateway存在，完整 tree/read/search/grant未闭环 |
 | 薄 Desktop Vault UI | `pending` | 旧 BiliNote UI不等于新 Runtime/Vault UI |
@@ -210,14 +210,14 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    W0["Wave 0：G0-1/2 证据 PASS；G0-3/4/5/6 收口中"] --> X0A["X0-A pending"]
+    W0["Wave 0：PASS（2026-07-21）"] --> X0A["X0-A Task 1 in progress"]
     X0A --> C0["并发正确性 C0 pending"]
     C0 --> DX0B["真实 Document/PPT + X0-B pending"]
     DX0B --> ARP["开放 Artifact + Review/Publisher pending"]
     ARP --> ENG["Engine + Production MCP：需求已触发，实现受阻"]
 ```
 
-这是强制硬依赖链：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。Wave 1A 已完成，但不代表 Wave 0 PASS；Dm、M 与 tests 全部关闭前，Wave 0 仍为 partial。X0-A 与 X0-B 均 pending，X0-B 必须由真实 Document/PPT 第二消费者驱动。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending。Engine 产品需求已经触发，但不得绕过 Wave 0-4 实施 production lifecycle。
+这是强制硬依赖链：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。Wave 1A 与 Wave 0 均已完成，X0-A 当前进入 Task 1；X0-B 必须由真实 Document/PPT 第二消费者驱动。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending。Engine 产品需求已经触发，但不得绕过 X0-A 至 Wave 4 实施 production lifecycle。
 
 ## 8. 下一位 AI 的使用规则
 

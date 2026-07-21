@@ -317,8 +317,8 @@ flowchart LR
 ### 7.0 当前实施状态与硬依赖
 
 - Wave 1A 已完成；其范围外的 Pack、Desktop Resolver、clean-machine 与分发仍待实现。
-- Wave 0 当前为 partial：G0-1/G0-2 证据 PASS，G0-3/G0-4/G0-5/G0-6 正在收口；Dm、M 与 tests 全部关闭前不得宣称 Wave 0 PASS。
-- X0-A pending；X0-B pending，且必须由 Video 与真实 Document/PPT 第二消费者共同驱动，不能以伪消费者或纸面抽象代替。
+- Wave 0 已于 2026-07-21 通过：权威文档基线 `3a75d0e` 已以来源标记集成到实现分支 `066884d`，集成后 full backend、Windows smoke 与 `git diff --check` 均通过。
+- X0-A 已进入 Task 1 基线冻结阶段；X0-B pending，且必须由 Video 与真实 Document/PPT 第二消费者共同驱动，不能以伪消费者或纸面抽象代替。
 - Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending；旧 BiliNote UI 不等于 Thin Desktop 完成。
 - Engine 的高并行、批量后台执行和本地 Agent 调度需求已经触发，但生产实现被 Wave 0-4 阻塞。
 - 固定硬依赖链为：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。不再使用 Engine 触发决策菱形。
@@ -379,14 +379,15 @@ flowchart LR
 
 ## 9. 当前仓库事实
 
-截至 2026-07-20：
+截至 2026-07-21：
 
-- 文档主工作树：`G:\AllToNote`，当前分支 `master`。
-- Video Recipe 实现工作树（历史目录名 `AllToNote-video-producer`）：`G:\AllToNote-video-producer`，分支 `codex/alltonote-video-producer`。
-- Video Recipe 的既有实现与测试已在本地 checkpoint `2b9e2b066e38d50ce040436d6b1995b845c61c28` 固化；实现侧 handoff/X0-A/Local Parallel 文档已在 `ff5e5de679771f21e089ae5d72cf72378b1a32be` 固化。两者均未 push。
-- 本轮权威文档收敛已按 19 个显式路径进入暂存区，尚未 commit；Research、其他未审阅设计、ADR、运行产物和本地配置仍保持未暂存，不得清理、覆盖或重置。
-- 主工作树与实现 worktree 的部分同名设计内容不同，必须通过精确文档 checkpoint 和显式 Git merge 同步，不能假设二者一致。
-- 本轮没有移动既有设计文件，没有 push、tag 或 release；Wave 0 的 Git 集成与集成后测试尚未完成。
+- 文档主工作树：`G:\AllToNote`，分支 `codex/alltonote-wave0-baseline`，权威文档基线提交为 `3a75d0e4101460b1924a4be2a47736efb4b29ed5`。
+- Video Recipe 实现工作树（历史目录名 `AllToNote-video-producer`）：`G:\AllToNote-video-producer`，分支 `codex/alltonote-x0a`。
+- Video Recipe 的既有实现与测试已在本地 checkpoint `2b9e2b066e38d50ce040436d6b1995b845c61c28` 固化；实现侧 handoff/X0-A/Local Parallel 文档已在 `ff5e5de679771f21e089ae5d72cf72378b1a32be` 固化。
+- 权威文档基线已以 `Authority-Baseline: 3a75d0e4101460b1924a4be2a47736efb4b29ed5` 来源标记集成到实现分支提交 `066884da43105e000e00e389ab213274ca2fd6c5`。
+- 集成后 backend 全量测试为 `1820 passed, 2 skipped, 1 warning, 3 subtests passed`；Windows 本地视频 smoke 为 `1 passed, 14 deselected, 1 warning`；`git diff --check` 通过。
+- `.superpowers/` 与 `config/downloader.json` 仍是明确排除的本地未跟踪资产；未被清理、覆盖或纳入提交。
+- 本轮没有 push、tag 或 release；Wave 0 已关闭，当前允许的主线是 Recipe X0-A Task 1。
 - 当前正式设计覆盖 18 个 ID；Wave 1A 已完成，Wave 0 仍在关闭 G0-3/G0-4/G0-5/G0-6，后续按固定硬依赖链实施，不得提前宣称 Wave 0 PASS 或启动 Engine production implementation。
 
 下一个执行者必须先读取总任务清单中的 `HANDOFF-01`，再从“推荐执行波次”选择一个实际开发任务。
