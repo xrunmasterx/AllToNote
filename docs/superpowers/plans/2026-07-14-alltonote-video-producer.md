@@ -1,5 +1,7 @@
 # AllToNote Video Producer Implementation Plan
 
+> **Status:** Partially superseded. 已完成的 Video 实现与验收记录继续有效；其中 generic `run`/`add` 接口任务已由单一 `produce`、X0-A/X0-B 和当前 handoff 取代，不得重新执行。当前平台接缝以 Recipe X0-A spec/tasks 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 建立一个不依赖 Desktop/Web 的 AllToNote Video Producer，使 Bilibili、YouTube 和本地视频可以通过 CLI 生成带 Transcript、Evidence、Markdown Draft、QualityReport 与 Receipt 的 Portable Source Bundle，并由 iwiki 原子提交。

@@ -1,11 +1,26 @@
 # AllToNote CLI-First Vault 浏览、Markdown 阅读与搜索设计
 
+```yaml
+doc_type: subsystem-design
+status: active
+authority: subsystem
+upstream:
+  - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
+  - 2026-07-12-alltonote-llm-iwiki-desktop-design.md
+downstream:
+  - ../plans/2026-07-18-alltonote-vault-desktop-implementation-plan.md
+implementation_status: core-cli-desktop-loop-mostly-not-implemented
+last_verified_at: 2026-07-18
+```
+
 - 日期：2026-07-13
-- 状态：已完成方案确认，待正式文档终审
+- 状态：当前有效；实现待闭环
 - 对应阶段：`2026-07-12-alltonote-llm-iwiki-desktop-design.md` 的 Phase 2
 - 产品基线：开放磁盘合同 + 稳定 iwiki CLI/SDK + 托管式独立 AllToNote Runtime
 - 首发平台：Windows 10/11 x64（Tier 1）
 - 次级平台：macOS Apple Silicon（Tier 2，通过独立发布 Gate 后支持）
+
+> 局部修正：本文后文如出现把 `jobs.sqlite` 放入 Workspace `.cache` 的未来建议，该建议已被上位架构替代。Job、lease、运行日志和 scheduler 状态属于单机操作状态，必须存放在平台用户状态目录；Vault 只保存可移植知识资产与可重建索引。
 
 ## 1. 文档目的
 

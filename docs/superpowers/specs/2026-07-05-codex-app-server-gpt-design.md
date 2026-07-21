@@ -1,5 +1,19 @@
 # Codex App Server GPT Design
 
+```yaml
+doc_type: subsystem-design
+status: partially-superseded
+authority: subsystem
+upstream:
+  - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
+superseded_by:
+  - Knowledge Compiler ModelExecutor / AgentExecutor ownership
+implementation_status: codex-client-and-bridge-retained-old-gpt-ownership-superseded
+last_verified_at: 2026-07-18
+```
+
+> 当前使用规则：本文只保留 Codex app-server 的登录态、协议帧、子进程生命周期和安全边界参考。本文中以 `NoteGenerator -> GPTFactory -> RequestChunker` 为扩展中心的职责划分已经失效；新功能必须服从 Knowledge Compiler 的 `ModelExecutor`、`AgentExecutor`、Coordinator 和 Job 边界。
+
 ## Background
 
 BiliNote currently treats every LLM provider as an OpenAI-compatible HTTP API. The backend stores provider `api_key`, `base_url`, and model names, then `GPTFactory` builds a `UniversalGPT` instance that calls `chat.completions.create()`.

@@ -1,11 +1,26 @@
 # AllToNote Portable Artifact 与 Source Bundle 设计
 
-- 状态：已确认设计，待用户审阅书面规格
+```yaml
+doc_type: contract-design
+status: active
+authority: subsystem
+upstream:
+  - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
+downstream:
+  - 2026-07-14-alltonote-video-producer-design.md
+  - 2026-07-18-alltonote-review-publisher-design.md
+implementation_status: portable-v1-foundation-and-real-iwiki-commit-implemented
+last_verified_at: 2026-07-18
+```
+
+- 状态：已确认，当前有效；iwiki 已发布合同在其协议域内更高
 - 日期：2026-07-14
 - 上位设计：`2026-07-13-alltonote-knowledge-compiler-architecture-design.md`
 - 相关设计：`2026-07-13-alltonote-cli-first-vault-workspace-design.md`
 - 产品基线：开放磁盘合同 + 稳定 iwiki CLI/SDK + 托管式独立 AllToNote Runtime
 - 首要平台：Windows；macOS 为第二平台 Gate
+
+> 当前解释：本文是 AllToNote 对 Portable Artifact / Source Bundle 的消费和生产设计，不拥有 iwiki 的 Workspace、Schema、Validator、SDK、CLI、commit 或 publish 协议。正文中关于“iwiki 当前尚无某 capability”的描述属于写作时快照；实现前必须以当前 `iwiki inspect/capabilities/schema/validator` 为准。
 
 ## 1. 文档目的与范围
 
@@ -2102,9 +2117,9 @@ alltonote capability doctor <id> --json
 alltonote recipe list --json
 alltonote recipe describe <id>@<version> --json
 
-alltonote run <recipe> --request <request.json> --workspace <path> --wait --json
-alltonote run <recipe> --request <request.json> --workspace <path> --detach --json
-alltonote video <url> --workspace <path> --wait --json
+alltonote produce --request <request.json> --recipe <recipe> --workspace <path> --wait --json
+alltonote produce --request <request.json> --recipe <recipe> --workspace <path> --detach --json
+alltonote produce video --input <input> --workspace <path> --wait --json
 
 alltonote job status <job-id> --json
 alltonote job wait <job-id> --json
@@ -2138,7 +2153,7 @@ alltonote legacy import --request <request.json> --json
 {
   "alltonote_cli_protocol_version": 1,
   "ok": true,
-  "command": "run",
+  "command": "produce",
   "correlation_id": "corr_...",
   "data": {
     "job_id": "job_...",
@@ -2160,7 +2175,7 @@ alltonote legacy import --request <request.json> --json
 {
   "alltonote_cli_protocol_version": 1,
   "ok": false,
-  "command": "run",
+  "command": "produce",
   "correlation_id": "corr_...",
   "data": null,
   "warnings": [],
@@ -2212,7 +2227,7 @@ Quality fail 返回 `ok: true`、Job `succeeded`、`quality.overall: fail` 和 `
 | 70 | 内部错误 |
 | 130 | 当前前台命令被 Ctrl+C 中断 |
 
-`job status` 成功查询到 failed Job 时退出 0，失败是返回数据；`run --wait` 等待的 Job 失败时命令退出非零。
+`job status` 成功查询到 failed Job 时退出 0，失败是返回数据；`produce --wait` 等待的 Job 失败时命令退出非零。
 
 ### 27.4 JSONL Event
 
@@ -2761,7 +2776,7 @@ Gate：CLI-only fake Recipe 产生合法 Bundle；cancel/commit/fencing/crash �
 - 时间 Evidence；
 - screenshot Artifact；
 - Draft/Quality/Receipt；
-- `alltonote video`。
+- `alltonote produce video`。
 
 Gate：不安装/打开 Desktop，从 URL 生成完整可审阅 Bundle；不再给旧 `NoteGenerator` 增加新来源分支。
 

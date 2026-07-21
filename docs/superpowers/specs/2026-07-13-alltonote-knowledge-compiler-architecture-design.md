@@ -1,7 +1,22 @@
 # AllToNote Knowledge Compiler 总体架构设计
 
+```yaml
+doc_type: architecture
+status: active
+authority: system
+downstream:
+  - 2026-07-14-alltonote-portable-artifact-source-bundle-design.md
+  - 2026-07-18-alltonote-runtime-cli-feature-pack-design.md
+  - 2026-07-18-alltonote-recipe-extension-contract-design.md
+  - 2026-07-18-alltonote-review-publisher-design.md
+  - 2026-07-18-alltonote-knowledge-access-mcp-design.md
+  - 2026-07-18-alltonote-engine-production-mcp-design.md
+implementation_status: foundation-and-first-video-vertical-slice-implemented-multi-recipe-seam-and-roadmap-incomplete
+last_verified_at: 2026-07-19
+```
+
 - 日期：2026-07-13
-- 状态：终稿，待用户确认
+- 状态：已确认，当前有效；AllToNote 系统域最高上位设计
 - 文档层级：AllToNote 知识生产系统上位设计
 - 适用阶段：Phase 3 及以后；同时约束 Phase 2 必须保留的扩展边界
 - 目标平台：Windows Tier 1；macOS Tier 2
@@ -26,7 +41,37 @@ AllToNote 的最终职责不是保存一种专有笔记格式，也不是提供�
 
 > AllToNote 是一个 Headless-first、本地优先、以开放 Artifact 和 Markdown Workspace 为数据底座、以可恢复知识生产流程为执行模型、以 CLI、MCP 和薄 Desktop 为多种入口的知识编译系统。
 
-### 1.2 与已有设计的关系
+### 1.2 AllToNote、Production 与 Recipe 的总体关系
+
+本设计进一步冻结以下唯一解释，后续下位设计和实现不得把第一个 Video 垂直切片反向提升为平台本身：
+
+```text
+AllToNote
+  = 上层知识编译、积累、审阅、发布和复用平台
+
+Production
+  = 用户发起“把一个来源转化为可积累知识”的产品用例
+
+Recipe
+  = AllToNote 内部版本化、可发现、可执行的知识生产扩展单位
+
+Video / Article / Document / Codebase / Personal
+  = 通过同一内部合同接入的并列顶层官方 Recipe
+
+CLI / Desktop / MCP
+  = 调用同一 ProduceService 的不同入口 Adapter
+
+Job / Checkpoint / Artifact / Evidence / Quality / Review / Publisher
+  = 由平台只实现一次、供所有 Recipe 复用的共享能力
+```
+
+因此，Video Production 是用户可见的第一个知识生产用例，Video Recipe 是它在平台内部的实现；它不是 AllToNote 的下层 Runtime、Job、CLI 或 Publisher 的所有者。`Video Producer` 只作为历史文档名和迁移期描述保留，其规范含义等同于“官方 Video Recipe”，不代表一个与 AllToNote 强绑定、拥有独立全栈 Pipeline 的产品。
+
+一个顶层 Recipe 可以在其内部固定多个输出编译绑定，例如 Video v2 同时绑定 Knowledge Note 与 Faithful Edition。CLI/Registry 选择并执行的是顶层 Recipe；输出绑定只固定 Draft 的 compiler/recipe identity 与 provenance，不创建第二个 Runtime、JobStore 或入口 Pipeline。X0-A 不公开 RecipePlan，这些绑定继续留在现有 Video 实现内部，直到真实 Document/PPT 在 X0-B 证明公共形状。
+
+新增 Recipe 的正常变化范围应主要落在 Recipe 包、领域 Adapter、descriptor/plan/quality 和注册组装；如果新增一种来源必须复制 Application Service、JobStore、Bundle、CLI 路由或 Publisher，则视为架构违规，而不是扩展成功。
+
+### 1.3 与已有设计的关系
 
 已有设计继续有效，但职责层级调整如下：
 
@@ -48,7 +93,7 @@ llm-iwiki 已发布的 Workspace/schema/publish/index 合同（仅限其拥有�
 
 不同协议域之间按所有权协作，不互相越权覆盖。下位设计只能细化本文，不能静默改变本文的不变量；当前代码也不自动成为目标架构。若确需改变，必须先修订本文并记录架构决策。
 
-### 1.3 设计范围分解
+### 1.4 设计范围分解
 
 Knowledge Compiler 涉及多个可独立实施的子系统，不能由一份实施计划一次完成。本文只冻结上位边界，后续至少拆分为：
 
@@ -176,6 +221,7 @@ QualityReport 是草稿的质量信息，Review 是从草稿到正式知识的�
 ### 4.2 运行组件术语
 
 - **Core**：领域模型、业务不变量和应用用例；不感知 CLI、HTTP、Tauri 或 MCP。
+- **ProduceService**：所有知识生产入口共享的进程内应用用例。X0-A 中它只把版本化 ProduceRequest 经静态 Registry 委托给 `RecipeEndpoint.submit` 并返回 ProduceSubmission；Preflight、Plan、Output、Result、Repository、commit 与 schema 不属于 X0-A 公开合同。名称中的 Service 不表示网络服务、常驻 daemon 或微服务。
 - **Engine**：执行长任务、持久化 Job、监督子进程、调度资源和发送事件的本地执行进程。
 - **Runtime**：Core、CLI、Engine launcher、Desktop bridge、MCP adapter 和基础平台适配器的安装/分发边界。
 - **CLI**：最重要、最稳定的一等公开自动化入口，但不是业务逻辑的唯一实现位置。
@@ -185,6 +231,8 @@ QualityReport 是草稿的质量信息，Review 是从草稿到正式知识的�
 
 ### 4.3 领域术语
 
+- **Production**：用户发起知识转化的产品用例，不是一个独立部署组件或第二套执行框架。
+- **Producer**：历史和描述性术语；在当前规范中指某个官方 Recipe 的产品外观，不拥有通用 Runtime、Job、Artifact、Review 或 Publisher。
 - **Source**：长期来源身份，例如一个 Bilibili 视频、网页、文件或 Git 仓库。
 - **SourceRevision**：某次实际采集的不可变来源版本。
 - **Artifact**：某个 Step 产生并经过校验、提交的类型化产物。
@@ -204,7 +252,7 @@ QualityReport 是草稿的质量信息，Review 是从草稿到正式知识的�
 1. 知识资产的寿命必须大于 AllToNote、llm-iwiki、模型、Agent 和索引引擎的寿命。
 2. Markdown、附件、来源证据和 portable provenance 是长期资产；JobStore 和索引不是。
 3. Core 是 CLI、MCP 和 Desktop 的唯一业务语义来源。
-4. Producer/Recipe 只能提交 Source Store 产物，不能通过 AllToNote 写入 Published Vault。
+4. Recipe（旧文档中可称 Producer）只能提交 Source Store 产物，不能通过 AllToNote 写入 Published Vault。
 5. 正式发布必须通过 `iwiki plan-publish/apply-publish` 或其后续兼容协议。
 6. `personal` 是默认发布目标；`common` 必须是额外明确操作。
 7. Job、Draft、PublishTransaction 和 Index 分别维护生命周期，不能共用一个大状态枚举。
@@ -216,6 +264,12 @@ QualityReport 是草稿的质量信息，Review 是从草稿到正式知识的�
 13. watcher、索引和缓存只能提升性能，不能成为正确性来源。
 14. 基础 Runtime 路径不得导入重型 Feature Pack。
 15. 任何远端传输都必须可识别目标服务、数据范围和凭据 Profile。
+16. AllToNote Core/Runtime 拥有通用 ProduceService、Recipe registry、Job、Checkpoint、Artifact、Evidence、Quality、Review 和 Publisher；任何单一 Recipe 都不得成为这些能力的所有者。
+17. CLI、Desktop 和 MCP 必须先归一化为同一版本化 ProduceRequest，再调用同一 ProduceService；命令别名不得拥有独立业务分支。
+18. 通用应用服务、领域模型和 Repository Port 不得导入 `video`、`document`、`web`、`codebase` 或其他 Recipe-specific DTO/模块；依赖方向只能由 Recipe 实现指向通用合同。
+19. Recipe-specific 字段进入有命名空间的 extension 或领域 Artifact；不能把某个首个消费者的字段伪装成通用必填字段。
+20. 新 Recipe 进入生产前必须证明其复用同一 Job/Checkpoint/Bundle/Review/Publisher，并通过至少一个非 Video 消费者验证公共字段；未经双消费者验证的接口保持 internal/可演进。
+21. 在多类官方 Recipe 和真实外部需求通过升级门前，不冻结公共插件 SDK，不引入任意动态代码加载、通用 YAML DAG 或微服务化 Recipe Runtime。
 
 ## 5. 架构候选与最终决策
 
@@ -300,7 +354,7 @@ QualityReport 是草稿的质量信息，Review 是从草稿到正式知识的�
 系统按职责分为五组组件：
 
 1. **入口与 Host**：CLI、Production MCP、Knowledge MCP 聚合器、Desktop bridge，以及只负责后台承载的 Engine Host。
-2. **共享应用服务**：RecipeCatalog、JobService、ArtifactService、ReviewService、PublishService，以及 JobCoordinator、RecipeRunner、AttemptRunner、ArtifactCommitter 和恢复决策。前台 CLI 与后台 Engine Host 必须复用这一组服务。
+2. **共享应用服务**：ProduceService、RecipeCatalog、JobService、ArtifactService、ReviewService、PublishService，以及 JobCoordinator、RecipeRunner、AttemptRunner、ArtifactCommitter 和恢复决策。前台 CLI 与后台 Engine Host 必须复用这一组服务。
 3. **Knowledge Compiler Core**：领域对象、不变量、策略和端口接口。
 4. **基础设施适配器**：Source Connector、ModelExecutor、AgentExecutor、ArtifactStore、JobRepository、ProcessSupervisor、CredentialStore、ResourceScheduler、IWikiGateway 和平台适配器。
 5. **组装与分发**：Runtime 组合根、Feature Pack 发现和版本兼容，不拥有第二套业务语义。
@@ -318,9 +372,11 @@ QualityReport 是草稿的质量信息，Review 是从草稿到正式知识的�
 
 ```text
 CLI foreground / Engine Host / MCP / Desktop
-    -> shared Application Services
+    -> ProduceService / shared Application Services
+        -> RecipeCatalog -> single RecipeRegistry -> fixed Recipe contract
+                               <- official Recipe implementations
         -> Core domain, policies and ports
-            <- infrastructure adapters implement ports
+                               <- infrastructure adapters implement ports
 
 AllToNote -> public iwiki protocol -> llm-iwiki -> Workspace contract
 ```
@@ -332,6 +388,8 @@ Engine Host 不实现另一套 Job/Recipe 编排，只承载 IPC、进程生命�
 - Core 导入 FastAPI、Tauri、MCP SDK 或 CLI parser；
 - Desktop 直接实现 Source、Recipe、Quality 或 Publish 规则；
 - MCP 复制另一套 Job 或权限逻辑；
+- 通用 Core/Application/Repository 导入 Recipe-specific 模块或返回 Video/PDF 等专用结果类型；
+- Recipe 自建 ProduceService、JobStore、Checkpoint、Bundle commit、Review 或 Publisher；
 - llm-iwiki 反向依赖 AllToNote；
 - Feature Pack 修改 Core 私有状态；
 - Source Connector 直接写 `wiki/`；
@@ -359,20 +417,30 @@ Runtime 不拥有第二套领域模型。CLI-only 安装和 Desktop 托管安装
 CLI tree/read/search -> Core -> IWikiGateway / safe file adapter
 ```
 
-生产路径通过 JobService：
+目标生产架构与 X0-A 过渡接缝必须分开表达。
+
+目标架构：
 
 ```text
-CLI --wait
-  -> 无 Engine owner 且 CLI 获得 scheduler lease
-       -> shared Execution Application Services -> Core
-  -> Engine 已持有 scheduler lease
-       -> Engine Host -> 同一组 Execution Application Services -> Core
-
-CLI/Desktop/MCP detached/background
-  -> Engine Host -> 同一组 Execution Application Services -> Core
+CLI / Desktop / MCP
+  -> ProduceService
+      -> static RecipeRegistry -> selected official Recipe
+      -> shared durable Job/JobService
+          -> foreground execution
+          -> on-demand Engine（Wave 0–4 通过后）
+      -> shared Artifact/result/commit boundary（X0-B 后）
 ```
 
-这样可以避免所有简单命令都启动后台进程，同时保证长任务拥有持久生命周期。
+当前 X0-A 过渡接缝：
+
+```text
+CLI / SDK / Runtime
+  -> ProduceRequest -> ProduceService -> static RecipeRegistry
+      -> RecipeEndpoint.submit -> ProduceSubmission
+          -> Video Adapter -> existing VideoService
+```
+
+Video Adapter 只是兼容迁移 wiring，不重新定义最终 Job 所有权；Desktop/MCP 不属于 X0-A 实施范围。Preflight、Plan、Output、Result、Repository、commit 与 schema 均不属于 X0-A 公开合同。真实 Document/PPT 纵切在 X0-B 中与 Video 共同证明必要的数据面；在此之前，现有 Job、Checkpoint、Artifact、Bundle 与提交语义保持不变。Engine 的业务触发条件已经成立，但其实施和 detached/background 路径受 Wave 0–4 阻塞。
 
 ## 7. 核心组件设计
 
@@ -382,8 +450,9 @@ CLI/Desktop/MCP detached/background
 |---|---|---|
 | `WorkspaceService` | 打开、授权和描述 Workspace | iwiki schema 规则 |
 | `SourceService` | 创建 Source、SourceRevision 和采集请求 | 平台下载实现 |
-| `RecipeCatalog` | 列出、解析和固定 Recipe 版本 | 执行任意 Recipe 代码 |
-| `JobService` | submit/get/list/wait/cancel/respond/retry | UI 状态和 Publisher 状态 |
+| `ProduceService` | X0-A 校验 ProduceRequest、通过静态 Registry 解析 Endpoint，并委托 `RecipeEndpoint.submit` 返回 ProduceSubmission | Preflight、Plan、Output、Result、Repository、commit、schema、Recipe 领域流水线、CLI 参数解析、Publisher |
+| `RecipeCatalog` | 在唯一 RecipeRegistry 之上提供 list/describe/resolve 和版本固定 | 第二份注册状态、执行任意 Recipe 代码 |
+| `JobService` | 从已固定 RecipePlan 创建 durable Job，并提供 get/list/wait/cancel/respond/retry | Recipe 选择、UI 状态和 Publisher 状态 |
 | `ArtifactService` | 注册、查询、校验和追溯 Artifact | 任意路径文件浏览 |
 | `QualityService` | 运行 Gate 并聚合 QualityReport | 把模型自评当唯一结论 |
 | `ReviewService` | Draft 审阅状态和审阅记录 | 正式文件写入 |
@@ -425,7 +494,7 @@ CLI/Desktop/MCP detached/background
 | 共享执行应用服务 | `RecoveryCoordinator` | 根据 Artifact、Attempt、租约和策略决定恢复、等待或终结 |
 | Engine Host | `EngineServer` | 本机认证 IPC、客户端连接和协议协商 |
 | Engine Host | `HostLifecycle` | 按需启动、空闲退出、版本 drain 和组件组装 |
-| Engine Host | `SchedulerLeaseHost` | 持有单一 scheduler lease 和 fencing token |
+| Engine Host | `SchedulerLeaseHost` | 持有单一 scheduler lease，负责 discovery、dispatch 和生命周期；不授权 Job 状态写入 |
 | Engine Host | `EventTransport` | 向客户端重放由 EventRepository 持久化的规范事件 |
 | 基础设施适配器 | `ProcessSupervisor` | 启动、取消、contain/kill process tree、收集退出状态 |
 | 基础设施适配器 | `ResourceScheduler` | 分配 CPU、GPU、模型、供应商并发和磁盘 I/O 租约 |
@@ -720,6 +789,10 @@ raw/personal/<bundle-id>/
 
 ### 9.1 Recipe 是产品扩展单位
 
+Production 是用户发起知识生产的用例，Recipe 是该用例在 AllToNote 内部被发现、版本化和执行的扩展单位。Video、Article/Wiki、Document、Codebase/UE5 和 Personal Work Digest 均为同级官方 Recipe；它们共享平台能力，但不共享被强行统一的领域 Pipeline。
+
+`produce` 的 selector 指向顶层可提交 Recipe。Recipe 内部可以固定一个或多个输出编译绑定；X0-A 不公开 RecipePlan，这些绑定继续留在现有 Video 实现及 provenance 中，直到真实 Document/PPT 在 X0-B 证明公共形状。它们不自动成为用户必须理解的顶层 Production 命令，也不另建 Job 生命周期。
+
 来源类型不等于 Recipe。一个视频可以选择“课程深度笔记”“快速摘要”“逐章节学习卡片”；同一个 Recipe 也可以消费视频字幕和配套 PPT。
 
 Recipe 至少声明：
@@ -911,7 +984,7 @@ Producer Job 在所有声明输出 Artifact、QualityReport、Bundle manifest �
   -> 创建 Attempt 和 staging
   -> 执行 Capability
   -> 校验输出
-  -> 校验 scheduler/Attempt fencing token、Job 状态和取消标志
+所有 Job 状态写入、Step Attempt、checkpoint、ExternalOperation、Artifact/bundle commit guard、event 和 terminal transition 都必须在同一写事务内校验当前 JobExecutionAuthority(job_id, owner_engine_id, worker_id, generation)。Scheduler lease 只表示机器级调度 leadership，不提供 Job 写权限。
   -> 原子创建当前 Job 可见的 checkpointed Artifact
   -> 在 JobStore 事务中标记 Attempt succeeded
 ```
@@ -921,13 +994,13 @@ Producer Job 在所有声明输出 Artifact、QualityReport、Bundle manifest �
 ```text
 校验所有声明输出
   -> 生成并校验 Bundle manifest 与 portable receipt
-  -> 取得带 fencing token 的 bundle commit guard
+  -> 取得绑定当前 JobExecutionAuthority generation 的 bundle commit guard
   -> 再次确认 Job=running、Attempt 归属有效且 cancellation_requested=false
   -> 原子切换完整 Bundle 为 portable_committed
   -> 持久记录 commit 结果并将 Job 标记 succeeded
 ```
 
-Bundle 原子切换是对外可见性的线性化点。取消标志若先于 commit guard 生效，提交必须拒绝并把迟到输出隔离；portable commit 若先完成，Job 成功终态获胜，随后 cancel 返回“已完成”而不能把已提交资产改成 cancelled。Job 已进入 `failed`/`cancelled`、scheduler fencing token 过期或 Attempt 归属失效后，旧 Worker 不能再 checkpoint 或 portable commit Artifact。
+Bundle 原子切换是对外可见性的线性化点。取消标志若先于 commit guard 生效，提交必须拒绝并把迟到输出隔离；portable commit 若先完成，Job 成功终态获胜，随后 cancel 返回“已完成”而不能把已提交资产改成 cancelled。Job 已进入 `failed`/`cancelled`、JobExecutionAuthority generation 过期或 Step Attempt 归属失效后，旧 Worker 不能再 checkpoint 或 portable commit Artifact。
 
 崩溃恢复时：
 
@@ -1006,9 +1079,9 @@ unknown_external_operations[]
 
 RetryService 必须拒绝不存在、重复、属于其他 Job、已经完成确定性对账或遗漏任一待确认 unknown operation 的 ID。只有原 Job 当前全部待确认 operation 都被逐项覆盖时，才允许创建新 Job。
 
-### 10.6 前台与后台模式
+### 10.6 前台与后台模式（目标设计，Engine 路径受 Wave 0-4 阻塞）
 
-目标架构最终支持以下模式，但按阶段引入：
+前台模式继续有效；所有 Engine、detach、后台续跑和 Production MCP 长任务内容仅描述解除 Wave 0-4 阻塞后的目标：
 
 - Phase 3A/3B：只承诺 `--wait`；调用方等待最终结果并流式接收事件，此阶段没有 Engine 时 CLI 通常取得 scheduler lease 并在当前进程执行；
 - Phase 3C：Desktop 可以通过会话绑定的临时 Desktop API 执行任务；正常关闭先请求取消并使 Job 进入 `cancelled`，宿主异常消失则把当前 Attempt 标记 `interrupted`，Job 在下次 reconcile 时按策略创建新 Attempt、进入 `waiting_for_input` 或进入 `failed`；
@@ -1018,9 +1091,9 @@ RetryService 必须拒绝不存在、重复、属于其他 Job、已经完成确
 
 `--wait` 定义调用方行为，不固定执行所有者。Phase 4 中若 Engine 已持有 scheduler lease，CLI 必须向 Engine 提交并作为等待客户端，不能为坚持“当前进程执行”而绕过 Engine。各阶段使用相同 Job、Attempt、Artifact 和 Recipe 语义；前台或会话绑定模式中断时不能留下永久 `running`，Phase 4 的后台模式才承诺客户端断开后继续执行。
 
-### 10.7 按需 Engine 生命周期
+### 10.7 按需 Engine 生命周期（目标设计，当前受 Wave 0-4 阻塞）
 
-Phase 2 临时 Desktop API 继续随 Desktop 启停。生产 Engine 在出现以下能力时引入：
+Engine 的业务触发条件已经成立，但本节只描述解除 Wave 0-4 阻塞后的目标行为，不构成当前可用能力。Phase 2 临时 Desktop API 继续随 Desktop 启停。解除阻塞后，生产 Engine 用于：
 
 - `--detach`；
 - Desktop 关闭后继续任务；
@@ -1359,13 +1432,18 @@ alltonote capability list --json
 alltonote capability inspect <id> --json
 alltonote capability doctor <id> --json
 
-# Recipe
+# 单一 Production 命令族：用户友好别名与显式自动化均进入同一 ProduceService
+alltonote produce video --input <input> [--workspace <path>]
+alltonote produce web <url> [--workspace <path>]
+alltonote produce document <path-or-url> [--workspace <path>]
+alltonote produce codebase <repo> [--workspace <path>]
+alltonote produce work-digest [--input <key=value>] [--workspace <path>]
+alltonote produce <input> --recipe <id>@<version> [--workspace <path>]
+alltonote produce --request <request.json> [--wait|--detach] [--json]
+
+# Recipe 发现，不是第二套生产入口
 alltonote recipe list --json
 alltonote recipe describe <id>@<version> --json
-
-# 通用执行
-alltonote run <recipe> --input <key=value> --workspace <path> --wait
-alltonote run <recipe> --request <request.json> --detach --json
 
 # Job
 alltonote job status <job-id> --json
@@ -1396,15 +1474,7 @@ alltonote mcp serve --profile knowledge-readonly --stdio
 alltonote mcp serve --profile producer --stdio
 ```
 
-用户友好别名可以提供：
-
-```text
-alltonote video <url>
-alltonote article <url>
-alltonote ppt <path-or-url>
-```
-
-别名只构造标准 Recipe Request，不拥有独立业务语义。
+所有 `produce <kind>`、`produce <input> --recipe ...` 与 `produce --request ...` 形式必须归一化为同一版本化 ProduceRequest，进入同一 ProduceService，并返回同一 ProduceSubmission/Job envelope。`produce <kind>` 是稳定、易发现的产品别名；`--recipe` 和 `--request` 是显式自动化形式。输入存在多个合理 Recipe、需要额外权限或会触发昂贵操作时，调用方必须显式选择；X0-A 不提供公共 Preflight，能力诊断沿用 `doctor` 或具体 Recipe 的现有路径。所有形式只负责参数翻译，不拥有 Recipe 选择后的业务语义。当前只发布单一 `produce` 命令族，不发布独立 `add` 或 `run` 主命令。
 
 ### 14.3 输出合同
 
@@ -1772,7 +1842,7 @@ ProcessSupervisor 只能启动已注册 Capability manifest 解析出的固定�
 - macOS Tier 2 使用独立 process group 加 watchdog pipe/launcher，明确父进程死亡后的收敛方式；
 - 不能随 owner 死亡立即终止的外部程序，必须持久化包含进程创建时间、可执行身份、Capability 和 Attempt 的可验证 process identity，不能只记录可能复用的 PID；
 - RecoveryCoordinator 在下一次 reconcile 时验证身份并回收遗留进程；不能验证归属时先隔离 staging 和提交权限，不盲目 kill 无关进程；
-- 孤儿 Worker 即使暂时继续运行，也会因 scheduler/Attempt fencing token 失效而无法 checkpoint 或 portable commit Artifact。
+- 孤儿 Worker 即使暂时继续运行，也会因 JobExecutionAuthority generation 失效而无法 start Step Attempt、checkpoint 或 portable commit Artifact。
 
 因此系统分别承诺“受 OS containment 的进程随 owner 关闭而终止”和“其他进程在下一次 reconcile 时回收”；不能笼统承诺强杀 CLI/Engine 后所有外部程序都会立即消失。
 
@@ -1980,12 +2050,13 @@ Engine 启动时执行 reconcile：
 
 ### 21.4 单一调度所有权
 
-同一 JobStore 任一时刻只有一个 active scheduler lease：
+同一 JobStore 任一时刻只有一个 active scheduler lease，负责发现、dispatch 和 Engine 生命周期；它不授权 Job 状态写入。
 
 - Engine 已持有 lease 时，CLI 向 Engine 提交；
 - Engine 不存在且使用 `--wait` 时，CLI 可以临时成为 scheduler owner；
 - 两个 CLI 不得同时领取同一 Job；
-- lease 具有 owner、heartbeat、expiry 和 fencing token；
+- scheduler lease 具有 owner、heartbeat 和 expiry，只控制 discovery/dispatch；
+- 每个 JobExecutionAuthority 具有 owner/worker 与单调 generation；release 保留 generation，takeover 原子递增；
 - 旧 owner 恢复后不能继续提交新 Artifact；
 - SQLite lock 失败必须返回明确冲突，不通过第二个数据库副本绕过。
 
@@ -2164,6 +2235,10 @@ Core/SDK 在第一阶段是 Runtime 内部同版本接口，不立即承诺稳�
 - Portable Bundle schema golden fixtures；
 - iwiki inspect/validate/query/plan/apply；
 - CLI JSON/JSONL golden tests；
+- 单一 `produce` 命令族归一化为等价 ProduceRequest/ProduceSubmission 的 golden tests；
+- X0-A 只覆盖 Request/Submission、`RecipeEndpoint.submit`、静态 Registry、薄 ProduceService 与 Video Adapter，并证明没有公开 Preflight/Plan/Output/Result/Repository/commit/schema；
+- X0-B 由真实 Document/PPT 与 Video 共同证明数据面字段；
+- 静态依赖测试证明通用 Application/Domain/Repository 不导入 Recipe-specific 模块，基础命令不 eager import 重 Pack；
 - `job respond` challenge/response、`job retry` 和 `client_request_id` 合同；
 - `ExternalOperation` preflight：两个 unknown operation 时，遗漏确认、错误 ID、重复 ID 和其他 Job ID 均拒绝，完整逐项确认才创建新 Job；
 - Engine handshake/events；
@@ -2204,7 +2279,7 @@ Core/SDK 在第一阶段是 Runtime 内部同版本接口，不立即承诺稳�
 14. Source 中的 Prompt Injection 无法扩大 Agent 权限。
 15. CLI、Desktop 和 MCP 对同一错误返回相同稳定 category。
 16. Job 进入 waiting_for_input 后，CLI 可用结构化 challenge response 创建新 Attempt 并继续；过期、重复和错误 challenge 确定失败。
-17. cancel 与 portable commit 并发时只有一个线性化结果，旧 Worker 和过期 fencing token 不能迟到提交。
+17. cancel 与 portable commit 并发时只有一个线性化结果，旧 Worker 和过期 Job generation 不能迟到提交。
 18. JobStore 损坏时停止调度、隔离数据库并保留 portable assets，不把 staging 猜测为成功。
 
 ### 23.5 故障注入
@@ -2270,6 +2345,7 @@ kill CLI/Engine 的用例必须同时验证 OS containment、孤儿进程回收�
 | 知识库 | Workspace Root |
 | 来源 | Source/SourceRevision |
 | 知识方案 | Recipe |
+| 知识生产 | Production（由 ProduceService 执行的用例） |
 | 生产任务 | Job/Run |
 | 草稿 | Draft Artifact |
 | 来源证据 | EvidenceRef |
@@ -2345,6 +2421,28 @@ kill CLI/Engine 的用例必须同时验证 OS containment、孤儿进程回收�
 
 Phase 2 新 Runtime/CLI/Desktop API 建立后，逐步移除 Tauri 中固定完整 PyInstaller sidecar、任意命令执行和完整环境读取。React 只迁移到明确 typed API，不直接访问文件或 Runtime 进程。
 
+### 25.6 Video-first 过渡耦合与退出 Gate
+
+截至 2026-07-19，Video 垂直切片已经验证了大量共享基础，但实现中的公共门面仍未达到多 Recipe 目标边界：
+
+- `backend/app/core/sdk.py` 的 `AllToNoteSDK` 直接依赖 `VideoService`，公共提交面仍只有 `submit_video`；
+- `backend/app/runtime.py` 暴露 `submit_video`，尚无通用 ProduceService；
+- `backend/app/cli/main.py` 只路由 `produce video`，尚无 `recipe list/describe` 与 generic `produce --recipe/--request` registry 路由；
+- `backend/app/core/ports/jobs.py` 导入 Video 领域类型，并包含 `VideoResultPlan`、`VideoProduceResult` 和 `commit_video_result_atomic` 等专用合同；
+- 通用 Job 状态目前定义/导出自 Video 领域模块；
+- `backend/app/core/recipes/video/` 已存在，而统一 Recipe contract/registry 尚未实现。
+
+这些是迁移期实现事实，不修改本设计的目标依赖方向。采用“包裹并抽取接缝”，不重写已经通过验收的 Video compiler：X0-A 只建立 ProduceRequest、ProduceSubmission、`RecipeEndpoint.submit`、薄 ProduceService 和静态官方 Registry，由 Video Adapter 适配现有 VideoService；不提前抽取或公开 ProduceResult、Preflight、Plan、Output、Repository、commit 或 schema。
+
+在第一个非 Video Recipe 合入前，必须同时通过以下退出 Gate：
+
+1. CLI/Desktop/MCP 入口只能调用通用 ProduceService，`produce video` 与 generic `produce --recipe alltonote.video-producer@2` 产生等价请求和 Job identity；
+2. 通用 Application/Domain/Repository 不再导入 Video-specific 类型；
+3. Video 全量 golden、长视频、Portable/iwiki、checkpoint 和零重放语义无变化；
+4. 至少一个非 Video 消费者通过同一 Registry/ProduceService/Job/Bundle 路径；
+5. 公共字段没有单消费者猜测，仍未满足双消费者的字段保留在 Recipe extension；
+6. 不以此次抽取为理由发布公共插件 SDK 或引入动态加载。
+
 ## 26. 分阶段路线与发布 Gate
 
 ### Phase 2：最小只读 Workspace
@@ -2391,6 +2489,18 @@ Gate：使用 fake capabilities 证明状态、checkpoint/portable commit、取�
 
 Gate：没有 Desktop 也能从 URL 产生完整可审阅草稿；不得继续向 `NoteGenerator` 增加新来源分支。
 
+### Phase 3B.5a：Recipe X0-A 最小控制面接缝
+
+在不重写 Video compiler 的前提下，只建立 Recipe identity/descriptor/input/request/submission、`RecipeEndpoint.submit`、静态官方 Registry、薄 ProduceService、Video Adapter，以及 SDK/Runtime/单一 `produce` 命令族的兼容路由。X0-A 不修改 SQLite schema、legacy request/result wire、两套 hash、config snapshot、Checkpoint、Portable 或 atomic commit，也不清除 Job/Repository 数据面的 Video-specific 类型。
+
+Gate：Video 行为零语义变化；legacy `produce video` 与 generic `produce --recipe/--request` 得到相同 canonical request、Job identity、hash 和 config snapshot；contracts/registry/produce_service 无 Video import；X0-A 不提供 Preflight、Plan、Output、Result、Repository、commit、schema、Engine、detach 或同 Workspace 多 Job 并发。
+
+### Phase 3B.5b：真实第二消费者驱动 X0-B
+
+以最小真实 Document/PPT 纵切共同抽取 Video 与第二消费者都需要的 Result、Artifact、Repository、atomic commit、durable query 和恢复边界；所有公共字段必须有两个真实消费者。Document/PPT 纵切可以提供 X0-B 的真实证据，但在 X0-B 的 legacy dual-read、migration、atomicity 和 import Gate 通过前不得合入。
+
+Gate：Video 与真实 Document/PPT 共享 ProduceService、JobStore、Checkpoint 和 atomic commit；旧成功/未完成 Video Job 可查询和恢复；通用 Job/Repository 无 Recipe-specific import；本阶段仍不冻结第三方插件 SDK。
+
 ### Phase 3C：Review 与 Publisher MVP
 
 完成：
@@ -2406,9 +2516,9 @@ Gate：没有 Desktop 也能从 URL 产生完整可审阅草稿；不得继续�
 
 Gate：这是第一个完整 Knowledge Compiler 产品闭环。
 
-### Phase 4：按需 Engine 与 Production MCP
+### Phase 4：按需 Engine 与 Production MCP（已触发，受 Wave 0-4 阻塞）
 
-在真实后台需求出现后完成：
+Engine 的业务触发条件已经成立，但实现与发布必须等待 Wave 0-4 完成。解除阻塞后才完成：
 
 - `--detach`；
 - on-demand Engine；
@@ -2482,6 +2592,7 @@ UE5 专业逻辑进入独立 Feature Pack，不进入通用 Core。
 |---|---|
 | 过度抽象后迟迟无法交付视频 | 所有抽象必须由 Video 垂直切片验证，首版 Recipe 用代码定义 |
 | 每个来源形成独立孤岛 | Connector/Artifact/Recipe/Job/Quality/Publish 统一合同 |
+| 首个 Video 垂直切片反向成为平台 | ProduceService/Registry 通用接缝、禁止通用层导入 Recipe 类型、非 Video 双消费者 Gate |
 | 变成 Obsidian 克隆 | Library Gate 和 Phase 2 timebox |
 | 变成 Dify/n8n 克隆 | 不做通用画布和任意 DSL，Recipe 是产品单位 |
 | Runtime 逻辑独立导致安装复杂 | 一个经过验证的发行套件，共同分发但协议独立 |
@@ -2533,6 +2644,8 @@ UE5 专业逻辑进入独立 Feature Pack，不进入通用 Core。
 16. **Windows Tier 1。** macOS 在共享接口稳定后通过独立 Gate。
 17. **不承诺 bit-for-bit AI 重放。** 承诺可审计、可解释和可重新执行。
 18. **不承诺全局文件写入控制。** 承诺经 AllToNote 接口的 Publisher 纪律。
+19. **AllToNote 高于任何单一 Production。** Video、Article、Document、Codebase 和 Personal 是并列官方 Recipe，不拥有平台共享能力。
+20. **统一 ProduceService。** CLI、Desktop、MCP 以及单一 `produce` 命令族只做请求适配，共享同一静态 Registry 和提交接缝；不发布独立 `add` 或 `run` 主命令。
 
 ## 30. 本设计的完成定义
 
@@ -2550,6 +2663,10 @@ UE5 专业逻辑进入独立 Feature Pack，不进入通用 Core。
 10. 性能、分发、安全、故障恢复和测试具有可验证 Gate；
 11. Phase 2 范围未被扩大；
 12. 后续实施被拆分成独立下位设计，不形成一次性大重写。
+13. AllToNote、Production、Recipe、Producer 和入口 Adapter 的层级含义唯一；
+14. ProduceService/Registry 的依赖方向及 Recipe 禁止拥有的共享能力明确；
+15. Video-first 当前实现漂移、兼容迁移方式和第一个非 Video Recipe 前的退出 Gate 可验证；
+16. internal Recipe 合同的多消费者门（Video + Document 建立候选、Article/Wiki 后冻结）与公共插件 SDK 升级门彼此分离。
 
 ## 31. 后续下位设计入口
 
@@ -2558,8 +2675,9 @@ UE5 专业逻辑进入独立 Feature Pack，不进入通用 Core。
 1. `AllToNote Portable Artifact 与 Source Bundle 设计`；
 2. `AllToNote Job Engine 与 Automation Protocol 设计`；
 3. `AllToNote Video Note Recipe 设计`；
-4. `AllToNote Review 与 Publisher 设计`；
-5. `AllToNote Production MCP 设计`；
-6. `AllToNote Runtime 与 Feature Pack 分发设计`。
+4. `AllToNote Recipe 最小扩展合同设计`；
+5. `AllToNote Review 与 Publisher 设计`；
+6. `AllToNote Production MCP 设计`；
+7. `AllToNote Runtime 与 Feature Pack 分发设计`。
 
 每份下位设计分别进入实施计划，不创建覆盖所有阶段的单一超大计划。Phase 2 仍按照现有只读工作区下位设计独立推进。

@@ -1,9 +1,26 @@
 # AllToNote × llm-iwiki 本地优先知识库桌面系统设计
 
+```yaml
+doc_type: product
+status: partially-superseded
+authority: system
+upstream:
+  - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
+superseded_by:
+  - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
+  - 2026-07-18-alltonote-runtime-cli-feature-pack-design.md
+  - 2026-07-18-alltonote-review-publisher-design.md
+  - 2026-07-18-alltonote-site-control-plane-design.md
+implementation_status: product-baseline-retained-desktop-loop-pending
+last_verified_at: 2026-07-18
+```
+
 - 日期：2026-07-12
-- 状态：已确认
+- 状态：部分被后续细化设计替代；保留产品基线
 - 目标平台：Windows Tier 1；macOS Tier 2
 - 产品基线：桌面应用管理本地 Markdown 知识库；网站仅承担账号、邀请、下载、设备和公共 MCP 管理
+
+> 仍然有效：本地优先、开放 Markdown、知识库与 AllToNote 解耦、CLI/Core 一等入口、薄 Desktop、网站不保存个人知识正文、`personal` 默认和 `common` 必须显式发布。已被替代：本文中的粗粒度进程、任务、Producer、Publisher、Runtime 和云端组件划分；这些内容以 Knowledge Compiler 总体架构及对应下位设计为准。
 
 ## 1. 摘要
 

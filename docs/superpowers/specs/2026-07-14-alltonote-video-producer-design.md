@@ -1,7 +1,21 @@
-# AllToNote Video Producer 架构设计
+# AllToNote Video Recipe 架构设计（历史名 Video Producer）
+
+```yaml
+doc_type: subsystem-design
+status: active
+authority: subsystem
+upstream:
+  - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
+  - 2026-07-14-alltonote-portable-artifact-source-bundle-design.md
+downstream:
+  - 2026-07-16-alltonote-long-video-knowledge-compilation-design.md
+  - ../plans/2026-07-18-alltonote-video-release-implementation-plan.md
+implementation_status: core-cli-bundle-mostly-complete-release-matrix-pending
+last_verified_at: 2026-07-19
+```
 
 - 日期：2026-07-14
-- 状态：交互设计已确认，待用户审阅书面规格
+- 状态：已确认，当前有效；核心大体实现，发布 Gate 待闭环
 - 对应阶段：Portable Artifact 设计中的 Phase P2（Video Note Headless）
 - 上位设计：`2026-07-13-alltonote-knowledge-compiler-architecture-design.md`
 - 数据合同：`2026-07-14-alltonote-portable-artifact-source-bundle-design.md`
@@ -11,7 +25,9 @@
 
 ## 1. 文档目的
 
-本文定义 AllToNote 第一个正式 Knowledge Compiler Producer：从视频 URL 或本地视频开始，复用现有下载、字幕、转写、LLM 和截图能力，生产一份可追溯、可审阅、可恢复、可由 iwiki 原子提交的 Portable Source Bundle。
+本文定义 AllToNote 第一个正式 Knowledge Compiler Recipe：从视频 URL 或本地视频开始，复用现有下载、字幕、转写、LLM 和截图能力，生产一份可追溯、可审阅、可恢复、可由 iwiki 原子提交的 Portable Source Bundle。
+
+为保持历史链接、实施计划和验收记录稳定，本文文件路径及 `REC-VIDEO-001` ID 不变；规范术语统一为 **Video Recipe**。文中的 “Video Producer” 仅表示该 Recipe 的产品外观或历史名称，不表示它拥有独立 Runtime、CLI、Job、Bundle、Review 或 Publisher。AllToNote 是上层平台，Video、Document、Article、Codebase 和 Personal 是并列官方 Recipe。
 
 它回答：
 
@@ -48,7 +64,9 @@ iwiki 已发布的 Workspace / Portable Contract
 6. **最终 Bundle 包含 `commit.json`。** AllToNote candidate 不创建该文件；iwiki 在权威 commit 临界区生成并绑定它。
 7. **字幕优先与截图分开。** 默认字幕黄金路径不下载媒体；只有用户明确启用截图且 Draft 产生通过校验的截图请求时，才延迟获取所需媒体并提取帧。
 
-本设计对上位文档中的临时用户别名作一项明确细化：通用机器入口仍是 `alltonote run <recipe>`；Video Recipe 的首选用户入口是 `alltonote produce video`。它只构造标准 Recipe Request，不拥有另一套 Pipeline。尚未发布的临时 `alltonote video` 示例不作为需要长期兼容的第二入口。
+本设计对上位文档中的临时用户别名作一项明确细化：通用机器入口与 Video 用户入口都属于单一 `produce` 命令族；通用自动化使用 `alltonote produce --recipe <selector> --request <request>`，Video 的兼容入口是 `alltonote produce video`。两者只构造同一标准 Recipe Request，不拥有第二套 Pipeline。旧文档中的独立 `run`、`add` 或 `alltonote video` 示例均未发布，不构成兼容承诺。
+
+多 Recipe 公共接缝由 `REC-CONTRACT-001` 细化；本设计继续拥有 Video 的 acquisition、transcript、编译、时间证据、截图和质量语义。二者冲突时，ARCH-001 的平台边界优先；不得为了复用而把 Video 的领域字段提升为通用合同。
 
 ## 3. 当前实现事实
 
@@ -258,12 +276,13 @@ backend/
 - JobStore、Source Identity Registry 和 Machine Cache 不进入 Portable Bundle；
 - 任何最终 Workspace mutation 都经过 iwiki；
 - CLI、FastAPI、Desktop API、MCP 不复制 Recipe 分支。
+- 通用 Application/Domain/Job Repository 不导入 Video-specific DTO；Video 实现只依赖通用 Recipe/Produce 合同。
 
 ### 5.4 Application Facade
 
-官方进程内入口提供窄、类型化用例：
+目标公共进程内入口是通用 `ProduceService.submit(ProduceRequest)`；Video 的参数由 Video Recipe schema 校验。迁移期间保留窄、类型化兼容用例，但它必须委托同一 ProduceService/Job 路径：
 
-- `SubmitVideoJob`；
+- `SubmitVideoJob`（兼容 facade，不是第二条 Pipeline）；
 - `WaitJob`；
 - `GetJobStatus`；
 - `ListJobs`；
@@ -299,8 +318,12 @@ P0 最小 Port：
 P0 注册代码定义的：
 
 ```text
-alltonote.video-course-note@1
+历史 v1 顶层 Recipe：alltonote.video-course-note@1
+当前多 Draft 顶层 Recipe：alltonote.video-producer@2
+输出编译绑定：alltonote.video-course-note@2、alltonote.video-faithful-edition@1
 ```
+
+`alltonote.video-producer@2` 是 `produce video`/通用 Registry 选择的顶层可执行 Recipe；两个输出绑定固定各 Draft 的 compiler identity、request hash 和 provenance，不创建第二个 Job 或 Pipeline。v1 identity 继续兼容读取/恢复，不重写历史 Bundle。
 
 它声明：
 
@@ -883,7 +906,7 @@ Provider 支持幂等键时复用稳定 operation key。Provider 不支持且进
 通用 Recipe 入口：
 
 ```powershell
-alltonote run alltonote.video-course-note@1 `
+alltonote produce --recipe alltonote.video-producer@2 `
   --request .\video-request.json `
   --workspace "E:\Agent_Learning\llm-iwiki" `
   --wait `
@@ -893,28 +916,28 @@ alltonote run alltonote.video-course-note@1 `
 首选用户入口：
 
 ```powershell
-alltonote produce video "https://www.bilibili.com/video/BV..." `
+alltonote produce video --input "https://www.bilibili.com/video/BV..." `
   --workspace "E:\Agent_Learning\llm-iwiki"
 ```
 
 本地视频：
 
 ```powershell
-alltonote produce video "D:\Videos\course.mp4" `
+alltonote produce video --input "D:\Videos\course.mp4" `
   --workspace "E:\Agent_Learning\llm-iwiki"
 ```
 
 Agent：
 
 ```powershell
-alltonote produce video "https://www.youtube.com/watch?v=..." `
+alltonote produce video --input "https://www.youtube.com/watch?v=..." `
   --workspace "E:\Agent_Learning\llm-iwiki" `
   --client-request-id "codex-task-20260714-001" `
   --wait `
   --json
 ```
 
-`produce video` 只翻译参数为同一 Recipe Request。
+`produce video` 和 generic `produce --recipe/--request` 只翻译参数为同一顶层 Recipe Request；历史 v1 Job/Bundle 继续按原 `alltonote.video-course-note@1` identity 读取和恢复。对等输入下，两种入口的 canonical request、两套 hash、Job identity、Artifact 和错误语义必须一致。当前不发布独立 `add` 或 `run`。
 
 ### 11.2 Video 参数
 
@@ -1505,7 +1528,7 @@ Gate：不理解内部 Python 的外部 Agent 能依据公开协议可靠调用�
 
 只有同时满足以下条件，才可宣称 Video Producer P0 完成：
 
-1. 用户无需 Desktop/Web，运行 `alltonote produce video <input> --workspace <path>` 可得到 committed Bundle；
+1. 用户无需 Desktop/Web，运行 `alltonote produce video --input <input> --workspace <path>` 可得到 committed Bundle；
 2. Bilibili、YouTube、本地视频两类黄金路径成立；
 3. 所有正式现有 Adapter 进入统一 Port 并通过 Contract；
 4. 产物满足 Portable Contract，并可被 Obsidian、Agent 和普通工具读取；
@@ -1531,9 +1554,11 @@ Gate：不理解内部 Python 的外部 Agent 能依据公开协议可靠调用�
 
 这些后续能力不能重新发明任务状态、Portable Bundle、Credential、CLI JSON 或 Workspace 写入协议。
 
+在第一个非 Video Recipe 合入前，先完成 `REC-CONTRACT-001` X0-A：建立最小 Request/Submission、RecipeEndpoint、静态 Registry、薄 ProduceService、Video Adapter 及 SDK/Runtime/单一 produce 路由；X0-A 不清除 Job/Repository 数据面的 Video-specific 类型。随后由 Video 与真实 Document/PPT 第二消费者共同完成 X0-B，抽取 Result/Artifact/Repository/atomic commit、migration 和 generic reconnect，并验证 `produce video --input` 与 generic `produce --recipe/--request` 的 canonical request、两套 hash、Job identity、result 和 Portable 等价。该 Gate 不反向阻止 Video P0 独立发布，但阻止把 Video 专用接缝复制到第二个 Recipe。
+
 ## 21. 最终架构决策摘要
 
-1. Video Producer 是 Knowledge Compiler 的首个正式垂直 Recipe，不是 NoteGenerator 的导出补丁。
+1. Video Recipe 是 Knowledge Compiler 的首个正式垂直 Recipe，不是 NoteGenerator 的导出补丁，也不是 AllToNote 平台本身。
 2. Core/Application 是唯一业务语义；CLI、FastAPI、Desktop、MCP 都是 Adapter。
 3. P0 前台 CLI + 持久 Job/Step Attempt；daemon 延后。
 4. Job 终态不可复活；终态 retry 创建新 Job。
@@ -1549,6 +1574,7 @@ Gate：不理解内部 Python 的外部 Agent 能依据公开协议可靠调用�
 14. Windows 是 Tier 1；macOS 保持低成本、诚实的 Tier 2。
 15. FastAPI 迁移后不得保留第二条视频生产 Pipeline。
 16. MCP、Desktop Producer、Publisher、daemon 和后续来源全部在稳定 CLI/Core/Portable 契约之上继续演进。
+17. `SubmitVideoJob`/`submit_video` 只可作为迁移期兼容 facade；多 Recipe 阶段的规范入口是通用 ProduceService/Registry。
 
 ## 22. 进入实施计划的 Gate
 
