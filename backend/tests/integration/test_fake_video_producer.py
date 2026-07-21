@@ -1547,6 +1547,98 @@ def test_concurrent_waits_on_one_runtime_execute_job_once(
     assert calls.commit == 1
 
 
+def test_distinct_jobs_on_one_runtime_execute_serially(
+    tmp_path: Path,
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    second_workspace = tmp_path / "second-workspace"
+    shutil.copytree(workspace_root, second_workspace)
+    start = threading.Barrier(3)
+    first_model_entered = threading.Event()
+    release_first_model = threading.Event()
+    active_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def observe_model(_heartbeat: Callable[[], None]) -> None:
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+            is_first = active == 1 and not first_model_entered.is_set()
+        if is_first:
+            first_model_entered.set()
+            assert release_first_model.wait(timeout=5)
+        with active_lock:
+            active -= 1
+
+    runtime, calls = runtime_factory(operation_hooks={"model": observe_model})
+    jobs = (
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="serial-first")
+        ),
+        runtime.submit_video(
+            replace(
+                valid_request(
+                    second_workspace,
+                    client_request_id="serial-second",
+                ),
+                input_value="fixture://second-course",
+            )
+        ),
+    )
+
+    def wait(job_id: str) -> object:
+        start.wait(timeout=5)
+        return runtime.wait_job(job_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = tuple(executor.submit(wait, job.job_id) for job in jobs)
+        start.wait(timeout=5)
+        assert first_model_entered.wait(timeout=5)
+        release_first_model.set()
+        snapshots = tuple(future.result(timeout=15) for future in futures)
+
+    assert all(snapshot.state is JobState.SUCCEEDED for snapshot in snapshots)
+    assert calls.download == calls.transcribe == calls.model == 2
+    assert calls.commit == 2
+    assert max_active == 1
+
+
+def test_submitted_job_survives_independent_runtime_wait(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "queued-reopen-machine"
+    calls = runtime_module.FakeCallCounts()
+    first = runtime_module.create_fake_runtime(
+        machine_root,
+        calls=calls,
+        owner_id="submit-process",
+    )
+
+    submitted = first.submit_video(
+        valid_request(workspace_root, client_request_id="queued-reopen")
+    )
+
+    assert submitted.state is JobState.QUEUED
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+
+    del first
+    reopened = runtime_module.create_fake_runtime(
+        machine_root,
+        calls=calls,
+        owner_id="wait-process",
+    )
+    completed = reopened.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert calls.download == calls.transcribe == calls.model == 1
+    assert calls.commit == 1
+
+
 def test_candidate_checkpoint_decode_rejects_malformed_control_payloads(
     runtime_factory: Callable[..., tuple[object, object]],
     workspace_root: Path,

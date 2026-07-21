@@ -8,6 +8,7 @@ import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.application.video_service import VideoService
+from app.core.sdk import AllToNoteSDK
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
     FaithfulLanguagePolicy,
@@ -102,6 +103,24 @@ def test_v1_job_request_json_and_hash_remain_frozen(tmp_path: Path) -> None:
     )
 
 
+def test_sdk_submit_video_is_direct_queued_durable_boundary(tmp_path: Path) -> None:
+    service, repository = _service(tmp_path)
+    request = VideoProduceRequest(
+        request_schema_version=1,
+        workspace_root=Path("C:/vault"),
+        input_value="fixture://course",
+        client_request_id="sdk-submit",
+    )
+
+    submitted = AllToNoteSDK(service).submit_video(request)
+    stored = repository.get_job(submitted.job_id)
+
+    assert submitted.state.value == "queued"
+    assert stored.state.value == "queued"
+    assert repository.get_job_request(submitted.job_id) is not None
+    assert stored.request_hash is not None
+
+
 def test_v2_job_request_round_trips_canonical_outputs_and_bindings(
     tmp_path: Path,
 ) -> None:
@@ -112,7 +131,7 @@ def test_v2_job_request_round_trips_canonical_outputs_and_bindings(
     )
     request = VideoProduceRequest(
         request_schema_version=2,
-        workspace_root=tmp_path / "vault",
+        workspace_root=Path("C:/vault"),
         input_value="https://example.test/video",
         recipe_id="alltonote.video-producer",
         recipe_version=2,
@@ -148,29 +167,38 @@ def test_v2_job_request_round_trips_canonical_outputs_and_bindings(
         provided_transcript=transcript,
     )
 
+    expected_json = (
+        '{"faithful_language_policy":"translate-to-output",'
+        '"input_value":"https://example.test/video","model_override":"gpt-test",'
+        '"output_bindings":[{"document_kind":"knowledge-note",'
+        '"quality_preset":"balanced","recipe_id":"alltonote.video-course-note",'
+        '"recipe_version":2},{"document_kind":"faithful-edition",'
+        '"quality_preset":"balanced",'
+        '"recipe_id":"alltonote.video-faithful-edition","recipe_version":1}],'
+        '"output_language":"zh-CN","provided_transcript":{"language":"en",'
+        '"segments":[{"end_ms":1000,"segment_id":"seg_000001",'
+        '"start_ms":0,"text":"Source text"}]},'
+        '"provider_profile":"openai-main","quality_preset":"balanced",'
+        '"recipe_id":"alltonote.video-producer","recipe_version":2,'
+        '"request_schema_version":2,'
+        '"requested_outputs":["knowledge-note","faithful-edition"],'
+        '"screenshot_policy":"off","style":"structured",'
+        '"transcriber_profile":"local-whisper","workspace_root":"C:\\\\vault"}'
+    )
+
     submitted = service.submit_video(request)
     replay = service.submit_video(canonical_request)
-    stored = json.loads(repository.get_job_request(submitted.job_id) or "null")
     restored = service._load_request(submitted.job_id)
 
     assert replay.job_id == submitted.job_id
-    assert stored["requested_outputs"] == ["knowledge-note", "faithful-edition"]
-    assert stored["faithful_language_policy"] == "translate-to-output"
-    assert stored["output_bindings"] == [
-        {
-            "document_kind": "knowledge-note",
-            "quality_preset": "balanced",
-            "recipe_id": "alltonote.video-course-note",
-            "recipe_version": 2,
-        },
-        {
-            "document_kind": "faithful-edition",
-            "quality_preset": "balanced",
-            "recipe_id": "alltonote.video-faithful-edition",
-            "recipe_version": 1,
-        },
-    ]
+    assert repository.get_job_request(submitted.job_id) == expected_json
+    assert repository.get_job(submitted.job_id).request_hash == (
+        "sha256:38a48e85e8b1e4866ca972d834310f8828f3849cd15ce6d124b987a9d6f430b9"
+    )
     assert restored == canonical_request
+    assert VideoService._request_hash(request) == (
+        "sha256:fb73f1a581a5fa272e95f71bb5af64b4ae7e96fdac4bea633180a6024fbcb9a8"
+    )
     assert VideoService._request_hash(request) == VideoService._request_hash(
         canonical_request
     )

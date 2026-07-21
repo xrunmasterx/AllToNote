@@ -31,7 +31,7 @@
 9. 所有兼容 facade 必须委托同一路由，不保留第二套业务语义；
 10. X0-A 不宣称完成 Job/Repository/Bundle 去 Video 化或多 Job 高并发。
 
-## Task 1: [ ] 冻结兼容与当前执行能力基线
+## Task 1: [x] 冻结兼容与当前执行能力基线
 
 - 风险：中
 - 预计生产代码：0 行
@@ -45,18 +45,18 @@
 
 验收：
 
-- [ ] 固定 legacy SDK submit；
-- [ ] 固定 Video v1/v2 canonical request；
-- [ ] 明确区分 Job request hash 与 Video/checkpoint hash；
-- [ ] 固定 config snapshot；
-- [ ] 固定 legacy raw result round-trip；
-- [ ] 固定 crash/reopen、historical candidate 和 zero replay；
-- [ ] 固定 Portable manifest/bundle identity 与 source conflict rollback；
-- [ ] 固定 CLI JSON/Human envelope、warning、exit code、wait 和 Ctrl+C/cancel；
-- [ ] characterization 明确同一 Runtime 当前完整执行串行；
-- [ ] characterization 明确同 Workspace 第二 scheduler owner 返回 scheduler_busy；
-- [ ] characterization 明确 submit 不 wait 只创建 queued Job，后续 job wait 可接管；
-- [ ] 不修改生产代码。
+- [x] 固定 legacy SDK submit；
+- [x] 固定 Video v1/v2 canonical request；
+- [x] 明确区分 Job request hash 与 Video/checkpoint hash；
+- [x] 固定 config snapshot；
+- [x] 固定 legacy raw result round-trip；
+- [x] 固定 crash/reopen、historical candidate 和 zero replay；
+- [x] 固定 Portable manifest/bundle identity 与 source conflict rollback；
+- [x] 固定 CLI JSON/Human envelope、warning、exit code、wait 和 Ctrl+C/cancel；
+- [x] characterization 明确同一 Runtime 当前完整执行串行；
+- [x] characterization 明确同 Workspace 第二 scheduler owner 返回 scheduler_busy；
+- [x] characterization 明确 submit 不 wait 只创建 queued Job，后续 job wait 可接管；
+- [x] 不修改生产代码。
 
 Stop condition：
 

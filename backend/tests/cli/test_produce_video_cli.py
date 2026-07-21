@@ -317,6 +317,30 @@ def test_canonical_input_and_positional_alias_keep_request_hash_compatible(
     )
 
 
+def test_human_positional_video_warning_preserves_success_output_contract(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _RequestCaptureRuntime()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+        ],
+        runtime=runtime,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out == "Job: job_captured\nState: queued\n"
+    assert captured.err == "Warning: Positional video input is deprecated; use --input\n"
+    assert runtime.request is not None
+
+
 def test_cli_rejects_conflicting_canonical_and_legacy_inputs_before_submit(
     workspace_root: Path,
     capsys: pytest.CaptureFixture[str],
