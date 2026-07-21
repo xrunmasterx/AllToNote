@@ -64,7 +64,7 @@ Stop condition：
 - 测试暴露当前数据已不满足已有 request/result wire；
 - 必须修改生产代码才能“让旧测试通过”。
 
-## Task 2: [ ] 只归位 JobState 所有权
+## Task 2: [x] 只归位 JobState 所有权
 
 - 风险：中
 - 预计生产代码：40 至 100 行
@@ -78,13 +78,13 @@ Stop condition：
 
 验收：
 
-- [ ] 只有一份 JobState Enum 定义；
-- [ ] domain.video re-export 的 JobState 与新通用 import 是同一类型对象；
-- [ ] 所有 is JobState.* 判断保持正确；
-- [ ] 状态转换集合和持久化字符串不变；
-- [ ] 不迁移携带 VideoProduceResult 的 JobSnapshot；
-- [ ] 不引入通用 result DTO；
-- [ ] Job submit/get/wait/cancel/retry 的相关测试通过。
+- [x] 只有一份 JobState Enum 定义；
+- [x] domain.video re-export 的 JobState 与新通用 import 是同一类型对象；
+- [x] 所有 is JobState.* 判断保持正确；
+- [x] 状态转换集合和持久化字符串不变；
+- [x] 不迁移携带 VideoProduceResult 的 JobSnapshot；
+- [x] 不引入通用 result DTO；
+- [x] Job submit/get/wait/cancel/retry 的相关测试通过。
 
 Stop condition：
 

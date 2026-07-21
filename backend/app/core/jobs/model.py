@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from app.core.domain.video import JobState
+
+class JobState(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING_FOR_INPUT = "waiting_for_input"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class AttemptState(StrEnum):

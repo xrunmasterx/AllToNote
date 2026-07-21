@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from app.core.domain.video import JobState
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import AttemptState
+from app.core.jobs.model import AttemptState, JobState
 
 
 TERMINAL_JOB_STATES = frozenset(

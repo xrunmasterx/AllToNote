@@ -9,6 +9,7 @@ from typing import Mapping
 
 from app.core.config.model import JobConfigSnapshot
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
+from app.core.jobs.model import JobState
 
 
 _SEGMENT_ID_PATTERN = re.compile(r"seg_[0-9]{6,}\Z")
@@ -36,15 +37,6 @@ class VideoDocumentKind(StrEnum):
 class FaithfulLanguagePolicy(StrEnum):
     PRESERVE_SOURCE = "preserve-source"
     TRANSLATE_TO_OUTPUT = "translate-to-output"
-
-
-class JobState(StrEnum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    WAITING_FOR_INPUT = "waiting_for_input"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 def _snapshot_mapping(
