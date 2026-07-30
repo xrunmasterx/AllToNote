@@ -164,7 +164,7 @@ Stop condition：
 - ProduceService 开始拥有 Recipe 领域 Pipeline；
 - 为未来并发加入 worker、queue 或 ResourceRequirement DSL。
 
-## Task 5: [ ] 用兼容 Adapter 注册 Video Recipe
+## Task 5: [x] 用兼容 Adapter 注册 Video Recipe
 
 - 风险：高
 - 预计生产代码：120 至 200 行
@@ -177,15 +177,15 @@ Stop condition：
 
 验收：
 
-- [ ] Video descriptor 可在冷路径读取；
-- [ ] v1/v2 所有现有字段确定性转换；
-- [ ] 同一 client request identity 下 generic 与 legacy submit 得到相同 Job ID；
-- [ ] request JSON、Job hash、Video/checkpoint hash 和 config snapshot 不变；
-- [ ] requested outputs、output bindings、language policy 和 principal 不变；
-- [ ] Adapter 不绕过 VideoService 直接调用 JobService；
-- [ ] Adapter 不重写 acquisition、transcription、compiler、quality、Checkpoint 或 Portable；
-- [ ] 无版本 legacy produce video 仍映射 v1；
-- [ ] 显式 v2 generic 与显式 v2 legacy 路径等价。
+- [x] Video descriptor 可在冷路径读取；
+- [x] v1/v2 所有现有字段确定性转换；
+- [x] 同一 client request identity 下 generic 与 legacy submit 得到相同 Job ID；
+- [x] request JSON、Job hash、Video/checkpoint hash 和 config snapshot 不变；
+- [x] requested outputs、output bindings、language policy 和 principal 不变；
+- [x] Adapter 不绕过 VideoService 直接调用 JobService；
+- [x] Adapter 不重写 acquisition、transcription、compiler、quality、Checkpoint 或 Portable；
+- [x] 无版本 legacy produce video 仍映射 v1；
+- [x] 显式 v2 generic 与显式 v2 legacy 路径等价。
 
 Stop condition：
 
@@ -194,7 +194,7 @@ Stop condition：
 - 需要移动 Job 创建或 config snapshot 所有权；
 - 需要修改 SQLite schema、result wire 或 atomic commit。
 
-## Task 6: [ ] 改造 SDK 与 Runtime 组合根
+## Task 6: [x] 改造 SDK 与 Runtime 组合根
 
 - 风险：高
 - 预计生产代码：100 至 180 行
@@ -207,14 +207,14 @@ Stop condition：
 
 验收：
 
-- [ ] 组合方向为 VideoService -> VideoRecipeAdapter -> Registry -> ProduceService -> SDK -> Runtime；
-- [ ] SDK/Runtime 暴露通用 submit；
-- [ ] submit_video 保留原签名和行为，但内部委托 ProduceService；
-- [ ] 不保留并行的旧 Video 业务路径；
-- [ ] 所有现有 factory 名称和参数不变；
-- [ ] workspace/machine root 解析不变；
-- [ ] reopen、Job query/wait/cancel 的兼容测试通过；
-- [ ] Runtime 基础 import 不 eager load 未使用重型 Pack。
+- [x] 组合方向为 VideoService -> VideoRecipeAdapter -> Registry -> ProduceService -> SDK -> Runtime；
+- [x] SDK/Runtime 暴露通用 submit；
+- [x] submit_video 保留原签名和行为，但内部委托 ProduceService；
+- [x] 不保留并行的旧 Video 业务路径；
+- [x] 所有现有 factory 名称和参数不变；
+- [x] workspace/machine root 解析不变；
+- [x] reopen、Job query/wait/cancel 的兼容测试通过；
+- [x] Runtime 基础 import 不 eager load 未使用重型 Pack。
 
 Stop condition：
 
@@ -222,7 +222,7 @@ Stop condition：
 - factory 兼容必须通过静默改默认路径实现；
 - 组合根开始拥有 Recipe 业务判断。
 
-## Task 7: [ ] 收敛为单一 produce CLI 心智模型
+## Task 7: [x] 收敛为单一 produce CLI 心智模型
 
 - 风险：高
 - 预计生产代码：160 至 260 行
@@ -236,23 +236,23 @@ Stop condition：
 
 实现范围：
 
-- [ ] 保留 alltonote produce video；
-- [ ] 增加 alltonote produce <input> --recipe <id>@<version>；
-- [ ] 增加 alltonote produce --request <request.json>；
-- [ ] 增加 recipe list/describe 作为高级发现入口；
-- [ ] 不新增独立 run；
-- [ ] 不新增 add。
+- [x] 保留 alltonote produce video；
+- [x] 增加 alltonote produce <input> --recipe <id>@<version>；
+- [x] 增加 alltonote produce --request <request.json>；
+- [x] 增加 recipe list/describe 作为高级发现入口；
+- [x] 不新增独立 run；
+- [x] 不新增 add。
 
 验收：
 
-- [ ] legacy produce video 参数、warning、JSON/Human output、exit code 和 Ctrl+C/cancel 不变；
-- [ ] 无版本 produce video 仍为 v1；
-- [ ] 显式 v2 legacy 与 generic produce 生成相同 Video request、Job identity 和结果；
-- [ ] request 文件未知 contract/字段、非法 selector 和明文 Secret fail closed；
-- [ ] recipe list/describe stdout 保持稳定 envelope；
-- [ ] recipe list/describe 不导入 Runtime、Downloader、Whisper、Torch、FFmpeg、Model client 或 FastAPI；
-- [ ] 普通 Video 用户不需要理解 Recipe ID 或 request JSON；
-- [ ] CLI handler 不复制 wait、Job query 或结果渲染 Pipeline。
+- [x] legacy produce video 参数、warning、JSON/Human output、exit code 和 Ctrl+C/cancel 不变；
+- [x] 无版本 produce video 仍为 v1；
+- [x] 显式 v2 legacy 与 generic produce 生成相同 Video request、Job identity 和结果；
+- [x] request 文件未知 contract/字段、非法 selector 和明文 Secret fail closed；
+- [x] recipe list/describe stdout 保持稳定 envelope；
+- [x] recipe list/describe 不导入 Runtime、Downloader、Whisper、Torch、FFmpeg、Model client 或 FastAPI；
+- [x] 普通 Video 用户不需要理解 Recipe ID 或 request JSON；
+- [x] CLI handler 不复制 wait、Job query 或结果渲染 Pipeline。
 
 Stop condition：
 
@@ -260,7 +260,7 @@ Stop condition：
 - 为 run 新建第二套语义相同的命令；
 - 为保持 golden 而复制一整条旧业务路径。
 
-## Task 8: [ ] 执行 X0-A 架构、兼容与冷路径 Gate
+## Task 8: [x] 执行 X0-A 架构、兼容与冷路径 Gate
 
 - 风险：高
 - 预计生产代码：0 至 80 行，仅修复本阶段暴露的缺陷
@@ -272,29 +272,29 @@ Stop condition：
 
 架构验收：
 
-- [ ] contracts、registry、produce_service 不导入 Video；
-- [ ] ProduceService/Recipe 路径不导入旧 task_serial_executor；
-- [ ] X0-A 未新增线程池、daemon、Engine、DAG、动态插件或 DB schema；
-- [ ] Registry/ProduceService 无新的全局锁或活动 Job 状态；
-- [ ] Job/Repository/Bundle 剩余 Video 耦合已登记为 X0-B，不被隐藏。
+- [x] contracts、registry、produce_service 不导入 Video；
+- [x] ProduceService/Recipe 路径不导入旧 task_serial_executor；
+- [x] X0-A 未新增线程池、daemon、Engine、DAG、动态插件或 DB schema；
+- [x] Registry/ProduceService 无新的全局锁或活动 Job 状态；
+- [x] Job/Repository/Bundle 剩余 Video 耦合已登记为 X0-B，不被隐藏。
 
 兼容验收：
 
-- [ ] Task 1 全部 characterization 通过；
-- [ ] generic 与 legacy Video submit 等价；
-- [ ] CLI golden 通过；
-- [ ] Job、SQLite、恢复、Portable/iwiki 定向回归通过；
-- [ ] 全量 backend pytest 通过，或只剩实施前登记且可复现的环境基线；
-- [ ] git diff --check 通过；
-- [ ] 每个改动文件都能直接追溯到 X0-A；
-- [ ] 没有覆盖当前工作树中的用户修改。
+- [x] Task 1 全部 characterization 通过；
+- [x] generic 与 legacy Video submit 等价；
+- [x] CLI golden 通过；
+- [x] Job、SQLite、恢复、Portable/iwiki 定向回归通过；
+- [x] 全量 backend pytest 通过，或只剩实施前登记且可复现的环境基线；
+- [x] git diff --check 通过；
+- [x] 每个改动文件都能直接追溯到 X0-A；
+- [x] 没有覆盖当前工作树中的用户修改。
 
 声明验收：
 
-- [ ] 文档和发布说明明确 X0-A 不提供同 Workspace 多 Job 并发；
-- [ ] 文档和发布说明明确 X0-A 不提供 detach/Engine/AgentExecutor；
-- [ ] 文档和发布说明明确 X0-B 才完成 Job/Repository 数据面去 Video 化；
-- [ ] 文档和发布说明明确第一个真实非 Video Recipe 才能验证完整扩展合同。
+- [x] 文档和发布说明明确 X0-A 不提供同 Workspace 多 Job 并发；
+- [x] 文档和发布说明明确 X0-A 不提供 detach/Engine/AgentExecutor；
+- [x] 文档和发布说明明确 X0-B 才完成 Job/Repository 数据面去 Video 化；
+- [x] 文档和发布说明明确第一个真实非 Video Recipe 才能验证完整扩展合同。
 
 ## 2. X0-B 延后项，不得从本任务清单直接开工
 

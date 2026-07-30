@@ -27,6 +27,7 @@ from app.core.domain.video import (
     VideoProduceResult,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
 
 if TYPE_CHECKING:
     from app.adapters.credentials.keyring_broker import CredentialBroker
@@ -40,7 +41,11 @@ RUNTIME_VERSION = "0.1.0"
 
 
 class _VideoRuntime(Protocol):
+    def submit(self, request: ProduceRequest) -> ProduceSubmission: ...
+
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot: ...
+
+    def get_job(self, job_id: str) -> JobSnapshot: ...
 
     def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot: ...
 
@@ -130,10 +135,29 @@ def _build_parser(
         from app.cli.commands.artifacts import add_artifact_parsers
 
         add_artifact_parsers(subparsers)
+    recipe_parser = subparsers.add_parser("recipe")
+    recipe_subparsers = recipe_parser.add_subparsers(
+        dest="recipe_command", required=True
+    )
+    recipe_list_parser = recipe_subparsers.add_parser("list")
+    recipe_list_parser.add_argument("--json", action="store_true")
+    recipe_describe_parser = recipe_subparsers.add_parser("describe")
+    recipe_describe_parser.add_argument("selector")
+    recipe_describe_parser.add_argument("--json", action="store_true")
     produce_parser = subparsers.add_parser("produce")
     produce_subparsers = produce_parser.add_subparsers(
         dest="produce_kind", required=True
     )
+    generic_parser = produce_subparsers.add_parser(
+        "_generic",
+        prog="alltonote produce",
+    )
+    generic_parser.add_argument("input_value", nargs="?")
+    generic_parser.add_argument("--recipe")
+    generic_parser.add_argument("--request", type=Path)
+    generic_parser.add_argument("--workspace", type=Path)
+    generic_parser.add_argument("--wait", action="store_true")
+    generic_parser.add_argument("--json", action="store_true")
     video_parser = produce_subparsers.add_parser("video")
     video_parser.add_argument(
         "input_value",
@@ -184,6 +208,21 @@ def main(
     input_stream: TextIO | None = None,
 ) -> int:
     arguments = tuple(argv) if argv is not None else tuple(sys.argv[1:])
+    parse_arguments = (
+        ("produce", "_generic", *arguments[1:])
+        if arguments
+        and arguments[0] == "produce"
+        and (
+            len(arguments) == 1
+            or arguments[1] != "video"
+            or any(
+                argument == option or argument.startswith(f"{option}=")
+                for argument in arguments
+                for option in ("--recipe", "--request")
+            )
+        )
+        else arguments
+    )
     correlation_id = new_typed_id("corr")
     json_requested = "--json" in arguments or "--jsonl" in arguments
     include_job_commands = (
@@ -199,13 +238,29 @@ def main(
         args = _build_parser(
             include_job_commands=include_job_commands,
             include_artifact_commands=include_artifact_commands,
-        ).parse_args(arguments)
+        ).parse_args(parse_arguments)
         if (
             args.command == "produce"
             and args.produce_kind == "video"
             and (
                 (args.input_value is None and args.input_option is None)
                 or (args.input_value is not None and args.input_option is not None)
+            )
+        ):
+            raise _CliUsageError
+        if (
+            args.command == "produce"
+            and args.produce_kind == "_generic"
+            and (
+                (args.request is None and (args.input_value is None or args.recipe is None))
+                or (
+                    args.request is not None
+                    and (
+                        args.input_value is not None
+                        or args.recipe is not None
+                        or args.workspace is not None
+                    )
+                )
             )
         ):
             raise _CliUsageError
@@ -236,6 +291,39 @@ def main(
         )
         render_result(result, json_mode=args.json)
         return int(ExitCode.SUCCESS)
+
+    if args.command == "recipe":
+        command = f"recipe {args.recipe_command}"
+        try:
+            from app.cli.recipe_commands import (
+                recipe_describe_result,
+                recipe_list_result,
+            )
+
+            result = (
+                recipe_list_result(correlation_id)
+                if args.recipe_command == "list"
+                else recipe_describe_result(args.selector, correlation_id)
+            )
+            exit_code = ExitCode.SUCCESS
+        except DomainError as error:
+            mapped = map_domain_error(error)
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        except Exception:
+            mapped = internal_error()
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        render_result(result, json_mode=args.json)
+        return int(exit_code)
 
     if args.command == "runtime":
         try:
@@ -423,6 +511,48 @@ def main(
         render_result(result, json_mode=args.json)
         return int(exit_code)
 
+    if args.command == "produce" and args.produce_kind == "_generic":
+        try:
+            snapshot = _produce_generic(
+                args,
+                runtime,
+                correlation_id,
+                config_service=config_service,
+            )
+            result, exit_code = _video_snapshot_result(
+                snapshot,
+                correlation_id,
+                command="produce",
+            )
+        except DomainError as error:
+            mapped = map_domain_error(error)
+            result = _failure_result(
+                command="produce",
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        except KeyboardInterrupt:
+            mapped = map_domain_error(
+                DomainError("interrupted", ErrorCategory.CANCELLED, "Command was interrupted")
+            )
+            result = _failure_result(
+                command="produce",
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = ExitCode.INTERRUPTED
+        except Exception:
+            mapped = internal_error()
+            result = _failure_result(
+                command="produce",
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        render_result(result, json_mode=args.json)
+        return int(exit_code)
+
     try:
         snapshot = _produce_video(
             args,
@@ -472,6 +602,116 @@ def main(
         )
     render_result(result, json_mode=args.json)
     return int(exit_code)
+
+
+def _produce_generic(
+    args: argparse.Namespace,
+    runtime: _VideoRuntime | None,
+    correlation_id: str,
+    *,
+    config_service: RuntimeConfigService | None,
+) -> JobSnapshot:
+    from app.cli.produce_request import load_produce_request, parse_recipe_selector
+    from app.core.recipes.contracts import InputDescriptor
+
+    if args.request is not None:
+        request = load_produce_request(args.request)
+        workspace_root = Path(request.workspace_ref).resolve()
+        effective_args = argparse.Namespace(
+            workspace=workspace_root,
+            provider_profile=None,
+            transcriber_profile=None,
+            output_language=None,
+            quality=None,
+            style=None,
+            screenshot_policy=None,
+            config_profile=None,
+        )
+        effective = _effective_video_config(
+            effective_args,
+            runtime_injected=runtime is not None,
+            config_service=config_service,
+        )
+        config_snapshot = effective.job_snapshot()
+        request = replace(
+            request,
+            workspace_ref=str(workspace_root),
+            parameters={
+                **request.parameters,
+                "config_snapshot": {
+                    "snapshot_version": config_snapshot.snapshot_version,
+                    "values": dict(config_snapshot.values),
+                    "digest": config_snapshot.digest,
+                    "semantic_digest": config_snapshot.semantic_digest,
+                },
+            },
+        )
+        active_runtime = runtime or _default_runtime(
+            workspace_root,
+            current_config_snapshot=config_snapshot,
+        )
+    else:
+        effective_args = argparse.Namespace(
+            workspace=args.workspace,
+            provider_profile=None,
+            transcriber_profile=None,
+            output_language=None,
+            quality=None,
+            style=None,
+            screenshot_policy=None,
+            config_profile=None,
+        )
+        effective = _effective_video_config(
+            effective_args,
+            runtime_injected=runtime is not None,
+            config_service=config_service,
+        )
+        config = effective.config
+        workspace_value = args.workspace or config.default_workspace
+        if workspace_value is None:
+            raise DomainError(
+                "workspace_required",
+                ErrorCategory.INVALID_REQUEST,
+                "A Workspace must be provided by flag or Runtime configuration",
+            )
+        workspace_root = Path(workspace_value).resolve()
+        key = parse_recipe_selector(args.recipe)
+        requested_outputs = ("knowledge-note",)
+        provider_profile = config.default_provider_profile
+        provider = config.providers.get(provider_profile)
+        request = ProduceRequest(
+            1,
+            key,
+            InputDescriptor("source", args.input_value),
+            str(workspace_root),
+            requested_outputs,
+            {
+                "provider_profile": provider_profile,
+                "model_override": (
+                    provider.default_model if provider is not None else None
+                ),
+                "transcriber_profile": config.default_transcriber_profile,
+                "output_language": config.recipe_defaults.output_language,
+                "quality_preset": config.recipe_defaults.quality_preset,
+                "style": config.recipe_defaults.style,
+                "screenshot_policy": config.recipe_defaults.screenshot_policy,
+                "config_snapshot": {
+                    "snapshot_version": effective.job_snapshot().snapshot_version,
+                    "values": dict(effective.job_snapshot().values),
+                    "digest": effective.job_snapshot().digest,
+                    "semantic_digest": effective.job_snapshot().semantic_digest,
+                },
+            },
+            client_request_id=correlation_id,
+        )
+        active_runtime = runtime or _default_runtime(
+            workspace_root,
+            current_config_snapshot=effective.job_snapshot(),
+        )
+
+    submission = active_runtime.submit(request)
+    snapshot = active_runtime.get_job(submission.job_id)
+    return _wait_for_submitted_job(active_runtime, snapshot, wait=args.wait)
 
 
 def _produce_video(
@@ -556,23 +796,34 @@ def _produce_video(
         config_snapshot=config_snapshot,
     )
     snapshot = active_runtime.submit_video(request)
-    if args.wait:
-        try:
-            snapshot = active_runtime.wait_job(snapshot.job_id)
-        except KeyboardInterrupt:
-            cancel = getattr(active_runtime, "cancel_job", None)
-            if callable(cancel):
-                try:
-                    cancel(snapshot.job_id)
-                except Exception:
-                    pass
-            raise
-    return snapshot
+    return _wait_for_submitted_job(active_runtime, snapshot, wait=args.wait)
+
+
+def _wait_for_submitted_job(
+    runtime: _VideoRuntime,
+    snapshot: JobSnapshot,
+    *,
+    wait: bool,
+) -> JobSnapshot:
+    if not wait:
+        return snapshot
+    try:
+        return runtime.wait_job(snapshot.job_id)
+    except KeyboardInterrupt:
+        cancel = getattr(runtime, "cancel_job", None)
+        if callable(cancel):
+            try:
+                cancel(snapshot.job_id)
+            except Exception:
+                pass
+        raise
 
 
 def _video_snapshot_result(
     snapshot: JobSnapshot,
     correlation_id: str,
+    *,
+    command: str = "produce video",
 ) -> tuple[ApplicationResult, ExitCode]:
     job = _job_projection(snapshot)
     data: dict[str, object] = {
@@ -598,7 +849,7 @@ def _video_snapshot_result(
         )
         return (
             _failure_result(
-                command="produce video",
+                command=command,
                 correlation_id=correlation_id,
                 mapped=mapped,
                 data=data,
@@ -610,7 +861,7 @@ def _video_snapshot_result(
         mapped = map_error_detail(snapshot.error)
         return (
             _failure_result(
-                command="produce video",
+                command=command,
                 correlation_id=correlation_id,
                 mapped=mapped,
                 data=data,
@@ -628,7 +879,7 @@ def _video_snapshot_result(
         )
         return (
             _failure_result(
-                command="produce video",
+                command=command,
                 correlation_id=correlation_id,
                 mapped=mapped,
                 data=data,
@@ -678,7 +929,7 @@ def _video_snapshot_result(
         )
     return (
         ApplicationResult(
-            command="produce video",
+            command=command,
             correlation_id=correlation_id,
             ok=True,
             data=data,
@@ -1118,8 +1369,10 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
         return f"job {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] in {"artifact", "draft"}:
         return f"{arguments[0]} {arguments[1]}"
-    if len(arguments) >= 2 and arguments[0] == "produce" and arguments[1] == "video":
-        return "produce video"
+    if len(arguments) >= 2 and arguments[0] == "recipe":
+        return f"recipe {arguments[1]}"
+    if arguments and arguments[0] == "produce":
+        return "produce video" if len(arguments) >= 2 and arguments[1] == "video" else "produce"
     return "alltonote"
 
 

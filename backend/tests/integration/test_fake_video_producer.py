@@ -89,6 +89,20 @@ def workspace_root(tmp_path: Path) -> Path:
     return root
 
 
+class _RuntimeHarness:
+    def __init__(self, runtime: object, video_service: object) -> None:
+        self.runtime = runtime
+        self.video_service = video_service
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.runtime, name)
+
+
+def _create_fake_runtime(runtime_module: object, *args: object, **kwargs: object) -> _RuntimeHarness:
+    runtime, service = runtime_module._create_fake_runtime_components(*args, **kwargs)
+    return _RuntimeHarness(runtime, service)
+
+
 @pytest.fixture
 def runtime_factory(
     tmp_path: Path,
@@ -100,7 +114,8 @@ def runtime_factory(
         created += 1
         runtime_module = importlib.import_module("app.runtime")
         calls = runtime_module.FakeCallCounts()
-        runtime = runtime_module.create_fake_runtime(
+        runtime = _create_fake_runtime(
+            runtime_module,
             tmp_path / f"machine-{created}",
             calls=calls,
             **options,
@@ -296,7 +311,7 @@ def test_v2_single_knowledge_note_uses_injected_compiler_and_draft_checkpoint(
     workspace_root: Path,
 ) -> None:
     runtime, calls = runtime_factory()
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     compiler = _FakeV2KnowledgeCompiler()
     service._knowledge_compiler = compiler
     request = VideoProduceRequest(
@@ -359,7 +374,7 @@ def test_v2_recovery_rejects_compiler_binding_drift_before_replay(
     workspace_root: Path,
 ) -> None:
     runtime, calls = runtime_factory()
-    service = runtime._sdk._video_service
+    service = runtime.video_service
 
     class InterruptedCompiler(_FakeV2KnowledgeCompiler):
         def compile(
@@ -413,7 +428,7 @@ def test_v2_recovery_rejects_document_behavior_drift_before_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, calls = runtime_factory()
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     compiler = _FakeV2KnowledgeCompiler()
     service._knowledge_compiler = compiler
     original_assemble = service._assemble
@@ -463,7 +478,7 @@ def test_v2_faithful_and_dual_outputs_commit_one_atomic_bundle(
     dual: bool,
 ) -> None:
     runtime, calls = runtime_factory()
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     knowledge = _FakeV2KnowledgeCompiler()
     faithful = _FakeV2FaithfulCompiler()
     service._knowledge_compiler = knowledge
@@ -552,7 +567,7 @@ def test_v2_preflight_fails_closed_before_external_work(
     expected_code: str,
 ) -> None:
     runtime, calls = runtime_factory()
-    runtime._sdk._video_service._knowledge_compiler = _FakeV2KnowledgeCompiler()
+    runtime.video_service._knowledge_compiler = _FakeV2KnowledgeCompiler()
 
     submitted = runtime.submit_video(request_factory(workspace_root))
     snapshot = runtime.wait_job(submitted.job_id)
@@ -570,7 +585,7 @@ def test_repeated_segment_citations_keep_two_uses_and_one_definition(
     workspace_root: Path,
 ) -> None:
     runtime, _ = runtime_factory()
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     delegate = service._operations
 
     class RepeatedCitationOperations:
@@ -736,7 +751,7 @@ def test_invalid_screenshot_work_never_reaches_screenshot_operation(
     error_code: str,
 ) -> None:
     runtime, calls = runtime_factory()
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     delegate = service._operations
 
     class InvalidDraftOperations:
@@ -850,7 +865,8 @@ def test_crash_after_rename_recovers_after_runtime_reopen_and_new_fence(
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "durable-machine"
     call_log = tmp_path / "external-calls.ndjson"
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         crash_after_commit_once=True,
@@ -865,7 +881,8 @@ def test_crash_after_rename_recovers_after_runtime_reopen_and_new_fence(
         first.wait_job(submitted.job_id)
 
     del first
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         owner_id="process-b",
@@ -922,7 +939,8 @@ def test_current_runtime_reconciles_historical_v1_candidate_after_portable_renam
         "_CANDIDATE_ASSEMBLY_BEHAVIOR",
         historical_behavior,
     )
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         crash_after_commit_once=True,
@@ -963,7 +981,8 @@ def test_current_runtime_reconciles_historical_v1_candidate_after_portable_renam
         "portable-output-profile-v2",
     )
     del first
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         owner_id="v2-commit-process",
@@ -1001,7 +1020,8 @@ def test_restart_after_draft_failure_reuses_transcript_checkpoint(
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "transcript-replay-machine"
     call_log = tmp_path / "transcript-replay-calls.ndjson"
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         crash_operation_once="model",
@@ -1016,7 +1036,8 @@ def test_restart_after_draft_failure_reuses_transcript_checkpoint(
         first.wait_job(submitted.job_id)
 
     del first
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         owner_id="process-b",
@@ -1038,7 +1059,8 @@ def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "draft-replay-machine"
     call_log = tmp_path / "draft-replay-calls.ndjson"
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         crash_operation_once="screenshots",
@@ -1056,7 +1078,8 @@ def test_restart_after_screenshot_failure_reuses_draft_checkpoint(
         first.wait_job(submitted.job_id)
 
     del first
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         owner_id="process-b",
@@ -1096,13 +1119,14 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
         "_CANDIDATE_ASSEMBLY_BEHAVIOR",
         "linked-screenshot-draft-v1",
     )
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         owner_id="legacy-spacing-first",
         clock=lambda: 1_000,
     )
-    service = first._sdk._video_service
+    service = first.video_service
     delegate = service._operations
 
     class AdjacentCitationOperations:
@@ -1202,7 +1226,8 @@ def test_recovered_legacy_draft_spaces_citations_without_repeating_model_work(
     )
     assert VideoService._candidate_assembly_input_hash(request_hash) != old_candidate_hash
     del first
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         call_log_path=call_log,
         owner_id="legacy-spacing-second",
@@ -1312,7 +1337,8 @@ def test_long_external_step_renews_scheduler_lease_cooperatively(
         now_ms[0] += 200_000
 
     calls = runtime_module.FakeCallCounts()
-    runtime = runtime_module.create_fake_runtime(
+    runtime = _create_fake_runtime(
+        runtime_module,
         tmp_path / "heartbeat-machine",
         calls=calls,
         clock=lambda: now_ms[0],
@@ -1347,13 +1373,14 @@ def test_blocking_checkpoint_action_renews_scheduler_lease_in_background(
         now_ms[0] = 400_000
 
     calls = runtime_module.FakeCallCounts()
-    runtime = runtime_module.create_fake_runtime(
+    runtime = _create_fake_runtime(
+        runtime_module,
         tmp_path / "background-heartbeat-machine",
         calls=calls,
         clock=lambda: now_ms[0],
         operation_hooks={"model": block_model_without_cooperative_heartbeat},
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     service._heartbeat_interval_seconds = 0.01
     repository = runtime.job_repository
     original_heartbeat = repository.heartbeat_scheduler_lease
@@ -1392,11 +1419,12 @@ def test_checkpoint_heartbeat_worker_stops_when_action_raises(
         assert background_heartbeat.wait(timeout=2)
         raise failure_type("action failed")
 
-    runtime = runtime_module.create_fake_runtime(
+    runtime = _create_fake_runtime(
+        runtime_module,
         tmp_path / f"heartbeat-{failure_type.__name__}",
         operation_hooks={"model": fail_model_after_heartbeat},
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     service._heartbeat_interval_seconds = 0.01
     repository = runtime.job_repository
     original_heartbeat = repository.heartbeat_scheduler_lease
@@ -1439,13 +1467,14 @@ def test_fenced_background_heartbeat_prevents_checkpoint_and_commit(
             raise action_failure("control flow interrupted")
 
     calls = runtime_module.FakeCallCounts()
-    runtime = runtime_module.create_fake_runtime(
+    runtime = _create_fake_runtime(
+        runtime_module,
         tmp_path / "fenced-heartbeat-machine",
         calls=calls,
         clock=lambda: now_ms[0],
         operation_hooks={"model": fence_during_model},
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     service._heartbeat_interval_seconds = 0.01
     repository = runtime.job_repository
     original_heartbeat = repository.heartbeat_scheduler_lease
@@ -1481,7 +1510,8 @@ def test_takeover_of_running_generate_draft_leaves_no_running_replacement(
 ) -> None:
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "takeover-machine"
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         owner_id="process-a",
         clock=lambda: 1_000,
@@ -1499,7 +1529,8 @@ def test_takeover_of_running_generate_draft_leaves_no_running_replacement(
 
     del first
     calls = runtime_module.FakeCallCounts()
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         calls=calls,
         owner_id="process-b",
@@ -1613,7 +1644,8 @@ def test_submitted_job_survives_independent_runtime_wait(
     runtime_module = importlib.import_module("app.runtime")
     machine_root = tmp_path / "queued-reopen-machine"
     calls = runtime_module.FakeCallCounts()
-    first = runtime_module.create_fake_runtime(
+    first = _create_fake_runtime(
+        runtime_module,
         machine_root,
         calls=calls,
         owner_id="submit-process",
@@ -1627,7 +1659,8 @@ def test_submitted_job_survives_independent_runtime_wait(
     assert calls.download == calls.transcribe == calls.model == calls.commit == 0
 
     del first
-    reopened = runtime_module.create_fake_runtime(
+    reopened = _create_fake_runtime(
+        runtime_module,
         machine_root,
         calls=calls,
         owner_id="wait-process",

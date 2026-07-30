@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -17,6 +18,7 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
+from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
@@ -244,6 +246,408 @@ def test_invalid_video_request_is_one_safe_envelope(
     assert calls.download == calls.transcribe == calls.model == 0
     assert captured.err == ""
     assert captured.out.count("\n") == 1
+
+
+class _GenericCaptureRuntime:
+    def __init__(self) -> None:
+        self.requests: list[ProduceRequest] = []
+        self.video_calls = 0
+        self.wait_calls: list[str] = []
+        self.cancel_calls: list[str] = []
+        self.snapshot = JobSnapshot(
+            job_id="job_generic",
+            state=JobState.QUEUED,
+            cancellation_requested=False,
+            active_attempt_id=None,
+            challenge_id=None,
+            retry_of_job_id=None,
+            result=None,
+            error=None,
+        )
+
+    def submit(self, request: ProduceRequest) -> ProduceSubmission:
+        self.requests.append(request)
+        return ProduceSubmission("job_generic", request.recipe_key, JobState.QUEUED)
+
+    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
+        del request
+        self.video_calls += 1
+        return self.snapshot
+
+    def get_job(self, job_id: str) -> JobSnapshot:
+        assert job_id == "job_generic"
+        return self.snapshot
+
+    def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del event_sink
+        self.wait_calls.append(job_id)
+        return self.snapshot
+
+    def cancel_job(self, job_id: str) -> JobSnapshot:
+        self.cancel_calls.append(job_id)
+        return self.snapshot
+
+
+def test_generic_produce_calls_runtime_submit_once(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _GenericCaptureRuntime()
+
+    code = main(
+        [
+            "produce",
+            "fixture://course",
+            "--recipe",
+            "alltonote.video-producer@2",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=runtime,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert envelope["command"] == "produce"
+    assert runtime.video_calls == 0
+    assert len(runtime.requests) == 1
+    assert runtime.requests[0].recipe_key.recipe_id == "alltonote.video-producer"
+    assert runtime.requests[0].recipe_key.recipe_version == 2
+    assert runtime.requests[0].requested_outputs == ("knowledge-note",)
+
+
+def test_generic_explicit_v2_matches_legacy_v2_job_identity(
+    runtime_factory,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _ = runtime_factory()
+    monkeypatch.setattr(
+        "app.cli.main.new_typed_id",
+        lambda prefix: "corr_018f0000-0000-7000-8000-000000000002",
+    )
+    common = ["--workspace", str(workspace_root), "--json"]
+
+    legacy_code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--recipe-version",
+            "2",
+            *common,
+        ],
+        runtime=runtime,
+    )
+    legacy = json.loads(capsys.readouterr().out)
+    generic_code = main(
+        [
+            "produce",
+            "fixture://course",
+            "--recipe",
+            "alltonote.video-producer@2",
+            *common,
+        ],
+        runtime=runtime,
+    )
+    generic = json.loads(capsys.readouterr().out)
+
+    assert legacy_code == generic_code == 0
+    assert legacy["data"] == generic["data"]
+    assert legacy["job"] == generic["job"]
+    assert legacy["artifacts"] == generic["artifacts"]
+    assert legacy["command"] == "produce video"
+    assert generic["command"] == "produce"
+
+
+def test_generic_literal_video_input_uses_generic_route(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _GenericCaptureRuntime()
+
+    assert main(
+        [
+            "produce",
+            "video",
+            "--recipe",
+            "alltonote.video-course-note@1",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=runtime,
+    ) == 0
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert envelope["command"] == "produce"
+    assert runtime.requests[0].input.value == "video"
+    assert runtime.video_calls == 0
+
+
+def test_generic_literal_video_input_accepts_equals_recipe_option(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _GenericCaptureRuntime()
+
+    assert main(
+        [
+            "produce",
+            "video",
+            "--recipe=alltonote.video-course-note@1",
+            f"--workspace={workspace_root}",
+            "--json",
+        ],
+        runtime=runtime,
+    ) == 0
+    capsys.readouterr()
+
+    assert runtime.requests[0].input.value == "video"
+    assert runtime.video_calls == 0
+
+
+def test_generic_produce_help_does_not_expose_internal_parser_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["produce", "--help"])
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 0
+    assert "usage: alltonote produce " in captured.out
+    assert "_generic" not in captured.out
+
+
+def test_request_file_rejects_conflicting_workspace(
+    tmp_path: Path,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "request.json"
+    path.write_text("{}", encoding="utf-8")
+
+    assert main(
+        [
+            "produce",
+            "--request",
+            str(path),
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=_GenericCaptureRuntime(),
+    ) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "cli_usage_invalid"
+
+
+def test_generic_direct_uses_provider_default_model(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.core.config.model import ProviderProfileConfig, RuntimeConfig
+    from app.runtime_config import effective_runtime_config
+
+    class ConfigService:
+        def effective(self, *, profile: object, cli_overrides: object) -> object:
+            del profile, cli_overrides
+            return effective_runtime_config(
+                RuntimeConfig(
+                    default_workspace=workspace_root,
+                    providers={
+                        "default": ProviderProfileConfig(
+                            "fixture", default_model="model-from-profile"
+                        )
+                    },
+                )
+            )
+
+    runtime = _GenericCaptureRuntime()
+    assert main(
+        [
+            "produce",
+            "fixture://course",
+            "--recipe",
+            "alltonote.video-producer@2",
+            "--json",
+        ],
+        runtime=runtime,
+        config_service=ConfigService(),  # type: ignore[arg-type]
+    ) == 0
+    capsys.readouterr()
+
+    assert runtime.requests[0].parameters["model_override"] == "model-from-profile"
+
+
+def test_request_file_resolves_workspace_in_submitted_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    working = tmp_path / "working"
+    workspace = working / "vault"
+    workspace.mkdir(parents=True)
+    request_path = working / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.video-course-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "source", "value": "fixture://course"},
+                "workspace_ref": "vault",
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = _GenericCaptureRuntime()
+    monkeypatch.chdir(working)
+
+    assert main(["produce", "--request", str(request_path), "--json"], runtime=runtime) == 0
+    capsys.readouterr()
+
+    assert runtime.requests[0].workspace_ref == str(workspace.resolve())
+
+
+def test_generic_request_file_uses_existing_contract(
+    tmp_path: Path,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _GenericCaptureRuntime()
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.video-course-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "source", "value": "fixture://course"},
+                "workspace_ref": str(workspace_root),
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["produce", "--request", str(request_path), "--json"], runtime=runtime) == 0
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert envelope["command"] == "produce"
+    assert len(runtime.requests) == 1
+    assert runtime.requests[0].input.value == "fixture://course"
+
+
+def test_request_file_binds_current_config_snapshot_and_reopens(
+    tmp_path: Path,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.core.config.model import RuntimeConfig
+    from app.runtime import create_fake_runtime
+    from app.runtime_config import effective_runtime_config
+
+    base_config = RuntimeConfig(default_workspace=workspace_root)
+    effective = effective_runtime_config(base_config)
+
+    class ConfigService:
+        def effective(self, *, profile: object, cli_overrides: object) -> object:
+            del profile, cli_overrides
+            return effective
+
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.video-course-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "source", "value": "fixture://course"},
+                "workspace_ref": str(workspace_root),
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {},
+                "client_request_id": "request-file-snapshot",
+            }
+        ),
+        encoding="utf-8",
+    )
+    machine_root = tmp_path / "machine"
+    runtime = create_fake_runtime(machine_root)
+
+    assert main(
+        ["produce", f"--request={request_path}", "--json"],
+        runtime=runtime,
+        config_service=ConfigService(),  # type: ignore[arg-type]
+    ) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    job_id = envelope["data"]["job_id"]
+    events = runtime.job_repository.list_events(job_id)
+
+    assert [event.event_type for event in events] == ["configuration.snapshot.v1"]
+    assert json.loads(events[0].payload_json)["digest"] == effective.digest
+
+    changed_config = replace(
+        base_config,
+        recipe_defaults=replace(base_config.recipe_defaults, style="changed"),
+    )
+    mismatched = create_fake_runtime(
+        machine_root,
+        current_config_snapshot=effective_runtime_config(
+            changed_config
+        ).job_snapshot(),
+    )
+    with pytest.raises(DomainError, match="effective_config_drift"):
+        mismatched.wait_job(job_id)
+    assert mismatched.get_job(job_id).state is JobState.QUEUED
+
+    reopened = create_fake_runtime(
+        machine_root,
+        current_config_snapshot=effective.job_snapshot(),
+    )
+    assert reopened.wait_job(job_id).state is JobState.SUCCEEDED
+
+
+def test_generic_wait_reuses_job_control_and_interrupt_cancels(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _GenericCaptureRuntime()
+
+    def interrupt(job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del job_id, event_sink
+        raise KeyboardInterrupt
+
+    runtime.wait_job = interrupt  # type: ignore[method-assign]
+    code = main(
+        [
+            "produce",
+            "fixture://course",
+            "--recipe",
+            "alltonote.video-course-note@1",
+            "--workspace",
+            str(workspace_root),
+            "--wait",
+            "--json",
+        ],
+        runtime=runtime,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 130
+    assert envelope["error"]["code"] == "interrupted"
+    assert runtime.cancel_calls == ["job_generic"]
 
 
 class _RequestCaptureRuntime:

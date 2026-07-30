@@ -263,6 +263,15 @@ def _fixture(platform: str, name: str) -> dict[str, object]:
     return json.loads((PLATFORM_FIXTURES / platform / name).read_text("utf-8"))
 
 
+class _RuntimeHarness:
+    def __init__(self, runtime: object, video_service: object) -> None:
+        self.runtime = runtime
+        self.video_service = video_service
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.runtime, name)
+
+
 def _create_runtime(
     machine_root: Path,
     platform: str,
@@ -288,7 +297,7 @@ def _create_runtime(
         bridge=_Completion(calls, failure),
         capabilities=LegacyModelCapabilities(),
     )
-    return runtime_module.create_platform_video_runtime(
+    runtime, service = runtime_module._create_platform_video_runtime_components(
         machine_root,
         source=source,
         source_metadata={platform: _fixture(platform, "metadata.json")},
@@ -296,6 +305,7 @@ def _create_runtime(
         owner_id=owner_id,
         clock=(None if now_ms is None else lambda: now_ms),
     )
+    return _RuntimeHarness(runtime, service)
 
 
 def _create_v2_runtime(
@@ -317,7 +327,7 @@ def _create_v2_runtime(
         bridge=_V2Completion(calls, failure),
         capabilities=LegacyModelCapabilities(),
     )
-    return runtime_module.create_platform_video_runtime(
+    runtime, service = runtime_module._create_platform_video_runtime_components(
         machine_root,
         source=source,
         source_metadata={"youtube": _fixture("youtube", "metadata.json")},
@@ -325,6 +335,7 @@ def _create_v2_runtime(
         model_execution_binding=model_binding,
         model_execution_profile=model_profile,
     )
+    return _RuntimeHarness(runtime, service)
 
 
 def _terminate_job_before_model(machine_root: str, job_id: str) -> None:
@@ -335,7 +346,7 @@ def _terminate_job_before_model(machine_root: str, job_id: str) -> None:
         owner_id="terminated-process",
         now_ms=1_000,
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     service._operations = _TerminateBeforeModel(service._operations)
     runtime.wait_job(job_id)
     os._exit(24)
@@ -463,7 +474,7 @@ def test_platform_runtime_shares_one_coordinator_between_v2_compilers(
         Calls(),
         model_binding=_v2_model_binding(),
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
 
     assert (
         service._knowledge_compiler._compiler._coordinator

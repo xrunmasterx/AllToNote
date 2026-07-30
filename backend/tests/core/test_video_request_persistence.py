@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+from app.core.application.produce_service import ProduceService
 from app.core.application.video_service import VideoService
+from app.core.config.model import JobConfigSnapshot
 from app.core.sdk import AllToNoteSDK
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
@@ -18,6 +20,13 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError
+from app.core.recipes.contracts import InputDescriptor, ProduceRequest
+from app.core.recipes.registry import RecipeRegistry
+from app.core.recipes.video.adapter import (
+    VideoRecipeAdapter,
+    adapt_video_produce_request,
+)
+from app.core.recipes.video.descriptor import VIDEO_COURSE_NOTE_V1, VIDEO_PRODUCER_V2
 
 
 def _service(tmp_path: Path) -> tuple[VideoService, SqliteJobRepository]:
@@ -112,7 +121,12 @@ def test_sdk_submit_video_is_direct_queued_durable_boundary(tmp_path: Path) -> N
         client_request_id="sdk-submit",
     )
 
-    submitted = AllToNoteSDK(service).submit_video(request)
+    sdk = AllToNoteSDK(
+        ProduceService(RecipeRegistry(((VIDEO_COURSE_NOTE_V1, VideoRecipeAdapter(service)),))),
+        service,
+        adapt_video_produce_request,
+    )
+    submitted = sdk.submit_video(request)
     stored = repository.get_job(submitted.job_id)
 
     assert submitted.state.value == "queued"
@@ -202,6 +216,130 @@ def test_v2_job_request_round_trips_canonical_outputs_and_bindings(
     assert VideoService._request_hash(request) == VideoService._request_hash(
         canonical_request
     )
+
+
+def test_generic_and_legacy_v1_submission_share_durable_identity(tmp_path: Path) -> None:
+    service, repository = _service(tmp_path)
+    legacy = VideoProduceRequest(
+        request_schema_version=1,
+        workspace_root=Path("C:/vault"),
+        input_value="fixture://course",
+        client_request_id="shared-v1",
+    )
+    generic = ProduceRequest(
+        1,
+        VIDEO_COURSE_NOTE_V1.key,
+        InputDescriptor("source", "fixture://course"),
+        "C:/vault",
+        ("knowledge-note",),
+        client_request_id="shared-v1",
+    )
+
+    legacy_submission = service.submit_video(legacy)
+    generic_submission = VideoRecipeAdapter(service).submit(generic)
+
+    assert generic_submission.job_id == legacy_submission.job_id
+    assert repository.get_job_request(generic_submission.job_id) == repository.get_job_request(
+        legacy_submission.job_id
+    )
+    assert repository.get_job(generic_submission.job_id).request_hash == repository.get_job(
+        legacy_submission.job_id
+    ).request_hash
+    assert VideoService._request_hash(legacy) == VideoService._request_hash(
+        service._load_request(generic_submission.job_id)
+    )
+
+
+def test_generic_and_legacy_v2_submission_share_durable_identity(tmp_path: Path) -> None:
+    service, repository = _service(tmp_path)
+    transcript = TranscriptDocument(
+        "en",
+        (TranscriptSegment("seg_000001", 0, 1_000, "Source text"),),
+    )
+    snapshot_digest = sha256_digest("{}")
+    config_snapshot = JobConfigSnapshot(
+        1,
+        {},
+        snapshot_digest,
+        snapshot_digest,
+    )
+    legacy = VideoProduceRequest(
+        request_schema_version=2,
+        workspace_root=Path("C:/vault"),
+        input_value="https://example.test/video",
+        recipe_id="alltonote.video-producer",
+        recipe_version=2,
+        provider_profile="openai-main",
+        model_override="gpt-test",
+        transcriber_profile="local-whisper",
+        requested_outputs=(
+            VideoDocumentKind.FAITHFUL_EDITION,
+            VideoDocumentKind.KNOWLEDGE_NOTE,
+        ),
+        faithful_language_policy=FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT,
+        client_request_id="shared-v2",
+        principal="agent-a",
+        provided_transcript=transcript,
+        config_snapshot=config_snapshot,
+    )
+    generic = ProduceRequest(
+        1,
+        VIDEO_PRODUCER_V2.key,
+        InputDescriptor("source", "https://example.test/video"),
+        "C:/vault",
+        ("faithful-edition", "knowledge-note"),
+        {
+            "provider_profile": "openai-main",
+            "model_override": "gpt-test",
+            "transcriber_profile": "local-whisper",
+            "faithful_language_policy": "translate-to-output",
+            "provided_transcript": {
+                "language": "en",
+                "segments": [
+                    {
+                        "segment_id": "seg_000001",
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "text": "Source text",
+                    }
+                ],
+            },
+            "config_snapshot": {
+                "snapshot_version": config_snapshot.snapshot_version,
+                "values": dict(config_snapshot.values),
+                "digest": config_snapshot.digest,
+                "semantic_digest": config_snapshot.semantic_digest,
+            },
+        },
+        principal="agent-a",
+        client_request_id="shared-v2",
+    )
+
+    generic_submission = VideoRecipeAdapter(service).submit(generic)
+    legacy_submission = service.submit_video(legacy)
+    restored = service._load_request(generic_submission.job_id)
+
+    assert generic_submission.job_id == legacy_submission.job_id
+    assert restored == legacy
+    assert restored.principal == "agent-a"
+    assert [
+        (event.event_type, json.loads(event.payload_json))
+        for event in repository.list_events(generic_submission.job_id)
+    ] == [
+        (
+            "configuration.snapshot.v1",
+            {
+                "digest": config_snapshot.digest,
+                "semantic_digest": config_snapshot.semantic_digest,
+                "snapshot_version": config_snapshot.snapshot_version,
+                "values": dict(config_snapshot.values),
+            },
+        )
+    ]
+    assert repository.get_job(generic_submission.job_id).request_hash == repository.get_job(
+        legacy_submission.job_id
+    ).request_hash
+    assert VideoService._request_hash(restored) == VideoService._request_hash(legacy)
 
 
 def test_v2_job_request_rejects_modified_recipe_binding(tmp_path: Path) -> None:

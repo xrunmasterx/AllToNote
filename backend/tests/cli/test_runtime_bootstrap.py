@@ -7,6 +7,42 @@ import subprocess
 import sys
 
 
+import pytest
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("recipe", "list", "--json"),
+        ("recipe", "describe", "alltonote.video-producer@2", "--json"),
+    ),
+)
+def test_recipe_discovery_does_not_import_runtime_or_heavy_modules(
+    arguments: tuple[str, ...],
+) -> None:
+    result = subprocess.run(
+        [sys.executable, str(HELPER), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(result.stdout)
+
+    assert report["exit_code"] == 0
+    assert not {
+        "app.runtime",
+        "app.core.application.video_service",
+        "app.core.recipes.video.adapter",
+        "app.adapters.sources.legacy_video",
+        "app.adapters.transcription.legacy_transcriber",
+        "fastapi",
+        "torch",
+        "faster_whisper",
+        "yt_dlp",
+        "openai",
+    } & set(report["imported_modules"])
+
+
 HELPER = Path(__file__).resolve().parents[1] / "helpers" / "report_cli_imports.py"
 
 EXPECTED_LOCK = {

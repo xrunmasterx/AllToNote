@@ -31,6 +31,7 @@ from app.adapters.transcription.legacy_transcriber import (
     LegacyTranscriberAdapter,
     normalize_platform_subtitle,
 )
+from app.core.application.produce_service import ProduceService
 from app.core.application.video_acquisition import (
     StoredAssetRole,
     TranscriptProvenance,
@@ -90,6 +91,13 @@ from app.core.ports.source import (
 )
 from app.core.ports.transcript import MediaInput
 from app.core.ports.transcript import TranscriptPort
+from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
+from app.core.recipes.registry import RecipeRegistry
+from app.core.recipes.video.adapter import (
+    VideoRecipeAdapter,
+    adapt_video_produce_request,
+)
+from app.core.recipes.video.descriptor import VIDEO_DESCRIPTORS
 from app.core.recipes.video.compilation.contracts import (
     CompilationQualityProfile,
     ComposerParserLimitsV1,
@@ -1197,6 +1205,9 @@ class AllToNoteRuntime:
         self._sdk = sdk
         self.job_repository = job_repository
 
+    def submit(self, request: ProduceRequest) -> ProduceSubmission:
+        return self._sdk.submit(request)
+
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
         return self._sdk.submit_video(request)
 
@@ -1208,6 +1219,22 @@ class AllToNoteRuntime:
 
     def cancel_job(self, job_id: str) -> JobSnapshot:
         return self._sdk.cancel_job(job_id)
+
+
+def _create_video_runtime(
+    service: VideoService,
+    repository: SqliteJobRepository,
+) -> AllToNoteRuntime:
+    endpoint = VideoRecipeAdapter(service)
+    registry = RecipeRegistry(
+        (descriptor, endpoint) for descriptor in VIDEO_DESCRIPTORS
+    )
+    sdk = AllToNoteSDK(
+        ProduceService(registry),
+        service,
+        adapt_video_produce_request,
+    )
+    return AllToNoteRuntime(sdk, repository)
 
 
 def _checkpoint_payload_is_valid(payload: bytes) -> bool:
@@ -1238,7 +1265,7 @@ def _read_checkpoint(
     return (storage.root / relative).read_bytes()
 
 
-def create_platform_video_runtime(
+def _create_platform_video_runtime_components(
     machine_root: Path,
     *,
     source: VideoSourcePort,
@@ -1250,7 +1277,7 @@ def create_platform_video_runtime(
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
-) -> AllToNoteRuntime:
+) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
     repository = SqliteJobRepository.open(
@@ -1290,10 +1317,38 @@ def create_platform_video_runtime(
         faithful_compiler=faithful_compiler,
         current_config_snapshot=current_config_snapshot,
     )
-    return AllToNoteRuntime(AllToNoteSDK(service), repository)
+    return _create_video_runtime(service, repository), service
 
 
-def create_local_video_runtime(
+def create_platform_video_runtime(
+    machine_root: Path,
+    *,
+    source: VideoSourcePort,
+    source_metadata: Mapping[str, Mapping[str, object]],
+    model: LegacyModelBinding,
+    model_execution_binding: ModelExecutionBinding | None = None,
+    model_execution_profile: str | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
+    owner_id: str | None = None,
+    local_instance_id: str | None = None,
+    clock: Callable[[], int] | None = None,
+) -> AllToNoteRuntime:
+    runtime, _ = _create_platform_video_runtime_components(
+        machine_root,
+        source=source,
+        source_metadata=source_metadata,
+        model=model,
+        model_execution_binding=model_execution_binding,
+        model_execution_profile=model_execution_profile,
+        current_config_snapshot=current_config_snapshot,
+        owner_id=owner_id,
+        local_instance_id=local_instance_id,
+        clock=clock,
+    )
+    return runtime
+
+
+def _create_local_video_runtime_components(
     machine_root: Path,
     *,
     source: VideoSourcePort,
@@ -1310,7 +1365,7 @@ def create_local_video_runtime(
         [FileAttemptStorage, SqliteJobRepository], ScreenshotPort
     ]
     | None = None,
-) -> AllToNoteRuntime:
+) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
     repository = SqliteJobRepository.open(
@@ -1357,10 +1412,45 @@ def create_local_video_runtime(
         faithful_compiler=faithful_compiler,
         current_config_snapshot=current_config_snapshot,
     )
-    return AllToNoteRuntime(AllToNoteSDK(service), repository)
+    return _create_video_runtime(service, repository), service
 
 
-def create_fake_runtime(
+def create_local_video_runtime(
+    machine_root: Path,
+    *,
+    source: VideoSourcePort,
+    source_metadata: Mapping[str, Mapping[str, object]],
+    transcriber: TranscriptPort,
+    model: LegacyModelBinding,
+    model_execution_binding: ModelExecutionBinding | None = None,
+    model_execution_profile: str | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
+    owner_id: str | None = None,
+    local_instance_id: str | None = None,
+    clock: Callable[[], int] | None = None,
+    screenshot_adapter_factory: Callable[
+        [FileAttemptStorage, SqliteJobRepository], ScreenshotPort
+    ]
+    | None = None,
+) -> AllToNoteRuntime:
+    runtime, _ = _create_local_video_runtime_components(
+        machine_root,
+        source=source,
+        source_metadata=source_metadata,
+        transcriber=transcriber,
+        model=model,
+        model_execution_binding=model_execution_binding,
+        model_execution_profile=model_execution_profile,
+        current_config_snapshot=current_config_snapshot,
+        owner_id=owner_id,
+        local_instance_id=local_instance_id,
+        clock=clock,
+        screenshot_adapter_factory=screenshot_adapter_factory,
+    )
+    return runtime
+
+
+def _create_fake_runtime_components(
     machine_root: Path,
     *,
     calls: FakeCallCounts | None = None,
@@ -1375,7 +1465,7 @@ def create_fake_runtime(
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
     screenshot_requests: tuple[ScreenshotRequest, ...] = (),
     current_config_snapshot: JobConfigSnapshot | None = None,
-) -> AllToNoteRuntime:
+) -> tuple[AllToNoteRuntime, VideoService]:
     call_counts = calls or FakeCallCounts()
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
@@ -1412,7 +1502,41 @@ def create_fake_runtime(
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         current_config_snapshot=current_config_snapshot,
     )
-    return AllToNoteRuntime(AllToNoteSDK(service), repository)
+    return _create_video_runtime(service, repository), service
+
+
+def create_fake_runtime(
+    machine_root: Path,
+    *,
+    calls: FakeCallCounts | None = None,
+    capabilities: VideoPreflightCapabilities | None = None,
+    quality_fail: bool = False,
+    crash_after_commit_once: bool = False,
+    crash_operation_once: str | None = None,
+    call_log_path: Path | None = None,
+    owner_id: str | None = None,
+    local_instance_id: str | None = None,
+    clock: Callable[[], int] | None = None,
+    operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
+    screenshot_requests: tuple[ScreenshotRequest, ...] = (),
+    current_config_snapshot: JobConfigSnapshot | None = None,
+) -> AllToNoteRuntime:
+    runtime, _ = _create_fake_runtime_components(
+        machine_root,
+        calls=calls,
+        capabilities=capabilities,
+        quality_fail=quality_fail,
+        crash_after_commit_once=crash_after_commit_once,
+        crash_operation_once=crash_operation_once,
+        call_log_path=call_log_path,
+        owner_id=owner_id,
+        local_instance_id=local_instance_id,
+        clock=clock,
+        operation_hooks=operation_hooks,
+        screenshot_requests=screenshot_requests,
+        current_config_snapshot=current_config_snapshot,
+    )
+    return runtime
 
 
 def create_fake_runtime_for_workspace(

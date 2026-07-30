@@ -347,6 +347,15 @@ class _CorruptSnapshotBeforeTranscript:
         return acquired
 
 
+class _RuntimeHarness:
+    def __init__(self, runtime: object, video_service: VideoService) -> None:
+        self.runtime = runtime
+        self.video_service = video_service
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.runtime, name)
+
+
 def _create_runtime(
     machine_root: Path,
     *,
@@ -357,7 +366,7 @@ def _create_runtime(
     transcriber: object | None = None,
     screenshot_process_factory: _ScreenshotProcessFactory | None = None,
 ) -> object:
-    factory = getattr(runtime_module, "create_local_video_runtime", None)
+    factory = getattr(runtime_module, "_create_local_video_runtime_components", None)
     assert callable(factory), "Task 16A.1 local runtime composition is missing"
     observed = calls or Calls()
     source = _RecordingSource(
@@ -377,7 +386,7 @@ def _create_runtime(
             screenshot_requests=screenshot_process_factory is not None
         ),
     )
-    runtime = factory(
+    runtime, service = factory(
         machine_root,
         source=source,
         source_metadata={"local": LOCAL_METADATA},
@@ -398,13 +407,12 @@ def _create_runtime(
             )
         ),
     )
-    service = runtime._sdk._video_service
     service._portable = _RecordingPortableGateway(
         service._portable,
         observed,
         call_log,
     )
-    return runtime
+    return _RuntimeHarness(runtime, service)
 
 
 def _request(
@@ -446,7 +454,7 @@ def _terminate_after_transcript(
         owner_id="terminated-process",
         now_ms=1_000,
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     service._operations = _TerminateBeforeModel(service._operations)
     runtime.wait_job(job_id)
     os._exit(24)
@@ -567,7 +575,7 @@ def test_valid_local_screenshot_uses_snapshot_once_and_checkpoints_verified_webp
         calls=calls,
         screenshot_process_factory=process_factory,
     )
-    storage = runtime._sdk._video_service._attempt_storage
+    storage = runtime.video_service._attempt_storage
     original_resolve = storage.resolve_asset
     resolves = 0
 
@@ -655,7 +663,7 @@ def test_screenshot_cleanup_failure_never_checkpoints_accepted_asset(
         calls=calls,
         screenshot_process_factory=process_factory,
     )
-    storage = runtime._sdk._video_service._operations._storage
+    storage = runtime.video_service._operations._storage
 
     def fail_cleanup(*_args: object, **_kwargs: object) -> None:
         raise OSError("private cleanup path")
@@ -703,7 +711,7 @@ def test_restart_after_screenshot_checkpoint_does_not_run_ffmpeg_again(
             screenshot_policy=ScreenshotPolicy.ON_DEMAND,
         )
     )
-    service = first._sdk._video_service
+    service = first.video_service
     original_assemble = service._assemble
     linked_drafts: list[bytes] = []
     linked_asset_ids: list[tuple[str, ...]] = []
@@ -767,7 +775,7 @@ def test_plan_mismatched_screenshot_checkpoint_fails_before_candidate_commit(
             screenshot_policy=ScreenshotPolicy.ON_DEMAND,
         )
     )
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     original_assemble = service._assemble
 
     def crash_after_screenshot_checkpoint(value: object) -> object:
@@ -842,7 +850,7 @@ def test_pre16a3_candidate_checkpoint_is_rebuilt_without_repeating_paid_work(
         screenshot_process_factory=process_factory,
     )
     submitted = first.submit_video(request)
-    service = first._sdk._video_service
+    service = first.video_service
     original_assemble = service._assemble
     original_validate = service._validate_candidate
 
@@ -924,7 +932,7 @@ def test_pre16a3_candidate_checkpoint_is_rebuilt_without_repeating_paid_work(
         now_ms=302_001,
         screenshot_process_factory=process_factory,
     )
-    second_service = second._sdk._video_service
+    second_service = second.video_service
     original_after_commit = second_service._operations.after_portable_commit
 
     def crash_after_rename(result: object) -> None:
@@ -1024,7 +1032,7 @@ def test_restart_before_screenshot_checkpoint_rebuilds_identical_plan(
         screenshot_process_factory=process_factory,
     )
     first_plans: list[tuple[object, ...]] = []
-    first_operations = first._sdk._video_service._operations
+    first_operations = first.video_service._operations
     first_operations._screenshot_adapter = _RecordingScreenshotAdapter(
         first_operations._screenshot_adapter, first_plans
     )
@@ -1054,7 +1062,7 @@ def test_restart_before_screenshot_checkpoint_rebuilds_identical_plan(
         screenshot_process_factory=process_factory,
     )
     recovered_plans: list[tuple[object, ...]] = []
-    recovered_operations = recovered._sdk._video_service._operations
+    recovered_operations = recovered.video_service._operations
     recovered_operations._screenshot_adapter = _RecordingScreenshotAdapter(
         recovered_operations._screenshot_adapter, recovered_plans
     )
@@ -1123,7 +1131,7 @@ def test_corrupted_snapshot_is_rejected_before_transcriber_model_or_public_path_
 ) -> None:
     calls = Calls()
     runtime = _create_runtime(tmp_path / "corrupt-machine", calls=calls)
-    service = runtime._sdk._video_service
+    service = runtime.video_service
     service._operations = _CorruptSnapshotBeforeTranscript(service._operations)
     submitted = runtime.submit_video(
         _request(local_video, workspace_root, "local-corrupt-snapshot")

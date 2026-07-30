@@ -1501,7 +1501,7 @@ Step Attempt
 3. 基线无法复现或失败无法归因；
 4. migration 可能丢旧 Job、Result、Checkpoint 或 Artifact 引用；
 5. Codex client 风险没有失败测试却准备大改 transport；
-6. 开发、CI、EXE SQLite 版本不一致或仍为 3.50.4；
+6. 从 Wave 2 并发 C0 起，开发、CI、EXE SQLite 版本不一致或仍为 3.50.4；该条件不阻塞不改变 schema、不启用多连接 WAL 或并发执行的 Wave 1 X0-A；
 7. per-job fencing 未完成就删除全局串行保护；
 8. 通用抽象只有一个真实消费者；
 9. Engine leader 再次等同于单执行者；

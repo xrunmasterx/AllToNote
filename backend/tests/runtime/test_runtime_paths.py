@@ -12,6 +12,8 @@ from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegis
 from app.cli.main import main
 from app.core.domain.video import VideoProduceRequest
 from app.core.errors import DomainError
+from app.core.recipes.contracts import InputDescriptor, ProduceRequest
+from app.core.recipes.video.descriptor import VIDEO_COURSE_NOTE_V1
 from app.runtime import create_fake_runtime, create_fake_runtime_for_workspace
 from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
@@ -179,6 +181,36 @@ def test_read_only_compatible_workspace_gets_no_machine_state_files(
     assert instance.machine_root.is_relative_to(paths.workspace_machine_parent)
     assert not tuple(workspace.rglob("jobs.sqlite"))
     assert not tuple(workspace.rglob("workspace-instances.json"))
+
+
+def test_generic_and_legacy_runtime_submit_share_identity_after_reopen(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "generic-runtime-machine"
+    workspace = _workspace(tmp_path, "Vault generic runtime")
+    first = create_fake_runtime(machine_root)
+    generic = ProduceRequest(
+        1,
+        VIDEO_COURSE_NOTE_V1.key,
+        InputDescriptor("source", "fixture://course"),
+        str(workspace),
+        ("knowledge-note",),
+        client_request_id="runtime-generic-identity",
+    )
+    legacy = VideoProduceRequest(
+        request_schema_version=1,
+        workspace_root=workspace,
+        input_value="fixture://course",
+        client_request_id="runtime-generic-identity",
+    )
+
+    generic_submission = first.submit(generic)
+    legacy_snapshot = first.submit_video(legacy)
+    reopened = create_fake_runtime(machine_root)
+
+    assert generic_submission.job_id == legacy_snapshot.job_id
+    assert reopened.get_job(generic_submission.job_id).job_id == generic_submission.job_id
+    assert reopened.wait_job(generic_submission.job_id).result is not None
 
 
 def test_copied_workspace_does_not_copy_a_live_job(tmp_path: Path) -> None:
