@@ -2,8 +2,10 @@
 
 > 来源：本目录 spec.md
 > 任务数：9
-> 前置：产品需求已触发；Task 3–9 的生产实现必须等待 Wave 0–4 全部通过；Task 1 和 Task 2 仅可按 Wave 2 提前执行只读 characterization
+> 前置：2026-07-30 起本阶段 deferred；当前 Video 三样本 Pilot 固定单活跃 Job。只有单 Job 内部真实 model fan-out 暴露隔离问题时才条件式执行 Task 1；Task 2–9 等待可信复用后的产品与技术 re-admission
 > 原则：先证明正确，再增加并发；一次只开启一个能力层
+
+当前阶段入口：[`Video 三样本 Pilot`](../../video-dogfood-validation/spec.md)。本任务清单保留为后续技术规格，不得把“历史需求已触发”解释为当前自动开工授权。
 
 ## Task 1: [ ] 修复模型客户端并发正确性基线
 

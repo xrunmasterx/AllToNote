@@ -1,10 +1,12 @@
 # Feature: Local Parallel Production
 
 - 日期：2026-07-19
-- 状态：产品需求已触发；生产实现受 Wave 0–4 Gate 阻塞
+- 状态：技术设计保留；2026-07-30 起 deferred，等待 Video 可信复用后的产品 re-admission
 - 目标：在保持 CLI-first、无常驻重型服务和可恢复语义的前提下，交付同一 Workspace 多 Job、多 Agent 的高吞吐执行
 
 ## 0. 结论
+
+> 2026-07-30 admission 更新：本规格不属于当前 [`Video 三样本 Pilot`](../../video-dogfood-validation/spec.md) 关键路径。首阶段固定单活跃 Job；只有现有单 Job 内部真实 model fan-out 暴露 turn 隔离问题时，才条件式执行 Task 1 的最小 characterization/fix。Task 2 以及多 Job/Engine Tasks 3–9 等待可信复用后出现真实并发/后台瓶颈并重新评审。本更新调整实施顺序，不删除下述技术设计和正确性 Gate。
 
 当前实现的强项是 durable Job、Checkpoint、fencing、crash/reopen 和避免重复昂贵操作；弱项是同一 Workspace 的执行吞吐基本等于 1。
 

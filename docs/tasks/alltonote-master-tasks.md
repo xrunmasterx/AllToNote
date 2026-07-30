@@ -11,15 +11,15 @@ upstream:
 downstream:
   - ../superpowers/plans/
 implementation_status: live-handoff-and-progress-source
-last_verified_at: 2026-07-20
+last_verified_at: 2026-07-30
 ```
 
 - 文档类型：跨阶段总任务与交接入口
 - 状态：当前有效
-- 最后核验：2026-07-20
+- 最后核验：2026-07-30
 - 文档权威入口：[`docs/README.md`](../README.md)
 - 文档主工作树：`G:\AllToNote`（`master`）
-- 当前实现工作树：`G:\AllToNote-video-producer`（`codex/alltonote-video-producer`）
+- 当前阶段工作树：`G:\.worktrees\AllToNote\video-dogfood-validation`（`codex/video-dogfood-validation`）
 
 本文用于让下一位 AI 在不丢失架构上下文、不破坏未提交成果、不重复已经通过的工作前提下继续开发。本文记录执行优先级和状态，但不高于已发布 iwiki 合同、Knowledge Compiler 总体架构和适用下位设计。
 
@@ -52,57 +52,62 @@ last_verified_at: 2026-07-20
 ```powershell
 git -C G:\AllToNote status --short
 git -C G:\AllToNote branch --show-current
-git -C G:\AllToNote-video-producer status --short
-git -C G:\AllToNote-video-producer branch --show-current
+git -C G:\.worktrees\AllToNote\video-dogfood-validation status --short
+git -C G:\.worktrees\AllToNote\video-dogfood-validation branch --show-current
+git -C G:\.worktrees\AllToNote\iwiki-readonly-client status --short
 ```
 
 当前已知事实：
 
 - `G:\AllToNote` 是文档主工作树，分支为 `master`。
-- `G:\AllToNote-video-producer` 是实现 worktree，分支为 `codex/alltonote-video-producer`。
-- 文档主工作树已有多份已修改/未跟踪设计、计划、Research、ADR、Acceptance 和 tasks，均属于本次交接成果。
-- 实现 worktree 有大量未提交、未跟踪代码和测试，属于当前开发成果。
+- `G:\.worktrees\AllToNote\video-dogfood-validation` 是当前阶段 worktree，分支为 `codex/video-dogfood-validation`。
+- `G:\.worktrees\AllToNote\iwiki-readonly-client` 是独立 iWiki 只读 CLI worktree，不属于当前 Dogfood 依赖。
+- 历史路径 `G:\AllToNote-video-producer` 已不存在，也没有残留 Git worktree 注册，不得继续把它写成活跃路径。
+- `G:\AllToNote` 中未跟踪的 `AGENTS.md` 与 `config/` 是用户本地内容，不得复制、提交、移动或清理。
 - 不得使用 `git reset --hard`、`git checkout --`、递归删除或批量覆盖。
 - 未经用户明确授权，不 stage、commit、push、合并或移动分支。
 
 验收：执行者先报告工作树事实和计划触碰的文件，再进行修改。
 
-### HANDOFF-03：恢复测试基线
+### HANDOFF-03：确认已验收基线，再由真实 Dogfood 建立新基线
 
-- 状态：`completed on 2026-07-16; rerun before new code changes`
+- 状态：`X0-A accepted on 2026-07-30; Dogfood technical/user gate repaired 3/3; reliability gap retained`
 - 优先级：P0
 
-最近一次 Video Producer 完整回归：
+X0-A 最终全量回归：
 
 ```text
-1731 passed
+1906 passed
 2 skipped
+1 warning
 3 subtests passed
-0 failed
 ```
 
-独立定向审查回归：
+Windows 本地视频 smoke：
 
 ```text
-181 passed
-未发现可复现 P0/P1
+1 passed, 14 deselected, 1 warning
+model=tiny; device=cpu; compute_type=int8
+ffmpeg=8.1.2
 ```
 
-建议命令：
+权威证据：[`Recipe X0-A Task 8 验收报告`](../acceptance/2026-07-30-recipe-x0a-task-8.md)。`tiny` 只证明安装/运行，不是 Dogfood 的质量模型。
+
+当前阶段按 [`Video 三样本 Pilot tasks`](../design-docs/video-dogfood-validation/tasks.md) 使用已冻结的 `V01` 至 `V03`。在真实基线前不得先重写产品链路。代码修改开始前，在阶段工作树使用声明的 Python 环境运行受影响测试和完整回归：
 
 ```powershell
-cd G:\AllToNote-video-producer
-.\.venv\Scripts\python.exe -m pytest -q
+cd G:\.worktrees\AllToNote\video-dogfood-validation
+python -m pytest -q
 git diff --check
 ```
 
-若基线失败：先判断是环境、外部依赖还是代码回归；不要在原因不明时继续新功能。
+若命令依赖尚未准备，必须记录为环境前置而不是伪造测试结果。若基线失败，先判断是环境、外部平台还是代码回归；不要在原因不明时继续新功能。
 
 ## 2. 当前总体进度
 
 | 能力域 | 状态 | 当前事实 |
 |---|---|---|
-| 文档控制面与详细设计 | `completed for current roadmap` | 18 个正式设计 ID、13 份新增实施计划、关系/替代矩阵、Research、ADR 和验收摘要已建立 |
+| 文档控制面与详细设计 | `completed for current roadmap` | 18 个正式架构设计 ID、1 个阶段价值验证 ID、13 份新增实施计划、关系/替代矩阵、Research、ADR 和验收摘要已建立 |
 | 产品与架构基线 | `confirmed` | AllToNote 是上层知识编译/积累平台；Production 是用例，Video/Article/Document/Codebase/Personal 是并列 Recipe；CLI/Desktop/MCP 共享 ProduceService；所有当前路线阶段已有下位设计 |
 | iwiki Portable 消费/提交基础 | `implemented foundation` | AllToNote Bundle 已通过真实 iwiki semantic validation 和 commit |
 | Knowledge Compiler Core | `implemented foundation` | Job、Attempt、Checkpoint、ExternalOperation、ModelExecutor、Quality、Bundle 基础已建立 |
@@ -113,20 +118,21 @@ git diff --check
 | Runtime CLI / Feature Pack 产品面 | `Wave 1A complete; later waves pending` | RCP-00..07 / Wave 1A 已完成并有验收证据；Pack、完整 doctor/repair、Desktop Resolver、clean-machine/分发仍待实现 |
 | Wave 0 基线与权威收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；原 trailer 的 `3a75d0e410...` 为已记录的抄录错误；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
 | Recipe X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；范围止于 submission/control-plane 接缝，不包含数据面迁移或多 Job 并发 |
+| Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原用户结果 V01/V02 PASS、V03 FAIL；Evidence 默认呈现与跨拓扑术语修正后新 V03 用户 PASS；不能外推为 10 样本、字幕、本地文件、长视频或干净安装已验证 |
 | Recipe X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同抽取 Result/Artifact/Repository/atomic commit、迁移与恢复边界，不得用伪消费者或纸面抽象代替 |
 | Vault 选择/文件树/Markdown 阅读/搜索 | `design complete; implementation pending` | Core/CLI/Desktop 详细设计和计划已完成，目标闭环尚未实现 |
 | Review/Publisher | `design complete; implementation pending` | 审批 hash、PublishPlan、personal/common 权限与失败语义已设计 |
 | AgentExecutor | `design complete; implementation pending` | Codebase/UE5 所需受控 AgentExecutor/ExecutionGrant 尚未实现 |
 | Thin Desktop | `design complete; implementation pending` | Desktop API、Runtime Resolver、Vault UI 与发布 Gate 均待实现；旧 BiliNote UI 不等于目标架构 |
 | Knowledge MCP | `design complete; implementation pending` | 与 Production MCP 分离；默认 published-only stdio server |
-| Engine/Production MCP | `demand triggered; implementation blocked by Wave 0-4` | 高并行、批量后台执行和本地 Agent 调度已构成真实需求；但必须依次完成 Wave 0、X0-A、C0、真实 Document/PPT + X0-B、Artifact/Review/Publisher 后才能实施 |
+| Engine/Production MCP | `deferred; re-admission requires product and technical evidence` | 设计保留；当前单 Job Dogfood 不需要 Engine。只有可信复用后出现真实多 Job/后台瓶颈，且模型 turn、SQLite 与 per-job authority Gate 可证明时才重新 admission |
 | Article/Wiki/PDF/PPT Recipe | `design complete; implementation pending` | 可先使用 foreground durable Job，不依赖 Engine |
 | UE5/Codebase/Personal Recipe | `design complete; implementation pending/deferred by gates` | Code prototype等待 Recipe 合同验证；Personal manual MVP 可先做，scheduler 等 Engine |
 | 网站账号/邀请/下载/设备/公共知识 | `design complete; implementation deferred` | 网站不保存个人 Markdown，等待本地产品和合规 Gate |
 | Windows 正式分发 | `design complete; implementation pending` | 仍缺签名安装、Pack、升级、回滚、卸载和 clean-machine E2E |
 | macOS Tier 2 | `designed; deferred` | Windows 闭环及共享合同稳定后进行签名/notarization/E2E |
 
-直观判断：**当前路线的设计工作已经补齐，但产品实现远未整体完成。** 已经较成熟的是 Portable/Model/Video 长视频编译内核；尚未形成正式用户产品闭环的是 Runtime/Pack 分发、Vault/Desktop、Review/Publisher、Knowledge MCP、其他 Recipe、Windows 安装与网站。不要把“18 个设计都有计划”误报成“18 个能力已经可用”。
+直观判断：**当前路线的设计工作已经补齐，但产品实现远未整体完成。** 已经较成熟的是 Portable/Model/Video 长视频编译内核；尚未证明的是用户是否愿意保留和重复使用结果。不要把“架构设计都有计划”误报成“产品价值或对应能力已经可用”。
 
 ## 3. 已完成任务：不要重复开发
 
@@ -260,12 +266,34 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 
 任务只能在前置 Gate 成立后进入。一个任务完成后更新本文状态和验收证据。
 
+### VALUE-VIDEO-01：Video 三样本 Pilot
+
+- 状态：`reliability gap; repaired system/user value 3/3`
+- 优先级：历史 P0；Pilot 已关闭
+- 工作树：`G:\.worktrees\AllToNote\video-dogfood-validation`
+- 分支：`codex/video-dogfood-validation`
+- 设计：[`Video 三样本 Pilot 规格`](../design-docs/video-dogfood-validation/spec.md)
+- 任务：[`Video 三样本 Pilot 任务`](../design-docs/video-dogfood-validation/tasks.md)
+- 样本：[`V01–V03 冻结登记`](../design-docs/video-dogfood-validation/samples.md)
+
+范围：
+
+1. 用户已冻结 `V01` 至 `V03` 三个 Bilibili 短视频，不再提供额外校准集或正式样本；
+2. 冻结 Runtime 字幕发现优先、`faster-whisper small` CPU/int8 回退、Codex app-server + `gpt-5.6-sol`、单活跃 Job和 CLI-first Golden Path；
+3. 先建立可复现源码环境，再按顺序运行 `V01`、`V02`、`V03`，不得先扩架构；
+4. 任一样本失败时每轮只修复首要根因，最多两轮，并分开记录首次/修复后结果；
+5. 系统链路与用户价值分别以 `3/3` 报告；7 天保留作为后续观察，不阻塞三份技术结果；
+6. 明确 `3/3` 不能外推为原 `8/10`、字幕成功、本地文件、长视频、干净 Windows 或多用户验证。
+
+非目标：Document/PPT、完整 C0、多 Job、Engine、Publisher、Desktop GUI、多 Provider、自动 iWiki 发布、正式安装器与完全离线模型。
+
+完成决策：首次系统/用户价值均 `3/3` 时也只判 Pilot PASS，由用户显式决定是否扩大验证或进入可信复用；首次不足但修复后 `3/3` 时先报告可靠性缺口；修复后仍不足 `3/3` 时判 Pilot FAIL 并停止扩张。
+
 ### RELEASE-VIDEO-01：收敛 Video Producer 发布矩阵
 
 - 状态：`pending`
-- 优先级：P0
-- 建议作为 Wave 0 的 G0-1..G0-6 全部关闭后的首个 Video 发布任务；当前不得先于 Wave 0 收敛执行
-- 依赖：`HANDOFF-01` 至 `HANDOFF-03`，以及 Wave 0 G0-1..G0-6 全部 PASS
+- 优先级：P1，作为 `VALUE-VIDEO-01` 暴露真实发布缺口时的受控技术收敛来源，不再独立于产品证据自动启动
+- 依赖：`HANDOFF-01` 至 `HANDOFF-03`、Wave 0 PASS，以及 `VALUE-VIDEO-01` 的真实基线证据
 - 设计：
   - [`Video Producer`](../superpowers/specs/2026-07-14-alltonote-video-producer-design.md)
   - [`Portable Artifact`](../superpowers/specs/2026-07-14-alltonote-portable-artifact-source-bundle-design.md)
@@ -465,20 +493,20 @@ alltonote vault index-status
 ### RECIPE-CONTRACT-01：分阶段建立 X0-A，并由真实 Document/PPT 驱动 X0-B
 
 - 状态：`design completed; X0-A Tasks 1-8 accepted; X0-B pending`
-- 优先级：P1
-- 依赖：X0-A 只能在 Wave 0 的 G0-1..G0-6 全部关闭后开始；X0-B 还依赖并发正确性 C0 和真实 Document/PPT 第二消费者；两者都不依赖 Engine、Desktop 或公共插件 SDK
+- 优先级：P2，等待 Video 单次价值与可信复用
+- 依赖：X0-A 已完成；X0-B 必须由可信复用后的一个真实 born-digital PDF 第二消费者驱动。串行 foreground 纵切不把完整 C0 作为逻辑前置；若实现触及并发模型 turn、多连接 SQLite 或多 Job authority，则先关闭对应 C0 Gate
 - 设计：[`REC-CONTRACT-001`](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md)
 - 逐步计划：[`Recipe 最小扩展合同实施计划`](../superpowers/plans/2026-07-18-alltonote-recipe-extension-contract-implementation-plan.md)
 
 范围：X0-A 只建立 Recipe identity/descriptor/input/request/submission、submit-only endpoint、静态官方 Registry、薄 ProduceService 与 Video adapter；CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。X0-A 不修改 SQLite schema、legacy request/result wire、hash、config snapshot、Checkpoint、Portable 或 atomic commit，也不清除 Job/Repository 数据面的 Video-specific 类型。
 
-分阶段 Gate：X0-A 先证明 Video 零语义变化以及 legacy/generic `produce` 共用 canonical request、Job identity、hash 和 config snapshot；C0 随后关闭并发正确性；X0-B 必须由 Video 与最小真实 Document/PPT 纵切共同抽取 Result、Artifact、Repository、atomic commit、durable query、迁移和恢复边界。Document/PPT 不得在 X0-B 的 legacy dual-read、migration、atomicity、恢复和 import Gate 通过前合入；Article/Wiki 后续再验证第三类来源，全部通过前不冻结公共插件 SDK。
+分阶段 Gate：X0-A 已证明 Video 零语义变化以及 legacy/generic `produce` 共用 canonical request、Job identity、hash 和 config snapshot。当前先完成 Video 单次价值与可信复用；随后由 Video 与一个最小真实 born-digital PDF 纵切共同抽取 Result、Artifact、Repository、atomic commit、durable query、迁移和恢复边界。PDF 不得在 X0-B 的 legacy dual-read、migration、atomicity、恢复和 import Gate 通过前合入；Article/Wiki 后续再验证第三类来源，全部通过前不冻结公共插件 SDK。
 
 ### ENGINE-01：按需 Engine 与 Production MCP
 
-- 状态：`demand triggered; production implementation blocked by Wave 0-4`
-- 优先级：P2
-- 依赖：固定硬依赖链 `Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`；需求触发不等于实现就绪，Engine 不得提前成为 foreground CLI 或 Recipe 的依赖
+- 状态：`deferred; product re-admission and technical gates required`
+- 优先级：P3
+- 依赖：Video 可信复用后出现被测用户的真实多 Job、detach 或后台执行瓶颈；同时完成模型 turn 隔离、SQLite 版本/并发策略、per-job authority、恢复和零重复副作用 Gate。Engine 不得提前成为 foreground CLI 或 Recipe 的依赖
 - 设计：[`ENGINE-001`](../superpowers/specs/2026-07-18-alltonote-engine-production-mcp-design.md)、[`ADR-0001`](../decisions/ADR-0001-machine-state-outside-vault.md)
 - 条件式计划：[`Engine 与 Production MCP 实施计划`](../superpowers/plans/2026-07-18-alltonote-engine-production-mcp-implementation-plan.md)
 
@@ -499,7 +527,7 @@ alltonote vault index-status
 
 - 状态：`design completed; implementation pending`
 - 优先级：P3
-- 依赖：X0-A、C0、真实 Document/PPT + X0-B、Portable/Runtime；调研可与 Document 并行，正式合入位于 Document/X0-B 之后；MVP 可用 foreground durable Job，不依赖 Engine
+- 依赖：Video 可信复用、一个真实 PDF + X0-B、Portable/Runtime；调研可独立进行，正式合入位于 PDF/X0-B 之后；MVP 可用 foreground durable Job，不依赖 Engine
 - 设计：[`REC-WEB-001`](../superpowers/specs/2026-07-18-alltonote-article-wiki-recipe-design.md)
 - 逐步计划：[`Article / Wiki Recipe 实施计划`](../superpowers/plans/2026-07-18-alltonote-article-wiki-recipe-implementation-plan.md)
 
@@ -508,8 +536,8 @@ alltonote vault index-status
 ### RECIPE-DOC-01：PPT/PDF/OCR Recipe
 
 - 状态：`design completed; implementation pending`
-- 优先级：P2
-- 依赖：X0-A 与 C0；作为 Video 之后驱动 X0-B 的真实第二消费者，可与 Web 调研并行，但必须使用真实 Document/PPT 纵切并先于 Web 合入
+- 优先级：P2，Video 可信复用后的第二来源
+- 依赖：X0-A、Video 单次价值 Gate 与 Video 可信复用 Gate；首个纵切只使用一个真实 born-digital PDF 驱动 X0-B。串行 foreground 实现不依赖完整 C0；若触及适用并发边界则先关闭对应 Gate
 - 设计：[`REC-DOC-001`](../superpowers/specs/2026-07-18-alltonote-document-recipe-design.md)
 - 逐步计划：[`Document Recipe 实施计划`](../superpowers/plans/2026-07-18-alltonote-document-recipe-implementation-plan.md)
 
@@ -661,6 +689,8 @@ alltonote vault index-status
 - 当前 tracked diff 通过 `git diff --check`；
 - README、覆盖矩阵和本清单均采用固定硬依赖链“Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine”；Engine 需求已触发，但生产实现仍被 Wave 0-4 阻塞。
 
+历史说明：上条是 2026-07-18 审计当时的结论，不改写其完成记录。2026-07-30 的第一性原理复核已由 [`VALUE-VIDEO-01`](#value-video-01video-dogfood-单次价值验证) 局部取代“X0-A 后自动进入 C0”的执行顺序；旧技术设计保留，但当前 admission 先受 Video 单次价值与可信复用 Gate 约束。
+
 ## 7. 明确暂不做
 
 在对应 Gate 前，不得擅自加入：
@@ -695,37 +725,41 @@ alltonote vault index-status
 
 在没有新的用户优先级覆盖时：
 
-1. 保留 Wave 1A 完成事实、未跟踪本地资产与验收证据；未经用户授权不得 push、merge 到共享分支或发布；
-2. Wave 0 已于 2026-07-21 通过；保持实际权威基线 `3a75d0eb921...`、实现集成提交 `066884da431...`、stable patch-id `9ca7ee7109ecdbbba7ba24526355e36a6ca7fabd` 和集成后测试证据可追溯；
-3. X0-A Tasks 1–8 已完成；保持其边界为 submission/control-plane 接缝和单一 `produce`，不发布活跃 `add` 或独立 `run`，也不把它解释为并发或数据面通用化完成；
-4. X0-A 后完成并发正确性 C0，再由最小真实 Document/PPT 纵切驱动 X0-B，不能用伪消费者提前抽象数据面；
-5. X0-B 后完成开放 Artifact 与 Review/Publisher；Engine 的产品需求虽已触发，生产实现仍必须等该硬依赖链全部完成；
-6. AgentExecutor 与 Thin Desktop 保持 pending，按各自前置 Gate 推进，不与 X0-A 或 Engine 偷跑合并。
+1. 保留 Wave 1A、Wave 0、X0-A 的完成事实与验收证据；不把 X0-A 解释为并发或数据面通用化完成；
+2. 使用 `codex/video-dogfood-validation` 和外置 worktree，不触碰 `master` 的 `AGENTS.md`、`config/` 或独立 iWiki 分支；
+3. `V01` 至 `V03` 已完成：首次系统 `2/3`，链路修复后系统 `3/3`；原用户价值 V01/V02 PASS、V03 FAIL，术语修正后 V03 用户 PASS，修正后用户价值 `3/3`；历史结果不回写；
+4. canonical Draft/EvidenceSet 继续作为审计权威；默认 `draft show` 使用已验证的干净阅读投影，核验时显式选择 `--presentation audit`；
+5. 跨样本 ASR 专有名词修正已在 V02 DIRECT 与 V03 MAP_COMPOSE 客观复验通过，未使用私有字符串替换表；
+6. 当前 Pilot 任务已关闭；用户已显式选择按最小范围进入 Video 可信复用验证，不扩大 Video 样本，也不自动启动其他阶段；
+7. 当前不启动 Document、完整 C0、Review/Publisher、Engine、AgentExecutor、Thin Desktop 或公共插件 SDK。
 
-Wave 1A、Wave 0 与 X0-A 均已完成。当前唯一允许的主线是 `C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。
+当前唯一允许的主线是 `三样本 Pilot -> Video 可信复用验证 -> 一个 born-digital PDF + X0-B -> 按真实瓶颈重新 admission 后续能力`。
 
 ### 9.2 推荐执行波次
 
 ```mermaid
 flowchart TD
     W0["Wave 0：PASS（2026-07-21）"] --> X0A["Wave 1：X0-A PASS（2026-07-30）"]
-    X0A --> C0["Wave 2：并发正确性 C0 pending"]
-    C0 --> DX0B["Wave 3：真实 Document/PPT + X0-B pending"]
-    DX0B --> ARP["Wave 4：开放 Artifact + Review/Publisher pending"]
-    ARP --> EN["Wave 5：Engine + Production MCP（需求已触发，实现受阻）"]
-    ARP --> AX["AgentExecutor pending"]
-    ARP --> TD["Thin Desktop pending"]
+    X0A --> VD["Video Pilot：修正后系统/用户价值 3/3"]
+    VD --> DEC["用户已决定继续"]
+    DEC --> VR["Video 可信复用验证"]
+    VR --> PDF["一个 born-digital PDF + 最小 X0-B"]
+    PDF --> ADMIT{"真实瓶颈重新 admission"}
+    ADMIT --> C0["适用的并发正确性 / C0"]
+    ADMIT --> ARP["最小 Review / Publisher"]
+    ADMIT --> EN["Engine / Production MCP"]
 ```
 
 执行约束：
 
-- 这是硬依赖链，不再使用 Engine 触发决策菱形：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。
-- Wave 1A 与 Wave 0 均已完成；Wave 0 的权威文档来源、实现集成提交和集成后测试记录见 2026-07-21 PASS 验收报告。
-- X0-A Tasks 1–8 已验收；X0-B 仍为 pending；X0-B 必须由真实 Document/PPT 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
+- Wave 1A、Wave 0 与 X0-A 均已完成；历史证据继续有效。
+- Pilot 的 `3/3` Gate、数据边界、时间盒和停止条件以本阶段 spec/tasks 为准，不得测试后重写或外推为原 `8/10`。
+- X0-B 仍为 pending，必须由可信复用后的一个真实 born-digital PDF 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
 - CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。
-- Engine 的高并行、批量后台执行和本地 Agent 调度需求已经触发，但触发不等于实现就绪；Wave 0-4 未完成前不得实施 Engine production lifecycle。
+- 当前单 Job Gate 不需要完整 C0；只有内部 fan-out 的 turn 隔离问题属于条件式最小修复。多 Job、SQLite 多 writer 和 Engine 仍受各自技术 Gate 约束。
+- Engine 的历史需求记录继续保留，但需求记录不等于当前产品 admission；只有被测用户出现真实多 Job/后台瓶颈时才重新决策。
 - AgentExecutor、Review/Publisher 与 Thin Desktop 均保持 pending；旧 BiliNote UI 不算 Thin Desktop 完成证据。
-- 同一执行者一次只推进一个 master task；并行只表示互不冲突的调研或读操作，不允许绕过硬依赖合入。
+- 同一执行者一次只推进一个 master task；并行只允许互不冲突的调研、评测准备或读操作。
 - `BLOCKED-YOUTUBE-01` 等待外部条件，不得用 Fake 或缓存验收改写其实时 acquisition 状态。
 
 ### 9.3 “完成”的报告格式
