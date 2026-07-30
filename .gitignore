@@ -320,6 +320,8 @@ cython_debug/
 /backend/uploads/*
 /backend/.idea/*
 /backend/config/*
+# User-local downloader cookies and platform configuration.
+/config/downloader.json
 /backend/vector_db/
 /BiliNote_frontend/.idea/*
 /BiliNote_frontend/src-tauri/bin/
