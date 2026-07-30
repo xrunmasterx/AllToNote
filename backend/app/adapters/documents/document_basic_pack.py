@@ -64,7 +64,7 @@ def _is_link_or_reparse(path: Path) -> bool:
     except OSError:
         return True
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return path.is_symlink() or bool(
+    return stat.S_ISLNK(metadata.st_mode) or bool(
         getattr(metadata, "st_file_attributes", 0) & reparse_flag
     )
 
@@ -91,12 +91,50 @@ def _reject_non_finite_json(_value: str) -> None:
     raise ValueError("non_finite_json")
 
 
+def _unique_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate_json_key")
+        payload[key] = value
+    return payload
+
+
+def _same_open_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+    )
+
+
 def _read_control_file(path: Path) -> dict[str, object] | None:
     try:
-        if not _ordinary_file(path) or path.stat().st_size > _CONTROL_FILE_LIMIT:
+        metadata = path.lstat()
+        if (
+            _is_link_or_reparse(path)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _CONTROL_FILE_LIMIT
+        ):
+            return None
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not _same_open_file(metadata, opened):
+                return None
+            content = stream.read(_CONTROL_FILE_LIMIT + 1)
+            finished = os.fstat(stream.fileno())
+        if (
+            len(content) > _CONTROL_FILE_LIMIT
+            or len(content) != finished.st_size
+            or not _same_open_file(opened, finished)
+        ):
             return None
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            content.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
             parse_constant=_reject_non_finite_json,
         )
     except (OSError, UnicodeError, ValueError):
@@ -104,7 +142,27 @@ def _read_control_file(path: Path) -> dict[str, object] | None:
     return payload if type(payload) is dict else None
 
 
-def _managed_pack_paths(pack_root: Path) -> tuple[Path, Path] | None:
+def _ordinary_directory_chain(root: Path, target: Path) -> bool:
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    if not _ordinary_directory(current):
+        return False
+    for part in relative.parts:
+        current /= part
+        if not _ordinary_directory(current):
+            return False
+    return True
+
+
+def _managed_pack_paths(
+    pack_root: Path,
+    trusted_data_root: Path,
+) -> tuple[Path, Path] | None:
+    if not _ordinary_directory_chain(trusted_data_root, pack_root):
+        return None
     pointer = _read_control_file(pack_root / "active.json")
     if pointer is None or frozenset(pointer) != _ACTIVE_KEYS:
         return None
@@ -115,7 +173,8 @@ def _managed_pack_paths(pack_root: Path) -> tuple[Path, Path] | None:
         else None
     )
     if (
-        pointer.get("schema_version") != 1
+        type(pointer.get("schema_version")) is not int
+        or pointer.get("schema_version") != 1
         or pointer.get("pack_id") != PACK_ID
         or pointer.get("pack_version") != PACK_VERSION
         or match is None
@@ -130,6 +189,7 @@ def _managed_pack_paths(pack_root: Path) -> tuple[Path, Path] | None:
         or not _ordinary_directory(generation)
         or receipt is None
         or frozenset(receipt) != _RECEIPT_KEYS
+        or type(receipt.get("schema_version")) is not int
         or receipt.get("schema_version") != 1
         or receipt.get("pack_id") != PACK_ID
         or receipt.get("pack_version") != PACK_VERSION
@@ -144,13 +204,27 @@ def _managed_pack_paths(pack_root: Path) -> tuple[Path, Path] | None:
     python_executable = generation / python_relative
     artifacts_path = generation / "artifacts"
     try:
+        resolved_data_root = trusted_data_root.resolve(strict=True)
+        resolved_pack_root = pack_root.resolve(strict=True)
+        resolved_installs_root = installs_root.resolve(strict=True)
         resolved_generation = generation.resolve(strict=True)
-        if not resolved_generation.is_relative_to(pack_root.resolve(strict=True)):
+        resolved_python = python_executable.resolve(strict=True)
+        resolved_artifacts = artifacts_path.resolve(strict=True)
+        if (
+            not resolved_pack_root.is_relative_to(resolved_data_root)
+            or not resolved_installs_root.is_relative_to(resolved_pack_root)
+            or not resolved_generation.is_relative_to(resolved_installs_root)
+            or not resolved_python.is_relative_to(resolved_generation)
+            or not resolved_artifacts.is_relative_to(resolved_generation)
+        ):
             return None
     except (OSError, RuntimeError, ValueError):
         return None
-    if not _ordinary_file(python_executable) or not _ordinary_directory(
-        artifacts_path
+    if (
+        not _ordinary_directory_chain(installs_root, generation)
+        or not _ordinary_directory_chain(generation, python_executable.parent)
+        or not _ordinary_file(python_executable)
+        or not _ordinary_directory_chain(generation, artifacts_path)
     ):
         return None
     return python_executable, artifacts_path
@@ -174,7 +248,7 @@ def resolve_document_basic_pack_paths(
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
     active_pointer = pack_root / "active.json"
     if _lexically_exists(active_pointer):
-        return _managed_pack_paths(pack_root)
+        return _managed_pack_paths(pack_root, paths.data_dir)
     return (
         pack_root
         / ("venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"),

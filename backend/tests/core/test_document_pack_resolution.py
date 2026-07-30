@@ -154,6 +154,64 @@ def test_document_pack_invalid_active_pointer_never_falls_back_to_legacy(
     assert raised.value.code == "document_pack_unavailable"
 
 
+@pytest.mark.parametrize("schema_version", (True, False))
+def test_document_pack_rejects_boolean_active_schema_version(
+    tmp_path: Path,
+    schema_version: bool,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    _create_managed_install(paths)
+    pointer_path = (
+        paths.data_dir / "packs" / PACK_ID / PACK_VERSION / "active.json"
+    )
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["schema_version"] = schema_version
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    with pytest.raises(DomainError) as raised:
+        _resolve_document_worker_config(paths, {})
+
+    assert raised.value.code == "document_pack_unavailable"
+
+
+def test_document_pack_rejects_duplicate_active_pointer_keys(tmp_path: Path) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    _create_managed_install(paths)
+    pointer_path = (
+        paths.data_dir / "packs" / PACK_ID / PACK_VERSION / "active.json"
+    )
+    pointer_path.write_text(
+        pointer_path.read_text(encoding="utf-8").replace(
+            '"schema_version":1',
+            '"schema_version":1,"schema_version":1',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DomainError) as raised:
+        _resolve_document_worker_config(paths, {})
+
+    assert raised.value.code == "document_pack_unavailable"
+
+
+def test_document_pack_rejects_linked_generation_artifacts(tmp_path: Path) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    _python, artifacts = _create_managed_install(paths)
+    artifacts.rmdir()
+    external_artifacts = tmp_path / "external-artifacts"
+    external_artifacts.mkdir()
+    try:
+        artifacts.symlink_to(external_artifacts, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this host")
+
+    with pytest.raises(DomainError) as raised:
+        _resolve_document_worker_config(paths, {})
+
+    assert raised.value.code == "document_pack_unavailable"
+
+
 def test_document_pack_explicit_paths_override_standard_installation(
     tmp_path: Path,
 ) -> None:
