@@ -292,7 +292,7 @@ flowchart LR
 
 - [`AllToNote 设计覆盖、替代关系与实施矩阵`](tasks/alltonote-design-coverage-matrix.md)
 
-当前受治理的 Markdown 共 56 份：18 份正式设计、19 份实施计划、3 份任务/交接记录（含长视频子任务）、1 份 Research、1 份 ADR、13 份 Acceptance，以及本文。`specs/tasks.md` 是长视频实施记录，不计入 18 份正式设计。
+当前受治理的 Markdown 共 57 份：18 份正式设计、19 份实施计划、3 份任务/交接记录（含长视频子任务）、1 份 Research、1 份 ADR、14 份 Acceptance，以及本文。`specs/tasks.md` 是长视频实施记录，不计入 18 份正式设计。
 
 这里仅保留稳定分层，避免复制第二份会漂移的全量表：
 
