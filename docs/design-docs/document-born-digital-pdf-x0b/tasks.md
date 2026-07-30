@@ -77,6 +77,16 @@
 - [x] 不新增隐藏 HTML 协议、第二份审计 Markdown 或 Document 专用 reading 投影；
 - [x] 中文表格与英文双栏 PDF 均通过新 Bundle 回归，主 Draft 系统脚注为 0，Evidence 记录数分别为 109 和 82。
 
+## Task 8：[x] 不可信 PDF 文本的 Markdown 安全与质量诚实
+
+- [x] 失败测试证明 raw Docling block 可以把标题、链接、图片、列表、HTML 与 Mermaid fence 注入主 Draft；
+- [x] 普通文本按 Markdown 字面量投影，裸 URL/邮箱按行内代码投影，未经信任的解析文本不再获得链接、HTML 或图表执行权限；
+- [x] Docling Markdown 表格继续保留表格结构，仅把单元格内容按字面量处理；
+- [x] exact raw text 继续只保存在 normalized content 与 Evidence 中，不损失审计证据；
+- [x] 最终 Markdown 安全验证失败时输出固定安全占位内容，并统一记录 `overall=fail`、`publish_eligible=false`；
+- [x] 中文表格与英文双栏 PDF 均生成新 Bundle，安全验证、Portable inspection、无噪声检查、raw text/hash 往返与源文件 hash 检查通过；
+- [x] 聚焦回归 `298 passed`、完整 backend 回归 `1940 passed, 2 skipped, 1 warning, 3 subtests passed`，独立只读复审无剩余 P0/P1，`git diff --check` 通过。
+
 ## Stop conditions
 
 - 必须把 `DoclingDocument` 或 page/bbox 放进通用 Job schema 才能继续；

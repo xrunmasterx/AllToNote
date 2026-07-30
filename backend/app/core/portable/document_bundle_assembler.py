@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from uuid import UUID
 
 from app.core.domain.document import ParsedDocument
 from app.core.domain.ids import new_typed_id, sha256_digest
+from app.core.errors import DomainError
 from app.core.portable.bundle_assembler import CandidateBundle
 from app.core.portable.jsonio import encode_json, encode_ndjson
+from app.core.portable.markdown_safety import validate_markdown_safety
 from app.core.ports.portable import CandidateLocationCapabilityPort
 
 
@@ -34,6 +37,117 @@ class _Payload:
     media_type: str
     data: bytes
     charset: str = "utf-8"
+
+
+_MARKDOWN_PUNCTUATION = re.compile(r"([\\`*_\[\]{}()<>#+!|&])")
+_DANGEROUS_LITERAL_SCHEME = re.compile(
+    r"(javascript|vbscript|data|file)(\s*):",
+    re.IGNORECASE,
+)
+_GFM_AUTOLINK_TOKEN = re.compile(
+    r"https?://[^\s<]+|(?<![A-Za-z0-9])www\.[^\s<]+|[^\s<>@]+@[^\s<>@]+",
+    re.IGNORECASE,
+)
+_TABLE_PIPE_ENTITY = re.compile(r"&#(?:124|x0*7c);", re.IGNORECASE)
+_TABLE_SEPARATOR = re.compile(
+    r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$"
+)
+
+
+def _markdown_literal(text: str) -> str:
+    escaped_lines: list[str] = []
+    for line in text.split("\n"):
+        parts: list[str] = []
+        cursor = 0
+        for match in _GFM_AUTOLINK_TOKEN.finditer(line):
+            literal = _MARKDOWN_PUNCTUATION.sub(
+                r"\\\1",
+                line[cursor : match.start()],
+            )
+            parts.append(_DANGEROUS_LITERAL_SCHEME.sub(r"\1\2\\:", literal))
+            parts.append(_code_span(match.group()))
+            cursor = match.end()
+        literal = _MARKDOWN_PUNCTUATION.sub(r"\\\1", line[cursor:])
+        parts.append(_DANGEROUS_LITERAL_SCHEME.sub(r"\1\2\\:", literal))
+        escaped = "".join(parts)
+        escaped = re.sub(r"^(\s{0,3})-(?=\s)", r"\1\\-", escaped)
+        escaped = re.sub(r"^(\s{0,3})(\d+)\.(?=\s)", r"\1\2\\.", escaped)
+        escaped = re.sub(r"^(\s{0,3})(?=[=-]+\s*$)", r"\1\\", escaped)
+        escaped_lines.append(escaped)
+    return "\n".join(escaped_lines)
+
+
+def _table_cell_markdown_literal(text: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for match in _TABLE_PIPE_ENTITY.finditer(text):
+        parts.append(_markdown_literal(text[cursor : match.start()]))
+        parts.append(match.group())
+        cursor = match.end()
+    parts.append(_markdown_literal(text[cursor:]))
+    return "".join(parts)
+
+
+def _table_markdown_literal(text: str) -> str:
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if _TABLE_SEPARATOR.fullmatch(line):
+            lines.append(line)
+        elif line.strip().startswith("|") and line.strip().endswith("|"):
+            lines.append(
+                "|".join(
+                    _table_cell_markdown_literal(cell)
+                    for cell in line.split("|")
+                )
+            )
+        else:
+            lines.append(_markdown_literal(line))
+    return "\n".join(lines)
+
+
+def _longest_backtick_run(text: str) -> int:
+    return max((len(match.group()) for match in re.finditer(r"`+", text)), default=0)
+
+
+def _code_span(text: str) -> str:
+    delimiter = "`" * max(1, _longest_backtick_run(text) + 1)
+    return f"{delimiter} {text} {delimiter}"
+
+
+def _code_block(text: str) -> str:
+    fence = "`" * max(3, _longest_backtick_run(text) + 1)
+    return f"{fence}text\n{text}\n{fence}"
+
+
+def _markdown_is_safe(markdown: str) -> bool:
+    try:
+        validate_markdown_safety(
+            markdown,
+            bundle_relative_path="drafts/document.md",
+        )
+    except DomainError:
+        return False
+    return True
+
+
+def _render_inline_text(text: str, *, prefix: str, suffix: str = "") -> str:
+    preferred = f"{prefix}{_markdown_literal(text)}{suffix}"
+    if _markdown_is_safe(preferred):
+        return preferred
+    return f"{prefix}{_code_span(text)}{suffix}"
+
+
+def _render_document_block(kind: str, text: str) -> str:
+    if kind == "section_header":
+        return _render_inline_text(text, prefix="## ")
+    if kind == "caption":
+        return _render_inline_text(text, prefix="*", suffix="*")
+    preferred = (
+        _table_markdown_literal(text)
+        if kind == "table"
+        else _markdown_literal(text)
+    )
+    return preferred if _markdown_is_safe(preferred) else _code_block(text)
 
 
 class DocumentBundleAssembler:
@@ -153,17 +267,30 @@ class DocumentBundleAssembler:
             None,
         )
         title = title_block.text if title_block is not None else parsed.source_name
-        draft_lines = [f"# {title}", ""]
+        draft_lines = [_render_inline_text(title, prefix="# "), ""]
         for block in blocks:
             if block is title_block:
                 continue
-            if block.kind == "section_header":
-                draft_lines.extend((f"## {block.text}", ""))
-            elif block.kind == "caption":
-                draft_lines.extend((f"*{block.text}*", ""))
-            else:
-                draft_lines.extend((block.text, ""))
-        draft = ("\n".join(draft_lines) + "\n").encode("utf-8")
+            draft_lines.extend((_render_document_block(block.kind, block.text), ""))
+        draft_text = "\n".join(draft_lines) + "\n"
+        try:
+            validate_markdown_safety(
+                draft_text,
+                bundle_relative_path=f"drafts/{ids['draft']}.md",
+            )
+            markdown_safe = True
+        except DomainError:
+            markdown_safe = False
+            draft_text = (
+                "# Document output blocked\n\n"
+                "The extracted content could not be rendered safely.\n"
+            )
+        draft = draft_text.encode("utf-8")
+        quality_overall = "pass" if markdown_safe else "fail"
+        publish_eligible = markdown_safe
+        quality_messages = list(parsed.warnings)
+        if not markdown_safe:
+            quality_messages.append("markdown-safety")
         quality = encode_json(
             {
                 "quality_report_schema_version": 1,
@@ -173,15 +300,19 @@ class DocumentBundleAssembler:
                     "sha256": sha256_digest(draft),
                 },
                 "profile": {"id": "alltonote.document-note", "version": 1},
-                "overall": "pass",
+                "overall": quality_overall,
                 "checks": [
                     {"id": "native-text", "status": "pass"},
                     {"id": "page-bbox", "status": "pass"},
                     {"id": "source-hash", "status": "pass"},
+                    {
+                        "id": "markdown-safety",
+                        "status": "pass" if markdown_safe else "fail",
+                    },
                 ],
                 "method": {"kind": "deterministic"},
                 "metrics": {"quality_repair_attempts": 0},
-                "messages": list(parsed.warnings),
+                "messages": quality_messages,
                 "evidence_ids": list(evidence_ids.values()),
             }
         )
@@ -297,7 +428,11 @@ class DocumentBundleAssembler:
                     {"kind": "document-parser", "identity": f"docling/{parsed.parser_version}@{parsed.model_revision}"},
                 ],
                 "usage": {"pages": len(parsed.pages), "blocks": len(blocks)},
-                "quality": {"overall": "pass", "publish_eligible": True, "repair_attempts": 0},
+                "quality": {
+                    "overall": quality_overall,
+                    "publish_eligible": publish_eligible,
+                    "repair_attempts": 0,
+                },
                 "redactions": {"source_path": "omitted"},
             }
         )
@@ -358,8 +493,8 @@ class DocumentBundleAssembler:
             normalized_artifact_id=ids["normalized"],
             evidence_set_artifact_id=ids["evidence"],
             quality_report_artifact_id=ids["quality"],
-            quality_overall="pass",
-            publish_eligible=True,
+            quality_overall=quality_overall,
+            publish_eligible=publish_eligible,
         )
 
 

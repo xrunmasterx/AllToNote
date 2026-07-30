@@ -149,3 +149,23 @@ Spike JSON 位于工作树外，只用于诊断；仓库不提交论文正文或
 | 英文双栏 PDF | `job_019fb413-b693-7599-a8c4-52714b6bd0d8` / `bnd_019fb413-b693-7915-a07f-d08a8889dbf1` | 0 | 82 | 4 页，无 warning，源 SHA-256 不变 |
 
 第 7 节“canonical Draft 保留 111 个审计脚注”仍是当时旧 Bundle 的历史事实，不回写或伪装；当前合同以上述新 Bundle 为准。
+
+## 12. 不可信 PDF 文本的 Markdown 安全边界
+
+Task 7 去除了系统 Evidence 噪声，但同时暴露出更基础的信任边界：Docling 的 `block.text` 来源于用户输入文件，不能因为进入 Document 装配器就自动获得 Markdown、HTML、链接、图片或 Mermaid 语义。问题来自 AllToNote 的 Draft 拼接方式，不是 Docling 主动加入的人类不可读标记。
+
+本轮按最小职责边界修复：
+
+1. 标题、章节、caption 和正文默认按 Markdown 字面量呈现；危险结构只能作为可见文本，不会成为活动链接、HTML、图片或图表；裸 HTTP(S)、`www` 与邮箱使用可读、可复制的行内代码，避免 GFM 在转义解析后重新自动链接；
+2. Docling 已恢复的 Markdown 表格继续保留行列结构，但每个单元格独立按字面量处理；不新增表格识别 heuristic；
+3. normalized content 与 EvidenceSet 继续保存 exact raw text、page、bbox 与 hash，显示层转义不改变审计事实；
+4. 完整 Draft 在写入 Bundle 前复用既有全局 Markdown safety validator；若最终验证失败，主 Draft 改为固定安全占位内容，Quality Report、Produce result 与 receipt 一致记录 `fail` / `publish_eligible=false`。
+
+真实回归结果：
+
+| 样本 | 新 Job / Bundle | 块 / Evidence | 主 Draft 检查 | 结果 |
+|---|---|---:|---|---|
+| 中文表格 PDF | `job_019fb442-b43d-72e5-828b-60de435bb97f` / `bnd_019fb442-b43d-7692-9509-0575e1b91ff5` | 109 / 109 | safety pass；Evidence 脚注 0；`Document page` 0；8 表格保留；raw text/hash 往返一致 | `pass` / publishable |
+| 英文双栏 PDF | `job_019fb443-e458-75d4-9cd7-bce1336a0d38` / `bnd_019fb443-e458-7027-a054-a5f9d056d917` | 82 / 82 | safety pass；Evidence 脚注 0；`Document page` 0；6 个 URL/邮箱为行内代码；raw text/hash 往返一致 | `pass` / publishable |
+
+本轮没有解决 Document 默认 CLI/Pack 可达性、扫描件/OCR、figure/page 覆盖质量、Docling worker 的 OS/网络/环境权限隔离、SQLite/Job 全局权威或高并发资源调度。这些仍是后续产品与发布 Gate，不能由本次 Markdown 安全通过外推为已完成。
