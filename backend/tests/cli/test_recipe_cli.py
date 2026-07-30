@@ -17,6 +17,13 @@ def test_recipe_list_json_is_stable_and_sorted(
     assert envelope["command"] == "recipe list"
     assert envelope["data"]["recipes"] == [
         {
+            "display_name": "Document note",
+            "input_kinds": ["file"],
+            "output_kinds": ["knowledge-note"],
+            "recipe_id": "alltonote.document-note",
+            "recipe_version": 1,
+        },
+        {
             "display_name": "Video course note",
             "input_kinds": ["source"],
             "output_kinds": ["knowledge-note"],
@@ -48,6 +55,21 @@ def test_recipe_describe_json_is_stable(
         "output_kinds": ["knowledge-note", "faithful-edition"],
         "recipe_id": "alltonote.video-producer",
         "recipe_version": 2,
+    }
+
+
+def test_document_recipe_describe_json_is_stable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["recipe", "describe", "alltonote.document-note@1", "--json"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert envelope["data"] == {
+        "display_name": "Document note",
+        "input_kinds": ["file"],
+        "output_kinds": ["knowledge-note"],
+        "recipe_id": "alltonote.document-note",
+        "recipe_version": 1,
     }
 
 

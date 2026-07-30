@@ -15,6 +15,7 @@ import pytest
     (
         ("recipe", "list", "--json"),
         ("recipe", "describe", "alltonote.video-producer@2", "--json"),
+        ("recipe", "describe", "alltonote.document-note@1", "--json"),
     ),
 )
 def test_recipe_discovery_does_not_import_runtime_or_heavy_modules(
@@ -32,7 +33,10 @@ def test_recipe_discovery_does_not_import_runtime_or_heavy_modules(
     assert not {
         "app.runtime",
         "app.core.application.video_service",
+        "app.core.application.document_service",
         "app.core.recipes.video.adapter",
+        "app.core.recipes.document.adapter",
+        "app.adapters.documents.docling_worker_parser",
         "app.adapters.sources.legacy_video",
         "app.adapters.transcription.legacy_transcriber",
         "fastapi",

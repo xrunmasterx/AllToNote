@@ -14,6 +14,7 @@ from app.adapters.documents.docling_worker_parser import (
     DoclingWorkerConfig,
     DoclingWorkerParser,
 )
+from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
@@ -124,7 +125,7 @@ from app.core.recipes.video.faithful_edition.contracts import (
 )
 from app.core.sdk import AllToNoteSDK
 from app.services.codex_app_server import CodexAppServerStatusService
-from app.runtime_paths import resolve_runtime_paths
+from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 from iwiki.workspace import open_workspace
 
 
@@ -1516,6 +1517,64 @@ def create_document_runtime(
     return _create_document_runtime(service, repository)
 
 
+def _resolve_document_worker_config(
+    paths: RuntimePaths,
+    environ: Mapping[str, str],
+) -> DoclingWorkerConfig:
+    python_override = environ.get("ALLTONOTE_DOCUMENT_BASIC_PYTHON")
+    artifacts_override = environ.get("ALLTONOTE_DOCUMENT_BASIC_ARTIFACTS")
+    if bool(python_override) != bool(artifacts_override):
+        raise DomainError(
+            "document_pack_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The document-basic Pack installation is incomplete",
+        )
+    if python_override and artifacts_override:
+        python_executable = Path(python_override).expanduser().resolve(strict=False)
+        artifacts_path = Path(artifacts_override).expanduser().resolve(strict=False)
+    else:
+        pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+        python_executable = pack_root / (
+            "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
+        )
+        artifacts_path = pack_root / "artifacts"
+    if not python_executable.is_file() or not artifacts_path.is_dir():
+        raise DomainError(
+            "document_pack_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "Install the compatible document-basic Pack before producing PDF notes",
+        )
+    return DoclingWorkerConfig(
+        python_executable=python_executable,
+        artifacts_path=artifacts_path,
+        backend_root=Path(__file__).resolve().parent.parent,
+    )
+
+
+def create_document_runtime_for_workspace(
+    workspace_root: Path,
+    *,
+    local_app_data: Path | None = None,
+) -> AllToNoteRuntime:
+    trusted_root = local_app_data or _default_local_app_data()
+    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    paths.assert_outside_workspace(workspace_root)
+    worker_config = _resolve_document_worker_config(paths, os.environ)
+    trusted_root.mkdir(parents=True, exist_ok=True)
+    registry = WorkspaceInstanceRegistry(
+        trusted_root,
+        inspect_workspace=lambda root: open_workspace(
+            root, writable=False
+        ).manifest.workspace_id,
+    )
+    instance = registry.resolve(workspace_root)
+    return create_document_runtime(
+        instance.machine_root,
+        worker_config=worker_config,
+        local_instance_id=instance.instance_id,
+    )
+
+
 def _create_local_video_runtime_components(
     machine_root: Path,
     *,
@@ -1824,6 +1883,7 @@ __all__ = [
     "create_fake_runtime",
     "create_fake_runtime_for_workspace",
     "create_codex_app_server_runtime_for_workspace",
+    "create_document_runtime_for_workspace",
     "create_local_video_runtime",
     "create_platform_video_runtime",
 ]

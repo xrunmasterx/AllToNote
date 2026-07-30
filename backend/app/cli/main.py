@@ -17,6 +17,7 @@ from app.cli.errors import (
 )
 from app.cli.render import render_json_lines, render_result
 from app.core.domain.ids import new_typed_id
+from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import (
     FaithfulLanguagePolicy,
     JobSnapshot,
@@ -27,7 +28,7 @@ from app.core.domain.video import (
     VideoProduceResult,
 )
 from app.core.errors import DomainError, ErrorCategory
-from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
+from app.core.recipes.contracts import ProduceRequest, ProduceSubmission, RecipeKey
 
 if TYPE_CHECKING:
     from app.adapters.credentials.keyring_broker import CredentialBroker
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 
 
 RUNTIME_VERSION = "0.1.0"
+_DOCUMENT_NOTE_V1 = RecipeKey("alltonote.document-note", 1)
 
 
 class _VideoRuntime(Protocol):
@@ -617,97 +619,144 @@ def _produce_generic(
     if args.request is not None:
         request = load_produce_request(args.request)
         workspace_root = Path(request.workspace_ref).resolve()
-        effective_args = argparse.Namespace(
-            workspace=workspace_root,
-            provider_profile=None,
-            transcriber_profile=None,
-            output_language=None,
-            quality=None,
-            style=None,
-            screenshot_policy=None,
-            config_profile=None,
-        )
-        effective = _effective_video_config(
-            effective_args,
-            runtime_injected=runtime is not None,
-            config_service=config_service,
-        )
-        config_snapshot = effective.job_snapshot()
-        request = replace(
-            request,
-            workspace_ref=str(workspace_root),
-            parameters={
-                **request.parameters,
-                "config_snapshot": {
-                    "snapshot_version": config_snapshot.snapshot_version,
-                    "values": dict(config_snapshot.values),
-                    "digest": config_snapshot.digest,
-                    "semantic_digest": config_snapshot.semantic_digest,
-                },
-            },
-        )
-        active_runtime = runtime or _default_runtime(
-            workspace_root,
-            current_config_snapshot=config_snapshot,
-        )
-    else:
-        effective_args = argparse.Namespace(
-            workspace=args.workspace,
-            provider_profile=None,
-            transcriber_profile=None,
-            output_language=None,
-            quality=None,
-            style=None,
-            screenshot_policy=None,
-            config_profile=None,
-        )
-        effective = _effective_video_config(
-            effective_args,
-            runtime_injected=runtime is not None,
-            config_service=config_service,
-        )
-        config = effective.config
-        workspace_value = args.workspace or config.default_workspace
-        if workspace_value is None:
-            raise DomainError(
-                "workspace_required",
-                ErrorCategory.INVALID_REQUEST,
-                "A Workspace must be provided by flag or Runtime configuration",
+        if request.recipe_key == _DOCUMENT_NOTE_V1:
+            request = replace(request, workspace_ref=str(workspace_root))
+            active_runtime = runtime or _default_runtime(
+                workspace_root,
+                recipe_key=request.recipe_key,
             )
-        workspace_root = Path(workspace_value).resolve()
+        else:
+            effective_args = argparse.Namespace(
+                workspace=workspace_root,
+                provider_profile=None,
+                transcriber_profile=None,
+                output_language=None,
+                quality=None,
+                style=None,
+                screenshot_policy=None,
+                config_profile=None,
+            )
+            effective = _effective_video_config(
+                effective_args,
+                runtime_injected=runtime is not None,
+                config_service=config_service,
+            )
+            config_snapshot = effective.job_snapshot()
+            request = replace(
+                request,
+                workspace_ref=str(workspace_root),
+                parameters={
+                    **request.parameters,
+                    "config_snapshot": {
+                        "snapshot_version": config_snapshot.snapshot_version,
+                        "values": dict(config_snapshot.values),
+                        "digest": config_snapshot.digest,
+                        "semantic_digest": config_snapshot.semantic_digest,
+                    },
+                },
+            )
+            active_runtime = runtime or _default_runtime(
+                workspace_root,
+                current_config_snapshot=config_snapshot,
+            )
+    else:
         key = parse_recipe_selector(args.recipe)
         requested_outputs = ("knowledge-note",)
-        provider_profile = config.default_provider_profile
-        provider = config.providers.get(provider_profile)
-        request = ProduceRequest(
-            1,
-            key,
-            InputDescriptor("source", args.input_value),
-            str(workspace_root),
-            requested_outputs,
-            {
-                "provider_profile": provider_profile,
-                "model_override": (
-                    provider.default_model if provider is not None else None
-                ),
-                "transcriber_profile": config.default_transcriber_profile,
-                "output_language": config.recipe_defaults.output_language,
-                "quality_preset": config.recipe_defaults.quality_preset,
-                "style": config.recipe_defaults.style,
-                "screenshot_policy": config.recipe_defaults.screenshot_policy,
-                "config_snapshot": {
-                    "snapshot_version": effective.job_snapshot().snapshot_version,
-                    "values": dict(effective.job_snapshot().values),
-                    "digest": effective.job_snapshot().digest,
-                    "semantic_digest": effective.job_snapshot().semantic_digest,
+        if key == _DOCUMENT_NOTE_V1:
+            if args.workspace is None:
+                effective_args = argparse.Namespace(
+                    workspace=None,
+                    provider_profile=None,
+                    transcriber_profile=None,
+                    output_language=None,
+                    quality=None,
+                    style=None,
+                    screenshot_policy=None,
+                    config_profile=None,
+                )
+                effective = _effective_video_config(
+                    effective_args,
+                    runtime_injected=runtime is not None,
+                    config_service=config_service,
+                )
+                workspace_value = effective.config.default_workspace
+            else:
+                workspace_value = args.workspace
+            if workspace_value is None:
+                raise DomainError(
+                    "workspace_required",
+                    ErrorCategory.INVALID_REQUEST,
+                    "A Workspace must be provided by flag or Runtime configuration",
+                )
+            workspace_root = Path(workspace_value).resolve()
+            request = ProduceRequest(
+                1,
+                key,
+                InputDescriptor("file", args.input_value),
+                str(workspace_root),
+                requested_outputs,
+                client_request_id=correlation_id,
+            )
+            active_runtime = runtime or _default_runtime(
+                workspace_root,
+                recipe_key=key,
+            )
+        else:
+            effective_args = argparse.Namespace(
+                workspace=args.workspace,
+                provider_profile=None,
+                transcriber_profile=None,
+                output_language=None,
+                quality=None,
+                style=None,
+                screenshot_policy=None,
+                config_profile=None,
+            )
+            effective = _effective_video_config(
+                effective_args,
+                runtime_injected=runtime is not None,
+                config_service=config_service,
+            )
+            config = effective.config
+            workspace_value = args.workspace or config.default_workspace
+            if workspace_value is None:
+                raise DomainError(
+                    "workspace_required",
+                    ErrorCategory.INVALID_REQUEST,
+                    "A Workspace must be provided by flag or Runtime configuration",
+                )
+            workspace_root = Path(workspace_value).resolve()
+            provider_profile = config.default_provider_profile
+            provider = config.providers.get(provider_profile)
+            request = ProduceRequest(
+                1,
+                key,
+                InputDescriptor("source", args.input_value),
+                str(workspace_root),
+                requested_outputs,
+                {
+                    "provider_profile": provider_profile,
+                    "model_override": (
+                        provider.default_model if provider is not None else None
+                    ),
+                    "transcriber_profile": config.default_transcriber_profile,
+                    "output_language": config.recipe_defaults.output_language,
+                    "quality_preset": config.recipe_defaults.quality_preset,
+                    "style": config.recipe_defaults.style,
+                    "screenshot_policy": config.recipe_defaults.screenshot_policy,
+                    "config_snapshot": {
+                        "snapshot_version": effective.job_snapshot().snapshot_version,
+                        "values": dict(effective.job_snapshot().values),
+                        "digest": effective.job_snapshot().digest,
+                        "semantic_digest": effective.job_snapshot().semantic_digest,
+                    },
                 },
-            },
-            client_request_id=correlation_id,
-        )
-        active_runtime = runtime or _default_runtime(
-            workspace_root,
-            current_config_snapshot=effective.job_snapshot(),
-        )
+                client_request_id=correlation_id,
+            )
+            active_runtime = runtime or _default_runtime(
+                workspace_root,
+                current_config_snapshot=effective.job_snapshot(),
+            )
 
     submission = active_runtime.submit(request)
     snapshot = active_runtime.get_job(submission.job_id)
@@ -891,7 +940,34 @@ def _video_snapshot_result(
     produced = snapshot.result
     human_lines = [f"Job: {snapshot.job_id}", f"State: {snapshot.state.value}"]
     artifacts: list[dict[str, object]] = []
-    if produced is not None:
+    if isinstance(produced, RecipeProduceResult):
+        primary_draft = produced.artifacts.get("primary_draft")
+        data.update(
+            {
+                "result_kind": produced.result_kind,
+                "run_id": produced.run_id,
+                "bundle_id": produced.bundle_id,
+                "manifest_sha256": produced.manifest_sha256,
+                "commit_sha256": produced.commit_sha256,
+                "workspace_relative_bundle_path": (
+                    produced.workspace_relative_bundle_path
+                ),
+                "primary_draft_artifact_id": primary_draft,
+                "quality": {
+                    "overall": produced.quality_overall,
+                    "publish_eligible": produced.publish_eligible,
+                },
+                "usage": dict(produced.usage),
+            }
+        )
+        artifacts = [
+            {"artifact_id": artifact_id, "role": role}
+            for role, artifact_id in sorted(produced.artifacts.items())
+        ]
+        human_lines.append(f"Bundle: {produced.bundle_id}")
+        if primary_draft is not None:
+            human_lines.append(f"Draft: {primary_draft}")
+    elif produced is not None:
         data.update(
             {
                 "run_id": produced.run_id,
@@ -1380,7 +1456,12 @@ def _default_runtime(
     workspace_root: Path,
     *,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    recipe_key: RecipeKey | None = None,
 ) -> _VideoRuntime:
+    if recipe_key == _DOCUMENT_NOTE_V1:
+        from app.runtime import create_document_runtime_for_workspace
+
+        return create_document_runtime_for_workspace(workspace_root)
     from app.runtime import create_codex_app_server_runtime_for_workspace
 
     return create_codex_app_server_runtime_for_workspace(

@@ -241,13 +241,25 @@ def create_job_runtime_for_workspace(
     repository = SqliteJobRepository.open(instance.machine_root / "job-store")
 
     def execute(job_id: str) -> JobSnapshot:
-        from app.runtime import create_codex_app_server_runtime_for_workspace
+        binding = repository.get_job_execution_binding(job_id)
+        if (
+            binding.recipe_id == "alltonote.document-note"
+            and binding.recipe_version == 1
+        ):
+            from app.runtime import create_document_runtime_for_workspace
 
-        runtime = create_codex_app_server_runtime_for_workspace(
-            workspace_root,
-            local_app_data=trusted_root,
-            current_config_snapshot=current_config_snapshot,
-        )
+            runtime = create_document_runtime_for_workspace(
+                workspace_root,
+                local_app_data=trusted_root,
+            )
+        else:
+            from app.runtime import create_codex_app_server_runtime_for_workspace
+
+            runtime = create_codex_app_server_runtime_for_workspace(
+                workspace_root,
+                local_app_data=trusted_root,
+                current_config_snapshot=current_config_snapshot,
+            )
         return runtime.wait_job(job_id)
 
     return JobRuntime(

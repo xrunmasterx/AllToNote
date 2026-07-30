@@ -4,7 +4,11 @@ from app.cli.contracts import ApplicationResult
 from app.cli.produce_request import parse_recipe_selector
 from app.core.errors import DomainError, ErrorCategory
 from app.core.recipes.contracts import RecipeDescriptor
+from app.core.recipes.document.descriptor import DOCUMENT_NOTE_V1
 from app.core.recipes.video.descriptor import VIDEO_DESCRIPTORS
+
+
+_OFFICIAL_DESCRIPTORS = (DOCUMENT_NOTE_V1, *VIDEO_DESCRIPTORS)
 
 
 def _projection(descriptor: RecipeDescriptor) -> dict[str, object]:
@@ -21,7 +25,7 @@ def recipe_list_result(correlation_id: str) -> ApplicationResult:
     recipes = tuple(
         _projection(descriptor)
         for descriptor in sorted(
-            VIDEO_DESCRIPTORS,
+            _OFFICIAL_DESCRIPTORS,
             key=lambda item: (item.key.recipe_id, item.key.recipe_version),
         )
     )
@@ -40,7 +44,9 @@ def recipe_list_result(correlation_id: str) -> ApplicationResult:
 def recipe_describe_result(selector: str, correlation_id: str) -> ApplicationResult:
     key = parse_recipe_selector(selector)
     matching_id = tuple(
-        descriptor for descriptor in VIDEO_DESCRIPTORS if descriptor.key.recipe_id == key.recipe_id
+        descriptor
+        for descriptor in _OFFICIAL_DESCRIPTORS
+        if descriptor.key.recipe_id == key.recipe_id
     )
     if not matching_id:
         raise DomainError(

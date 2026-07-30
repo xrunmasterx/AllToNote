@@ -9,6 +9,7 @@ from pathlib import Path
 from app.cli.contracts import ApplicationResult
 from app.cli.errors import ExitCode, map_domain_error, map_error_detail
 from app.core.application.job_query_service import JobEventPage, JobView
+from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
 from app.job_runtime import JobRuntime
@@ -326,6 +327,20 @@ def _job_projection(view: JobView) -> dict[str, object]:
 def _result_refs(result: object) -> dict[str, object] | None:
     if result is None:
         return None
+    if isinstance(result, RecipeProduceResult):
+        return {
+            "result_kind": result.result_kind,
+            "run_id": result.run_id,
+            "bundle_id": result.bundle_id,
+            "manifest_sha256": result.manifest_sha256,
+            "commit_sha256": result.commit_sha256,
+            "source_id": result.source_id,
+            "source_revision_id": result.source_revision_id,
+            "artifacts": dict(result.artifacts),
+            "primary_draft_artifact_id": result.artifacts.get("primary_draft"),
+            "quality_overall": result.quality_overall,
+            "publish_eligible": result.publish_eligible,
+        }
     return {
         "run_id": result.run_id,
         "bundle_id": result.bundle_id,
