@@ -664,6 +664,16 @@ def test_direct_compiler_returns_one_article_in_one_model_wave(tmp_path: Path) -
     assert [request.stage_id for request in executor.requests] == ["global-compose"]
     assert "never write footnote-definition lines" in executor.requests[0].system_instruction
     assert "never headings" in executor.requests[0].system_instruction
+    assert "possible ASR output" in executor.requests[0].system_instruction
+    assert "even when evidence contains only the corrupted form" in (
+        executor.requests[0].system_instruction
+    )
+    assert "do not preserve or caveat the corrupted spelling" in (
+        executor.requests[0].system_instruction
+    )
+    assert "preserve the source wording and mark it as uncertain" in (
+        executor.requests[0].system_instruction
+    )
 
 
 def test_compiler_behavior_identity_covers_consolidation_versions(
@@ -710,6 +720,17 @@ def test_map_compose_uses_stable_chunk_ordinals_then_one_global_article(
     assert result.markdown.count("# One coherent article") == 1
     assert result.execution_summary.sequential_model_waves == 2
     assert result.execution_summary.model_operation_count == len(map_payloads) + 1
+    map_requests = [
+        value for value in executor.requests if value.stage_id == "knowledge-map"
+    ]
+    assert all(
+        "Fix clear ASR name errors" in value.system_instruction
+        for value in map_requests
+    )
+    assert all(
+        "only ambiguous forms in term_candidates" in value.system_instruction
+        for value in map_requests
+    )
 
 
 def test_map_response_schema_freezes_the_same_bounds_as_the_parser(

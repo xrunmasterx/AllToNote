@@ -77,7 +77,13 @@ class ApplyPatchTest(unittest.TestCase):
         ie._sign_wbi = fake_sign_wbi
         ie._download_json = fake_download_json
 
-        ie._download_playinfo("BV1X9L16oEgB", 4242, headers={}, query={"qn": 64})
+        ie._download_playinfo(
+            "BV1X9L16oEgB",
+            4242,
+            headers={},
+            query={"qn": 64},
+            fatal=False,
+        )
 
         self.assertTrue(
             REQUIRED_KEYS.issubset(captured.keys()),

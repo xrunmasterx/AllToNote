@@ -357,6 +357,7 @@ class VideoService:
         knowledge_compiler: VideoKnowledgeCompilerPort | None = None,
         faithful_compiler: VideoFaithfulCompilerPort | None = None,
         current_config_snapshot: JobConfigSnapshot | None = None,
+        generated_transcriber_identity: str = "fake/transcriber-v1",
     ) -> None:
         self._repository = repository
         self._job_service = JobService(repository)
@@ -370,6 +371,7 @@ class VideoService:
         self._knowledge_compiler = knowledge_compiler
         self._faithful_compiler = faithful_compiler
         self._current_config_snapshot = current_config_snapshot
+        self._generated_transcriber_identity = generated_transcriber_identity
         self._submitted_config_snapshots: dict[str, JobConfigSnapshot] = {}
         self._execution_lock = threading.Lock()
         self._checkpoint_runner = CheckpointedStepRunner(
@@ -616,6 +618,7 @@ class VideoService:
         resumed_attempt: Attempt | None,
     ) -> VideoBundleInput:
         source = acquired.metadata
+        job = self._repository.get_job_details(job_id)[0]
         ids = self._ids(job_id)
         transcript_payload = build_transcript(
             source.source_revision_id, transcript.language, transcript.segments
@@ -646,6 +649,7 @@ class VideoService:
                 authority=authority,
                 request_hash=request_hash,
                 resumed_attempt=resumed_attempt,
+                retry_of_job_id=job.retry_of_job_id,
             )
         draft = self._checkpointed(
             job_id,
@@ -749,6 +753,7 @@ class VideoService:
                     and type(value) is int
                 },
                 warnings=(),
+                retry_of_job_id=job.retry_of_job_id,
                 redactions={
                     "secrets": "omitted",
                     "prompts": "hash_only",
@@ -781,6 +786,7 @@ class VideoService:
         authority: ExecutionAuthority,
         request_hash: str,
         resumed_attempt: Attempt | None,
+        retry_of_job_id: str | None,
     ) -> VideoBundleInput:
         outputs = request.resolved_outputs or ()
         if not outputs:
@@ -1054,6 +1060,7 @@ class VideoService:
                 transcriber_identity=self._transcriber_identity(source),
                 usage=usage,
                 warnings=(),
+                retry_of_job_id=retry_of_job_id,
                 redactions={
                     "secrets": "omitted",
                     "prompts": "hash_only",
@@ -1721,13 +1728,12 @@ class VideoService:
     def _canonical_source_identity(source: VideoSourceMetadata) -> str:
         return f"{source.canonical_identity_scheme}:{source.stable_video_identity}"
 
-    @staticmethod
-    def _transcriber_identity(source: VideoSourceMetadata) -> str:
+    def _transcriber_identity(self, source: VideoSourceMetadata) -> str:
         if source.subtitle_acquisition == "provided":
             return "core/provided-transcript-v1"
         if source.subtitle_acquisition == "platform":
             return f"{source.connector_id}/platform-subtitle-v1"
-        return "fake/transcriber-v1"
+        return self._generated_transcriber_identity
 
     def _preflight(self, request: VideoProduceRequest) -> str:
         capabilities = self._operations.preflight_capabilities(request)

@@ -369,6 +369,8 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         source_metadata: Mapping[str, Mapping[str, object]],
         model: LegacyModelBinding,
         result_root: Path,
+        storage: FileAttemptStorage | None = None,
+        transcriber: TranscriptPort | None = None,
     ) -> None:
         self._repository = repository
         self._source = source
@@ -379,6 +381,8 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         self._model = model
         self._result_store = ModelChunkResultStore(result_root)
         self._acquisition_root = result_root / "acquisition"
+        self._storage = storage
+        self._transcriber = transcriber
 
     def preflight_capabilities(
         self, request: VideoProduceRequest
@@ -429,6 +433,41 @@ class _PlatformVideoOperations(VideoRecipeOperations):
                 check_cancelled=token.raise_if_cancelled,
             )
             provenance = TranscriptProvenance.PLATFORM
+        subtitle_availability = acquired.subtitle_availability
+        stored_media = None
+        if (
+            transcript is None
+            and self._storage is not None
+            and self._transcriber is not None
+        ):
+            acquired = self._source.acquire(
+                source,
+                need_media=True,
+                need_subtitles=False,
+                output_dir=self._acquisition_root / execution.job_id,
+                token=token,
+            )
+            media_path = acquired.media_path
+            if media_path is None:
+                raise DomainError(
+                    "source_media_missing",
+                    ErrorCategory.RECIPE_FAILED,
+                    "Platform media fallback did not produce media",
+                )
+            digest = hashlib.sha256()
+            with media_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    token.raise_if_cancelled()
+                    digest.update(chunk)
+            stored_media = self._storage.snapshot_asset(
+                media_path,
+                job_id=execution.job_id,
+                attempt_id=execution.attempt_id,
+                role=StoredAssetRole.SOURCE_MEDIA,
+                expected_sha256=f"sha256:{digest.hexdigest()}",
+                authority=execution.authority,
+                token=token,
+            )
         fixture = self._source_metadata.get(source.platform)
         if fixture is not None and frozenset(fixture) != _SOURCE_METADATA_FIELDS:
             raise DomainError(
@@ -481,7 +520,11 @@ class _PlatformVideoOperations(VideoRecipeOperations):
                 subtitle_acquisition=(
                     provenance.value
                     if provenance is not None
-                    else acquired.subtitle_availability.value
+                    else (
+                        TranscriptProvenance.GENERATED.value
+                        if stored_media is not None
+                        else subtitle_availability.value
+                    )
                 ),
                 source_link=canonical_uri,
                 materialization_reason="remote_video_reference",
@@ -500,13 +543,14 @@ class _PlatformVideoOperations(VideoRecipeOperations):
             subtitle_availability=(
                 SubtitleAvailability.AVAILABLE
                 if transcript is not None
-                else acquired.subtitle_availability
+                else subtitle_availability
             ),
             transcript=transcript,
             transcript_identity=(
                 transcript_identity(transcript) if transcript is not None else None
             ),
             transcript_provenance=provenance,
+            stored_media=stored_media,
         )
 
     def transcribe(
@@ -517,18 +561,27 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> TranscriptDocument:
-        del acquisition_checkpoint
         token = CancellationToken(self._repository, execution.job_id)
         transcript = acquired.transcript
-        if transcript is None:
+        if transcript is not None:
+            return LegacyTranscriberAdapter("fast-whisper").transcribe(
+                MediaInput(provided_transcript=transcript), token
+            )
+        storage = self._storage
+        transcriber = self._transcriber
+        stored_media = acquired.stored_media
+        if storage is None or transcriber is None or stored_media is None:
             raise DomainError(
                 "platform_subtitle_unavailable",
                 ErrorCategory.RECIPE_FAILED,
                 "Platform subtitles are unavailable; media fallback is not enabled",
             )
-        return LegacyTranscriberAdapter("fast-whisper").transcribe(
-            MediaInput(provided_transcript=transcript), token
+        media_path = storage.resolve_asset(
+            stored_media,
+            expected_job_id=acquisition_checkpoint.job_id,
+            expected_attempt_id=acquisition_checkpoint.attempt_id,
         )
+        return transcriber.transcribe(MediaInput(media_path=media_path), token)
 
     def generate_draft(
         self,
@@ -897,7 +950,7 @@ class _RuntimeVideoKnowledgeCompiler:
                 },
                 "compiler_behavior": self._compiler.behavior_identity(),
                 "knowledge_map_parser": 2,
-                "knowledge_map_prompt": 2,
+                "knowledge_map_prompt": 4,
                 "knowledge_map_stage": 2,
                 "planner": 2,
             },
@@ -956,7 +1009,7 @@ class _RuntimeVideoKnowledgeCompiler:
             stage_id="knowledge-map",
             stage_version=2,
             prompt_id="knowledge-map-balanced",
-            prompt_version=2,
+            prompt_version=4,
             prompt_overhead_tokens=1_400,
             prompt_overhead_bytes=1_400,
             reserved_output_tokens=binding.max_output_tokens,
@@ -1270,6 +1323,8 @@ def _create_platform_video_runtime_components(
     *,
     source: VideoSourcePort,
     source_metadata: Mapping[str, Mapping[str, object]],
+    transcriber: TranscriptPort | None = None,
+    generated_transcriber_identity: str | None = None,
     model: LegacyModelBinding,
     model_execution_binding: ModelExecutionBinding | None = None,
     model_execution_profile: str | None = None,
@@ -1295,6 +1350,8 @@ def _create_platform_video_runtime_components(
         source_metadata,
         model,
         result_root,
+        storage=storage,
+        transcriber=transcriber,
     )
     knowledge_compiler, faithful_compiler = _create_runtime_compilers(
         repository=repository,
@@ -1316,6 +1373,9 @@ def _create_platform_video_runtime_components(
         knowledge_compiler=knowledge_compiler,
         faithful_compiler=faithful_compiler,
         current_config_snapshot=current_config_snapshot,
+        generated_transcriber_identity=(
+            generated_transcriber_identity or "fake/transcriber-v1"
+        ),
     )
     return _create_video_runtime(service, repository), service
 
@@ -1325,6 +1385,8 @@ def create_platform_video_runtime(
     *,
     source: VideoSourcePort,
     source_metadata: Mapping[str, Mapping[str, object]],
+    transcriber: TranscriptPort | None = None,
+    generated_transcriber_identity: str | None = None,
     model: LegacyModelBinding,
     model_execution_binding: ModelExecutionBinding | None = None,
     model_execution_profile: str | None = None,
@@ -1337,6 +1399,8 @@ def create_platform_video_runtime(
         machine_root,
         source=source,
         source_metadata=source_metadata,
+        transcriber=transcriber,
+        generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=model_execution_binding,
         model_execution_profile=model_execution_profile,
@@ -1563,6 +1627,16 @@ def create_fake_runtime_for_workspace(
     )
 
 
+def _create_cpu_whisper_transcriber(model_size: str) -> object:
+    from app.transcriber.whisper import WhisperTranscriber
+
+    return WhisperTranscriber(
+        model_size=model_size,
+        device="cpu",
+        compute_type="int8",
+    )
+
+
 def create_codex_app_server_runtime_for_workspace(
     workspace_root: Path,
     *,
@@ -1610,10 +1684,23 @@ def create_codex_app_server_runtime_for_workspace(
         timeout_seconds=600,
     )
     source = LegacyVideoSourceAdapter(local_machine_id=instance.instance_id)
+    whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "base")
+    transcriber = LegacyTranscriberAdapter(
+        "fast-whisper",
+        factories={
+            "fast-whisper": lambda: _create_cpu_whisper_transcriber(
+                whisper_model_size
+            )
+        },
+    )
     return create_platform_video_runtime(
         instance.machine_root,
         source=source,
         source_metadata={},
+        transcriber=transcriber,
+        generated_transcriber_identity=(
+            f"faster-whisper/{whisper_model_size}-cpu-int8"
+        ),
         model=model,
         model_execution_binding=binding,
         model_execution_profile="default",

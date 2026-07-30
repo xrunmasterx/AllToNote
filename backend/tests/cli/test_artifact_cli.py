@@ -240,6 +240,86 @@ def test_draft_body_requires_explicit_bounded_option_and_is_truncated_safely(
     assert data["body_truncated"] is True
 
 
+def test_draft_show_defaults_to_clean_reading_projection(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _commit(workspace_root)
+    before = _file_snapshot(workspace_root)
+
+    code = main(
+        [
+            "draft",
+            "show",
+            DRAFT_ARTIFACT_ID,
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ]
+    )
+    data = json.loads(capsys.readouterr().out)["data"]
+
+    assert code == 0
+    assert data["body_presentation"] == "reading"
+    assert data["body"].startswith("# ")
+    assert "Bundle" in data["body"]
+    assert "[^ev_" not in data["body"]
+    assert ": 视频 00:00" not in data["body"]
+    assert data["draft"]["evidence_reference_count"] == 1
+    assert _file_snapshot(workspace_root) == before
+
+
+def test_draft_show_can_return_canonical_audit_markdown(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _commit(workspace_root)
+
+    code = main(
+        [
+            "draft",
+            "show",
+            DRAFT_ARTIFACT_ID,
+            "--presentation",
+            "audit",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ]
+    )
+    data = json.loads(capsys.readouterr().out)["data"]
+
+    assert code == 0
+    assert data["body_presentation"] == "audit"
+    assert "[^ev_018f0000-0000-7000-8000-000000000109]" in data["body"]
+    assert ": 视频 00:00–00:01" in data["body"]
+
+
+def test_draft_show_human_output_is_the_reading_markdown(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _commit(workspace_root)
+
+    code = main(
+        [
+            "draft",
+            "show",
+            DRAFT_ARTIFACT_ID,
+            "--workspace",
+            str(workspace_root),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out.startswith("# ")
+    assert "Bundle" in captured.out
+    assert "Artifact:" not in captured.out
+    assert "[^ev_" not in captured.out
+    assert captured.err == ""
+
+
 def test_v2_faithful_and_knowledge_drafts_keep_distinct_document_kinds(
     workspace_root: Path,
     capsys: pytest.CaptureFixture[str],

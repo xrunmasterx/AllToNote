@@ -10,6 +10,7 @@ from app.core.ports.portable_queries import (
     PortableInspectionPort,
     PortableInspectionRecord,
 )
+from app.core.portable.markdown_safety import markdown_visible_mask
 
 
 _ARTIFACT_ID = re.compile(
@@ -23,6 +24,10 @@ _BUNDLE_ID = re.compile(
 _EVIDENCE_REF = re.compile(
     r"\[\^(ev_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\]"
+)
+_EVIDENCE_DEFINITION = re.compile(
+    r"^ {0,3}\[\^(ev_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\]:(?:[ \t]|$)"
 )
 _ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)\s*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -111,8 +116,10 @@ class ArtifactQueryService:
         draft_id: str,
         *,
         body_bytes: int | None = None,
+        presentation: str = "audit",
     ) -> Mapping[str, object]:
         _require_body_limit(body_bytes)
+        _require_presentation(presentation)
         if type(draft_id) is not str or _ARTIFACT_ID.fullmatch(draft_id) is None:
             raise DomainError(
                 "draft_target_invalid",
@@ -161,7 +168,13 @@ class ArtifactQueryService:
         data = _common_projection(inspected)
         data.update({"target_kind": "draft", "draft": draft_projection})
         if body_bytes is not None:
-            data.update(_text_body_projection(text, body_bytes))
+            presented_text = (
+                project_reading_markdown(text)
+                if presentation == "reading"
+                else text
+            )
+            data.update(_text_body_projection(presented_text, body_bytes))
+            data["body_presentation"] = presentation
         return data
 
 
@@ -176,6 +189,100 @@ def _require_body_limit(body_bytes: int | None) -> None:
             ErrorCategory.INVALID_REQUEST,
             "Body preview limit must be between 1 and 262144 bytes",
         )
+
+
+def _require_presentation(presentation: str) -> None:
+    if presentation not in {"audit", "reading"}:
+        raise DomainError(
+            "draft_presentation_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "Draft presentation must be 'audit' or 'reading'",
+        )
+
+
+def project_reading_markdown(markdown: str) -> str:
+    """Project an audited draft into human reading Markdown.
+
+    The committed draft remains authoritative. This projection removes only
+    rendered system Evidence footnotes; ordinary footnotes and code literals
+    remain part of the reading text.
+    """
+
+    visible = markdown_visible_mask(markdown)
+    projected_lines: list[str] = []
+    offset = 0
+    changed = False
+    fence_character: str | None = None
+    fence_length = 0
+
+    for line in markdown.splitlines(keepends=True):
+        source_line_length = len(line)
+        content = line.rstrip("\r\n")
+        line_ending = line[len(content) :]
+        fence = _FENCE.match(content)
+        if fence is not None:
+            marker = fence.group(1)
+            if fence_character is None:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+                fence_length = 0
+            projected_lines.append(line)
+            offset += len(line)
+            continue
+
+        definition = (
+            _EVIDENCE_DEFINITION.match(content)
+            if fence_character is None
+            else None
+        )
+        if definition is not None:
+            changed = True
+            offset += source_line_length
+            continue
+
+        removals: list[tuple[int, int]] = []
+        for match in _EVIDENCE_REF.finditer(content):
+            absolute_start = offset + match.start()
+            absolute_end = offset + match.end()
+            if (
+                not all(visible[absolute_start:absolute_end])
+                or _backslash_escaped(markdown, absolute_start)
+            ):
+                continue
+            start = match.start()
+            end = match.end()
+            if start > 0 and content[start - 1] in " \t":
+                start -= 1
+            removals.append((start, end))
+
+        if removals:
+            changed = True
+            pieces: list[str] = []
+            cursor = 0
+            for start, end in removals:
+                pieces.append(content[cursor:start])
+                cursor = end
+            pieces.append(content[cursor:])
+            content = "".join(pieces).rstrip(" \t")
+            line = content + line_ending
+        projected_lines.append(line)
+        offset += source_line_length
+
+    if not changed:
+        return markdown
+    projected = "".join(projected_lines).rstrip(" \t\r\n")
+    return f"{projected}\n" if projected else ""
+
+
+def _backslash_escaped(value: str, index: int) -> bool:
+    backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and value[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
 
 
 def _public_query_error(
@@ -397,4 +504,4 @@ def _draft_summary(
     return tuple(headings), heading_count, tuple(evidence_ids)
 
 
-__all__ = ["ArtifactQueryService"]
+__all__ = ["ArtifactQueryService", "project_reading_markdown"]

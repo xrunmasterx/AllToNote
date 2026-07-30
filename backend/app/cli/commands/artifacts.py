@@ -8,6 +8,9 @@ from app.cli.contracts import ApplicationResult
 from app.core.application.artifact_query_service import ArtifactQueryService
 
 
+_DEFAULT_DRAFT_SHOW_BYTES = 256 * 1024
+
+
 def add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
     artifact_parser = subparsers.add_parser("artifact")
     artifact_commands = artifact_parser.add_subparsers(
@@ -24,10 +27,19 @@ def add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
         dest="draft_command",
         required=True,
     )
-    for command in ("inspect", "show"):
-        parser = draft_commands.add_parser(command)
-        parser.add_argument("draft_id", help="draft artifact ID")
-        _add_common_options(parser)
+    draft_inspect = draft_commands.add_parser("inspect")
+    draft_inspect.add_argument("draft_id", help="draft artifact ID")
+    _add_common_options(draft_inspect)
+
+    draft_show = draft_commands.add_parser("show")
+    draft_show.add_argument("draft_id", help="draft artifact ID")
+    _add_common_options(draft_show)
+    draft_show.add_argument(
+        "--presentation",
+        choices=("reading", "audit"),
+        default="reading",
+        help="render clean reading Markdown or the canonical audited draft",
+    )
 
 
 def execute_artifact_command(
@@ -47,10 +59,16 @@ def execute_artifact_command(
         )
     else:
         command = f"draft {args.draft_command}"
+        show = args.draft_command == "show"
         data = service.inspect_draft(
             workspace_root,
             args.draft_id,
-            body_bytes=args.body_bytes,
+            body_bytes=(
+                args.body_bytes
+                if args.body_bytes is not None or not show
+                else _DEFAULT_DRAFT_SHOW_BYTES
+            ),
+            presentation=args.presentation if show else "audit",
         )
     artifacts = _result_artifacts(data)
     return ApplicationResult(
@@ -60,7 +78,10 @@ def execute_artifact_command(
         data=data,
         artifacts=artifacts,
         versions=versions,
-        human_lines=_human_lines(data),
+        human_lines=_human_lines(
+            data,
+            body_only=args.command == "draft" and args.draft_command == "show",
+        ),
     )
 
 
@@ -87,7 +108,15 @@ def _result_artifacts(
     return ()
 
 
-def _human_lines(data: Mapping[str, object]) -> tuple[str, ...]:
+def _human_lines(
+    data: Mapping[str, object],
+    *,
+    body_only: bool = False,
+) -> tuple[str, ...]:
+    if body_only:
+        body = data.get("body")
+        if isinstance(body, str):
+            return (body.rstrip("\r\n"),)
     bundle = data.get("bundle")
     bundle_id = bundle.get("bundle_id") if isinstance(bundle, Mapping) else None
     target = data.get("artifact") or data.get("draft")

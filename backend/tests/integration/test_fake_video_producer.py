@@ -15,11 +15,13 @@ from iwiki.portable import PortableBundleRef, ValidationLevel, validate_bundle
 from iwiki.workspace import open_workspace
 
 import app.core.application.video_service as video_service_module
+from app.core.application.job_service import JobService
 from app.core.domain.video import (
     FaithfulLanguagePolicy,
     GeneratedVideoDraft,
     JobState,
     QualityOverall,
+    RetryJobRequest,
     ScreenshotPolicy,
     ScreenshotRequest,
     TranscriptDocument,
@@ -659,6 +661,51 @@ def test_quality_fail_still_commits_and_returns_success(
     assert snapshot.result.publish_eligible is False
     assert calls.commit == 1
     _validate_committed_bundle(workspace_root, snapshot.result.bundle_id)
+
+
+def test_retry_bundle_receipt_preserves_parent_job_id(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "retry-receipt-machine"
+    first = _create_fake_runtime(
+        runtime_module,
+        machine_root,
+        capabilities=replace(
+            VideoPreflightCapabilities(), source_capability=False
+        ),
+        owner_id="retry-receipt-first",
+    )
+    original = first.wait_job(
+        first.submit_video(
+            valid_request(workspace_root, client_request_id="retry-receipt-original")
+        ).job_id
+    )
+    assert original.state is JobState.FAILED
+
+    retried = JobService(first.job_repository).retry(
+        original.job_id,
+        RetryJobRequest(
+            retry_request_schema_version=1,
+            client_request_id="retry-receipt-child",
+            expected_original_job_state=JobState.FAILED,
+        ),
+    )
+    del first
+    reopened = _create_fake_runtime(
+        runtime_module,
+        machine_root,
+        owner_id="retry-receipt-second",
+    )
+
+    snapshot = reopened.wait_job(retried.job_id)
+
+    assert snapshot.state is JobState.SUCCEEDED
+    assert snapshot.result is not None
+    bundle = workspace_root / snapshot.result.workspace_relative_bundle_path
+    receipt = json.loads((bundle / "receipt.json").read_text("utf-8"))
+    assert receipt["parameters"]["summary"]["retry_of_job_id"] == original.job_id
 
 
 @pytest.mark.parametrize(("field_name", "error_code"), PREFLIGHT_CAPABILITY_FAILURES)

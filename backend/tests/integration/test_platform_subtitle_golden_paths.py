@@ -44,6 +44,7 @@ from app.core.ports.model_executor import (
     ModelExecutionBinding,
     ModelExecutionRequest,
 )
+from app.core.ports.transcript import MediaInput
 import app.runtime as runtime_module
 import app.adapters.iwiki.portable_gateway as portable_gateway_module
 
@@ -97,11 +98,17 @@ class _FixtureDownloader:
     def download(self, _url: str, **kwargs: object) -> object:
         if kwargs.get("skip_download") is not True:
             self._calls.media_download += 1
+            media_path = Path(str(kwargs["output_dir"])) / "fixture-audio.mp3"
+            media_path.write_bytes(b"fixture-audio")
+        else:
+            media_path = None
         self._calls.metadata += 1
         return SimpleNamespace(
             title=self._metadata["title"],
             duration=self._metadata["duration_ms"] / 1000,
             cover_url=None,
+            file_path=None if media_path is None else str(media_path),
+            video_path=None,
         )
 
     def download_subtitles(self, _url: str, **_kwargs: object) -> object:
@@ -141,6 +148,28 @@ class _Completion:
             input_tokens=20,
             output_tokens=10,
             actual_model="fixture/model-v1",
+        )
+
+
+class _Transcript:
+    def __init__(self, calls: Calls) -> None:
+        self._calls = calls
+
+    def transcribe(self, media: MediaInput, token: object) -> TranscriptDocument:
+        assert media.media_path is not None
+        assert media.media_path.is_file()
+        token.raise_if_cancelled()
+        self._calls.transcriber += 1
+        return TranscriptDocument(
+            language="zh-CN",
+            segments=(
+                TranscriptSegment(
+                    "seg_000001",
+                    0,
+                    2_000,
+                    "无平台字幕时回退到本地转写。",
+                ),
+            ),
         )
 
 
@@ -281,6 +310,7 @@ def _create_runtime(
     subtitle_outcome: str = "available",
     owner_id: str | None = None,
     now_ms: int | None = None,
+    media_fallback: bool = False,
 ) -> object:
     downloader = _FixtureDownloader(
         platform,
@@ -301,6 +331,10 @@ def _create_runtime(
         machine_root,
         source=source,
         source_metadata={platform: _fixture(platform, "metadata.json")},
+        transcriber=_Transcript(calls) if media_fallback else None,
+        generated_transcriber_identity=(
+            "fixture/transcriber-v1" if media_fallback else None
+        ),
         model=model,
         owner_id=owner_id,
         clock=(None if now_ms is None else lambda: now_ms),
@@ -922,6 +956,41 @@ def test_platform_subtitle_path_commits_without_media(
         if executor["kind"] == "transcriber"
     )
     assert transcriber["identity"] == f"{platform}/platform-subtitle-v1"
+
+
+def test_platform_without_subtitles_downloads_media_and_transcribes(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    calls = Calls()
+    runtime = _create_runtime(
+        tmp_path / "machine-fallback",
+        "bilibili",
+        calls,
+        subtitle_outcome="unavailable",
+        media_fallback=True,
+    )
+
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.SUCCEEDED
+    assert result.result is not None
+    assert calls.subtitle == 1
+    assert calls.media_download == 1
+    assert calls.transcriber == 1
+    assert calls.model == 1
+    acquisition = _decode_acquisition_checkpoint(runtime, submitted.job_id)
+    assert acquisition.stored_media is not None
+    assert acquisition.metadata.subtitle_acquisition == "generated"
+    bundle = workspace_root / result.result.workspace_relative_bundle_path
+    receipt = json.loads((bundle / "receipt.json").read_text("utf-8"))
+    transcriber = next(
+        executor
+        for executor in receipt["executors"]
+        if executor["kind"] == "transcriber"
+    )
+    assert transcriber["identity"] == "fixture/transcriber-v1"
 
 
 @pytest.mark.parametrize("subtitle_outcome", ["unavailable", "malformed"])
