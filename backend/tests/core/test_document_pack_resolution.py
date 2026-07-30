@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +14,7 @@ from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.job_runtime import create_job_runtime_for_workspace
 from app.runtime import _resolve_document_worker_config
-from app.runtime_paths import resolve_runtime_paths
+from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 from iwiki.workspace import open_workspace
 
 
@@ -26,6 +27,43 @@ def _python_relative_path() -> Path:
         if os.name == "nt"
         else Path("venv/bin/python")
     )
+
+
+def _managed_python_relative_path() -> Path:
+    return Path("python/python.exe") if os.name == "nt" else Path("python/bin/python")
+
+
+def _create_managed_install(paths: RuntimePaths) -> tuple[Path, Path]:
+    digest = "a" * 64
+    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+    generation = pack_root / "installs" / digest
+    python = generation / _managed_python_relative_path()
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    artifacts = generation / "artifacts"
+    artifacts.mkdir()
+    receipt = {
+        "schema_version": 1,
+        "pack_id": PACK_ID,
+        "pack_version": PACK_VERSION,
+        "manifest_sha256": f"sha256:{digest}",
+        "verified": True,
+    }
+    (generation / "receipt.json").write_text(
+        json.dumps(receipt, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    pointer = {
+        "schema_version": 1,
+        "pack_id": PACK_ID,
+        "pack_version": PACK_VERSION,
+        "manifest_sha256": f"sha256:{digest}",
+    }
+    (pack_root / "active.json").write_text(
+        json.dumps(pointer, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return python, artifacts
 
 
 def test_document_pack_resolves_frozen_standard_installation(tmp_path: Path) -> None:
@@ -42,6 +80,78 @@ def test_document_pack_resolves_frozen_standard_installation(tmp_path: Path) -> 
     assert config.python_executable == python
     assert config.artifacts_path == artifacts
     assert config.backend_root.name == "backend"
+
+
+def test_document_pack_resolves_verified_managed_generation(tmp_path: Path) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    python, artifacts = _create_managed_install(paths)
+
+    config = _resolve_document_worker_config(paths, {})
+
+    assert config.python_executable == python
+    assert config.artifacts_path == artifacts
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("pointer_identity", "receipt_digest", "receipt_unverified", "missing_python"),
+)
+def test_document_pack_managed_generation_fails_closed_when_invalid(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    python, _artifacts = _create_managed_install(paths)
+    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+    pointer_path = pack_root / "active.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    generation = pack_root / "installs" / ("a" * 64)
+    receipt_path = generation / "receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    if mutation == "pointer_identity":
+        pointer["pack_id"] = "other-pack"
+        pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    elif mutation == "receipt_digest":
+        receipt["manifest_sha256"] = "sha256:" + "b" * 64
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    elif mutation == "receipt_unverified":
+        receipt["verified"] = False
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    else:
+        python.unlink()
+
+    with pytest.raises(DomainError) as raised:
+        _resolve_document_worker_config(paths, {})
+
+    assert raised.value.code == "document_pack_unavailable"
+
+
+def test_document_pack_invalid_active_pointer_never_falls_back_to_legacy(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+    legacy_python = pack_root / _python_relative_path()
+    legacy_python.parent.mkdir(parents=True)
+    legacy_python.write_bytes(b"python")
+    (pack_root / "artifacts").mkdir()
+    (pack_root / "active.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pack_id": PACK_ID,
+                "pack_version": PACK_VERSION,
+                "manifest_sha256": "sha256:../escape",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DomainError) as raised:
+        _resolve_document_worker_config(paths, {})
+
+    assert raised.value.code == "document_pack_unavailable"
 
 
 def test_document_pack_explicit_paths_override_standard_installation(

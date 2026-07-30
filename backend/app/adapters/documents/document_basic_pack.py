@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,6 +50,111 @@ PARSER_MODEL_REVISION = (
     f"layout:{LAYOUT_MODEL_REVISION}+tableformer:{TABLE_MODEL_REVISION}"
 )
 
+_ACTIVE_KEYS = frozenset(
+    {"schema_version", "pack_id", "pack_version", "manifest_sha256"}
+)
+_RECEIPT_KEYS = _ACTIVE_KEYS | {"verified"}
+_SHA256_PATTERN = re.compile(r"sha256:([0-9a-f]{64})\Z")
+_CONTROL_FILE_LIMIT = 16 * 1024
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return path.is_symlink() or bool(
+        getattr(metadata, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _lexically_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _ordinary_file(path: Path) -> bool:
+    return not _is_link_or_reparse(path) and path.is_file()
+
+
+def _ordinary_directory(path: Path) -> bool:
+    return not _is_link_or_reparse(path) and path.is_dir()
+
+
+def _reject_non_finite_json(_value: str) -> None:
+    raise ValueError("non_finite_json")
+
+
+def _read_control_file(path: Path) -> dict[str, object] | None:
+    try:
+        if not _ordinary_file(path) or path.stat().st_size > _CONTROL_FILE_LIMIT:
+            return None
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_non_finite_json,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return payload if type(payload) is dict else None
+
+
+def _managed_pack_paths(pack_root: Path) -> tuple[Path, Path] | None:
+    pointer = _read_control_file(pack_root / "active.json")
+    if pointer is None or frozenset(pointer) != _ACTIVE_KEYS:
+        return None
+    manifest_sha256 = pointer.get("manifest_sha256")
+    match = (
+        _SHA256_PATTERN.fullmatch(manifest_sha256)
+        if type(manifest_sha256) is str
+        else None
+    )
+    if (
+        pointer.get("schema_version") != 1
+        or pointer.get("pack_id") != PACK_ID
+        or pointer.get("pack_version") != PACK_VERSION
+        or match is None
+    ):
+        return None
+
+    installs_root = pack_root / "installs"
+    generation = installs_root / match.group(1)
+    receipt = _read_control_file(generation / "receipt.json")
+    if (
+        not _ordinary_directory(installs_root)
+        or not _ordinary_directory(generation)
+        or receipt is None
+        or frozenset(receipt) != _RECEIPT_KEYS
+        or receipt.get("schema_version") != 1
+        or receipt.get("pack_id") != PACK_ID
+        or receipt.get("pack_version") != PACK_VERSION
+        or receipt.get("manifest_sha256") != manifest_sha256
+        or receipt.get("verified") is not True
+    ):
+        return None
+
+    python_relative = (
+        Path("python/python.exe") if os.name == "nt" else Path("python/bin/python")
+    )
+    python_executable = generation / python_relative
+    artifacts_path = generation / "artifacts"
+    try:
+        resolved_generation = generation.resolve(strict=True)
+        if not resolved_generation.is_relative_to(pack_root.resolve(strict=True)):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not _ordinary_file(python_executable) or not _ordinary_directory(
+        artifacts_path
+    ):
+        return None
+    return python_executable, artifacts_path
+
 
 def resolve_document_basic_pack_paths(
     paths: RuntimePaths,
@@ -64,6 +172,9 @@ def resolve_document_basic_pack_paths(
             Path(artifacts_override).expanduser().resolve(strict=False),
         )
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+    active_pointer = pack_root / "active.json"
+    if _lexically_exists(active_pointer):
+        return _managed_pack_paths(pack_root)
     return (
         pack_root
         / ("venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"),
