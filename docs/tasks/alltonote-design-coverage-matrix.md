@@ -39,6 +39,7 @@ flowchart TD
     VIDEO["REC-VIDEO-001 Video Recipe（历史名 Producer）"]
     LONG["REC-VIDEO-LONG-001 长视频编译"]
     DOGFOOD["VAL-VIDEO-001 Video 三样本 Pilot"]
+    REUSE["VAL-VIDEO-REUSE-001 可信复用"]
     REVIEW["REVIEW-001 Review / Publisher"]
     KMCP["MCP-READ-001 Knowledge MCP"]
     ENGINE["ENGINE-001 Engine / Production MCP"]
@@ -66,6 +67,7 @@ flowchart TD
     RX --> VIDEO
     VIDEO --> LONG
     LONG --> DOGFOOD
+    DOGFOOD --> REUSE
     DATA --> VIDEO
     RX --> WEB
     RX --> DOC
@@ -99,6 +101,7 @@ flowchart TD
 | `REC-VIDEO-001` | [Video Recipe（历史名 Video Producer）](../superpowers/specs/2026-07-14-alltonote-video-producer-design.md) | Video Recipe | [原计划](../superpowers/plans/2026-07-14-alltonote-video-producer.md) + [发布收敛](../superpowers/plans/2026-07-18-alltonote-video-release-implementation-plan.md) | active | VREL-00/01 CLI seam 已验收；VREL-02..11 真实发布矩阵未闭合；通用 facade 迁移属于 Recipe X0 |
 | `REC-VIDEO-LONG-001` | [长视频知识编译](../superpowers/specs/2026-07-16-alltonote-long-video-knowledge-compilation-design.md) | Transcript -> Draft/Quality | 原 tasks + Video release plan | active | Knowledge/Faithful core 已实现；实时 YouTube acquisition 外部阻塞 |
 | `VAL-VIDEO-001` | [Video 三样本 Pilot](../design-docs/video-dogfood-validation/spec.md) | 当前产品证据 Gate | [阶段任务](../design-docs/video-dogfood-validation/tasks.md) + [冻结样本](../design-docs/video-dogfood-validation/samples.md) + [技术结果](../design-docs/video-dogfood-validation/report.md) | active | Pilot closed；首次系统 `2/3`，链路修复后 `3/3`；用户原值 `2/3`，术语修正与 V03 重评后 `3/3`；保留 reliability gap |
+| `VAL-VIDEO-REUSE-001` | [Video 可信复用验证](../design-docs/video-trusted-reuse-validation/spec.md) | 保留、延迟检索与真实复用 Gate | [观察任务](../design-docs/video-trusted-reuse-validation/tasks.md) + [观察日志](../design-docs/video-trusted-reuse-validation/observation-log.md) | active | 2026-07-30 开始；只用 V01–V03 最终 reading；最早 2026-08-06 冻结结论 |
 | `REVIEW-001` | [Review / Publisher](../superpowers/specs/2026-07-18-alltonote-review-publisher-design.md) | 审阅/正式写入 | [实施计划](../superpowers/plans/2026-07-18-alltonote-review-publisher-implementation-plan.md) | active | 未实现 |
 | `MCP-READ-001` | [Knowledge Access MCP](../superpowers/specs/2026-07-18-alltonote-knowledge-access-mcp-design.md) | 本地/公共只读知识 | [实施计划](../superpowers/plans/2026-07-18-alltonote-knowledge-access-mcp-implementation-plan.md) | active | 未实现 |
 | `ENGINE-001` | [Engine / Production MCP](../superpowers/specs/2026-07-18-alltonote-engine-production-mcp-design.md) | 后台执行/生产 Agent 接口 | [实施计划](../superpowers/plans/2026-07-18-alltonote-engine-production-mcp-implementation-plan.md) | active | 设计保留；当前实现 deferred，等待可信复用后的真实多 Job/后台瓶颈与技术 re-admission |
@@ -131,11 +134,11 @@ flowchart TD
 | 21 故障恢复 | Runtime/Video/Review/Engine | fault matrix plans | 已覆盖 |
 | 22 版本治理 | Runtime/Pack/iwiki/Release | Runtime + Release | 已覆盖 |
 | 23 测试/验收 | 全部下位设计 | 每份计划 acceptance task | 已覆盖 |
-| 24 产品 Gate | `ARCH-001` + `VAL-VIDEO-001` + Site/Recipe non-goals | Pilot tasks + master tasks | 当前 Gate 已覆盖：固定 V01–V03、系统/用户价值 `3/3`、最多两轮修复和不得外推范围 |
+| 24 产品 Gate | `ARCH-001` + `VAL-VIDEO-001` + `VAL-VIDEO-REUSE-001` + Site/Recipe non-goals | Pilot/reuse tasks + master tasks | 当前 Gate 已覆盖：固定 V01–V03、系统/用户价值 `3/3`、7 天可信复用和不得外推范围 |
 | 25 迁移当前代码 | Runtime/Video/Vault plans | 分阶段无大重写 | 已覆盖 |
 | Phase 2 Vault | `SUB-VAULT-001` | Vault/Desktop plan | 设计 complete，实现 pending |
 | Phase 3A Compiler contract | `DATA-001`、`RUNTIME-001`、`REC-CONTRACT-001` | 既有 + 新计划 | 基础 partial |
-| Phase 3B Video | Video + Long + `VAL-VIDEO-001` | Video release plan + Pilot tasks | core mostly complete；三样本 Pilot closed，修复后系统/用户价值 `3/3`，但首次系统 `2/3`；用户已选择最小可信复用验证，广泛验证仍未完成 |
+| Phase 3B Video | Video + Long + `VAL-VIDEO-001` + `VAL-VIDEO-REUSE-001` | Video release plan + Pilot/reuse tasks | core mostly complete；三样本 Pilot closed，修复后系统/用户价值 `3/3`，但首次系统 `2/3`；可信复用观察进行中，广泛验证仍未完成 |
 | Phase 3C Review/Publisher | `REVIEW-001` | Review plan | pending |
 | Phase 4 Engine/Production MCP | `ENGINE-001` | Engine plan | deferred；等待可信复用后的真实多 Job/后台瓶颈与技术 re-admission |
 | Phase 5 Article/Wiki | `REC-WEB-001` | Web plan | pending |
@@ -190,13 +193,13 @@ flowchart TD
 - 保留：各阶段已有技术规格、正确性不变量和进入对应实现后的 Gate；
 - 现行规则：`VAL-VIDEO-001` 三样本 Pilot 已完成，用户已显式选择进入最小可信复用验证；通过后只用一个真实 born-digital PDF 驱动 X0-B；完整 C0、Review/Publisher 与 Engine 由真实瓶颈重新 admission；
 - 原因：已有实现证明了编译内核深度，但尚无用户采用、保留和重复使用证据，继续扩架构会优先解决未经验证的问题；
-- 新权威：master tasks、`VAL-VIDEO-001` 与本矩阵第 7 节。既有下位技术设计未被删除。
+- 新权威：master tasks、`VAL-VIDEO-001`、`VAL-VIDEO-REUSE-001` 与本矩阵第 7 节。既有下位技术设计未被删除。
 
 ## 6. 当前实施进度（能力而非虚假总百分比）
 
 | 能力层 | 状态 | 证据/说明 |
 |---|---|---|
-| 上位架构与所有下位详细设计 | `complete for current roadmap` | 18 个正式架构设计 ID 均有关系/计划；另有 `VAL-VIDEO-001` 阶段价值验证；未来新范围另走 admission gate |
+| 上位架构与所有下位详细设计 | `complete for current roadmap` | 18 个正式架构设计 ID 均有关系/计划；另有 2 个 Video 阶段价值验证 ID；未来新范围另走 admission gate |
 | Portable/iwiki Consumer | `implemented foundation` | Artifact/Evidence/Bundle/validate/atomic commit/多 Draft |
 | Model execution | `implemented foundation` | ModelExecution/Coordinator/ExternalOperation/Codex Bridge |
 | Video Knowledge/Faithful compiler | `implemented core` | 65 分钟真实 transcript E2E、quality/pass/restart zero replay |
@@ -205,6 +208,7 @@ flowchart TD
 | Runtime CLI Wave 1A | `complete` | RCP-00..07 与 VREL-00/01 已验收；后续 Pack/Desktop/分发不属于 Wave 1A 完成定义 |
 | ProduceService / Multi-Recipe Registry X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；只完成 submission/control-plane 接缝，不代表 X0-B 数据面或多 Job 并发完成 |
 | Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原 V03 用户 FAIL；Evidence 双表示与跨拓扑术语修正后 V03 用户 PASS；不得外推范围见 `VAL-VIDEO-001` |
+| Video 可信复用验证 | `in progress; observation only` | 7 天窗口 2026-07-30 开始；等待 3/3 延迟检索和至少 1 次自然下游复用 |
 | Multi-Recipe 数据面 X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同证明 Result/Artifact/Repository/atomic commit、迁移与恢复边界 |
 | Vault Core/CLI | `mostly not implemented` | foundation plan/部分 gateway存在，完整 tree/read/search/grant未闭环 |
 | 薄 Desktop Vault UI | `pending` | 旧 BiliNote UI不等于新 Runtime/Vault UI |
@@ -225,7 +229,7 @@ flowchart TD
     W0["Wave 0：PASS（2026-07-21）"] --> X0A["X0-A：PASS（2026-07-30）"]
     X0A --> VD["Video Pilot：修正后系统/用户价值 3/3"]
     VD --> DEC["用户已决定继续"]
-    DEC --> VR["Video 可信复用验证"]
+    DEC --> VR["Video 可信复用验证：观察中"]
     VR --> PDF["一个 born-digital PDF + 最小 X0-B"]
     PDF --> ADMIT{"真实瓶颈重新 admission"}
     ADMIT --> C0["适用 C0"]
@@ -233,7 +237,7 @@ flowchart TD
     ADMIT --> ENG["Engine / Production MCP"]
 ```
 
-当前产品执行链是：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用验证 -> 一个 born-digital PDF + X0-B`。Wave 1A、Wave 0、X0-A Tasks 1–8 与三样本 Pilot 均已完成；用户已选择进入最小可信复用验证。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Pilot `3/3` 不能外推为原 `8/10`。完整 C0、Review/Publisher、AgentExecutor、Thin Desktop 与 Engine 均 pending/deferred，必须由之后出现的真实瓶颈重新 admission；其既有技术规格没有被删除。
+当前产品执行链是：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用验证 -> 一个 born-digital PDF + X0-B`。Wave 1A、Wave 0、X0-A Tasks 1–8 与三样本 Pilot 均已完成；`VAL-VIDEO-REUSE-001` 正在观察，最早 2026-08-06 冻结结论。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Pilot `3/3` 不能外推为原 `8/10`。完整 C0、Review/Publisher、AgentExecutor、Thin Desktop 与 Engine 均 pending/deferred，必须由之后出现的真实瓶颈重新 admission；其既有技术规格没有被删除。
 
 ## 8. 下一位 AI 的使用规则
 

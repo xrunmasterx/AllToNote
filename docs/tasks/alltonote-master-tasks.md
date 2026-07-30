@@ -107,7 +107,7 @@ git diff --check
 
 | 能力域 | 状态 | 当前事实 |
 |---|---|---|
-| 文档控制面与详细设计 | `completed for current roadmap` | 18 个正式架构设计 ID、1 个阶段价值验证 ID、13 份新增实施计划、关系/替代矩阵、Research、ADR 和验收摘要已建立 |
+| 文档控制面与详细设计 | `completed for current roadmap` | 18 个正式架构设计 ID、2 个阶段价值验证 ID、13 份新增实施计划、关系/替代矩阵、Research、ADR 和验收摘要已建立 |
 | 产品与架构基线 | `confirmed` | AllToNote 是上层知识编译/积累平台；Production 是用例，Video/Article/Document/Codebase/Personal 是并列 Recipe；CLI/Desktop/MCP 共享 ProduceService；所有当前路线阶段已有下位设计 |
 | iwiki Portable 消费/提交基础 | `implemented foundation` | AllToNote Bundle 已通过真实 iwiki semantic validation 和 commit |
 | Knowledge Compiler Core | `implemented foundation` | Job、Attempt、Checkpoint、ExternalOperation、ModelExecutor、Quality、Bundle 基础已建立 |
@@ -119,6 +119,7 @@ git diff --check
 | Wave 0 基线与权威收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；原 trailer 的 `3a75d0e410...` 为已记录的抄录错误；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
 | Recipe X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；范围止于 submission/control-plane 接缝，不包含数据面迁移或多 Job 并发 |
 | Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原用户结果 V01/V02 PASS、V03 FAIL；Evidence 默认呈现与跨拓扑术语修正后新 V03 用户 PASS；不能外推为 10 样本、字幕、本地文件、长视频或干净安装已验证 |
+| Video 可信复用验证 | `in progress; observation only` | 只用三份最终 reading；2026-07-30 至不早于 2026-08-06；等待延迟检索 3/3 与至少 1 次自然下游复用 |
 | Recipe X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同抽取 Result/Artifact/Repository/atomic commit、迁移与恢复边界，不得用伪消费者或纸面抽象代替 |
 | Vault 选择/文件树/Markdown 阅读/搜索 | `design complete; implementation pending` | Core/CLI/Desktop 详细设计和计划已完成，目标闭环尚未实现 |
 | Review/Publisher | `design complete; implementation pending` | 审批 hash、PublishPlan、personal/common 权限与失败语义已设计 |
@@ -288,6 +289,19 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 非目标：Document/PPT、完整 C0、多 Job、Engine、Publisher、Desktop GUI、多 Provider、自动 iWiki 发布、正式安装器与完全离线模型。
 
 完成决策：首次系统/用户价值均 `3/3` 时也只判 Pilot PASS，由用户显式决定是否扩大验证或进入可信复用；首次不足但修复后 `3/3` 时先报告可靠性缺口；修复后仍不足 `3/3` 时判 Pilot FAIL 并停止扩张。
+
+### VALUE-VIDEO-REUSE-01：Video 可信复用验证
+
+- 状态：`in progress; observation only`
+- 优先级：P0，当前唯一活动
+- 开始：2026-07-30；最早结束：2026-08-06
+- 规格：[`VAL-VIDEO-REUSE-001`](../design-docs/video-trusted-reuse-validation/spec.md)
+- 任务：[`可信复用任务`](../design-docs/video-trusted-reuse-validation/tasks.md)
+- 日志：[`观察日志`](../design-docs/video-trusted-reuse-validation/observation-log.md)
+
+范围：只观察 V01–V03 三份最终 reading 的保留、延迟检索和自然下游复用；不增加输入、不调用 ASR/LLM、不改产品代码。前三天不做计划性检索；第 4–7 天完成三个固定问题；整个窗口记录自然复用。
+
+Gate：完整性与保留 `3/3`、延迟检索 `3/3`、至少 1 次自然下游复用、单次必要清洗不超过 10 分钟才 PASS；检索通过但没有自然复用为 NO-SIGNAL；任一阻塞性检索、事实或清洗失败为 FAIL。只有 PASS 才允许请求一个 born-digital PDF + 最小 X0-B，仍不得自动启动实现。
 
 ### RELEASE-VIDEO-01：收敛 Video Producer 发布矩阵
 
@@ -742,7 +756,7 @@ flowchart TD
     W0["Wave 0：PASS（2026-07-21）"] --> X0A["Wave 1：X0-A PASS（2026-07-30）"]
     X0A --> VD["Video Pilot：修正后系统/用户价值 3/3"]
     VD --> DEC["用户已决定继续"]
-    DEC --> VR["Video 可信复用验证"]
+    DEC --> VR["Video 可信复用验证：观察中"]
     VR --> PDF["一个 born-digital PDF + 最小 X0-B"]
     PDF --> ADMIT{"真实瓶颈重新 admission"}
     ADMIT --> C0["适用的并发正确性 / C0"]
@@ -754,6 +768,7 @@ flowchart TD
 
 - Wave 1A、Wave 0 与 X0-A 均已完成；历史证据继续有效。
 - Pilot 的 `3/3` Gate、数据边界、时间盒和停止条件以本阶段 spec/tasks 为准，不得测试后重写或外推为原 `8/10`。
+- `VAL-VIDEO-REUSE-001` 只观察现有三份 reading；最早 2026-08-06 冻结 PASS / NO-SIGNAL / FAIL，窗口内不启动新实现。
 - X0-B 仍为 pending，必须由可信复用后的一个真实 born-digital PDF 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
 - CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。
 - 当前单 Job Gate 不需要完整 C0；只有内部 fan-out 的 turn 隔离问题属于条件式最小修复。多 Job、SQLite 多 writer 和 Engine 仍受各自技术 Gate 约束。

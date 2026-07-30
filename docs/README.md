@@ -320,6 +320,7 @@ flowchart LR
 - Wave 0 已于 2026-07-21 通过；实际权威基线为 `3a75d0eb921acd2f5eac75d2033ae4d4e0e00cc3`，实现集成提交为 `066884da43105e000e00e389ab213274ca2fd6c5`。实现提交 trailer 中的 `3a75d0e410...` 是不可解析的抄录错误，验收记录已显式更正，不改写历史。
 - X0-A Tasks 1–8 已完成并通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；X0-A 只建立 submission/control-plane 接缝，不提供同 Workspace 多 Job 并发、detach、Engine 或 AgentExecutor，也未完成 Job/Repository/Bundle 数据面去 Video 化。X0-B pending，且必须由 Video 与真实 Document/PPT 第二消费者共同驱动，不能以伪消费者或纸面抽象代替。
 - [`VAL-VIDEO-001 Video 三样本 Pilot`](design-docs/video-dogfood-validation/spec.md) 已关闭：V01–V03 修复后系统 `3/3`，首次为 `2/3`；Evidence 默认呈现已修复；用户原判定 V01/V02 通过、V03 不通过。跨样本专有名词修正已在 V02 DIRECT 与 V03 MAP_COMPOSE 客观复验通过，新 V03 经用户重评通过，修正后用户价值 `3/3`。可靠性缺口和范围限制仍保留；用户已授权下一步只建立最小 Video 可信复用验证。
+- [`VAL-VIDEO-REUSE-001 Video 可信复用验证`](design-docs/video-trusted-reuse-validation/spec.md) 已进入 7 天观察：只使用三份最终 reading，不增加输入、不调用模型、不改产品代码；最早于 2026-08-06 按延迟检索、自然下游复用和人工清洗成本冻结 PASS / NO-SIGNAL / FAIL。
 - Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending；旧 BiliNote UI 不等于 Thin Desktop 完成。
 - 完整 C0 和 Engine 当前 deferred。它们的既有技术设计保留，但只有可信复用后出现真实多 Job/后台瓶颈，并关闭适用的模型 turn、SQLite 和 per-job authority Gate 时才重新 admission。
 - 当前产品执行链为：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用验证 -> 一个 born-digital PDF + X0-B -> 按真实瓶颈重新 admission 后续能力`。
@@ -343,6 +344,7 @@ flowchart LR
 | 任务 | 必读顺序 |
 |---|---|
 | Video 三样本 Pilot | `ARCH-001 -> DATA-001 -> RUNTIME-001 -> REC-VIDEO-001 -> REC-VIDEO-LONG-001 -> VAL-VIDEO-001 spec/tasks/samples -> 当前实现与 acceptance` |
+| Video 可信复用验证 | `VAL-VIDEO-001 report -> VAL-VIDEO-REUSE-001 spec -> tasks -> observation-log` |
 | Runtime / CLI / Pack | `ARCH-001 -> RUNTIME-001 -> Runtime plan -> 当前 CLI/Job/Pack 代码` |
 | Portable / iwiki | `iwiki published contract -> ARCH-001 -> DATA-001 -> Consumer/Provider contract tests` |
 | Video / 长视频 | `ARCH-001 -> DATA-001 -> RUNTIME-001 -> REC-VIDEO-001 -> REC-VIDEO-LONG-001 -> Video release plan -> acceptance` |
@@ -391,7 +393,7 @@ flowchart LR
 - 权威文档基线已集成到实现分支提交 `066884da43105e000e00e389ab213274ca2fd6c5`；实际来源提交与集成提交的 stable patch-id 均为 `9ca7ee7109ecdbbba7ba24526355e36a6ca7fabd`。实现提交 trailer 中的 `3a75d0e410...` 是不可解析的抄录错误，已在验收报告中更正而未改写历史。
 - X0-A 最终 backend 全量测试为 `1906 passed, 2 skipped, 1 warning, 3 subtests passed`；Windows 本地视频 smoke 为 `1 passed, 14 deselected, 1 warning`；`git diff --check` 通过。
 - `G:\AllToNote` 中未跟踪的 `AGENTS.md` 与 `config/` 是明确排除的用户本地资产；不得清理、覆盖或纳入本阶段提交。
-- Wave 0、X0-A 与 `VAL-VIDEO-001` 已关闭；X0-A 的最终验收见 `acceptance/2026-07-30-recipe-x0a-task-8.md`。下一条允许的产品验证是最小 Video 可信复用，不是自动进入 C0、PDF 或其他实现。
+- Wave 0、X0-A 与 `VAL-VIDEO-001` 已关闭；X0-A 的最终验收见 `acceptance/2026-07-30-recipe-x0a-task-8.md`。`VAL-VIDEO-REUSE-001` 已进入观察，不是自动进入 C0、PDF 或其他实现。
 - 当前正式架构设计继续有效；不得把 X0-A 或三样本 Pilot解释为多 Recipe 数据面、广泛产品价值或并发 Engine 已完成，也不得绕过用户显式决策提前启动 X0-B 或 Engine production implementation。
 
-下一个执行者必须先读取总任务清单中的 `HANDOFF-01` 和已关闭的 `VAL-VIDEO-001` 结果，再按可信复用 Gate 选择一个实际任务。
+下一个执行者必须先读取总任务清单中的 `HANDOFF-01`、已关闭的 `VAL-VIDEO-001` 结果和 `VAL-VIDEO-REUSE-001`，观察窗口结束前不得选择新的产品实现任务。
