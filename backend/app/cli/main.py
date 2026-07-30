@@ -115,6 +115,15 @@ def _build_parser(
     )
     config_set_parser.add_argument("value")
     config_set_parser.add_argument("--json", action="store_true")
+    workspace_parser = subparsers.add_parser("workspace")
+    workspace_subparsers = workspace_parser.add_subparsers(
+        dest="workspace_command", required=True
+    )
+    workspace_init_parser = workspace_subparsers.add_parser("init")
+    workspace_init_parser.add_argument("path", type=Path)
+    workspace_init_parser.add_argument("--name", required=True)
+    workspace_init_parser.add_argument("--set-default", action="store_true")
+    workspace_init_parser.add_argument("--json", action="store_true")
     credential_parser = subparsers.add_parser("credential")
     credential_subparsers = credential_parser.add_subparsers(
         dest="credential_command", required=True
@@ -293,6 +302,38 @@ def main(
         )
         render_result(result, json_mode=args.json)
         return int(ExitCode.SUCCESS)
+
+    if args.command == "workspace":
+        command = f"workspace {args.workspace_command}"
+        try:
+            from app.cli.workspace_commands import workspace_init_result
+
+            result = workspace_init_result(
+                args.path,
+                args.name,
+                set_default=args.set_default,
+                correlation_id=correlation_id,
+                config_service=config_service,
+            )
+            exit_code = ExitCode.SUCCESS
+        except DomainError as error:
+            mapped = map_domain_error(error)
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        except Exception:
+            mapped = internal_error()
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        render_result(result, json_mode=args.json)
+        return int(exit_code)
 
     if args.command == "recipe":
         command = f"recipe {args.recipe_command}"
@@ -1441,6 +1482,8 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
         return f"config {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "credential":
         return f"credential {arguments[1]}"
+    if len(arguments) >= 2 and arguments[0] == "workspace":
+        return f"workspace {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "job":
         return f"job {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] in {"artifact", "draft"}:

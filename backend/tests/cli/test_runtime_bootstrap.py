@@ -37,6 +37,7 @@ def test_recipe_discovery_does_not_import_runtime_or_heavy_modules(
         "app.core.recipes.video.adapter",
         "app.core.recipes.document.adapter",
         "app.adapters.documents.docling_worker_parser",
+        "app.workspace_initializer",
         "app.adapters.sources.legacy_video",
         "app.adapters.transcription.legacy_transcriber",
         "fastapi",
@@ -92,6 +93,7 @@ def test_cli_version_does_not_import_web_or_video_modules():
         "fastapi",
         "torch",
         "faster_whisper",
+        "app.workspace_initializer",
         "app.services.note",
     } & set(report["imported_modules"])
 

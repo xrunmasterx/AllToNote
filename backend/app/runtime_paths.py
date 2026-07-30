@@ -91,6 +91,18 @@ class RuntimePaths:
                 "Workspace root is invalid",
             )
 
+        self.assert_workspace_location(workspace)
+
+    def assert_workspace_location(self, workspace_root: Path) -> None:
+        try:
+            workspace = Path(workspace_root).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise DomainError(
+                "workspace_root_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Workspace root is invalid",
+            ) from error
+
         for record in self.role_records():
             machine_root = Path(record["path"]).resolve(strict=False)
             if (
