@@ -127,7 +127,7 @@ def test_download_removes_cookiefile_after_success(monkeypatch, tmp_path, caplog
     assert ".youtube.com\tTRUE\t/\tFALSE\t0\tSID\tabc\n" in _FakeYoutubeDL.cookie_contents[0]
     assert ".youtube.com\tTRUE\t/\tFALSE\t0\tHSID\tdef\n" in _FakeYoutubeDL.cookie_contents[0]
     assert opts["js_runtimes"] == {"node": {"path": r"C:\Program Files\nodejs\node.exe"}}
-    assert opts["remote_components"] == ["ejs:github"]
+    assert "remote_components" not in opts
 
     log_output = "\n".join(
         record.getMessage() for record in caplog.records if record.name == module.__name__

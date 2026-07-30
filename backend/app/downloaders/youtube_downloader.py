@@ -59,7 +59,6 @@ def _apply_youtube_challenge_support(ydl_opts: dict) -> dict:
     node_path = shutil.which("node")
     if node_path:
         ydl_opts['js_runtimes'] = {'node': {'path': node_path}}
-        ydl_opts['remote_components'] = ['ejs:github']
     return ydl_opts
 
 

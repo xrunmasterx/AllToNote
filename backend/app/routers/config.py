@@ -28,11 +28,8 @@ class CookieUpdateRequest(BaseModel):
 
 @router.get("/get_downloader_cookie/{platform}")
 def get_cookie(platform: str):
-    cookie = cookie_manager.get(platform)
-    if not cookie:
-        return R.success(msg='未找到Cookies')
     return R.success(
-        data={"platform": platform, "cookie": cookie}
+        data={"platform": platform, "configured": cookie_manager.exists(platform)}
     )
 
 
@@ -40,7 +37,15 @@ def get_cookie(platform: str):
 def update_cookie(data: CookieUpdateRequest):
     cookie_manager.set(data.platform, data.cookie)
     return R.success(
+        data={"platform": data.platform, "configured": True}
+    )
 
+
+@router.delete("/downloader_cookie/{platform}")
+def delete_cookie(platform: str):
+    cookie_manager.delete(platform)
+    return R.success(
+        data={"platform": platform, "configured": False}
     )
 
 class TranscriberConfigRequest(BaseModel):

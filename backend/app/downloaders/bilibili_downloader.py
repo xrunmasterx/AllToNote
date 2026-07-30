@@ -3,7 +3,8 @@ import json
 import logging
 import tempfile
 from abc import ABC
-from typing import Union, Optional, List
+from contextlib import contextmanager
+from typing import Iterator, Union, Optional, List
 
 import yt_dlp
 
@@ -18,10 +19,34 @@ from app.services.cookie_manager import CookieConfigManager
 
 logger = logging.getLogger(__name__)
 
+_COOKIE_CREATION_ERROR = "Failed to create Bilibili cookie file"
+_COOKIE_CREATION_CLEANUP_ERROR = "Failed to create and clean up Bilibili cookie file"
+_COOKIE_CLEANUP_ERROR = "Failed to clean up Bilibili cookie file"
+_COOKIE_CLEANUP_AFTER_ERROR_LOG = "Failed to clean up Bilibili cookie file after download error"
+_COOKIE_CLEANUP_NOTE = "Bilibili cookie file cleanup also failed"
+
 # Inject the dm_img_* / web_location risk-control params Bilibili's wbi/playurl
 # gateway now requires; without them the API path returns HTTP 412. See
 # app/downloaders/bilibili_dm_patch.py for details.
 apply_bilibili_dm_img_patch()
+
+
+def _remove_cookie_file(cookiefile: str) -> None:
+    try:
+        os.remove(cookiefile)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise RuntimeError(_COOKIE_CLEANUP_ERROR) from None
+
+
+def _add_safe_note(error: BaseException, note: str) -> None:
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+    except BaseException:
+        pass
 
 
 class BilibiliDownloader(Downloader, ABC):
@@ -29,7 +54,6 @@ class BilibiliDownloader(Downloader, ABC):
         super().__init__()
         self._cookie_mgr = CookieConfigManager()
         self._cookie = self._cookie_mgr.get('bilibili')
-        self._cookiefile = self._write_netscape_cookie_file()
 
     def _write_netscape_cookie_file(self) -> Optional[str]:
         """将 Cookie 写入 Netscape 格式临时文件，返回文件路径（供 yt-dlp cookiefile 使用）"""
@@ -37,15 +61,88 @@ class BilibiliDownloader(Downloader, ABC):
             logger.warning("B站 Cookie 未配置，下载可能失败")
             return None
         lines = ["# Netscape HTTP Cookie File\n"]
-        for pair in self._cookie.split("; "):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                lines.append(f".bilibili.com\tTRUE\t/\tFALSE\t0\t{key}\t{value}\n")
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-        tmp.writelines(lines)
-        tmp.close()
-        logger.info("已生成 B站 Netscape Cookie 文件: %s (条目: %d)", tmp.name, len(lines) - 1)
-        return tmp.name
+        for pair in self._cookie.replace("\n", ";").split(";"):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            key, value = pair.split("=", 1)
+            if key:
+                lines.append(
+                    f".bilibili.com\tTRUE\t/\tFALSE\t0\t{key}\t{value}\n"
+                )
+        if len(lines) == 1:
+            return None
+
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', delete=False, encoding='utf-8'
+            )
+            tmp.writelines(lines)
+            tmp.close()
+            logger.info(
+                "Created Bilibili Netscape cookie file for yt-dlp (entries: %d)",
+                len(lines) - 1,
+            )
+            return tmp.name
+        except BaseException as creation_error:
+            cleanup_errors = []
+            if tmp is not None:
+                try:
+                    tmp.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                try:
+                    _remove_cookie_file(tmp.name)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
+            if not isinstance(creation_error, Exception):
+                if cleanup_errors:
+                    _add_safe_note(creation_error, _COOKIE_CLEANUP_NOTE)
+                raise
+
+            cleanup_control_error = next(
+                (
+                    cleanup_error
+                    for cleanup_error in cleanup_errors
+                    if not isinstance(cleanup_error, Exception)
+                ),
+                None,
+            )
+            if cleanup_control_error is not None:
+                if len(cleanup_errors) > 1:
+                    _add_safe_note(cleanup_control_error, _COOKIE_CLEANUP_NOTE)
+                raise cleanup_control_error from None
+
+            message = (
+                _COOKIE_CREATION_CLEANUP_ERROR
+                if cleanup_errors
+                else _COOKIE_CREATION_ERROR
+            )
+            raise RuntimeError(message) from None
+
+    @contextmanager
+    def _cookiefile_for_download(self) -> Iterator[Optional[str]]:
+        cookiefile = self._write_netscape_cookie_file()
+        try:
+            yield cookiefile
+        except BaseException as primary_error:
+            if cookiefile:
+                try:
+                    _remove_cookie_file(cookiefile)
+                except BaseException as cleanup_error:
+                    if not isinstance(cleanup_error, Exception):
+                        raise
+                    _add_safe_note(primary_error, _COOKIE_CLEANUP_NOTE)
+                    try:
+                        logger.error(_COOKIE_CLEANUP_AFTER_ERROR_LOG)
+                    except BaseException:
+                        pass
+            raise
+        else:
+            if cookiefile:
+                _remove_cookie_file(cookiefile)
 
     def download(
         self,
@@ -76,16 +173,17 @@ class BilibiliDownloader(Downloader, ABC):
             'noplaylist': True,
             'quiet': False,
         }
-        if self._cookiefile:
-            ydl_opts['cookiefile'] = self._cookiefile
+        with self._cookiefile_for_download() as cookiefile:
+            if cookiefile:
+                ydl_opts['cookiefile'] = cookiefile
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            video_id = info.get("id")
-            title = info.get("title")
-            duration = info.get("duration", 0)
-            cover_url = info.get("thumbnail")
-            audio_path = os.path.join(output_dir, f"{video_id}.mp3")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                video_id = info.get("id")
+                title = info.get("title")
+                duration = info.get("duration", 0)
+                cover_url = info.get("thumbnail")
+                audio_path = os.path.join(output_dir, f"{video_id}.mp3")
 
         return AudioDownloadResult(
             file_path=audio_path,
@@ -110,7 +208,6 @@ class BilibiliDownloader(Downloader, ABC):
         if output_dir is None:
             output_dir = get_data_dir()
         os.makedirs(output_dir, exist_ok=True)
-        print("video_url",video_url)
         video_id=extract_video_id(video_url, "bilibili")
         video_path = os.path.join(output_dir, f"{video_id}.mp4")
         if os.path.exists(video_path):
@@ -129,13 +226,14 @@ class BilibiliDownloader(Downloader, ABC):
             'quiet': False,
             'merge_output_format': 'mp4',  # 确保合并成 mp4
         }
-        if self._cookiefile:
-            ydl_opts['cookiefile'] = self._cookiefile
+        with self._cookiefile_for_download() as cookiefile:
+            if cookiefile:
+                ydl_opts['cookiefile'] = cookiefile
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            video_id = info.get("id")
-            video_path = os.path.join(output_dir, f"{video_id}.mp4")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                video_id = info.get("id")
+                video_path = os.path.join(output_dir, f"{video_id}.mp4")
 
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"视频文件未找到: {video_path}")
@@ -192,65 +290,65 @@ class BilibiliDownloader(Downloader, ABC):
             'quiet': True,
         }
 
-        # 通过 CookieConfigManager 注入 B站 Cookie（Netscape cookiefile）
-        if self._cookiefile:
-            ydl_opts['cookiefile'] = self._cookiefile
-            ydl_opts['http_headers'] = {'Referer': 'https://www.bilibili.com'}
+        with self._cookiefile_for_download() as cookiefile:
+            if cookiefile:
+                ydl_opts['cookiefile'] = cookiefile
+                ydl_opts['http_headers'] = {'Referer': 'https://www.bilibili.com'}
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
 
-                # 查找下载的字幕文件
-                subtitles = info.get('requested_subtitles') or {}
-                if not subtitles:
-                    logger.info(f"B站视频 {video_id} 没有可用字幕")
-                    return None
+                    # 查找下载的字幕文件
+                    subtitles = info.get('requested_subtitles') or {}
+                    if not subtitles:
+                        logger.info(f"B站视频 {video_id} 没有可用字幕")
+                        return None
 
-                # 按优先级查找字幕
-                detected_lang = None
-                sub_info = None
-                for lang in langs:
-                    if lang in subtitles:
-                        detected_lang = lang
-                        sub_info = subtitles[lang]
-                        break
-
-                # 如果按优先级没找到，取第一个可用的（排除弹幕）
-                if not detected_lang:
-                    for lang, info_item in subtitles.items():
-                        if lang != 'danmaku':  # 排除弹幕
+                    # 按优先级查找字幕
+                    detected_lang = None
+                    sub_info = None
+                    for lang in langs:
+                        if lang in subtitles:
                             detected_lang = lang
-                            sub_info = info_item
+                            sub_info = subtitles[lang]
                             break
 
-                if not sub_info:
-                    logger.info(f"B站视频 {video_id} 没有可用字幕（排除弹幕）")
-                    return None
+                    # 如果按优先级没找到，取第一个可用的（排除弹幕）
+                    if not detected_lang:
+                        for lang, info_item in subtitles.items():
+                            if lang != 'danmaku':  # 排除弹幕
+                                detected_lang = lang
+                                sub_info = info_item
+                                break
 
-                # 检查是否有内嵌数据（yt-dlp 有时直接返回字幕内容）
-                if 'data' in sub_info and sub_info['data']:
-                    logger.info(f"直接从返回数据解析字幕: {detected_lang}")
-                    return self._parse_srt_content(sub_info['data'], detected_lang)
+                    if not sub_info:
+                        logger.info(f"B站视频 {video_id} 没有可用字幕（排除弹幕）")
+                        return None
 
-                # 查找字幕文件
-                ext = sub_info.get('ext', 'srt')
-                subtitle_file = os.path.join(output_dir, f"{video_id}.{detected_lang}.{ext}")
+                    # 检查是否有内嵌数据（yt-dlp 有时直接返回字幕内容）
+                    if 'data' in sub_info and sub_info['data']:
+                        logger.info(f"直接从返回数据解析字幕: {detected_lang}")
+                        return self._parse_srt_content(sub_info['data'], detected_lang)
 
-                if not os.path.exists(subtitle_file):
-                    logger.info(f"字幕文件不存在: {subtitle_file}")
-                    return None
+                    # 查找字幕文件
+                    ext = sub_info.get('ext', 'srt')
+                    subtitle_file = os.path.join(output_dir, f"{video_id}.{detected_lang}.{ext}")
 
-                # 根据格式解析字幕文件
-                if ext == 'json3':
-                    return self._parse_json3_subtitle(subtitle_file, detected_lang)
-                else:
-                    with open(subtitle_file, 'r', encoding='utf-8') as f:
-                        return self._parse_srt_content(f.read(), detected_lang)
+                    if not os.path.exists(subtitle_file):
+                        logger.info(f"字幕文件不存在: {subtitle_file}")
+                        return None
 
-        except Exception as e:
-            logger.warning(f"获取B站字幕失败: {e}")
-            return None
+                    # 根据格式解析字幕文件
+                    if ext == 'json3':
+                        return self._parse_json3_subtitle(subtitle_file, detected_lang)
+                    else:
+                        with open(subtitle_file, 'r', encoding='utf-8') as f:
+                            return self._parse_srt_content(f.read(), detected_lang)
+
+            except Exception as e:
+                logger.warning(f"获取B站字幕失败: {e}")
+                return None
 
     def _parse_srt_content(self, srt_content: str, language: str) -> Optional[TranscriptResult]:
         """
