@@ -192,19 +192,10 @@ class MachineResourceLeaseStore:
                     ),
                 )
             elif row["expires_at_ms"] > now_ms:
-                if not self._row_owned_by(row, owner):
-                    raise DomainError(
-                        "resource_busy",
-                        ErrorCategory.CONFLICT,
-                        "Machine resource is held by another process instance",
-                    )
-                fencing_token = row["fencing_token"]
-                connection.execute(
-                    """
-                    UPDATE resource_leases SET expires_at_ms = ?
-                    WHERE resource_name = ?
-                    """,
-                    (expires_at_ms, resource_name),
+                raise DomainError(
+                    "resource_busy",
+                    ErrorCategory.CONFLICT,
+                    "Machine resource is already leased",
                 )
             else:
                 fencing_token = row["fencing_token"] + 1
@@ -301,13 +292,6 @@ class MachineResourceLeaseStore:
             _release_callback=lambda: self._release(
                 resource_name, owner, fencing_token
             ),
-        )
-
-    @staticmethod
-    def _row_owned_by(row: sqlite3.Row, owner: ResourceOwner) -> bool:
-        return (
-            row["workspace_identity"] == owner.workspace_identity
-            and row["process_instance_id"] == owner.process_instance_id
         )
 
     @staticmethod

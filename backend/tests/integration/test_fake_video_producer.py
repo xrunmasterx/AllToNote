@@ -15,6 +15,8 @@ from iwiki.portable import PortableBundleRef, ValidationLevel, validate_bundle
 from iwiki.workspace import open_workspace
 
 import app.core.application.video_service as video_service_module
+from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.core.application.job_service import JobService
 from app.core.domain.video import (
     FaithfulLanguagePolicy,
@@ -39,6 +41,7 @@ from app.core.application.video_service import (
 from app.core.application.video_checkpoints import decode_draft, encode_draft
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError
+from app.core.jobs.resource_lease import ResourceOwner
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
@@ -1682,6 +1685,332 @@ def test_distinct_jobs_on_one_runtime_execute_serially(
     assert calls.download == calls.transcribe == calls.model == 2
     assert calls.commit == 2
     assert max_active == 1
+
+
+def test_machine_admission_keeps_competing_video_job_queued(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block_model(heartbeat: Callable[[], None]) -> None:
+        heartbeat()
+        entered.set()
+        assert release.wait(timeout=5)
+
+    store = MachineResourceLeaseStore.open(tmp_path / "shared-machine")
+    first_calls = runtime_module.FakeCallCounts()
+    second_calls = runtime_module.FakeCallCounts()
+    first = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "workspace-machine-a",
+        calls=first_calls,
+        operation_hooks={"model": block_model},
+        resource_lease_store=store,
+        resource_owner=ResourceOwner("workspace-a", "process-a", process_id=101),
+    )
+    second = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "workspace-machine-b",
+        calls=second_calls,
+        resource_lease_store=store,
+        resource_owner=ResourceOwner("workspace-b", "process-b", process_id=202),
+    )
+    first_job = first.submit_video(
+        valid_request(workspace_root, client_request_id="machine-admission-first")
+    )
+    second_workspace = tmp_path / "second-workspace-machine-admission"
+    shutil.copytree(workspace_root, second_workspace)
+    second_job = second.submit_video(
+        replace(
+            valid_request(
+                second_workspace,
+                client_request_id="machine-admission-second",
+            ),
+            input_value="fixture://second-course",
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_wait = executor.submit(first.wait_job, first_job.job_id)
+        assert entered.wait(timeout=5)
+        try:
+            with pytest.raises(DomainError, match="resource_busy"):
+                second.wait_job(second_job.job_id)
+            assert second.get_job(second_job.job_id).state is JobState.QUEUED
+            assert (
+                second_calls.download
+                == second_calls.transcribe
+                == second_calls.model
+                == second_calls.commit
+                == 0
+            )
+        finally:
+            release.set()
+        assert first_wait.result(timeout=15).state is JobState.SUCCEEDED
+
+    assert second.wait_job(second_job.job_id).state is JobState.SUCCEEDED
+    assert second_calls.download == second_calls.transcribe == second_calls.model == 1
+    assert second_calls.commit == 1
+
+
+def test_scheduler_busy_keeps_new_video_job_queued(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "scheduler-busy-machine",
+        owner_id="waiting-process",
+    )
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="scheduler-busy-queued")
+    )
+    authority = runtime.job_repository.acquire_scheduler_lease(
+        "blocking-process",
+        ttl_seconds=300,
+    )
+
+    try:
+        with pytest.raises(DomainError, match="scheduler_busy"):
+            runtime.wait_job(submitted.job_id)
+        assert runtime.get_job(submitted.job_id).state is JobState.QUEUED
+    finally:
+        runtime.job_repository.release_scheduler_lease(authority)
+
+
+def test_machine_admission_heartbeat_fences_takeover_before_checkpoint(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_now_ms = [1_000]
+    store = MachineResourceLeaseStore.open(
+        tmp_path / "takeover-shared-machine",
+        clock=lambda: machine_now_ms[0],
+    )
+    calls = runtime_module.FakeCallCounts()
+
+    def lose_machine_lease(_heartbeat: Callable[[], None]) -> None:
+        machine_now_ms[0] = 302_000
+        store.acquire(
+            "produce:heavy:v1",
+            ResourceOwner("workspace-b", "process-b", process_id=202),
+            ttl_seconds=300,
+        )
+
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "takeover-workspace-machine",
+        calls=calls,
+        operation_hooks={"model": lose_machine_lease},
+        resource_lease_store=store,
+        resource_owner=ResourceOwner("workspace-a", "process-a", process_id=101),
+    )
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="machine-takeover")
+    )
+
+    failed = runtime.wait_job(submitted.job_id)
+
+    assert failed.state is JobState.FAILED
+    assert failed.error is not None
+    assert failed.error.code == "resource_lease_lost"
+    assert runtime.job_repository.latest_checkpoint(
+        submitted.job_id,
+        "generate_draft",
+    ) is None
+    assert calls.model == 1
+    assert calls.commit == 0
+
+
+def test_machine_takeover_after_prepare_fences_video_before_commit(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_now_ms = [1_000]
+    store = MachineResourceLeaseStore.open(
+        tmp_path / "commit-takeover-shared-machine",
+        clock=lambda: machine_now_ms[0],
+    )
+    competing_owner = ResourceOwner(
+        "workspace-b",
+        "process-b",
+        process_id=202,
+    )
+
+    class TakeOverAfterPrepare:
+        def __init__(self) -> None:
+            self._delegate = IWikiPortableGateway()
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+        def prepare_candidate(self, *args: object, **kwargs: object) -> object:
+            prepared = self._delegate.prepare_candidate(*args, **kwargs)
+            machine_now_ms[0] = 302_000
+            store.acquire(
+                "produce:heavy:v1",
+                competing_owner,
+                ttl_seconds=300,
+            )
+            return prepared
+
+    calls = runtime_module.FakeCallCounts()
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "commit-takeover-workspace-machine",
+        calls=calls,
+        resource_lease_store=store,
+        resource_owner=ResourceOwner(
+            "workspace-a",
+            "process-a",
+            process_id=101,
+        ),
+    )
+    runtime.video_service._portable = TakeOverAfterPrepare()
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="machine-commit-takeover")
+    )
+
+    failed = runtime.wait_job(submitted.job_id)
+
+    assert failed.state is JobState.FAILED
+    assert failed.result is None
+    assert failed.error is not None
+    assert failed.error.code == "resource_lease_lost"
+    assert calls.commit == 0
+    assert not tuple(workspace_root.rglob("commit.json"))
+
+
+def test_blocking_action_renews_machine_admission_beyond_ttl(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_now_ms = [1_000]
+    heartbeat_observed = threading.Event()
+    store = MachineResourceLeaseStore.open(
+        tmp_path / "heartbeat-shared-machine",
+        clock=lambda: machine_now_ms[0],
+    )
+    competing_store = MachineResourceLeaseStore.open(
+        tmp_path / "heartbeat-shared-machine",
+        clock=lambda: machine_now_ms[0],
+    )
+    original_heartbeat = store._heartbeat
+
+    def observe_heartbeat(*args: object, **kwargs: object) -> object:
+        renewed = original_heartbeat(*args, **kwargs)
+        if threading.current_thread() is not threading.main_thread():
+            heartbeat_observed.set()
+        return renewed
+
+    store._heartbeat = observe_heartbeat  # type: ignore[method-assign]
+
+    def block_model(_heartbeat: Callable[[], None]) -> None:
+        machine_now_ms[0] = 200_000
+        assert heartbeat_observed.wait(timeout=2)
+        machine_now_ms[0] = 400_000
+        with pytest.raises(DomainError, match="resource_busy"):
+            competing_store.acquire(
+                "produce:heavy:v1",
+                ResourceOwner("workspace-b", "process-b", process_id=202),
+                ttl_seconds=300,
+            )
+
+    calls = runtime_module.FakeCallCounts()
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "heartbeat-workspace-machine",
+        calls=calls,
+        operation_hooks={"model": block_model},
+        resource_lease_store=store,
+        resource_owner=ResourceOwner("workspace-a", "process-a", process_id=101),
+    )
+    runtime.video_service._heartbeat_interval_seconds = 0.01
+
+    completed = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="machine-heartbeat")
+        ).job_id
+    )
+
+    assert completed.state is JobState.SUCCEEDED
+    assert calls.model == calls.commit == 1
+    next_lease = competing_store.acquire(
+        "produce:heavy:v1",
+        ResourceOwner("workspace-b", "process-b", process_id=202),
+        ttl_seconds=300,
+    )
+    assert next_lease.release()
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt))
+def test_machine_admission_is_released_after_execution_abort(
+    tmp_path: Path,
+    workspace_root: Path,
+    failure_type: type[BaseException],
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    store = MachineResourceLeaseStore.open(tmp_path / "abort-shared-machine")
+
+    def abort_model(_heartbeat: Callable[[], None]) -> None:
+        raise failure_type("injected execution abort")
+
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "abort-workspace-machine",
+        operation_hooks={"model": abort_model},
+        resource_lease_store=store,
+        resource_owner=ResourceOwner("workspace-a", "process-a", process_id=101),
+    )
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="machine-abort")
+    )
+
+    with pytest.raises(failure_type, match="execution abort"):
+        runtime.wait_job(submitted.job_id)
+
+    recovered = store.acquire(
+        "produce:heavy:v1",
+        ResourceOwner("workspace-b", "process-b", process_id=202),
+        ttl_seconds=300,
+    )
+    assert recovered.release()
+
+
+def test_video_runtime_rejects_partial_or_mismatched_machine_admission(
+    tmp_path: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    store = MachineResourceLeaseStore.open(tmp_path / "invariant-shared-machine")
+    owner = ResourceOwner("workspace-a", "process-a", process_id=101)
+
+    with pytest.raises(ValueError, match="resource_admission_pair_required"):
+        _create_fake_runtime(
+            runtime_module,
+            tmp_path / "missing-owner-machine",
+            resource_lease_store=store,
+        )
+    with pytest.raises(ValueError, match="resource_admission_pair_required"):
+        _create_fake_runtime(
+            runtime_module,
+            tmp_path / "missing-store-machine",
+            resource_owner=owner,
+        )
+    with pytest.raises(ValueError, match="resource_admission_owner_mismatch"):
+        _create_fake_runtime(
+            runtime_module,
+            tmp_path / "mismatched-owner-machine",
+            owner_id="different-process",
+            resource_lease_store=store,
+            resource_owner=owner,
+        )
 
 
 def test_submitted_job_survives_independent_runtime_wait(

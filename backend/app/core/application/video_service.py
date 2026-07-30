@@ -59,7 +59,13 @@ from app.core.jobs.model import (
     CheckpointMetadata,
     JobExecutionBinding,
 )
-from app.core.jobs.resource_lease import ExecutionAuthority
+from app.core.jobs.resource_lease import (
+    HEAVY_PRODUCTION_RESOURCE_NAME,
+    ExecutionAuthority,
+    ResourceLease,
+    ResourceLeaseStorePort,
+    ResourceOwner,
+)
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.bundle_assembler import (
     BundleAssembler,
@@ -369,7 +375,16 @@ class VideoService:
         faithful_compiler: VideoFaithfulCompilerPort | None = None,
         current_config_snapshot: JobConfigSnapshot | None = None,
         generated_transcriber_identity: str = "fake/transcriber-v1",
+        resource_lease_store: ResourceLeaseStorePort | None = None,
+        resource_owner: ResourceOwner | None = None,
     ) -> None:
+        if (resource_lease_store is None) != (resource_owner is None):
+            raise ValueError("resource_admission_pair_required")
+        if (
+            resource_owner is not None
+            and owner_id != resource_owner.process_instance_id
+        ):
+            raise ValueError("resource_admission_owner_mismatch")
         self._repository = repository
         self._job_service = JobService(repository)
         self._attempt_storage = attempt_storage
@@ -383,6 +398,9 @@ class VideoService:
         self._faithful_compiler = faithful_compiler
         self._current_config_snapshot = current_config_snapshot
         self._generated_transcriber_identity = generated_transcriber_identity
+        self._resource_lease_store = resource_lease_store
+        self._resource_owner = resource_owner
+        self._active_resource_lease: ResourceLease | None = None
         self._submitted_config_snapshots: dict[str, JobConfigSnapshot] = {}
         self._execution_lock = threading.Lock()
         self._checkpoint_runner = CheckpointedStepRunner(
@@ -392,6 +410,7 @@ class VideoService:
             checkpoint_schema=CHECKPOINT_SCHEMA,
             scheduler_lease_ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
             heartbeat_interval_seconds=_SCHEDULER_HEARTBEAT_INTERVAL_SECONDS,
+            additional_heartbeat=self._heartbeat_resource_lease,
         )
 
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
@@ -450,54 +469,93 @@ class VideoService:
             return snapshot
         self._assert_config_compatible(job_id)
         request = self._load_request(job_id)
-        if snapshot.state is JobState.QUEUED:
-            self._repository.transition_job(job_id, JobState.RUNNING)
-        authority = self._repository.acquire_scheduler_lease(
-            self._owner_id, ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS
-        )
-        _, active_attempt, _ = self._repository.get_job_details(job_id)
+        self._acquire_resource_lease()
         try:
-            if (
-                active_attempt is not None
-                and active_attempt.state is AttemptState.RUNNING
-                and active_attempt.fencing_token != authority.fencing_token
-            ):
-                active_attempt = self._repository.take_over_running_attempt(
-                    job_id, active_attempt.attempt_id, authority
-                )
-                unknown = self._repository.reconcile_external_operations_after_process_loss(
-                    job_id, authority
-                )
-                if unknown:
-                    self._repository.pause_for_external_outcome_atomic(
-                        job_id,
-                        active_attempt.attempt_id,
-                        authority,
-                    )
-                    return self._snapshot(job_id)
-            if active_attempt is not None and active_attempt.step_id == "commit":
-                return self._reconcile_commit(request, active_attempt, authority)
-            return self._execute(
-                job_id,
-                request,
-                authority,
-                resumed_attempt=active_attempt,
+            authority = self._repository.acquire_scheduler_lease(
+                self._owner_id, ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS
             )
-        except DomainError as error:
             try:
-                self._fail_job(job_id, active_attempt, authority, error)
-            except DomainError as convergence_error:
-                if convergence_error.code in _AUTHORITY_LOSS_CODES:
-                    raise error from convergence_error
-                raise
-            return self._snapshot(job_id)
+                snapshot = self._snapshot(job_id)
+                if snapshot.state in {
+                    JobState.SUCCEEDED,
+                    JobState.FAILED,
+                    JobState.CANCELLED,
+                    JobState.WAITING_FOR_INPUT,
+                }:
+                    return snapshot
+                if snapshot.state is JobState.QUEUED:
+                    self._repository.transition_job(job_id, JobState.RUNNING)
+                _, active_attempt, _ = self._repository.get_job_details(job_id)
+                try:
+                    if (
+                        active_attempt is not None
+                        and active_attempt.state is AttemptState.RUNNING
+                        and active_attempt.fencing_token != authority.fencing_token
+                    ):
+                        active_attempt = self._repository.take_over_running_attempt(
+                            job_id, active_attempt.attempt_id, authority
+                        )
+                        unknown = self._repository.reconcile_external_operations_after_process_loss(
+                            job_id, authority
+                        )
+                        if unknown:
+                            self._repository.pause_for_external_outcome_atomic(
+                                job_id,
+                                active_attempt.attempt_id,
+                                authority,
+                            )
+                            return self._snapshot(job_id)
+                    if active_attempt is not None and active_attempt.step_id == "commit":
+                        return self._reconcile_commit(request, active_attempt, authority)
+                    return self._execute(
+                        job_id,
+                        request,
+                        authority,
+                        resumed_attempt=active_attempt,
+                    )
+                except DomainError as error:
+                    try:
+                        self._fail_job(job_id, active_attempt, authority, error)
+                    except DomainError as convergence_error:
+                        if convergence_error.code in _AUTHORITY_LOSS_CODES:
+                            raise error from convergence_error
+                        raise
+                    return self._snapshot(job_id)
+            finally:
+                try:
+                    self._repository.release_scheduler_lease(authority)
+                except Exception:
+                    # The lease has a bounded TTL; cleanup must not replace the Job result
+                    # or the primary execution error.
+                    pass
         finally:
-            try:
-                self._repository.release_scheduler_lease(authority)
-            except Exception:
-                # The lease has a bounded TTL; cleanup must not replace the Job result
-                # or the primary execution error.
-                pass
+            self._release_resource_lease()
+
+    def _acquire_resource_lease(self) -> None:
+        if self._resource_lease_store is None or self._resource_owner is None:
+            return
+        self._active_resource_lease = self._resource_lease_store.acquire(
+            HEAVY_PRODUCTION_RESOURCE_NAME,
+            self._resource_owner,
+            ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
+        )
+
+    def _heartbeat_resource_lease(self) -> None:
+        if self._active_resource_lease is None:
+            return
+        self._active_resource_lease = self._active_resource_lease.heartbeat(
+            ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS
+        )
+
+    def _release_resource_lease(self) -> None:
+        lease = self._active_resource_lease
+        self._active_resource_lease = None
+        if lease is None:
+            return
+        try:
+            lease.release()
+        except Exception:
+            pass
 
     def _execute(
         self,
@@ -1578,6 +1636,7 @@ class VideoService:
         attempt: Attempt,
         authority: ExecutionAuthority,
     ) -> JobSnapshot:
+        self._heartbeat_resource_lease()
         prepared = self._portable.prepare_candidate(
             request.workspace_root,
             checkpoint.staging_relative_path,
@@ -1626,6 +1685,7 @@ class VideoService:
             )
 
         try:
+            self._heartbeat_resource_lease()
             self._repository.commit_video_result_atomic(
                 attempt.job_id,
                 attempt.attempt_id,

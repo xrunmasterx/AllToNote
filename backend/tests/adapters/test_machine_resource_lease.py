@@ -101,6 +101,22 @@ def test_expired_lease_takeover_fences_heartbeat_and_stale_release(
     assert renewed.expires_at_ms == clock.now_ms + 20_000
 
 
+def test_same_owner_cannot_reenter_exclusive_lease_without_reference_count(
+    tmp_path: Path,
+) -> None:
+    MachineResourceLeaseStore, ResourceOwner = _task7_lease_api()
+    store = MachineResourceLeaseStore.open(tmp_path / "machine", clock=_Clock())
+    owner = ResourceOwner("workspace-a", "process-a", process_id=100)
+    first = store.acquire("produce:heavy:v1", owner, ttl_seconds=30)
+
+    with pytest.raises(DomainError, match="resource_busy"):
+        store.acquire("produce:heavy:v1", owner, ttl_seconds=30)
+
+    assert first.release()
+    second = store.acquire("produce:heavy:v1", owner, ttl_seconds=30)
+    assert second.fencing_token == first.fencing_token + 1
+
+
 @pytest.mark.parametrize("ttl_seconds", (0, 301, True))
 def test_machine_lease_ttl_is_bounded(
     tmp_path: Path,

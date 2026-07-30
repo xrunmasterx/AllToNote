@@ -20,8 +20,12 @@ from app.adapters.documents.document_basic_pack import (
     resolve_document_basic_pack_paths,
 )
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
-from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
+from app.adapters.jobs.workspace_instance_registry import (
+    WorkspaceInstance,
+    WorkspaceInstanceRegistry,
+)
 from app.adapters.screenshots.ffmpeg import FFmpegScreenshotAdapter
 from app.adapters.models.legacy_gpt import (
     LegacyKnowledgeModelAdapter,
@@ -93,6 +97,7 @@ from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import CheckpointMetadata, JobExecutionBinding
+from app.core.jobs.resource_lease import ResourceLeaseStorePort, ResourceOwner
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
 from app.core.ports.model import KnowledgeModelRequest
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -1390,6 +1395,17 @@ def _read_checkpoint(
     return (storage.root / relative).read_bytes()
 
 
+def _resolve_execution_owner_id(
+    owner_id: str | None,
+    resource_owner: ResourceOwner | None,
+) -> str:
+    if owner_id is not None:
+        return owner_id
+    if resource_owner is not None:
+        return resource_owner.process_instance_id
+    return f"runtime-{uuid4().hex}"
+
+
 def _create_platform_video_runtime_components(
     machine_root: Path,
     *,
@@ -1404,6 +1420,8 @@ def _create_platform_video_runtime_components(
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
@@ -1438,7 +1456,7 @@ def _create_platform_video_runtime_components(
         IWikiPortableGateway(),
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
@@ -1448,6 +1466,8 @@ def _create_platform_video_runtime_components(
         generated_transcriber_identity=(
             generated_transcriber_identity or "fake/transcriber-v1"
         ),
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return _create_video_runtime(service, repository), service
 
@@ -1466,6 +1486,8 @@ def create_platform_video_runtime(
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_platform_video_runtime_components(
         machine_root,
@@ -1480,6 +1502,8 @@ def create_platform_video_runtime(
         owner_id=owner_id,
         local_instance_id=local_instance_id,
         clock=clock,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return runtime
 
@@ -1491,6 +1515,8 @@ def create_document_runtime(
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> AllToNoteRuntime:
     parser = DoclingWorkerParser(worker_config)
     parser.doctor()
@@ -1514,9 +1540,11 @@ def create_document_runtime(
         IWikiPortableGateway(),
         work_root=storage.root,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return _create_document_runtime(service, repository)
 
@@ -1546,6 +1574,22 @@ def _resolve_document_worker_config(
     )
 
 
+def _workspace_resource_admission(
+    paths: RuntimePaths,
+    instance: WorkspaceInstance,
+) -> tuple[str, MachineResourceLeaseStore, ResourceOwner]:
+    process_instance_id = f"runtime-{uuid4().hex}"
+    return (
+        process_instance_id,
+        MachineResourceLeaseStore.open(paths.data_dir / "machine"),
+        ResourceOwner(
+            instance.workspace_identity,
+            process_instance_id,
+            process_id=os.getpid(),
+        ),
+    )
+
+
 def create_document_runtime_for_workspace(
     workspace_root: Path,
     *,
@@ -1563,10 +1607,16 @@ def create_document_runtime_for_workspace(
         ).manifest.workspace_id,
     )
     instance = registry.resolve(workspace_root)
+    process_instance_id, resource_lease_store, resource_owner = (
+        _workspace_resource_admission(paths, instance)
+    )
     return create_document_runtime(
         instance.machine_root,
         worker_config=worker_config,
+        owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
 
 
@@ -1587,6 +1637,8 @@ def _create_local_video_runtime_components(
         [FileAttemptStorage, SqliteJobRepository], ScreenshotPort
     ]
     | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
@@ -1626,13 +1678,15 @@ def _create_local_video_runtime_components(
         IWikiPortableGateway(),
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         knowledge_compiler=knowledge_compiler,
         faithful_compiler=faithful_compiler,
         current_config_snapshot=current_config_snapshot,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return _create_video_runtime(service, repository), service
 
@@ -1654,6 +1708,8 @@ def create_local_video_runtime(
         [FileAttemptStorage, SqliteJobRepository], ScreenshotPort
     ]
     | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_local_video_runtime_components(
         machine_root,
@@ -1668,6 +1724,8 @@ def create_local_video_runtime(
         local_instance_id=local_instance_id,
         clock=clock,
         screenshot_adapter_factory=screenshot_adapter_factory,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return runtime
 
@@ -1687,6 +1745,8 @@ def _create_fake_runtime_components(
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
     screenshot_requests: tuple[ScreenshotRequest, ...] = (),
     current_config_snapshot: JobConfigSnapshot | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     call_counts = calls or FakeCallCounts()
     resolved_machine_root = Path(machine_root).resolve()
@@ -1718,11 +1778,13 @@ def _create_fake_runtime_components(
         IWikiPortableGateway(),
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         current_config_snapshot=current_config_snapshot,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return _create_video_runtime(service, repository), service
 
@@ -1742,6 +1804,8 @@ def create_fake_runtime(
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
     screenshot_requests: tuple[ScreenshotRequest, ...] = (),
     current_config_snapshot: JobConfigSnapshot | None = None,
+    resource_lease_store: ResourceLeaseStorePort | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_fake_runtime_components(
         machine_root,
@@ -1757,6 +1821,8 @@ def create_fake_runtime(
         operation_hooks=operation_hooks,
         screenshot_requests=screenshot_requests,
         current_config_snapshot=current_config_snapshot,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return runtime
 
@@ -1766,6 +1832,7 @@ def create_fake_runtime_for_workspace(
     *,
     local_app_data: Path | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
 ) -> AllToNoteRuntime:
     trusted_root = local_app_data or _default_local_app_data()
     paths = resolve_runtime_paths(local_data_parent=trusted_root)
@@ -1778,10 +1845,17 @@ def create_fake_runtime_for_workspace(
         ).manifest.workspace_id,
     )
     instance = registry.resolve(workspace_root)
+    process_instance_id, resource_lease_store, resource_owner = (
+        _workspace_resource_admission(paths, instance)
+    )
     return create_fake_runtime(
         instance.machine_root,
+        owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         current_config_snapshot=current_config_snapshot,
+        operation_hooks=operation_hooks,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
 
 
@@ -1851,6 +1925,9 @@ def create_codex_app_server_runtime_for_workspace(
             )
         },
     )
+    process_instance_id, resource_lease_store, resource_owner = (
+        _workspace_resource_admission(paths, instance)
+    )
     return create_platform_video_runtime(
         instance.machine_root,
         source=source,
@@ -1862,8 +1939,11 @@ def create_codex_app_server_runtime_for_workspace(
         model=model,
         model_execution_binding=binding,
         model_execution_profile="default",
+        owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         current_config_snapshot=current_config_snapshot,
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
 
 

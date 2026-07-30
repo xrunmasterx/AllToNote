@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from app.core.errors import DomainError, ErrorCategory
 
 
 MIN_LEASE_TTL_SECONDS = 1
 MAX_LEASE_TTL_SECONDS = 300
+HEAVY_PRODUCTION_RESOURCE_NAME = "produce:heavy:v1"
 
 
 def validate_lease_ttl(ttl_seconds: int) -> None:
@@ -84,11 +86,23 @@ class ResourceLease:
         return self._release_callback()
 
 
+class ResourceLeaseStorePort(Protocol):
+    def acquire(
+        self,
+        resource_name: str,
+        owner: ResourceOwner,
+        *,
+        ttl_seconds: int,
+    ) -> ResourceLease: ...
+
+
 __all__ = [
     "ExecutionAuthority",
+    "HEAVY_PRODUCTION_RESOURCE_NAME",
     "MAX_LEASE_TTL_SECONDS",
     "MIN_LEASE_TTL_SECONDS",
     "ResourceLease",
+    "ResourceLeaseStorePort",
     "ResourceOwner",
     "validate_lease_ttl",
 ]

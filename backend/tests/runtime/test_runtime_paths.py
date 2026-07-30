@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from iwiki.workspace import open_workspace
 
+import app.runtime as runtime_module
 import app.runtime_paths as runtime_paths_module
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.cli.main import main
@@ -296,6 +301,112 @@ def test_same_workspace_under_two_machine_roots_does_not_share_lease(
     assert first_lease.fencing_token == 1
     assert second_lease.fencing_token == 1
     assert first_instance.machine_root != second_instance.machine_root
+
+
+def test_workspace_runtimes_share_one_machine_production_admission(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    first_workspace = _workspace(tmp_path, "Vault admission one")
+    second_workspace = _workspace(tmp_path, "Vault admission two")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block_model(heartbeat: Callable[[], None]) -> None:
+        heartbeat()
+        entered.set()
+        assert release.wait(timeout=5)
+
+    first = create_fake_runtime_for_workspace(
+        first_workspace,
+        local_app_data=local_app_data,
+        operation_hooks={"model": block_model},
+    )
+    second = create_fake_runtime_for_workspace(
+        second_workspace,
+        local_app_data=local_app_data,
+    )
+    first_job = first.submit_video(
+        VideoProduceRequest(
+            request_schema_version=1,
+            workspace_root=first_workspace,
+            input_value="fixture://first",
+            client_request_id="workspace-admission-first",
+        )
+    )
+    second_job = second.submit_video(
+        VideoProduceRequest(
+            request_schema_version=1,
+            workspace_root=second_workspace,
+            input_value="fixture://second",
+            client_request_id="workspace-admission-second",
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_wait = executor.submit(first.wait_job, first_job.job_id)
+        assert entered.wait(timeout=5)
+        try:
+            with pytest.raises(DomainError, match="resource_busy"):
+                second.wait_job(second_job.job_id)
+            assert second.get_job(second_job.job_id).state.value == "queued"
+            assert second.job_repository.latest_checkpoint(
+                second_job.job_id,
+                "preflight",
+            ) is None
+        finally:
+            release.set()
+        assert first_wait.result(timeout=15).state.value == "succeeded"
+
+    assert second.wait_job(second_job.job_id).state.value == "succeeded"
+    paths = resolve_runtime_paths(local_data_parent=local_app_data)
+    assert (paths.data_dir / "machine" / "leases.sqlite").is_file()
+
+
+def test_document_workspace_factory_reuses_process_identity_for_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path, "Vault document admission")
+    local_app_data = tmp_path / "document-local-app-data"
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_resolve_document_worker_config",
+        lambda _paths, _environ: object(),
+    )
+
+    def capture_runtime(machine_root: Path, **options: object) -> object:
+        captured["machine_root"] = machine_root
+        captured.update(options)
+        return sentinel
+
+    monkeypatch.setattr(runtime_module, "create_document_runtime", capture_runtime)
+
+    created = runtime_module.create_document_runtime_for_workspace(
+        workspace,
+        local_app_data=local_app_data,
+    )
+
+    registry = json.loads(
+        (local_app_data / "AllToNote" / "workspace-instances.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    instance = registry["instances"][0]
+    resource_owner = captured["resource_owner"]
+    resource_lease_store = captured["resource_lease_store"]
+
+    assert created is sentinel
+    assert captured["local_instance_id"] == instance["instance_id"]
+    assert captured["owner_id"] == resource_owner.process_instance_id
+    assert resource_owner.workspace_identity == instance["workspace_identity"]
+    assert resource_owner.process_id == os.getpid()
+    assert resource_lease_store.database_path == (
+        local_app_data / "AllToNote" / "machine" / "leases.sqlite"
+    )
 
 
 def test_runtime_paths_json_redacts_by_default_and_requires_explicit_opt_in(

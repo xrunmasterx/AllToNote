@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ import pytest
 from app.adapters.documents.document_basic_pack import PACK_VERSION
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.application.document_service import CHECKPOINT_SCHEMA, DocumentService
 from app.core.application.job_execution_router import JobExecutionRouter
@@ -21,7 +25,10 @@ from app.core.domain.document import (
     ParsedDocument,
 )
 from app.core.domain.production import RecipeProduceResult
+from app.core.domain.video import VideoProduceRequest
+from app.core.errors import DomainError
 from app.core.jobs.model import JobState
+from app.core.jobs.resource_lease import ResourceOwner
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
 from app.core.recipes.document.adapter import DocumentRecipeAdapter
 from app.core.recipes.document.descriptor import DOCUMENT_NOTE_V1
@@ -112,6 +119,8 @@ def _service(
     gateway: object,
     *,
     owner_id: str,
+    resource_lease_store: MachineResourceLeaseStore | None = None,
+    resource_owner: ResourceOwner | None = None,
 ) -> tuple[DocumentService, SqliteJobRepository]:
     repository = SqliteJobRepository.open(machine_root / "job-store")
     storage = FileAttemptStorage(
@@ -132,6 +141,8 @@ def _service(
         ).read_bytes(),
         owner_id=owner_id,
         local_instance_id="document-test",
+        resource_lease_store=resource_lease_store,
+        resource_owner=resource_owner,
     )
     return service, repository
 
@@ -319,3 +330,176 @@ def test_document_job_can_be_cancelled_before_execution(tmp_path: Path) -> None:
     assert cancelled.state is JobState.CANCELLED
     assert router.wait_job(job_id) == cancelled
     assert parser.calls == 0
+
+
+def test_video_blocks_document_in_another_workspace_without_starting_parser(
+    tmp_path: Path,
+) -> None:
+    document_workspace = _workspace(tmp_path)
+    video_workspace = tmp_path / "video-workspace"
+    shutil.copytree(document_workspace, video_workspace)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    store = MachineResourceLeaseStore.open(tmp_path / "shared-machine")
+    video_entered = threading.Event()
+    release_video = threading.Event()
+
+    def block_video_model(heartbeat: Callable[[], None]) -> None:
+        heartbeat()
+        video_entered.set()
+        assert release_video.wait(timeout=5)
+
+    from app import runtime as runtime_module
+
+    video = runtime_module.create_fake_runtime(
+        tmp_path / "video-machine",
+        operation_hooks={"model": block_video_model},
+        resource_lease_store=store,
+        resource_owner=ResourceOwner(
+            "video-workspace",
+            "video-process",
+            process_id=101,
+        ),
+    )
+    video_job = video.submit_video(
+        VideoProduceRequest(
+            request_schema_version=1,
+            workspace_root=video_workspace,
+            input_value="fixture://video",
+            client_request_id="video-blocks-document",
+        )
+    )
+    service, repository = _service(
+        tmp_path / "document-machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="document-process",
+        resource_lease_store=store,
+        resource_owner=ResourceOwner(
+            "document-workspace",
+            "document-process",
+            process_id=202,
+        ),
+    )
+    job_id, router = _submit(
+        service,
+        repository,
+        document_workspace,
+        source,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        video_wait = executor.submit(video.wait_job, video_job.job_id)
+        assert video_entered.wait(timeout=5)
+        try:
+            with pytest.raises(DomainError, match="resource_busy"):
+                router.wait_job(job_id)
+            assert router.get_job(job_id).state is JobState.QUEUED
+            assert parser.calls == 0
+        finally:
+            release_video.set()
+        assert video_wait.result(timeout=15).state is JobState.SUCCEEDED
+
+    assert router.wait_job(job_id).state is JobState.SUCCEEDED
+    assert parser.calls == 1
+
+
+def test_scheduler_busy_keeps_new_document_job_queued(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    service, repository = _service(
+        tmp_path / "document-scheduler-machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="waiting-document-process",
+    )
+    job_id, router = _submit(service, repository, workspace, source)
+    authority = repository.acquire_scheduler_lease(
+        "blocking-document-process",
+        ttl_seconds=300,
+    )
+
+    try:
+        with pytest.raises(DomainError, match="scheduler_busy"):
+            router.wait_job(job_id)
+        assert router.get_job(job_id).state is JobState.QUEUED
+        assert parser.calls == 0
+    finally:
+        repository.release_scheduler_lease(authority)
+
+
+def test_blocking_document_parser_renews_machine_admission_beyond_ttl(
+    tmp_path: Path,
+) -> None:
+    document_workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    machine_now_ms = [1_000]
+    heartbeat_observed = threading.Event()
+    store = MachineResourceLeaseStore.open(
+        tmp_path / "document-heartbeat-shared-machine",
+        clock=lambda: machine_now_ms[0],
+    )
+    competing_store = MachineResourceLeaseStore.open(
+        tmp_path / "document-heartbeat-shared-machine",
+        clock=lambda: machine_now_ms[0],
+    )
+    original_heartbeat = store._heartbeat
+
+    def observe_heartbeat(*args: object, **kwargs: object) -> object:
+        renewed = original_heartbeat(*args, **kwargs)
+        if threading.current_thread() is not threading.main_thread():
+            heartbeat_observed.set()
+        return renewed
+
+    store._heartbeat = observe_heartbeat  # type: ignore[method-assign]
+
+    class BlockingParser(_Parser):
+        def parse(self, source: Path, *, work_root: Path) -> ParsedDocument:
+            machine_now_ms[0] = 200_000
+            assert heartbeat_observed.wait(timeout=2)
+            machine_now_ms[0] = 400_000
+            with pytest.raises(DomainError, match="resource_busy"):
+                competing_store.acquire(
+                    "produce:heavy:v1",
+                    ResourceOwner(
+                        "video-workspace",
+                        "video-process",
+                        process_id=202,
+                    ),
+                    ttl_seconds=300,
+                )
+            return super().parse(source, work_root=work_root)
+
+    parser = BlockingParser()
+    service, repository = _service(
+        tmp_path / "document-heartbeat-machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="document-process",
+        resource_lease_store=store,
+        resource_owner=ResourceOwner(
+            "document-workspace",
+            "document-process",
+            process_id=101,
+        ),
+    )
+    service._checkpoint_runner.heartbeat_interval_seconds = 0.01
+    job_id, router = _submit(
+        service,
+        repository,
+        document_workspace,
+        source,
+    )
+
+    assert router.wait_job(job_id).state is JobState.SUCCEEDED
+    assert parser.calls == 1
+    next_lease = competing_store.acquire(
+        "produce:heavy:v1",
+        ResourceOwner("video-workspace", "video-process", process_id=202),
+        ttl_seconds=300,
+    )
+    assert next_lease.release()

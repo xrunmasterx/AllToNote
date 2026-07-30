@@ -58,6 +58,7 @@ class CheckpointedStepRunner:
         checkpoint_schema: str,
         scheduler_lease_ttl_seconds: int,
         heartbeat_interval_seconds: float,
+        additional_heartbeat: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._attempt_storage = attempt_storage
@@ -65,6 +66,7 @@ class CheckpointedStepRunner:
         self._checkpoint_schema = checkpoint_schema
         self._scheduler_lease_ttl_seconds = scheduler_lease_ttl_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._additional_heartbeat = additional_heartbeat
 
     def run(
         self,
@@ -228,6 +230,8 @@ class CheckpointedStepRunner:
             authority,
             ttl_seconds=self._scheduler_lease_ttl_seconds,
         )
+        if self._additional_heartbeat is not None:
+            self._additional_heartbeat()
 
 
 __all__ = ["CheckpointedStepExecutionContext", "CheckpointedStepRunner"]

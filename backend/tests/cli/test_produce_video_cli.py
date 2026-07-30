@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -1386,15 +1387,24 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
         )
     )
     instance_id = registry["instances"][0]["instance_id"]
+    workspace_identity = registry["instances"][0]["workspace_identity"]
     expected_machine_root = (
         local_app_data / "AllToNote" / "workspaces" / instance_id
     )
     binding = captured["model_execution_binding"]
     model = captured["model"]
+    resource_owner = captured["resource_owner"]
+    resource_lease_store = captured["resource_lease_store"]
 
     assert created is sentinel
     assert captured["machine_root"] == expected_machine_root
     assert captured["local_instance_id"] == instance_id
+    assert captured["owner_id"] == resource_owner.process_instance_id
+    assert resource_owner.workspace_identity == workspace_identity
+    assert resource_owner.process_id == os.getpid()
+    assert resource_lease_store.database_path == (
+        local_app_data / "AllToNote" / "machine" / "leases.sqlite"
+    )
     assert captured["source_metadata"] == {}
     assert captured["model_execution_profile"] == "default"
     assert model.provider_kind == "codex-app-server"
