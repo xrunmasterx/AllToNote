@@ -118,3 +118,18 @@ iWiki 分支的 9 个独有提交已推送并写入 bundle，因此这些可由 
 5. 删除已合并且有远端/bundle 保护的旧本地分支；
 6. 清理精确列出的可再生缓存；
 7. 执行 `git fsck`、worktree/branch/remote/status 终审。
+
+## 10. 执行结果
+
+上述清理已按顺序完成：
+
+- 删除 2 份 G0 分析、6 份任务/终审报告和 10 份 iWiki review diff；
+- 通过 Git 移除 5 个旧 Agent worktree，并删除对应 5 个零独有本地分支；
+- 停止 2 个 Video 审计终端，通过 Git 移除 `G:/AllToNote-video-producer`；
+- 删除已合并的 `codex/alltonote-video-producer`、`codex/alltonote-wave0-baseline`、`codex/alltonote-x0a` 本地分支，并删除远端临时 X0-A 分支；
+- 删除两个 `node_modules`，以及 main/iWiki worktree 的 `__pycache__` 和 `.pytest_cache`；
+- 仅按清理前可量化目录计，回收至少 3,617,424,845 字节（约 3.37 GiB），还未计入被移除 Video checkout 本身与历史运行目录；
+- 主工作树只保留 `AGENTS.md` 与 `config/` 两类预期未跟踪本地资产；
+- iWiki worktree/分支继续保留，因为它相对 `master` 仍有 9 个独有提交（`master...codex/iwiki-readonly-client = 75/9`），不能当作已合并残留删除。
+
+终审结果：`git fsck --full --no-reflogs` 退出码为 0，只报告删除分支、历史 amend 和未提交草稿留下的 dangling objects，没有 missing/corrupt object；不手工执行 prune。Git 当前只注册 main 与 iWiki 两个 worktree；远端只保留 `master` 与 `codex/iwiki-readonly-client`；Video、两个 `node_modules`、main 的 `.claude`/`.superpowers` 路径均已不存在；bundle 再验证通过且 SHA-256 未变。
