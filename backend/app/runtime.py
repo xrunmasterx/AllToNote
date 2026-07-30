@@ -10,6 +10,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
+from app.adapters.documents.docling_worker_parser import (
+    DoclingWorkerConfig,
+    DoclingWorkerParser,
+)
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
@@ -32,6 +36,11 @@ from app.adapters.transcription.legacy_transcriber import (
     normalize_platform_subtitle,
 )
 from app.core.application.produce_service import ProduceService
+from app.core.application.document_service import (
+    CHECKPOINT_SCHEMA as DOCUMENT_CHECKPOINT_SCHEMA,
+    DocumentService,
+)
+from app.core.application.job_execution_router import JobExecutionRouter
 from app.core.application.video_acquisition import (
     StoredAssetRole,
     TranscriptProvenance,
@@ -78,7 +87,7 @@ from app.core.domain.video import (
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.external_operation import ExternalOperationGuard
-from app.core.jobs.model import CheckpointMetadata
+from app.core.jobs.model import CheckpointMetadata, JobExecutionBinding
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
 from app.core.ports.model import KnowledgeModelRequest
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -93,6 +102,8 @@ from app.core.ports.transcript import MediaInput
 from app.core.ports.transcript import TranscriptPort
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
 from app.core.recipes.registry import RecipeRegistry
+from app.core.recipes.document.adapter import DocumentRecipeAdapter
+from app.core.recipes.document.descriptor import DOCUMENT_NOTE_V1
 from app.core.recipes.video.adapter import (
     VideoRecipeAdapter,
     adapt_video_produce_request,
@@ -1282,12 +1293,60 @@ def _create_video_runtime(
     registry = RecipeRegistry(
         (descriptor, endpoint) for descriptor in VIDEO_DESCRIPTORS
     )
+    job_control = JobExecutionRouter(
+        repository,
+        (*(
+            (
+                JobExecutionBinding(
+                    recipe_id=descriptor.key.recipe_id,
+                    recipe_version=descriptor.key.recipe_version,
+                    executor_id="alltonote.video",
+                    executor_version=1,
+                    pack_id="media-basic",
+                    pack_version="builtin-v1",
+                ),
+                service,
+            )
+            for descriptor in VIDEO_DESCRIPTORS
+        ), (
+            JobExecutionBinding(
+                recipe_id="alltonote.legacy",
+                recipe_version=1,
+                executor_id="alltonote.video",
+                executor_version=1,
+                pack_id="media-basic",
+                pack_version="legacy-v1",
+            ),
+            service,
+        )),
+    )
     sdk = AllToNoteSDK(
         ProduceService(registry),
-        service,
+        job_control,
         adapt_video_produce_request,
     )
     return AllToNoteRuntime(sdk, repository)
+
+
+def _create_document_runtime(
+    service: DocumentService,
+    repository: SqliteJobRepository,
+) -> AllToNoteRuntime:
+    registry = RecipeRegistry(
+        ((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(service)),)
+    )
+    job_control = JobExecutionRouter(
+        repository,
+        ((service.execution_binding, service),),
+    )
+    return AllToNoteRuntime(
+        AllToNoteSDK(
+            ProduceService(registry),
+            job_control,
+            adapt_video_produce_request,
+        ),
+        repository,
+    )
 
 
 def _checkpoint_payload_is_valid(payload: bytes) -> bool:
@@ -1296,6 +1355,14 @@ def _checkpoint_payload_is_valid(payload: bytes) -> bool:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     return type(value) is dict and type(value.get("step")) is str
+
+
+def _document_checkpoint_payload_is_valid(payload: bytes) -> bool:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return type(value) is dict
 
 
 def _read_checkpoint(
@@ -1410,6 +1477,43 @@ def create_platform_video_runtime(
         clock=clock,
     )
     return runtime
+
+
+def create_document_runtime(
+    machine_root: Path,
+    *,
+    worker_config: DoclingWorkerConfig,
+    owner_id: str | None = None,
+    local_instance_id: str | None = None,
+    clock: Callable[[], int] | None = None,
+) -> AllToNoteRuntime:
+    parser = DoclingWorkerParser(worker_config)
+    parser.doctor()
+    resolved_machine_root = Path(machine_root).resolve()
+    resolved_machine_root.mkdir(parents=True, exist_ok=True)
+    repository = SqliteJobRepository.open(
+        resolved_machine_root / "job-store",
+        clock=clock,
+    )
+    storage = FileAttemptStorage(
+        resolved_machine_root / "attempts",
+        repository,
+        validators={
+            DOCUMENT_CHECKPOINT_SCHEMA: _document_checkpoint_payload_is_valid,
+        },
+    )
+    service = DocumentService(
+        repository,
+        storage,
+        parser,
+        IWikiPortableGateway(),
+        work_root=storage.root,
+        checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
+        owner_id=owner_id or f"runtime-{uuid4().hex}",
+        local_instance_id=local_instance_id
+        or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+    )
+    return _create_document_runtime(service, repository)
 
 
 def _create_local_video_runtime_components(

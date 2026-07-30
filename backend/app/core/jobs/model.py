@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+
+from app.core.errors import ErrorDetail
 
 
 class JobState(StrEnum):
@@ -30,6 +32,31 @@ class ChallengeState(StrEnum):
 
 
 @dataclass(frozen=True)
+class JobExecutionBinding:
+    recipe_id: str
+    recipe_version: int
+    executor_id: str
+    executor_version: int
+    pack_id: str
+    pack_version: str
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not str or not value.strip()
+            for value in (
+                self.recipe_id,
+                self.executor_id,
+                self.pack_id,
+                self.pack_version,
+            )
+        ) or any(
+            type(value) is not int or value < 1
+            for value in (self.recipe_version, self.executor_version)
+        ):
+            raise ValueError("Job execution binding is invalid")
+
+
+@dataclass(frozen=True)
 class Job:
     job_id: str
     request_hash: str
@@ -40,6 +67,33 @@ class Job:
     retry_of_job_id: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class JobSnapshot:
+    job_id: str
+    state: JobState
+    cancellation_requested: bool
+    active_attempt_id: str | None
+    challenge_id: str | None
+    retry_of_job_id: str | None
+    result: object | None
+    error: ErrorDetail | None
+
+
+@dataclass(frozen=True)
+class RetryJobRequest:
+    retry_request_schema_version: int
+    client_request_id: str
+    expected_original_job_state: JobState
+    confirmed_unknown_operation_ids: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "confirmed_unknown_operation_ids",
+            tuple(self.confirmed_unknown_operation_ids),
+        )
 
 
 @dataclass(frozen=True)
@@ -115,6 +169,9 @@ __all__ = [
     "CheckpointMetadata",
     "CheckpointRecord",
     "Job",
+    "JobExecutionBinding",
+    "JobSnapshot",
     "JobEvent",
     "JobState",
+    "RetryJobRequest",
 ]

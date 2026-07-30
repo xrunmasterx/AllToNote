@@ -53,7 +53,12 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
-from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata
+from app.core.jobs.model import (
+    Attempt,
+    AttemptState,
+    CheckpointMetadata,
+    JobExecutionBinding,
+)
 from app.core.jobs.resource_lease import ExecutionAuthority
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.bundle_assembler import (
@@ -104,6 +109,12 @@ _DOCUMENT_COMPILATION_BEHAVIOR = (
 _HISTORICAL_COMMIT_CANDIDATE_BEHAVIORS_V1 = (
     "linked-screenshot-draft-v1",
     "linked-screenshot-draft-v2",
+)
+_SUPPORTED_VIDEO_RECIPE_KEYS = frozenset(
+    {
+        ("alltonote.video-course-note", 1),
+        ("alltonote.video-producer", 2),
+    }
 )
 _SCHEDULER_LEASE_TTL_SECONDS = 300
 _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -396,9 +407,23 @@ class VideoService:
             if config_snapshot is not None
             else ()
         )
+        recipe_key = (request.recipe_id, request.recipe_version)
+        bound_recipe_id, bound_recipe_version = (
+            recipe_key
+            if recipe_key in _SUPPORTED_VIDEO_RECIPE_KEYS
+            else ("alltonote.video-course-note", 1)
+        )
         snapshot = self._job_service.submit(
             self._job_request_payload(request),
             initial_events=initial_events,
+            execution_binding=JobExecutionBinding(
+                recipe_id=bound_recipe_id,
+                recipe_version=bound_recipe_version,
+                executor_id="alltonote.video",
+                executor_version=1,
+                pack_id="media-basic",
+                pack_version="builtin-v1",
+            ),
         )
         if config_snapshot is not None:
             self._submitted_config_snapshots[snapshot.job_id] = config_snapshot

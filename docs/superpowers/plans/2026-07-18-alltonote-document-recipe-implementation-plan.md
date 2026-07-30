@@ -7,8 +7,8 @@ authority: execution
 upstream:
   - ../specs/2026-07-18-alltonote-document-recipe-design.md
   - ../specs/2026-07-18-alltonote-recipe-extension-contract-design.md
-implementation_status: not-started-x0-a-prerequisite-x0-b-joint-slice
-last_verified_at: 2026-07-20
+implementation_status: doc-00-and-doc-03-x0-b-passed-full-mvp-pending
+last_verified_at: 2026-07-31
 ```
 
 ## 1. 成功标准
@@ -19,8 +19,8 @@ born-digital PDF、扫描/混合 PDF、PPTX Notes/表格/图片、100+ 页长文
 
 任何 Document/PPT 生产代码开始前，只完成实现工作树中以下当前可执行文档定义的 X0-A：
 
-- `G:/AllToNote-video-producer/docs/design-docs/backend/recipe-x0-compatibility-extraction/spec.md`；
-- `G:/AllToNote-video-producer/docs/design-docs/backend/recipe-x0-compatibility-extraction/tasks.md`。
+- `docs/design-docs/backend/recipe-x0-compatibility-extraction/spec.md`；
+- `docs/design-docs/backend/recipe-x0-compatibility-extraction/tasks.md`。
 
 X0-A 仅包含最小 submission DTO、静态 Registry、薄 ProduceService、Video Adapter、SDK/Runtime 与单一 generic `produce` 兼容路由。不得在 X0-A 实现 `add`、独立 `run`、完整 Preflight/Plan/Output/Result DTO、JobSnapshot/result codec/Repository 泛化、atomic commit 抽取、schema migration、Engine 或 generic reconnect。Document 工具 Spike 与真实 fixture 准备可并行，但不能先创建独立 DocumentService、CLI、JobStore 或 commit 路径规避 Gate。
 
@@ -34,6 +34,10 @@ X0-A 完成后，首个生产纵切只选择一份真实本地 born-digital PDF 
 
 在独立临时 fixture 对候选 PDF/PPTX parser、renderer、OCR 工具做：结构覆盖、bbox、Notes、chart/table、中文、许可证、二进制大小、Windows/macOS支持、安全历史、启动性能。输出 decision matrix；不要先把 Tika/LibreOffice变成硬依赖。
 
+状态：**PASS（2026-07-30）**。唯一真实输入、对照指标、Windows 依赖缺口与选择记录见 `docs/design-docs/document-born-digital-pdf-x0b/`。首个 PDF 纵切选择 `docling-slim==2.117.0` 作为 `document-basic` 的可替换隔离解析引擎；AllToNote 继续拥有 parser-neutral DTO、source SHA-256、Evidence 与 durable schema。轻量 `pdfplumber==0.11.8` 只保留为比较基线。
+
+实用硬化状态：**PASS（2026-07-31）**。`document-basic` 已固定 Docling/SciPy/CPU Torch/OpenCV/NumPy、layout 与 TableFormer revision/权重；Document Runtime 在写 machine state 前执行离线 doctor，解析 worker 不再无界收集 stdout/stderr。第二份 6 页中文、8 表格真实 PDF 关闭了 Windows 中文路径和表格结构缺口，Pack 升级为 `docling-2.117.0-tableformer-v2.3.0`；原英文论文回归通过。当前没有实现通用 Pack 安装器或 repair，也不因此扩展 PPTX/OCR。
+
 ## 3. Task DOC-01：文件身份与安全探测
 
 实现 local root grant、stable copy/handle、file hash、magic/MIME、ZIP ratio/object/page/slide limits、encrypted/damaged/active content。测试编译中修改、symlink/reparse、密码不进argv/log。
@@ -44,7 +48,11 @@ X0-A 完成后，首个生产纵切只选择一份真实本地 born-digital PDF 
 
 ## 5. Task DOC-03：首个真实原生切片与 X0-B
 
+状态：**PASS（2026-07-30）**。正式链路通过 generic `produce` 完成 4 页/111 块解析、page/bbox Evidence、五类 Artifact、Portable commit、重开与故障原子性；X0-B 的 result discriminator、Artifact role、execution binding、dual-read migration、generic atomic commit 和 exact reconnect 已由 Video + Document 两个消费者共同验证。完整数据见 `docs/design-docs/document-born-digital-pdf-x0b/report.md`。
+
 从小型 born-digital PDF 或原生 PPTX 中只选一种：使用真实 parser 逐页/slide 提取原生文本与最小结构，生成 file hash、page/slide Evidence、可用 Markdown Draft 和 Artifact manifest，并经 X0-A 的 generic `produce` 进入 durable Job。
+
+本轮已固定 PDF `SA2023_RealTimeReflection.pdf`（4 页，SHA-256 `155f56096e8196b08f0aab9d6a162daea0196d308ad323ab1aebc7fb749db6b1`），不得替换为 PPTX 或 fake fixture。Docling 必须由可选固定 Pack/worker 离线调用；未固定模型或依赖不完整时 fail closed。
 
 同时只抽取 Video 与该消费者共同需要的数据面合同：result discriminator/schema version、durable result query、Artifact reference/manifest、atomic commit 边界和 generic JobExecutionRuntimeFactory。page/slide/bbox/Notes 保留在 Document Artifact/Evidence。故障 Gate 必须覆盖 legacy dual-read、旧成功/未完成 Job、可重复/可重开 migration、rollback oracle、原子终态提交、persisted identity 重连和 crash/reopen 零重复。
 

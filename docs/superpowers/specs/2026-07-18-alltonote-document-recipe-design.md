@@ -8,10 +8,12 @@ upstream:
   - 2026-07-13-alltonote-knowledge-compiler-architecture-design.md
   - 2026-07-14-alltonote-portable-artifact-source-bundle-design.md
   - 2026-07-18-alltonote-recipe-extension-contract-design.md
+  - ../../decisions/ADR-0002-docling-as-document-parsing-engine.md
 downstream:
   - ../plans/2026-07-18-alltonote-document-recipe-implementation-plan.md
-implementation_status: not-started-x0-a-prerequisite-x0-b-joint-slice
-last_verified_at: 2026-07-20
+  - ../../design-docs/document-born-digital-pdf-x0b/spec.md
+implementation_status: doc-00-and-first-pdf-x0-b-passed-full-mvp-pending
+last_verified_at: 2026-07-30
 ```
 
 ## 1. 决策摘要
@@ -70,6 +72,10 @@ Document 是 AllToNote 的并列官方 Recipe，不是新的“PDF Production �
 - 一份小型、无宏的本地 PPTX，完成原生文本/Notes、slide Evidence 与可用 Markdown Draft。
 
 该纵切必须使用真实 parser、真实文件 hash、真实 durable Job/result、Artifact commit 与 crash/reopen；测试中的模型输出可以 deterministic fake，但不得以 Fake Recipe 或纯内存/fake Repository 作为多 Recipe 验收。首个纵切明确不做另一种格式、OCR、视觉理解、URL、旧 `.ppt`、多文件 collection 或长文档全矩阵。
+
+截至 2026-07-30，首个输入已冻结为 4 页双栏 born-digital PDF `SA2023_RealTimeReflection.pdf`，SHA-256 为 `155f56096e8196b08f0aab9d6a162daea0196d308ad323ab1aebc7fb749db6b1`。DOC-00 同文件对照表明，轻量行提取会产生词粘连和双栏交错；`docling-slim==2.117.0` 能恢复标题、章节、图注、表格与 page/bbox，因此首个纵切选择 Docling。选择及资源成本见 [`ADR-0002`](../../decisions/ADR-0002-docling-as-document-parsing-engine.md) 和 [`VAL-DOC-PDF-X0B-001`](../../design-docs/document-born-digital-pdf-x0b/spec.md)。
+
+Docling 的定位是可替换 Document Parsing Engine，不是 Document Domain Kernel。`DoclingDocument`、内部对象 ID 和 Docling JSON 不得成为 durable schema 或 Evidence 权威；AllToNote 先计算完整 source SHA-256，再把解析结果归一化为私有 parser-neutral DTO。
 
 ### 4.1 MVP
 
@@ -439,17 +445,17 @@ X0-A 目标只发布 generic `produce --recipe/--request`；首个 Document/PPT 
 
 ## 14. Pack 设计
 
-- `document-basic`：文件探测、PDF/PPTX 原生提取；
+- `document-basic`：文件探测、PDF/PPTX 原生提取；首个 PDF 纵切固定 Docling、layout model 和显式完整依赖，以隔离 worker 离线执行；
 - `document-render`：PDF/PPTX 渲染；
 - `document-ocr`：OCR engine + 语言包；
 - `document-office`：LibreOffice/Tika/旧格式转换；
 - `model-vision-*`：可选视觉模型连接器。
 
-最小 Runtime 不依赖它们；basic Pack 未安装时 preflight 给出明确安装大小/来源/许可证。Job 固定 Pack version。
+最小 Runtime 不依赖它们；basic Pack 未安装时 preflight 给出明确安装大小/来源/许可证。Job 固定 Pack、parser、model revision 与 runtime identity。不得在 Job 中隐式联网下载模型或把 Docling 导入最小 Runtime 冷路径。
 
 ## 15. 安全与隐私
 
-- 恶意 PDF/Office 在隔离 worker 中解析；
+- PDF/Office 在隔离 worker 中解析；当前受信任真实 PDF 的进程级 Spike 只证明质量，不豁免正式恶意输入隔离；
 - 禁止宏、脚本、外链、OLE、embedded executable；
 - ZIP bomb/对象数/图片像素/页数/字体限制；
 - 临时目录配额和清理；

@@ -5,8 +5,8 @@ import binascii
 import json
 from dataclasses import dataclass
 
-from app.core.domain.video import JobSnapshot, JobState
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobSnapshot, JobState
 from app.core.jobs.model import JobEvent
 from app.core.ports.job_queries import (
     JobListRecord,

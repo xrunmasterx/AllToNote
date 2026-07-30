@@ -97,7 +97,7 @@ flowchart TD
 | `SUB-VAULT-001` | [CLI-First Vault](../superpowers/specs/2026-07-13-alltonote-cli-first-vault-workspace-design.md) | Vault/Desktop | [Vault/Desktop plan](../superpowers/plans/2026-07-18-alltonote-vault-desktop-implementation-plan.md) | active（JobStore 局部已修正） | 只读 foundation 计划存在，完整实现未完成 |
 | `DATA-001` | [Portable Artifact / Source Bundle](../superpowers/specs/2026-07-14-alltonote-portable-artifact-source-bundle-design.md) | AllToNote 数据设计；iwiki 合同更高 | [已有 foundation plan](../superpowers/plans/2026-07-14-llm-iwiki-portable-contract-foundation.md) | active | v1 基础、semantic validate、atomic commit、多 Draft 已实现 |
 | `RUNTIME-001` | [Runtime / CLI / Feature Pack](../superpowers/specs/2026-07-18-alltonote-runtime-cli-feature-pack-design.md) | Runtime/部署 | [实施计划](../superpowers/plans/2026-07-18-alltonote-runtime-cli-feature-pack-implementation-plan.md) | active | RCP-00..07 / Wave 1A 已验收；RCP-08+ Pack/Desktop/分发未完成 |
-| `REC-CONTRACT-001` | [Recipe 最小扩展合同](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md) | 多 Recipe 接缝 | [实施计划](../superpowers/plans/2026-07-18-alltonote-recipe-extension-contract-implementation-plan.md) | active | X0-A Tasks 1–8 已验收；X0-B pending，且必须由真实 Document/PPT 第二消费者驱动；CLI 仅单一 `produce`，无活跃 `add`/独立 `run` |
+| `REC-CONTRACT-001` | [Recipe 最小扩展合同](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md) | 多 Recipe 接缝 | [实施计划](../superpowers/plans/2026-07-18-alltonote-recipe-extension-contract-implementation-plan.md) | complete through X0-B | X0-A Tasks 1–8 与真实 PDF 驱动的最小 X0-B 已验收；CLI 仅单一 `produce`，无活跃 `add`/独立 `run`，未发布公共插件 ABI |
 | `REC-VIDEO-001` | [Video Recipe（历史名 Video Producer）](../superpowers/specs/2026-07-14-alltonote-video-producer-design.md) | Video Recipe | [原计划](../superpowers/plans/2026-07-14-alltonote-video-producer.md) + [发布收敛](../superpowers/plans/2026-07-18-alltonote-video-release-implementation-plan.md) | active | VREL-00/01 CLI seam 已验收；VREL-02..11 真实发布矩阵未闭合；通用 facade 迁移属于 Recipe X0 |
 | `REC-VIDEO-LONG-001` | [长视频知识编译](../superpowers/specs/2026-07-16-alltonote-long-video-knowledge-compilation-design.md) | Transcript -> Draft/Quality | 原 tasks + Video release plan | active | Knowledge/Faithful core 已实现；实时 YouTube acquisition 外部阻塞 |
 | `VAL-VIDEO-001` | [Video 三样本 Pilot](../design-docs/video-dogfood-validation/spec.md) | 当前产品证据 Gate | [阶段任务](../design-docs/video-dogfood-validation/tasks.md) + [冻结样本](../design-docs/video-dogfood-validation/samples.md) + [技术结果](../design-docs/video-dogfood-validation/report.md) | active | Pilot closed；首次系统 `2/3`，链路修复后 `3/3`；用户原值 `2/3`，术语修正与 V03 重评后 `3/3`；保留 reliability gap |
@@ -106,7 +106,7 @@ flowchart TD
 | `MCP-READ-001` | [Knowledge Access MCP](../superpowers/specs/2026-07-18-alltonote-knowledge-access-mcp-design.md) | 本地/公共只读知识 | [实施计划](../superpowers/plans/2026-07-18-alltonote-knowledge-access-mcp-implementation-plan.md) | active | 未实现 |
 | `ENGINE-001` | [Engine / Production MCP](../superpowers/specs/2026-07-18-alltonote-engine-production-mcp-design.md) | 后台执行/生产 Agent 接口 | [实施计划](../superpowers/plans/2026-07-18-alltonote-engine-production-mcp-implementation-plan.md) | active | 设计保留；当前实现 deferred，等待可信复用后的真实多 Job/后台瓶颈与技术 re-admission |
 | `REC-WEB-001` | [Article / Wiki Recipe](../superpowers/specs/2026-07-18-alltonote-article-wiki-recipe-design.md) | Web/Wiki | [实施计划](../superpowers/plans/2026-07-18-alltonote-article-wiki-recipe-implementation-plan.md) | active | 未实现 |
-| `REC-DOC-001` | [PDF / PPT / OCR Recipe](../superpowers/specs/2026-07-18-alltonote-document-recipe-design.md) | Document | [实施计划](../superpowers/plans/2026-07-18-alltonote-document-recipe-implementation-plan.md) | active | 未实现 |
+| `REC-DOC-001` | [PDF / PPT / OCR Recipe](../superpowers/specs/2026-07-18-alltonote-document-recipe-design.md) | Document | [实施计划](../superpowers/plans/2026-07-18-alltonote-document-recipe-implementation-plan.md) | active; first slice passed | 一个真实 born-digital PDF 纵切已通过；扫描件、OCR、PPTX、URL、长文档和完整 MVP 未实现 |
 | `REC-CODE-001` | [Codebase / UE5 Recipe](../superpowers/specs/2026-07-18-alltonote-codebase-ue5-recipe-design.md) | Code/UE5 | [实施计划](../superpowers/plans/2026-07-18-alltonote-codebase-ue5-recipe-implementation-plan.md) | active | 未实现 |
 | `REC-PERSONAL-001` | [Personal Work Digest](../superpowers/specs/2026-07-18-alltonote-personal-work-digest-design.md) | 个人工作整理 | [实施计划](../superpowers/plans/2026-07-18-alltonote-personal-work-digest-implementation-plan.md) | active | 未实现；manual MVP 可先做，scheduler 等 Engine |
 | `CLOUD-001` | [网站控制面](../superpowers/specs/2026-07-18-alltonote-site-control-plane-design.md) | 云账号/分发/公共知识 | [实施计划](../superpowers/plans/2026-07-18-alltonote-site-control-plane-implementation-plan.md) | active | 未实现，等待本地产品稳定 |
@@ -142,7 +142,7 @@ flowchart TD
 | Phase 3C Review/Publisher | `REVIEW-001` | Review plan | pending |
 | Phase 4 Engine/Production MCP | `ENGINE-001` | Engine plan | deferred；等待可信复用后的真实多 Job/后台瓶颈与技术 re-admission |
 | Phase 5 Article/Wiki | `REC-WEB-001` | Web plan | pending |
-| Phase 6 PPT/PDF | `REC-DOC-001` | Document plan | pending |
+| Phase 6 PPT/PDF | `REC-DOC-001` | Document plan | one born-digital PDF slice complete; remainder pending |
 | Phase 7 UE5/Codebase | `REC-CODE-001` | Code plan | pending |
 | Phase 8 Work Digest | `REC-PERSONAL-001` | Personal plan | pending |
 | Phase 9 Public Knowledge | `CLOUD-001`、`MCP-READ-001` | Site/MCP plans | pending |
@@ -209,7 +209,7 @@ flowchart TD
 | ProduceService / Multi-Recipe Registry X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；只完成 submission/control-plane 接缝，不代表 X0-B 数据面或多 Job 并发完成 |
 | Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原 V03 用户 FAIL；Evidence 双表示与跨拓扑术语修正后 V03 用户 PASS；不得外推范围见 `VAL-VIDEO-001` |
 | Video 可信复用验证 | `PASS by explicit user override` | 用户提前结束观察并授权继续；未到期时间窗和未提供指标不写成已验证 |
-| Multi-Recipe 数据面 X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同证明 Result/Artifact/Repository/atomic commit、迁移与恢复边界 |
+| Multi-Recipe 数据面 X0-B | `complete; real PDF-driven` | Video 与真实 Document 第二消费者已共同证明 Result/Artifact role、Repository atomic commit、dual-read migration、精确 reconnect 与故障恢复边界 |
 | Vault Core/CLI | `mostly not implemented` | foundation plan/部分 gateway存在，完整 tree/read/search/grant未闭环 |
 | 薄 Desktop Vault UI | `pending` | 旧 BiliNote UI不等于新 Runtime/Vault UI |
 | Review/Publisher | `pending` | 设计/计划已完成 |
@@ -237,7 +237,7 @@ flowchart TD
     ADMIT --> ENG["Engine / Production MCP"]
 ```
 
-当前产品执行链是：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用 PASS -> 冻结一个 born-digital PDF -> 最小 Document 纵切 + X0-B`。Wave 1A、Wave 0、X0-A Tasks 1–8 与两个 Video 验证均已关闭；当前仓库没有 PDF 候选，下一步等待真实输入。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Pilot `3/3` 不能外推为原 `8/10`。完整 C0、Review/Publisher、AgentExecutor、Thin Desktop 与 Engine 均 pending/deferred，必须由之后出现的真实瓶颈重新 admission；其既有技术规格没有被删除。
+已完成的产品执行链是：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用 PASS -> 一个 born-digital PDF + X0-B PASS`。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Pilot `3/3` 和单一 PDF 均不能外推为原 `8/10`、完整 Document MVP 或全格式支持。完整 C0、Review/Publisher、AgentExecutor、Thin Desktop 与 Engine 均 pending/deferred，必须由之后出现的真实瓶颈重新 admission；其既有技术规格没有被删除。
 
 ## 8. 下一位 AI 的使用规则
 

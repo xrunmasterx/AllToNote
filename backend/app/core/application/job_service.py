@@ -7,8 +7,13 @@ from dataclasses import fields, is_dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import (
+    JobExecutionBinding,
+    JobSnapshot,
+    JobState,
+    RetryJobRequest,
+)
 from app.core.ports.jobs import JobRepositoryPort
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
@@ -107,6 +112,7 @@ class JobService:
         request: object,
         *,
         initial_events: tuple[tuple[str, object], ...] = (),
+        execution_binding: JobExecutionBinding | None = None,
     ) -> JobSnapshot:
         principal = _request_field(request, "principal")
         client_request_id = _request_field(request, "client_request_id")
@@ -137,6 +143,7 @@ class JobService:
             principal=principal,
             client_request_id=client_request_id,
             initial_events=serialized_events,
+            execution_binding=execution_binding,
         )
         return self.get(job.job_id)
 

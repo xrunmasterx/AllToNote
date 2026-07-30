@@ -115,19 +115,19 @@ git diff --check
 | 65 分钟长视频知识编译 | `completed after acquisition` | 7 Map + 1 Compose，Quality/commit/恢复通过 |
 | 实时 YouTube acquisition | `blocked` | 当前 IP 与最新 Cookie 仍被 YouTube anti-bot 拦截 |
 | Bilibili/本地视频正式发布矩阵 | `partially verified` | 有 Adapter/测试基础，仍需真实发布 Gate 汇总 |
-| Runtime CLI / Feature Pack 产品面 | `Wave 1A complete; later waves pending` | RCP-00..07 / Wave 1A 已完成并有验收证据；Pack、完整 doctor/repair、Desktop Resolver、clean-machine/分发仍待实现 |
+| Runtime CLI / Feature Pack 产品面 | `Wave 1A complete; later waves pending` | RCP-00..07 / Wave 1A 已完成；`document-basic` 已固定 layout+TableFormer 依赖/模型并有离线 doctor；通用 Pack 安装/repair、Desktop Resolver、clean-machine/分发仍待实现 |
 | Wave 0 基线与权威收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；原 trailer 的 `3a75d0e410...` 为已记录的抄录错误；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
 | Recipe X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；范围止于 submission/control-plane 接缝，不包含数据面迁移或多 Job 并发 |
 | Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原用户结果 V01/V02 PASS、V03 FAIL；Evidence 默认呈现与跨拓扑术语修正后新 V03 用户 PASS；不能外推为 10 样本、字幕、本地文件、长视频或干净安装已验证 |
 | Video 可信复用验证 | `PASS by explicit user override` | 用户于 2026-07-30 提前结束观察并授权继续；不伪造原定 7 天或未提供的逐项指标 |
-| Recipe X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同抽取 Result/Artifact/Repository/atomic commit、迁移与恢复边界，不得用伪消费者或纸面抽象代替 |
+| Recipe X0-B | `complete; real born-digital PDF-driven` | Video 与真实 Document 第二消费者已共同证明 Result/Artifact role、Repository atomic commit、dual-read migration、精确 reconnect 与故障恢复；未发布公共插件 ABI |
 | Vault 选择/文件树/Markdown 阅读/搜索 | `design complete; implementation pending` | Core/CLI/Desktop 详细设计和计划已完成，目标闭环尚未实现 |
 | Review/Publisher | `design complete; implementation pending` | 审批 hash、PublishPlan、personal/common 权限与失败语义已设计 |
 | AgentExecutor | `design complete; implementation pending` | Codebase/UE5 所需受控 AgentExecutor/ExecutionGrant 尚未实现 |
 | Thin Desktop | `design complete; implementation pending` | Desktop API、Runtime Resolver、Vault UI 与发布 Gate 均待实现；旧 BiliNote UI 不等于目标架构 |
 | Knowledge MCP | `design complete; implementation pending` | 与 Production MCP 分离；默认 published-only stdio server |
 | Engine/Production MCP | `deferred; re-admission requires product and technical evidence` | 设计保留；当前单 Job Dogfood 不需要 Engine。只有可信复用后出现真实多 Job/后台瓶颈，且模型 turn、SQLite 与 per-job authority Gate 可证明时才重新 admission |
-| Article/Wiki/PDF/PPT Recipe | `design complete; implementation pending` | 可先使用 foreground durable Job，不依赖 Engine |
+| Article/Wiki/PDF/PPT Recipe | `design complete; two PDF samples implemented` | 英文双栏与中文表格密集 PDF 均通过正式纵切；Windows 中文路径、TableFormer 结构和 Document 默认 Evidence 呈现已关闭；Article/Wiki/PPT/OCR/完整 Document MVP 仍 pending |
 | UE5/Codebase/Personal Recipe | `design complete; implementation pending/deferred by gates` | Code prototype等待 Recipe 合同验证；Personal manual MVP 可先做，scheduler 等 Engine |
 | 网站账号/邀请/下载/设备/公共知识 | `design complete; implementation deferred` | 网站不保存个人 Markdown，等待本地产品和合规 Gate |
 | Windows 正式分发 | `design complete; implementation pending` | 仍缺签名安装、Pack、升级、回滚、卸载和 clean-machine E2E |
@@ -506,7 +506,7 @@ alltonote vault index-status
 
 ### RECIPE-CONTRACT-01：分阶段建立 X0-A，并由真实 Document/PPT 驱动 X0-B
 
-- 状态：`design completed; X0-A Tasks 1-8 accepted; X0-B pending`
+- 状态：`X0-A Tasks 1-8 accepted; real PDF-driven X0-B accepted`
 - 优先级：P2，等待 Video 单次价值与可信复用
 - 依赖：X0-A 已完成；X0-B 必须由可信复用后的一个真实 born-digital PDF 第二消费者驱动。串行 foreground 纵切不把完整 C0 作为逻辑前置；若实现触及并发模型 turn、多连接 SQLite 或多 Job authority，则先关闭对应 C0 Gate
 - 设计：[`REC-CONTRACT-001`](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md)
@@ -514,7 +514,7 @@ alltonote vault index-status
 
 范围：X0-A 只建立 Recipe identity/descriptor/input/request/submission、submit-only endpoint、静态官方 Registry、薄 ProduceService 与 Video adapter；CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。X0-A 不修改 SQLite schema、legacy request/result wire、hash、config snapshot、Checkpoint、Portable 或 atomic commit，也不清除 Job/Repository 数据面的 Video-specific 类型。
 
-分阶段 Gate：X0-A 已证明 Video 零语义变化以及 legacy/generic `produce` 共用 canonical request、Job identity、hash 和 config snapshot。当前先完成 Video 单次价值与可信复用；随后由 Video 与一个最小真实 born-digital PDF 纵切共同抽取 Result、Artifact、Repository、atomic commit、durable query、迁移和恢复边界。PDF 不得在 X0-B 的 legacy dual-read、migration、atomicity、恢复和 import Gate 通过前合入；Article/Wiki 后续再验证第三类来源，全部通过前不冻结公共插件 SDK。
+分阶段 Gate：X0-A 已证明 Video 零语义变化以及 legacy/generic `produce` 共用 canonical request、Job identity、hash 和 config snapshot。X0-B 随后由 Video 与一个最小真实 born-digital PDF 纵切共同抽取并验证 Result、Artifact role、Repository atomic commit、durable query、迁移和恢复边界。Article/Wiki 仍是未来第三类来源；在更多真实消费者通过前不冻结公共插件 SDK。
 
 ### ENGINE-01：按需 Engine 与 Production MCP
 
@@ -549,7 +549,7 @@ alltonote vault index-status
 
 ### RECIPE-DOC-01：PPT/PDF/OCR Recipe
 
-- 状态：`design completed; implementation pending`
+- 状态：`first born-digital PDF slice passed; full MVP pending`
 - 优先级：P2，Video 可信复用后的第二来源
 - 依赖：X0-A、Video 单次价值 Gate 与 Video 可信复用 Gate；首个纵切只使用一个真实 born-digital PDF 驱动 X0-B。串行 foreground 实现不依赖完整 C0；若触及适用并发边界则先关闭对应 Gate
 - 设计：[`REC-DOC-001`](../superpowers/specs/2026-07-18-alltonote-document-recipe-design.md)
@@ -742,12 +742,12 @@ alltonote vault index-status
 1. 保留 Wave 1A、Wave 0、X0-A 的完成事实与验收证据；不把 X0-A 解释为并发或数据面通用化完成；
 2. 使用 `codex/video-dogfood-validation` 和外置 worktree，不触碰 `master` 的 `AGENTS.md`、`config/` 或独立 iWiki 分支；
 3. `V01` 至 `V03` 已完成：首次系统 `2/3`，链路修复后系统 `3/3`；原用户价值 V01/V02 PASS、V03 FAIL，术语修正后 V03 用户 PASS，修正后用户价值 `3/3`；历史结果不回写；
-4. canonical Draft/EvidenceSet 继续作为审计权威；默认 `draft show` 使用已验证的干净阅读投影，核验时显式选择 `--presentation audit`；
+4. Video canonical Draft/EvidenceSet 继续作为审计权威，默认 `draft show` 使用干净 reading 投影；Document 的 `primary_draft` 直接作为干净阅读入口，逐块 page/bbox/hash 审计信息保留在独立 EvidenceSet；
 5. 跨样本 ASR 专有名词修正已在 V02 DIRECT 与 V03 MAP_COMPOSE 客观复验通过，未使用私有字符串替换表；
 6. Pilot 与可信复用任务均已关闭；可信复用以 `PASS by explicit user override` 记录；
-7. 当前只允许冻结一个真实 born-digital PDF 并实施最小 Document 纵切 + X0-B；仍不启动完整 C0、Review/Publisher、Engine、AgentExecutor、Thin Desktop 或公共插件 SDK。
+7. 真实 born-digital PDF、DOC-00、最小 Document 纵切与 X0-B 已通过；仍不自动启动完整 C0、Review/Publisher、Engine、AgentExecutor、Thin Desktop、OCR/PPTX 或公共插件 SDK。
 
-当前唯一允许的主线是 `冻结一个 born-digital PDF -> 最小 Document 纵切 + X0-B -> 按真实瓶颈重新 admission 后续能力`。
+当前主线已到达 `VAL-DOC-PDF-X0B-001 PASS`；下一项实现必须按真实瓶颈和用户优先级重新 admission。
 
 ### 9.2 推荐执行波次
 
@@ -757,7 +757,7 @@ flowchart TD
     X0A --> VD["Video Pilot：修正后系统/用户价值 3/3"]
     VD --> DEC["用户已决定继续"]
     DEC --> VR["Video 可信复用：PASS"]
-    VR --> PDF["冻结一个 born-digital PDF + 最小 X0-B"]
+    VR --> PDF["born-digital PDF + 最小 X0-B：PASS"]
     PDF --> ADMIT{"真实瓶颈重新 admission"}
     ADMIT --> C0["适用的并发正确性 / C0"]
     ADMIT --> ARP["最小 Review / Publisher"]
@@ -769,7 +769,7 @@ flowchart TD
 - Wave 1A、Wave 0 与 X0-A 均已完成；历史证据继续有效。
 - Pilot 的 `3/3` Gate、数据边界、时间盒和停止条件以本阶段 spec/tasks 为准，不得测试后重写或外推为原 `8/10`。
 - `VAL-VIDEO-REUSE-001` 已由用户提前判定 PASS；证据记录为产品 Owner override，不声称原定时间窗和逐项指标已经完成。
-- X0-B 仍为 pending，必须由可信复用后的一个真实 born-digital PDF 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
+- X0-B 已由冻结的真实 born-digital PDF 第二消费者关闭；后续公共数据面仍不能超出 Video + Document 已共同证明的 Result/Artifact/Repository 字段。
 - CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。
 - 当前单 Job Gate 不需要完整 C0；只有内部 fan-out 的 turn 隔离问题属于条件式最小修复。多 Job、SQLite 多 writer 和 Engine 仍受各自技术 Gate 约束。
 - Engine 的历史需求记录继续保留，但需求记录不等于当前产品 admission；只有被测用户出现真实多 Job/后台瓶颈时才重新决策。

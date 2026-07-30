@@ -3,9 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from app.core.domain.video import JobState, VideoProduceResult
 from app.core.errors import ErrorDetail
-from app.core.jobs.model import Attempt, Challenge, Job, JobEvent
+from app.core.jobs.model import Attempt, Challenge, Job, JobEvent, JobState
 
 
 @dataclass(frozen=True)
@@ -13,7 +12,7 @@ class JobQueryRecord:
     job: Job
     active_attempt: Attempt | None
     pending_challenge: Challenge | None
-    result: VideoProduceResult | None
+    result: object | None
     error: ErrorDetail | None
     unknown_operation_ids: tuple[str, ...] = ()
 
@@ -28,7 +27,7 @@ class JobQueryRecord:
 @dataclass(frozen=True)
 class JobListRecord:
     job: Job
-    result: VideoProduceResult | None
+    result: object | None
     error: ErrorDetail | None
 
 

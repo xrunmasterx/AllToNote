@@ -10,8 +10,8 @@ from pathlib import Path
 from uuid import RFC_4122, UUID
 
 from app.core.domain.ids import new_typed_id, sha256_digest, utc_now_millis
-from app.core.domain.video import (
-    JobState,
+from app.core.domain.production import RecipeProduceResult
+from app.core.jobs.legacy_video_result import (
     QualityOverall,
     VideoDocumentKind,
     VideoProducedDocument,
@@ -25,7 +25,9 @@ from app.core.jobs.model import (
     ChallengeState,
     CheckpointMetadata,
     Job,
+    JobExecutionBinding,
     JobEvent,
+    JobState,
 )
 from app.core.jobs.external_operation import ExternalOperation, ExternalOutcome
 from app.core.jobs.resource_lease import ExecutionAuthority, validate_lease_ttl
@@ -37,6 +39,7 @@ from app.core.jobs.state_machine import (
 from app.core.ports.jobs import (
     JobCompletion,
     PortableCommitReceipt,
+    RecipeResultPlan,
     SourceIdentityBinding,
     VideoResultPlan,
 )
@@ -44,10 +47,10 @@ from app.core.ports.job_queries import JobListRecord, JobQueryRecord
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5_000
 _RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
-_SCHEMA_STATEMENTS = (
+_SCHEMA_STATEMENTS_V1 = (
     """
     CREATE TABLE jobs (
         job_id TEXT PRIMARY KEY,
@@ -174,6 +177,26 @@ _SCHEMA_STATEMENTS = (
     )
     """,
 )
+_EXECUTION_BINDING_SCHEMA = """
+    CREATE TABLE job_execution_bindings (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+        recipe_id TEXT NOT NULL,
+        recipe_version INTEGER NOT NULL CHECK (recipe_version > 0),
+        executor_id TEXT NOT NULL,
+        executor_version INTEGER NOT NULL CHECK (executor_version > 0),
+        pack_id TEXT NOT NULL,
+        pack_version TEXT NOT NULL
+    )
+    """
+_SCHEMA_STATEMENTS = (*_SCHEMA_STATEMENTS_V1, _EXECUTION_BINDING_SCHEMA)
+_DEFAULT_EXECUTION_BINDING = JobExecutionBinding(
+    recipe_id="alltonote.legacy",
+    recipe_version=1,
+    executor_id="alltonote.video",
+    executor_version=1,
+    pack_id="media-basic",
+    pack_version="legacy-v1",
+)
 
 
 def _normalize_schema_sql(sql: str) -> str:
@@ -193,9 +216,11 @@ def _application_schema(
     return {(row[0], row[1]): _normalize_schema_sql(row[2]) for row in rows}
 
 
-def _expected_schema() -> dict[tuple[str, str], str]:
+def _expected_schema(
+    statements: tuple[str, ...] = _SCHEMA_STATEMENTS,
+) -> dict[tuple[str, str], str]:
     with sqlite3.connect(":memory:") as connection:
-        for statement in _SCHEMA_STATEMENTS:
+        for statement in statements:
             connection.execute(statement)
         return _application_schema(connection)
 
@@ -204,7 +229,7 @@ def _raise_schema_invalid(error: BaseException | None = None) -> None:
     raise DomainError(
         "job_store_schema_invalid",
         ErrorCategory.WORKSPACE_INCOMPATIBLE,
-        "JobStore schema does not match version 1",
+        f"JobStore schema does not match version {_SCHEMA_VERSION}",
     ) from error
 
 
@@ -269,7 +294,7 @@ class SqliteJobRepository:
     def _initialize_schema(self) -> None:
         with self._transaction(immediate=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, _SCHEMA_VERSION):
+            if version not in (0, 1, _SCHEMA_VERSION):
                 raise DomainError(
                     "job_store_schema_unsupported",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
@@ -283,8 +308,48 @@ class SqliteJobRepository:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
+            elif version == 1:
+                if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V1):
+                    _raise_schema_invalid()
+                self._migrate_v1_to_v2(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
             if actual_schema != _expected_schema():
                 _raise_schema_invalid()
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        connection.execute(_EXECUTION_BINDING_SCHEMA)
+        rows = connection.execute(
+            "SELECT job_id, request_json FROM jobs ORDER BY job_id"
+        ).fetchall()
+        for row in rows:
+            binding = self._legacy_execution_binding(row["request_json"])
+            self._insert_execution_binding(connection, row["job_id"], binding)
+
+    @staticmethod
+    def _legacy_execution_binding(request_json: str | None) -> JobExecutionBinding:
+        recipe_id = "alltonote.video-producer"
+        recipe_version = 1
+        if request_json is not None:
+            try:
+                value = json.loads(request_json)
+            except json.JSONDecodeError:
+                value = None
+            if type(value) is dict:
+                candidate_id = value.get("recipe_id")
+                candidate_version = value.get("recipe_version")
+                if type(candidate_id) is str and candidate_id.strip():
+                    recipe_id = candidate_id
+                if type(candidate_version) is int and candidate_version > 0:
+                    recipe_version = candidate_version
+        return JobExecutionBinding(
+            recipe_id=recipe_id,
+            recipe_version=recipe_version,
+            executor_id="alltonote.video",
+            executor_version=1,
+            pack_id="media-basic",
+            pack_version="legacy-v1",
+        )
 
     def create_job(
         self,
@@ -295,9 +360,12 @@ class SqliteJobRepository:
         client_request_id: str | None,
         retry_of_job_id: str | None = None,
         initial_events: tuple[tuple[str, str], ...] = (),
+        execution_binding: JobExecutionBinding | None = None,
     ) -> Job:
         self._validate_request_json(request_hash, request_json)
         self._validate_initial_events(initial_events)
+        binding = execution_binding or _DEFAULT_EXECUTION_BINDING
+        self._validate_execution_binding(binding)
         with self._transaction(immediate=True) as connection:
             job, created = self._create_job(
                 connection,
@@ -308,6 +376,7 @@ class SqliteJobRepository:
                 retry_of_job_id=retry_of_job_id,
             )
             if created:
+                self._insert_execution_binding(connection, job.job_id, binding)
                 for event_type, payload_json in initial_events:
                     self._insert_event(
                         connection,
@@ -315,7 +384,14 @@ class SqliteJobRepository:
                         event_type,
                         payload_json,
                     )
-            elif initial_events:
+            else:
+                if self._get_execution_binding(connection, job.job_id) != binding:
+                    raise DomainError(
+                        "idempotency_conflict",
+                        ErrorCategory.CONFLICT,
+                        "Idempotency key is already bound to another executor",
+                    )
+            if not created and initial_events:
                 stored = connection.execute(
                     """
                     SELECT event_type, payload_json FROM events
@@ -332,6 +408,11 @@ class SqliteJobRepository:
                         "Idempotency key is already bound to another request",
                     )
             return job
+
+    def get_job_execution_binding(self, job_id: str) -> JobExecutionBinding:
+        with self._transaction(immediate=False) as connection:
+            self._get_job(connection, job_id)
+            return self._get_execution_binding(connection, job_id)
 
     def get_job(self, job_id: str) -> Job:
         with self._transaction(immediate=False) as connection:
@@ -389,7 +470,7 @@ class SqliteJobRepository:
                     else None
                 ),
                 result=(
-                    self._decode_video_result(row["result_json"])
+                    self._decode_job_result(row["result_json"])
                     if row["result_json"] is not None
                     else None
                 ),
@@ -448,7 +529,7 @@ class SqliteJobRepository:
                 JobListRecord(
                     job=self._job_from_row(row),
                     result=(
-                        self._decode_video_result(row["result_json"])
+                        self._decode_job_result(row["result_json"])
                         if row["result_json"] is not None
                         else None
                     ),
@@ -537,7 +618,9 @@ class SqliteJobRepository:
             )
             return job, attempt, challenge
 
-    def get_job_result(self, job_id: str) -> VideoProduceResult | None:
+    def get_job_result(
+        self, job_id: str
+    ) -> VideoProduceResult | RecipeProduceResult | None:
         with self._transaction(immediate=False) as connection:
             row = connection.execute(
                 "SELECT result_json FROM jobs WHERE job_id = ?", (job_id,)
@@ -546,7 +629,7 @@ class SqliteJobRepository:
                 self._get_job(connection, job_id)
             if row["result_json"] is None:
                 return None
-            return self._decode_video_result(row["result_json"])
+            return self._decode_job_result(row["result_json"])
 
     def get_job_request(self, job_id: str) -> str | None:
         return self._get_nullable_job_json(job_id, "request_json")
@@ -1068,6 +1151,11 @@ class SqliteJobRepository:
                 retry_of_job_id=original.job_id,
             )
             if created:
+                self._insert_execution_binding(
+                    connection,
+                    job.job_id,
+                    self._get_execution_binding(connection, original.job_id),
+                )
                 for event_type, payload_json in initial_events:
                     self._insert_event(
                         connection,
@@ -1904,6 +1992,61 @@ class SqliteJobRepository:
             )
             return JobCompletion(result=result, source_identity=source_identity)
 
+    def commit_recipe_result_atomic(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+        *,
+        result_plan: RecipeResultPlan,
+        source_identity: SourceIdentityBinding,
+        commit: Callable[[], PortableCommitReceipt],
+    ) -> JobCompletion:
+        with self._transaction(immediate=True) as connection:
+            self._assert_commit_guard(connection, job_id, attempt_id, authority)
+            self._validate_recipe_result_plan(job_id, result_plan, source_identity)
+            existing = connection.execute(
+                """
+                SELECT * FROM source_identities
+                WHERE connector_id = ? AND canonical_identity = ?
+                """,
+                (source_identity.connector_id, source_identity.canonical_identity),
+            ).fetchone()
+            if existing is not None and existing["source_id"] != source_identity.source_id:
+                raise DomainError(
+                    "source_identity_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Canonical source identity is bound to another Source",
+                )
+            receipt = commit()
+            result = self._recipe_result_from_plan_receipt(result_plan, receipt)
+            connection.execute(
+                """
+                INSERT INTO source_identities (
+                    connector_id, canonical_identity, source_id,
+                    owning_bundle_id, manifest_sha256, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connector_id, canonical_identity) DO UPDATE SET
+                    owning_bundle_id = excluded.owning_bundle_id,
+                    manifest_sha256 = excluded.manifest_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source_identity.connector_id,
+                    source_identity.canonical_identity,
+                    source_identity.source_id,
+                    source_identity.owning_bundle_id,
+                    source_identity.manifest_sha256,
+                    utc_now_millis(),
+                ),
+            )
+            connection.execute(
+                "UPDATE jobs SET result_json = ? WHERE job_id = ?",
+                (self._encode_recipe_result(result), job_id),
+            )
+            self._finish_commit_guard(connection, job_id, attempt_id, authority)
+            return JobCompletion(result=result, source_identity=source_identity)
+
     def fail_job_atomic(
         self,
         job_id: str,
@@ -2178,6 +2321,182 @@ class SqliteJobRepository:
         )
         cls._encode_video_result(result)
         return result
+
+    @classmethod
+    def _validate_recipe_result_plan(
+        cls,
+        job_id: str,
+        plan: RecipeResultPlan,
+        binding: SourceIdentityBinding,
+    ) -> None:
+        if (
+            not isinstance(plan, RecipeResultPlan)
+            or type(plan.result_kind) is not str
+            or not plan.result_kind.strip()
+            or plan.job_id != job_id
+            or not cls._is_typed_uuid7(plan.job_id, "job")
+            or not cls._is_typed_uuid7(plan.run_id, "run")
+            or not cls._is_typed_uuid7(plan.bundle_id, "bnd")
+            or not cls._is_sha256_digest(plan.manifest_sha256)
+            or not cls._is_typed_uuid7(plan.source_id, "src")
+            or not cls._is_typed_uuid7(plan.source_revision_id, "rev")
+            or not plan.artifacts
+            or any(
+                type(role) is not str
+                or not role.strip()
+                or not cls._is_typed_uuid7(artifact_id, "art")
+                for role, artifact_id in plan.artifacts.items()
+            )
+            or len(plan.artifacts.values()) != len(set(plan.artifacts.values()))
+            or type(plan.quality_overall) is not str
+            or not plan.quality_overall.strip()
+            or type(plan.publish_eligible) is not bool
+            or any(type(warning) is not str or not warning.strip() for warning in plan.warnings)
+            or not isinstance(binding, SourceIdentityBinding)
+            or any(
+                type(value) is not str or not value.strip()
+                for value in (binding.connector_id, binding.canonical_identity)
+            )
+            or plan.source_id != binding.source_id
+            or plan.bundle_id != binding.owning_bundle_id
+            or plan.manifest_sha256 != binding.manifest_sha256
+        ):
+            raise DomainError(
+                "job_result_plan_invalid",
+                ErrorCategory.INTERNAL,
+                "Recipe result plan is invalid",
+            )
+
+    @classmethod
+    def _recipe_result_from_plan_receipt(
+        cls,
+        plan: RecipeResultPlan,
+        receipt: PortableCommitReceipt,
+    ) -> RecipeProduceResult:
+        if not isinstance(receipt, PortableCommitReceipt) or (
+            receipt.bundle_id != plan.bundle_id
+            or receipt.manifest_sha256 != plan.manifest_sha256
+            or not cls._is_sha256_digest(receipt.commit_sha256)
+            or type(receipt.workspace_relative_bundle_path) is not str
+            or not receipt.workspace_relative_bundle_path
+            or type(receipt.idempotent) is not bool
+        ):
+            raise DomainError(
+                "portable_commit_receipt_invalid",
+                ErrorCategory.INTERNAL,
+                "Portable commit receipt does not match the result plan",
+            )
+        return RecipeProduceResult(
+            result_schema_version=1,
+            result_kind=plan.result_kind,
+            job_id=plan.job_id,
+            run_id=plan.run_id,
+            bundle_id=plan.bundle_id,
+            manifest_sha256=plan.manifest_sha256,
+            commit_sha256=receipt.commit_sha256,
+            workspace_relative_bundle_path=receipt.workspace_relative_bundle_path,
+            source_id=plan.source_id,
+            source_revision_id=plan.source_revision_id,
+            artifacts=plan.artifacts,
+            quality_overall=plan.quality_overall,
+            publish_eligible=plan.publish_eligible,
+            usage=plan.usage,
+            warnings=plan.warnings,
+            idempotent=receipt.idempotent,
+        )
+
+    @staticmethod
+    def _encode_recipe_result(result: RecipeProduceResult) -> str:
+        return json.dumps(
+            {
+                "result_schema_version": result.result_schema_version,
+                "result_kind": result.result_kind,
+                "job_id": result.job_id,
+                "run_id": result.run_id,
+                "bundle_id": result.bundle_id,
+                "manifest_sha256": result.manifest_sha256,
+                "commit_sha256": result.commit_sha256,
+                "workspace_relative_bundle_path": result.workspace_relative_bundle_path,
+                "source_id": result.source_id,
+                "source_revision_id": result.source_revision_id,
+                "artifacts": dict(result.artifacts),
+                "quality_overall": result.quality_overall,
+                "publish_eligible": result.publish_eligible,
+                "usage": dict(result.usage),
+                "warnings": list(result.warnings),
+                "idempotent": result.idempotent,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    @staticmethod
+    def _decode_recipe_result(value: Mapping[str, object]) -> RecipeProduceResult:
+        try:
+            expected_fields = frozenset(
+                {
+                    "result_schema_version",
+                    "result_kind",
+                    "job_id",
+                    "run_id",
+                    "bundle_id",
+                    "manifest_sha256",
+                    "commit_sha256",
+                    "workspace_relative_bundle_path",
+                    "source_id",
+                    "source_revision_id",
+                    "artifacts",
+                    "quality_overall",
+                    "publish_eligible",
+                    "usage",
+                    "warnings",
+                    "idempotent",
+                }
+            )
+            if frozenset(value) != expected_fields:
+                raise TypeError
+            return RecipeProduceResult(
+                result_schema_version=value["result_schema_version"],
+                result_kind=value["result_kind"],
+                job_id=value["job_id"],
+                run_id=value["run_id"],
+                bundle_id=value["bundle_id"],
+                manifest_sha256=value["manifest_sha256"],
+                commit_sha256=value["commit_sha256"],
+                workspace_relative_bundle_path=value["workspace_relative_bundle_path"],
+                source_id=value["source_id"],
+                source_revision_id=value["source_revision_id"],
+                artifacts=value["artifacts"],
+                quality_overall=value["quality_overall"],
+                publish_eligible=value["publish_eligible"],
+                usage=value["usage"],
+                warnings=tuple(value["warnings"]),
+                idempotent=value["idempotent"],
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise DomainError(
+                "job_result_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Recipe result is invalid",
+            ) from error
+
+    @classmethod
+    def _decode_job_result(
+        cls, payload: str
+    ) -> VideoProduceResult | RecipeProduceResult:
+        try:
+            value = json.loads(payload)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise DomainError(
+                "job_result_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job result is invalid",
+            ) from error
+        if isinstance(value, dict) and "result_schema_version" in value:
+            return cls._decode_recipe_result(value)
+        return cls._decode_video_result(payload)
 
     @staticmethod
     def _encode_video_result(result: VideoProduceResult) -> str:
@@ -2455,6 +2774,70 @@ class SqliteJobRepository:
                 "Job does not exist",
             )
         return self._job_from_row(row)
+
+    @staticmethod
+    def _validate_execution_binding(binding: object) -> None:
+        if not isinstance(binding, JobExecutionBinding):
+            raise DomainError(
+                "job_execution_binding_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job execution binding is invalid",
+            )
+
+    @staticmethod
+    def _insert_execution_binding(
+        connection: sqlite3.Connection,
+        job_id: str,
+        binding: JobExecutionBinding,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO job_execution_bindings (
+                job_id, recipe_id, recipe_version, executor_id,
+                executor_version, pack_id, pack_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                binding.recipe_id,
+                binding.recipe_version,
+                binding.executor_id,
+                binding.executor_version,
+                binding.pack_id,
+                binding.pack_version,
+            ),
+        )
+
+    @staticmethod
+    def _get_execution_binding(
+        connection: sqlite3.Connection,
+        job_id: str,
+    ) -> JobExecutionBinding:
+        row = connection.execute(
+            "SELECT * FROM job_execution_bindings WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "job_execution_binding_missing",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Job execution binding is missing",
+            )
+        try:
+            return JobExecutionBinding(
+                recipe_id=row["recipe_id"],
+                recipe_version=row["recipe_version"],
+                executor_id=row["executor_id"],
+                executor_version=row["executor_version"],
+                pack_id=row["pack_id"],
+                pack_version=row["pack_version"],
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainError(
+                "job_execution_binding_invalid",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Stored Job execution binding is invalid",
+            ) from error
 
     @staticmethod
     def _raise_scoped_job_not_found() -> None:

@@ -4,8 +4,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
-from app.core.domain.video import (
-    JobState,
+from app.core.domain.production import RecipeProduceResult
+from app.core.jobs.legacy_video_result import (
     QualityOverall,
     VideoProducedDocument,
     VideoProduceResult,
@@ -20,7 +20,9 @@ from app.core.jobs.model import (
     CheckpointMetadata,
     CheckpointRecord,
     Job,
+    JobExecutionBinding,
     JobEvent,
+    JobState,
 )
 from app.core.jobs.resource_lease import ExecutionAuthority
 from app.core.ports.source import CancellationTokenPort
@@ -62,6 +64,27 @@ class VideoResultPlan:
 
 
 @dataclass(frozen=True)
+class RecipeResultPlan:
+    result_kind: str
+    job_id: str
+    run_id: str
+    bundle_id: str
+    manifest_sha256: str
+    source_id: str
+    source_revision_id: str
+    artifacts: Mapping[str, str]
+    quality_overall: str
+    publish_eligible: bool
+    usage: Mapping[str, int | float | str]
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifacts", MappingProxyType(dict(self.artifacts)))
+        object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+
+
+@dataclass(frozen=True)
 class PortableCommitReceipt:
     bundle_id: str
     manifest_sha256: str
@@ -72,7 +95,7 @@ class PortableCommitReceipt:
 
 @dataclass(frozen=True)
 class JobCompletion:
-    result: VideoProduceResult
+    result: VideoProduceResult | RecipeProduceResult
     source_identity: SourceIdentityBinding
 
 
@@ -112,13 +135,24 @@ class JobRepositoryPort(Protocol):
         client_request_id: str | None,
         retry_of_job_id: str | None = None,
         initial_events: tuple[tuple[str, str], ...] = (),
+        execution_binding: JobExecutionBinding | None = None,
     ) -> Job: ...
+
+    def get_job_execution_binding(self, job_id: str) -> JobExecutionBinding: ...
+
+    def read_source_identity_candidate(
+        self,
+        connector_id: str,
+        canonical_identity: str,
+    ) -> SourceIdentityBinding | None: ...
 
     def get_job_details(
         self, job_id: str
     ) -> tuple[Job, Attempt | None, Challenge | None]: ...
 
-    def get_job_result(self, job_id: str) -> VideoProduceResult | None: ...
+    def get_job_result(
+        self, job_id: str
+    ) -> VideoProduceResult | RecipeProduceResult | None: ...
 
     def get_job_request(self, job_id: str) -> str | None: ...
 
@@ -131,6 +165,17 @@ class JobRepositoryPort(Protocol):
         authority: ExecutionAuthority,
         *,
         result_plan: VideoResultPlan,
+        source_identity: SourceIdentityBinding,
+        commit: Callable[[], PortableCommitReceipt],
+    ) -> JobCompletion: ...
+
+    def commit_recipe_result_atomic(
+        self,
+        job_id: str,
+        attempt_id: str,
+        authority: ExecutionAuthority,
+        *,
+        result_plan: RecipeResultPlan,
         source_identity: SourceIdentityBinding,
         commit: Callable[[], PortableCommitReceipt],
     ) -> JobCompletion: ...
@@ -166,8 +211,8 @@ class JobRepositoryPort(Protocol):
     ) -> Job: ...
 
 
-class VideoExecutionRepositoryPort(JobRepositoryPort, Protocol):
-    """Narrow execution surface used by the sequential video recipe."""
+class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
+    """Narrow execution surface used by sequential Recipe executors."""
 
     def transition_job(self, job_id: str, state: JobState) -> Job: ...
 
@@ -220,6 +265,9 @@ class VideoExecutionRepositoryPort(JobRepositoryPort, Protocol):
         attempt_id: str,
         authority: ExecutionAuthority,
     ) -> Challenge: ...
+
+
+VideoExecutionRepositoryPort = JobExecutionRepositoryPort
 
 
 class AttemptMetadataRepositoryPort(Protocol):

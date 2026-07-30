@@ -9,7 +9,7 @@ from typing import TypeVar
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata, CheckpointRecord
 from app.core.jobs.resource_lease import ExecutionAuthority
-from app.core.ports.jobs import AttemptStoragePort, VideoExecutionRepositoryPort
+from app.core.ports.jobs import AttemptStoragePort, JobExecutionRepositoryPort
 
 
 _T = TypeVar("_T")
@@ -51,7 +51,7 @@ class CheckpointedStepRunner:
 
     def __init__(
         self,
-        repository: VideoExecutionRepositoryPort,
+        repository: JobExecutionRepositoryPort,
         attempt_storage: AttemptStoragePort,
         *,
         checkpoint_reader: Callable[[CheckpointMetadata], bytes],

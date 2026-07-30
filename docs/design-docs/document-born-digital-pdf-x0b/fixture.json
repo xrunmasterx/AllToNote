@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "fixture_id": "DOC-PDF-001",
+  "source_disposition": "external-user-provided-third-party-document-not-committed",
+  "source_name": "SA2023_RealTimeReflection.pdf",
+  "source_path_at_freeze": "E:\\Agent_Learning\\Paper\\SA2023_RealTimeReflection.pdf",
+  "size_bytes": 6200363,
+  "last_write_time_local": "2026-04-27T02:26:05+08:00",
+  "sha256": "155f56096e8196b08f0aab9d6a162daea0196d308ad323ab1aebc7fb749db6b1",
+  "format": "pdf",
+  "encrypted": false,
+  "classification": "born-digital",
+  "page_count": 4,
+  "page_size_points": [612.0, 792.0],
+  "metadata_title": "Real-Time Rendering of Glossy Reflections Using Ray Tracing and Two-Level Radiance Caching",
+  "structure_oracle": [
+    "ABSTRACT",
+    "1 INTRODUCTION",
+    "2 OUR METHOD",
+    "2.1 Glossy reflection rendering",
+    "2.2 Radiance evaluation",
+    "2.3 Hash grid cell placement",
+    "2.4 Denoising and upscaling",
+    "3 RESULT",
+    "ACKNOWLEDGMENTS",
+    "REFERENCES"
+  ],
+  "frozen_at": "2026-07-30"
+}

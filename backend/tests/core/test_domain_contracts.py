@@ -626,16 +626,19 @@ def test_ports_are_protocols_without_unapproved_speculative_methods() -> None:
     assert {
         name for name in JobRepositoryPort.__dict__ if not name.startswith("_")
     } == {
-        "cancel_job",
-        "commit_video_result_atomic",
+            "cancel_job",
+            "commit_recipe_result_atomic",
+            "commit_video_result_atomic",
         "create_job",
         "create_retry_job_atomic",
         "fail_job_atomic",
-        "get_job_details",
-        "get_job_error",
+            "get_job_details",
+            "get_job_error",
+            "get_job_execution_binding",
         "get_job_request",
-        "get_job_result",
-        "respond_challenge_atomic",
+            "get_job_result",
+            "read_source_identity_candidate",
+            "respond_challenge_atomic",
     }
     event_argument, event_return = get_args(EventSink)
     assert event_argument[0].__forward_arg__ == "JobEvent"

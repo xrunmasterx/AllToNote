@@ -150,7 +150,7 @@ Feature Pack 是官方受控、版本化的部署单元，不是无限制插件�
 | `transcribe-cpu` | faster-whisper CPU runtime，可选模型引用 | 独立 worker/子进程 |
 | `transcribe-gpu-*` | 平台/GPU 特定运行库 | 独立 worker |
 | `browser-capture` | Playwright runtime/browser 或已安装浏览器桥 | 独立受控进程 |
-| `document-basic` | PPTX/PDF 原生结构提取器 | Python adapter 或隔离 worker |
+| `document-basic` | PPTX/PDF 原生结构提取器；首个 PDF 内核为固定离线 Docling | Docling 隔离 worker；其他轻量 adapter 需单独过 Gate |
 | `document-ocr` | OCRmyPDF/Tesseract/语言包 | 子进程 |
 | `document-office` | LibreOffice headless/Tika 等 | 隔离 sidecar |
 | `code-basic` | Git/Tree-sitter/通用索引 | 子进程或 adapter |

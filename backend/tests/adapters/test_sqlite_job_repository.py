@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app.adapters.jobs import sqlite_repository as repository_module
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.video import (
@@ -17,7 +18,7 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.cancellation import CancellationToken
-from app.core.jobs.model import AttemptState
+from app.core.jobs.model import AttemptState, JobExecutionBinding
 from app.core.jobs.state_machine import (
     LEGAL_ATTEMPT_TRANSITIONS,
     LEGAL_JOB_TRANSITIONS,
@@ -55,6 +56,7 @@ EXPECTED_TABLES = {
     "events",
     "external_operations",
     "jobs",
+    "job_execution_bindings",
     "leases",
     "source_identities",
     "steps",
@@ -431,7 +433,7 @@ def test_corrupt_database_is_rejected_without_overwrite(tmp_path: Path) -> None:
     assert database_path.read_bytes() == corrupt_bytes
 
 
-def test_open_creates_version_one_database_with_exact_schema_and_pragmas(
+def test_open_creates_version_two_database_with_exact_schema_and_pragmas(
     repo: SqliteJobRepository,
 ) -> None:
     assert repo.database_path == repo.machine_root / "jobs.sqlite"
@@ -456,8 +458,77 @@ def test_open_creates_version_one_database_with_exact_schema_and_pragmas(
     assert foreign_keys == 1
     assert journal_mode == "wal"
     assert busy_timeout == 5_000
-    assert user_version == 1
+    assert user_version == 2
     assert foreign_key_violations == []
+
+
+def test_version_one_database_migrates_execution_binding_and_reopens(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v1")
+    request_json = json.dumps(
+        {
+            "recipe_id": "alltonote.video-course-note",
+            "recipe_version": 2,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with sqlite3.connect(database_path) as connection:
+        for statement in repository_module._SCHEMA_STATEMENTS_V1:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_id, request_hash, request_json, principal,
+                client_request_id, state, cancellation_requested,
+                retry_of_job_id, result_json, error_json, created_at, updated_at
+            ) VALUES ('job_legacy', ?, ?, 'local', 'legacy', 'queued', 0,
+                      NULL, NULL, NULL, '1', '1')
+            """,
+            (sha256_digest(request_json), request_json),
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    migrated = SqliteJobRepository.open(machine_root)
+
+    assert migrated.get_job_execution_binding("job_legacy") == JobExecutionBinding(
+        recipe_id="alltonote.video-course-note",
+        recipe_version=2,
+        executor_id="alltonote.video",
+        executor_version=1,
+        pack_id="media-basic",
+        pack_version="legacy-v1",
+    )
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    reopened = SqliteJobRepository.open(machine_root)
+    assert reopened.get_job_execution_binding("job_legacy") == (
+        migrated.get_job_execution_binding("job_legacy")
+    )
+
+
+def test_new_job_persists_exact_execution_binding(repo: SqliteJobRepository) -> None:
+    binding = JobExecutionBinding(
+        recipe_id="alltonote.document-note",
+        recipe_version=1,
+        executor_id="alltonote.document",
+        executor_version=1,
+        pack_id="document-basic",
+        pack_version="docling-2.117.0",
+    )
+
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="document-binding",
+        execution_binding=binding,
+    )
+
+    assert repo.get_job_execution_binding(job.job_id) == binding
 
 
 def test_json_columns_are_utf8_text_and_schema_has_no_secret_columns(

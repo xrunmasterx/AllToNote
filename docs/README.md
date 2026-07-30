@@ -311,6 +311,7 @@ flowchart LR
 跨文档决策当前登记在：
 
 - [`ADR-0001：机器运行状态必须位于 Vault 之外`](decisions/ADR-0001-machine-state-outside-vault.md)
+- [`ADR-0002：Docling 只作为可替换的 Document Parsing Engine`](decisions/ADR-0002-docling-as-document-parsing-engine.md)
 
 ## 7. 强制阅读规则
 
@@ -318,12 +319,13 @@ flowchart LR
 
 - Wave 1A 已完成；其范围外的 Pack、Desktop Resolver、clean-machine 与分发仍待实现。
 - Wave 0 已于 2026-07-21 通过；实际权威基线为 `3a75d0eb921acd2f5eac75d2033ae4d4e0e00cc3`，实现集成提交为 `066884da43105e000e00e389ab213274ca2fd6c5`。实现提交 trailer 中的 `3a75d0e410...` 是不可解析的抄录错误，验收记录已显式更正，不改写历史。
-- X0-A Tasks 1–8 已完成并通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；X0-A 只建立 submission/control-plane 接缝，不提供同 Workspace 多 Job 并发、detach、Engine 或 AgentExecutor，也未完成 Job/Repository/Bundle 数据面去 Video 化。X0-B pending，且必须由 Video 与真实 Document/PPT 第二消费者共同驱动，不能以伪消费者或纸面抽象代替。
+- X0-A Tasks 1–8 已完成并通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；由冻结的真实 born-digital PDF 驱动的最小 X0-B 也已通过，完成通用 Result/Artifact role、精确 execution binding、dual-read migration、atomic commit 与 reconnect。仍不提供同 Workspace 多 Job 并发、detach、Engine、AgentExecutor 或公共插件 ABI。
 - [`VAL-VIDEO-001 Video 三样本 Pilot`](design-docs/video-dogfood-validation/spec.md) 已关闭：V01–V03 修复后系统 `3/3`，首次为 `2/3`；Evidence 默认呈现已修复；用户原判定 V01/V02 通过、V03 不通过。跨样本专有名词修正已在 V02 DIRECT 与 V03 MAP_COMPOSE 客观复验通过，新 V03 经用户重评通过，修正后用户价值 `3/3`。可靠性缺口和范围限制仍保留；用户已授权下一步只建立最小 Video 可信复用验证。
-- [`VAL-VIDEO-REUSE-001 Video 可信复用验证`](design-docs/video-trusted-reuse-validation/spec.md) 已由用户提前判定通过并授权继续；记录为 `PASS by explicit user override`，不伪造未流逝的 7 天或未提供的逐项指标。下一步等待冻结一个真实 born-digital PDF，进入最小 Document 纵切 + X0-B。
+- [`VAL-VIDEO-REUSE-001 Video 可信复用验证`](design-docs/video-trusted-reuse-validation/spec.md) 已由用户提前判定通过并授权继续；记录为 `PASS by explicit user override`，不伪造未流逝的 7 天或未提供的逐项指标。
+- [`VAL-DOC-PDF-X0B-001`](design-docs/document-born-digital-pdf-x0b/spec.md) 已通过：Docling 被固定为可替换、离线、进程隔离的解析引擎；真实 4 页论文经 generic `produce` 生成 111 个结构块、page/bbox Evidence、Draft 与 Portable Bundle，源哈希不变，重开/故障原子性与 X0-B 回归通过。
 - Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending；旧 BiliNote UI 不等于 Thin Desktop 完成。
 - 完整 C0 和 Engine 当前 deferred。它们的既有技术设计保留，但只有可信复用后出现真实多 Job/后台瓶颈，并关闭适用的模型 turn、SQLite 和 per-job authority Gate 时才重新 admission。
-- 当前产品执行链为：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用 PASS -> 冻结一个 born-digital PDF -> 最小 Document 纵切 + X0-B -> 按真实瓶颈重新 admission 后续能力`。
+- 已完成的产品执行链为：`Wave 0 -> X0-A -> 三样本 Pilot -> Video 可信复用 PASS -> born-digital PDF + X0-B PASS`；下一步必须按这次真实纵切暴露的瓶颈重新 admission，不能自动扩张到 OCR/PPTX/Engine。
 - CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run`。
 
 ### 7.1 任意新 AI 的启动顺序
@@ -393,7 +395,7 @@ flowchart LR
 - 权威文档基线已集成到实现分支提交 `066884da43105e000e00e389ab213274ca2fd6c5`；实际来源提交与集成提交的 stable patch-id 均为 `9ca7ee7109ecdbbba7ba24526355e36a6ca7fabd`。实现提交 trailer 中的 `3a75d0e410...` 是不可解析的抄录错误，已在验收报告中更正而未改写历史。
 - X0-A 最终 backend 全量测试为 `1906 passed, 2 skipped, 1 warning, 3 subtests passed`；Windows 本地视频 smoke 为 `1 passed, 14 deselected, 1 warning`；`git diff --check` 通过。
 - `G:\AllToNote` 中未跟踪的 `AGENTS.md` 与 `config/` 是明确排除的用户本地资产；不得清理、覆盖或纳入本阶段提交。
-- Wave 0、X0-A、`VAL-VIDEO-001` 与 `VAL-VIDEO-REUSE-001` 已关闭；X0-A 的最终验收见 `acceptance/2026-07-30-recipe-x0a-task-8.md`。下一步只允许一个真实 born-digital PDF + 最小 X0-B，不是自动进入 C0 或其他实现。
+- Wave 0、X0-A、`VAL-VIDEO-001`、`VAL-VIDEO-REUSE-001` 与 `VAL-DOC-PDF-X0B-001` 已关闭；X0-A 的最终验收见 `acceptance/2026-07-30-recipe-x0a-task-8.md`。这不自动进入 C0、OCR、PPTX、Review/Publisher 或 Engine 实现。
 - 当前正式架构设计继续有效；不得把 X0-A 或三样本 Pilot解释为多 Recipe 数据面、广泛产品价值或并发 Engine 已完成，也不得绕过用户显式决策提前启动 X0-B 或 Engine production implementation。
 
-下一个执行者必须先读取总任务清单中的 `HANDOFF-01`、已关闭的两个 Video 验证结果和 Document/X0-B 既有设计；没有冻结真实 PDF 输入前不得编写第二 Recipe 实现。
+下一个执行者必须先读取总任务清单中的 `HANDOFF-01`、已关闭的两个 Video 验证结果、ADR-0002、`VAL-DOC-PDF-X0B-001` 和 Document/X0-B 既有设计；不得替换冻结 PDF 或绕过 DOC-00/X0-B Gate。
