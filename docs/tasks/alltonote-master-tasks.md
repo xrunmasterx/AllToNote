@@ -119,7 +119,7 @@ git diff --check
 | Wave 0 基线与权威收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；原 trailer 的 `3a75d0e410...` 为已记录的抄录错误；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
 | Recipe X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；范围止于 submission/control-plane 接缝，不包含数据面迁移或多 Job 并发 |
 | Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原用户结果 V01/V02 PASS、V03 FAIL；Evidence 默认呈现与跨拓扑术语修正后新 V03 用户 PASS；不能外推为 10 样本、字幕、本地文件、长视频或干净安装已验证 |
-| Video 可信复用验证 | `in progress; observation only` | 只用三份最终 reading；2026-07-30 至不早于 2026-08-06；等待延迟检索 3/3 与至少 1 次自然下游复用 |
+| Video 可信复用验证 | `PASS by explicit user override` | 用户于 2026-07-30 提前结束观察并授权继续；不伪造原定 7 天或未提供的逐项指标 |
 | Recipe X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同抽取 Result/Artifact/Repository/atomic commit、迁移与恢复边界，不得用伪消费者或纸面抽象代替 |
 | Vault 选择/文件树/Markdown 阅读/搜索 | `design complete; implementation pending` | Core/CLI/Desktop 详细设计和计划已完成，目标闭环尚未实现 |
 | Review/Publisher | `design complete; implementation pending` | 审批 hash、PublishPlan、personal/common 权限与失败语义已设计 |
@@ -292,7 +292,7 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 
 ### VALUE-VIDEO-REUSE-01：Video 可信复用验证
 
-- 状态：`in progress; observation only`
+- 状态：`completed; PASS by explicit user override`
 - 优先级：P0，当前唯一活动
 - 开始：2026-07-30；最早结束：2026-08-06
 - 规格：[`VAL-VIDEO-REUSE-001`](../design-docs/video-trusted-reuse-validation/spec.md)
@@ -301,7 +301,7 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 
 范围：只观察 V01–V03 三份最终 reading 的保留、延迟检索和自然下游复用；不增加输入、不调用 ASR/LLM、不改产品代码。前三天不做计划性检索；第 4–7 天完成三个固定问题；整个窗口记录自然复用。
 
-Gate：完整性与保留 `3/3`、延迟检索 `3/3`、至少 1 次自然下游复用、单次必要清洗不超过 10 分钟才 PASS；检索通过但没有自然复用为 NO-SIGNAL；任一阻塞性检索、事实或清洗失败为 FAIL。只有 PASS 才允许请求一个 born-digital PDF + 最小 X0-B，仍不得自动启动实现。
+原 Gate 要求完整性与保留 `3/3`、延迟检索 `3/3`、至少 1 次自然下游复用和清洗不超过 10 分钟。用户在原定窗口结束前显式声明整体通过并授权继续，因此以产品 Owner override 关闭；不把未执行或未提供的逐项数据写成已验证。下一步只允许冻结一个真实 born-digital PDF 并启动最小 X0-B。
 
 ### RELEASE-VIDEO-01：收敛 Video Producer 发布矩阵
 
@@ -744,10 +744,10 @@ alltonote vault index-status
 3. `V01` 至 `V03` 已完成：首次系统 `2/3`，链路修复后系统 `3/3`；原用户价值 V01/V02 PASS、V03 FAIL，术语修正后 V03 用户 PASS，修正后用户价值 `3/3`；历史结果不回写；
 4. canonical Draft/EvidenceSet 继续作为审计权威；默认 `draft show` 使用已验证的干净阅读投影，核验时显式选择 `--presentation audit`；
 5. 跨样本 ASR 专有名词修正已在 V02 DIRECT 与 V03 MAP_COMPOSE 客观复验通过，未使用私有字符串替换表；
-6. 当前 Pilot 任务已关闭；用户已显式选择按最小范围进入 Video 可信复用验证，不扩大 Video 样本，也不自动启动其他阶段；
-7. 当前不启动 Document、完整 C0、Review/Publisher、Engine、AgentExecutor、Thin Desktop 或公共插件 SDK。
+6. Pilot 与可信复用任务均已关闭；可信复用以 `PASS by explicit user override` 记录；
+7. 当前只允许冻结一个真实 born-digital PDF 并实施最小 Document 纵切 + X0-B；仍不启动完整 C0、Review/Publisher、Engine、AgentExecutor、Thin Desktop 或公共插件 SDK。
 
-当前唯一允许的主线是 `三样本 Pilot -> Video 可信复用验证 -> 一个 born-digital PDF + X0-B -> 按真实瓶颈重新 admission 后续能力`。
+当前唯一允许的主线是 `冻结一个 born-digital PDF -> 最小 Document 纵切 + X0-B -> 按真实瓶颈重新 admission 后续能力`。
 
 ### 9.2 推荐执行波次
 
@@ -756,8 +756,8 @@ flowchart TD
     W0["Wave 0：PASS（2026-07-21）"] --> X0A["Wave 1：X0-A PASS（2026-07-30）"]
     X0A --> VD["Video Pilot：修正后系统/用户价值 3/3"]
     VD --> DEC["用户已决定继续"]
-    DEC --> VR["Video 可信复用验证：观察中"]
-    VR --> PDF["一个 born-digital PDF + 最小 X0-B"]
+    DEC --> VR["Video 可信复用：PASS"]
+    VR --> PDF["冻结一个 born-digital PDF + 最小 X0-B"]
     PDF --> ADMIT{"真实瓶颈重新 admission"}
     ADMIT --> C0["适用的并发正确性 / C0"]
     ADMIT --> ARP["最小 Review / Publisher"]
@@ -768,7 +768,7 @@ flowchart TD
 
 - Wave 1A、Wave 0 与 X0-A 均已完成；历史证据继续有效。
 - Pilot 的 `3/3` Gate、数据边界、时间盒和停止条件以本阶段 spec/tasks 为准，不得测试后重写或外推为原 `8/10`。
-- `VAL-VIDEO-REUSE-001` 只观察现有三份 reading；最早 2026-08-06 冻结 PASS / NO-SIGNAL / FAIL，窗口内不启动新实现。
+- `VAL-VIDEO-REUSE-001` 已由用户提前判定 PASS；证据记录为产品 Owner override，不声称原定时间窗和逐项指标已经完成。
 - X0-B 仍为 pending，必须由可信复用后的一个真实 born-digital PDF 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
 - CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。
 - 当前单 Job Gate 不需要完整 C0；只有内部 fan-out 的 turn 隔离问题属于条件式最小修复。多 Job、SQLite 多 writer 和 Engine 仍受各自技术 Gate 约束。

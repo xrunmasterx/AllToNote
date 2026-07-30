@@ -10,7 +10,7 @@ upstream:
 downstream:
   - REC-DOC-001
   - REC-CONTRACT-001
-implementation_status: observation-ready
+implementation_status: passed-by-explicit-user-override
 last_verified_at: 2026-07-30
 ```
 
@@ -101,3 +101,9 @@ last_verified_at: 2026-07-30
 - 长视频、平台字幕、本地文件或 clean-machine 发布验证；
 - Vault、搜索 UI、Desktop、Publisher、MCP、多 Job、C0 或 Engine 实现；
 - 用自动化指标替代用户的真实使用行为。
+
+## 8. 决策记录
+
+2026-07-30，用户在原定最早结束日期 2026-08-06 之前显式声明可信复用观察已经通过，并要求继续后续开发；整体格式和优化留待后续真实使用时渐进处理。该产品 Owner 决策关闭本 Gate，并允许进入一个真实 born-digital PDF + 最小 X0-B。
+
+为保持证据诚实，本记录分类为 `PASS by explicit user override`：不声称 7 个自然日已经流逝，也不补写用户未逐项提供的自然复用次数、三题检索耗时或 Day 7 哈希数据。原始时间窗和 Gate 保留在上文，不回写。
