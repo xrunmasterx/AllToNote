@@ -93,7 +93,7 @@ flowchart TD
 | `SUB-VAULT-001` | [CLI-First Vault](../superpowers/specs/2026-07-13-alltonote-cli-first-vault-workspace-design.md) | Vault/Desktop | [Vault/Desktop plan](../superpowers/plans/2026-07-18-alltonote-vault-desktop-implementation-plan.md) | active（JobStore 局部已修正） | 只读 foundation 计划存在，完整实现未完成 |
 | `DATA-001` | [Portable Artifact / Source Bundle](../superpowers/specs/2026-07-14-alltonote-portable-artifact-source-bundle-design.md) | AllToNote 数据设计；iwiki 合同更高 | [已有 foundation plan](../superpowers/plans/2026-07-14-llm-iwiki-portable-contract-foundation.md) | active | v1 基础、semantic validate、atomic commit、多 Draft 已实现 |
 | `RUNTIME-001` | [Runtime / CLI / Feature Pack](../superpowers/specs/2026-07-18-alltonote-runtime-cli-feature-pack-design.md) | Runtime/部署 | [实施计划](../superpowers/plans/2026-07-18-alltonote-runtime-cli-feature-pack-implementation-plan.md) | active | RCP-00..07 / Wave 1A 已验收；RCP-08+ Pack/Desktop/分发未完成 |
-| `REC-CONTRACT-001` | [Recipe 最小扩展合同](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md) | 多 Recipe 接缝 | [实施计划](../superpowers/plans/2026-07-18-alltonote-recipe-extension-contract-implementation-plan.md) | active | X0-A pending；X0-B pending，且必须由真实 Document/PPT 第二消费者驱动；CLI 仅单一 `produce`，无活跃 `add`/独立 `run` |
+| `REC-CONTRACT-001` | [Recipe 最小扩展合同](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md) | 多 Recipe 接缝 | [实施计划](../superpowers/plans/2026-07-18-alltonote-recipe-extension-contract-implementation-plan.md) | active | X0-A Tasks 1–8 已验收；X0-B pending，且必须由真实 Document/PPT 第二消费者驱动；CLI 仅单一 `produce`，无活跃 `add`/独立 `run` |
 | `REC-VIDEO-001` | [Video Recipe（历史名 Video Producer）](../superpowers/specs/2026-07-14-alltonote-video-producer-design.md) | Video Recipe | [原计划](../superpowers/plans/2026-07-14-alltonote-video-producer.md) + [发布收敛](../superpowers/plans/2026-07-18-alltonote-video-release-implementation-plan.md) | active | VREL-00/01 CLI seam 已验收；VREL-02..11 真实发布矩阵未闭合；通用 facade 迁移属于 Recipe X0 |
 | `REC-VIDEO-LONG-001` | [长视频知识编译](../superpowers/specs/2026-07-16-alltonote-long-video-knowledge-compilation-design.md) | Transcript -> Draft/Quality | 原 tasks + Video release plan | active | Knowledge/Faithful core 已实现；实时 YouTube acquisition 外部阻塞 |
 | `REVIEW-001` | [Review / Publisher](../superpowers/specs/2026-07-18-alltonote-review-publisher-design.md) | 审阅/正式写入 | [实施计划](../superpowers/plans/2026-07-18-alltonote-review-publisher-implementation-plan.md) | active | 未实现 |
@@ -190,9 +190,9 @@ flowchart TD
 | Model execution | `implemented foundation` | ModelExecution/Coordinator/ExternalOperation/Codex Bridge |
 | Video Knowledge/Faithful compiler | `implemented core` | 65 分钟真实 transcript E2E、quality/pass/restart zero replay |
 | Video 正式支持矩阵 | `pending` | Bilibili、本地 clean-machine/Pack/发布证据待闭合；YouTube外部阻塞 |
-| Wave 0 权威/基线收敛 | `complete` | 2026-07-21：权威基线 `3a75d0e` 已集成到实现提交 `066884d`；full backend、Windows smoke 与 `git diff --check` 通过 |
+| Wave 0 权威/基线收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；错误 trailer 已在验收记录中更正；full backend、Windows smoke 与 `git diff --check` 通过 |
 | Runtime CLI Wave 1A | `complete` | RCP-00..07 与 VREL-00/01 已验收；后续 Pack/Desktop/分发不属于 Wave 1A 完成定义 |
-| ProduceService / Multi-Recipe Registry X0-A | `in progress: Task 1` | 当前只冻结兼容与执行能力基线；后续只建立 submission/control-plane、静态 Registry、薄 ProduceService 与 Video adapter |
+| ProduceService / Multi-Recipe Registry X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；只完成 submission/control-plane 接缝，不代表 X0-B 数据面或多 Job 并发完成 |
 | Multi-Recipe 数据面 X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同证明 Result/Artifact/Repository/atomic commit、迁移与恢复边界 |
 | Vault Core/CLI | `mostly not implemented` | foundation plan/部分 gateway存在，完整 tree/read/search/grant未闭环 |
 | 薄 Desktop Vault UI | `pending` | 旧 BiliNote UI不等于新 Runtime/Vault UI |
@@ -210,14 +210,14 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    W0["Wave 0：PASS（2026-07-21）"] --> X0A["X0-A Task 1 in progress"]
+    W0["Wave 0：PASS（2026-07-21）"] --> X0A["X0-A：PASS（2026-07-30）"]
     X0A --> C0["并发正确性 C0 pending"]
     C0 --> DX0B["真实 Document/PPT + X0-B pending"]
     DX0B --> ARP["开放 Artifact + Review/Publisher pending"]
     ARP --> ENG["Engine + Production MCP：需求已触发，实现受阻"]
 ```
 
-这是强制硬依赖链：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。Wave 1A 与 Wave 0 均已完成，X0-A 当前进入 Task 1；X0-B 必须由真实 Document/PPT 第二消费者驱动。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending。Engine 产品需求已经触发，但不得绕过 X0-A 至 Wave 4 实施 production lifecycle。
+这是强制硬依赖链：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。Wave 1A、Wave 0 与 X0-A Tasks 1–8 均已完成；X0-B 必须由真实 Document/PPT 第二消费者驱动。CLI 只有单一 `produce` 主入口，不存在活跃 `add` 或独立 `run`。Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending。Engine 产品需求已经触发，但不得绕过 C0 至 Wave 4 实施 production lifecycle。
 
 ## 8. 下一位 AI 的使用规则
 

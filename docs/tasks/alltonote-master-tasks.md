@@ -111,8 +111,8 @@ git diff --check
 | 实时 YouTube acquisition | `blocked` | 当前 IP 与最新 Cookie 仍被 YouTube anti-bot 拦截 |
 | Bilibili/本地视频正式发布矩阵 | `partially verified` | 有 Adapter/测试基础，仍需真实发布 Gate 汇总 |
 | Runtime CLI / Feature Pack 产品面 | `Wave 1A complete; later waves pending` | RCP-00..07 / Wave 1A 已完成并有验收证据；Pack、完整 doctor/repair、Desktop Resolver、clean-machine/分发仍待实现 |
-| Wave 0 基线与权威收敛 | `complete` | 2026-07-21：权威文档基线 `3a75d0e` 已集成到实现提交 `066884d`；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
-| Recipe X0-A | `in progress: Task 1 baseline freeze` | 仅建立 submission/control-plane 接缝、静态 Registry、薄 ProduceService 与 Video adapter；不扩大到数据面迁移 |
+| Wave 0 基线与权威收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；原 trailer 的 `3a75d0e410...` 为已记录的抄录错误；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
+| Recipe X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；范围止于 submission/control-plane 接缝，不包含数据面迁移或多 Job 并发 |
 | Recipe X0-B | `pending; real Document/PPT-driven` | 必须由 Video 与真实 Document/PPT 第二消费者共同抽取 Result/Artifact/Repository/atomic commit、迁移与恢复边界，不得用伪消费者或纸面抽象代替 |
 | Vault 选择/文件树/Markdown 阅读/搜索 | `design complete; implementation pending` | Core/CLI/Desktop 详细设计和计划已完成，目标闭环尚未实现 |
 | Review/Publisher | `design complete; implementation pending` | 审批 hash、PublishPlan、personal/common 权限与失败语义已设计 |
@@ -464,7 +464,7 @@ alltonote vault index-status
 
 ### RECIPE-CONTRACT-01：分阶段建立 X0-A，并由真实 Document/PPT 驱动 X0-B
 
-- 状态：`design completed; X0-A pending; X0-B pending`
+- 状态：`design completed; X0-A Tasks 1-8 accepted; X0-B pending`
 - 优先级：P1
 - 依赖：X0-A 只能在 Wave 0 的 G0-1..G0-6 全部关闭后开始；X0-B 还依赖并发正确性 C0 和真实 Document/PPT 第二消费者；两者都不依赖 Engine、Desktop 或公共插件 SDK
 - 设计：[`REC-CONTRACT-001`](../superpowers/specs/2026-07-18-alltonote-recipe-extension-contract-design.md)
@@ -696,19 +696,19 @@ alltonote vault index-status
 在没有新的用户优先级覆盖时：
 
 1. 保留 Wave 1A 完成事实、未跟踪本地资产与验收证据；未经用户授权不得 push、merge 到共享分支或发布；
-2. Wave 0 已于 2026-07-21 通过；保持权威基线 `3a75d0e`、实现集成提交 `066884d` 和集成后测试证据可追溯；
-3. 当前只推进 X0-A Task 1；X0-A 只做 submission/control-plane 接缝和单一 `produce`，不发布活跃 `add` 或独立 `run`；
+2. Wave 0 已于 2026-07-21 通过；保持实际权威基线 `3a75d0eb921...`、实现集成提交 `066884da431...`、stable patch-id `9ca7ee7109ecdbbba7ba24526355e36a6ca7fabd` 和集成后测试证据可追溯；
+3. X0-A Tasks 1–8 已完成；保持其边界为 submission/control-plane 接缝和单一 `produce`，不发布活跃 `add` 或独立 `run`，也不把它解释为并发或数据面通用化完成；
 4. X0-A 后完成并发正确性 C0，再由最小真实 Document/PPT 纵切驱动 X0-B，不能用伪消费者提前抽象数据面；
 5. X0-B 后完成开放 Artifact 与 Review/Publisher；Engine 的产品需求虽已触发，生产实现仍必须等该硬依赖链全部完成；
 6. AgentExecutor 与 Thin Desktop 保持 pending，按各自前置 Gate 推进，不与 X0-A 或 Engine 偷跑合并。
 
-Wave 1A 与 Wave 0 均已完成。当前唯一允许的主线是从 X0-A Task 1 开始，再按 `X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine` 前进。
+Wave 1A、Wave 0 与 X0-A 均已完成。当前唯一允许的主线是 `C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。
 
 ### 9.2 推荐执行波次
 
 ```mermaid
 flowchart TD
-    W0["Wave 0：PASS（2026-07-21）"] --> X0A["Wave 1：X0-A Task 1 in progress"]
+    W0["Wave 0：PASS（2026-07-21）"] --> X0A["Wave 1：X0-A PASS（2026-07-30）"]
     X0A --> C0["Wave 2：并发正确性 C0 pending"]
     C0 --> DX0B["Wave 3：真实 Document/PPT + X0-B pending"]
     DX0B --> ARP["Wave 4：开放 Artifact + Review/Publisher pending"]
@@ -721,7 +721,7 @@ flowchart TD
 
 - 这是硬依赖链，不再使用 Engine 触发决策菱形：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。
 - Wave 1A 与 Wave 0 均已完成；Wave 0 的权威文档来源、实现集成提交和集成后测试记录见 2026-07-21 PASS 验收报告。
-- X0-A 已进入 Task 1，X0-B 仍为 pending；X0-B 必须由真实 Document/PPT 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
+- X0-A Tasks 1–8 已验收；X0-B 仍为 pending；X0-B 必须由真实 Document/PPT 第二消费者驱动，不能先造通用 Result/Artifact/Repository 数据面。
 - CLI 只保留单一 `produce` 主入口，不发布活跃 `add` 或独立 `run` 主入口。
 - Engine 的高并行、批量后台执行和本地 Agent 调度需求已经触发，但触发不等于实现就绪；Wave 0-4 未完成前不得实施 Engine production lifecycle。
 - AgentExecutor、Review/Publisher 与 Thin Desktop 均保持 pending；旧 BiliNote UI 不算 Thin Desktop 完成证据。

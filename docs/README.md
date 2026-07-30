@@ -292,7 +292,7 @@ flowchart LR
 
 - [`AllToNote 设计覆盖、替代关系与实施矩阵`](tasks/alltonote-design-coverage-matrix.md)
 
-当前受治理的 Markdown 共 46 份：18 份正式设计、19 份实施计划、3 份任务/交接记录（含长视频子任务）、1 份 Research、1 份 ADR、3 份 Acceptance，以及本文。`specs/tasks.md` 是长视频实施记录，不计入 18 份正式设计。
+当前受治理的 Markdown 共 56 份：18 份正式设计、19 份实施计划、3 份任务/交接记录（含长视频子任务）、1 份 Research、1 份 ADR、13 份 Acceptance，以及本文。`specs/tasks.md` 是长视频实施记录，不计入 18 份正式设计。
 
 这里仅保留稳定分层，避免复制第二份会漂移的全量表：
 
@@ -317,8 +317,8 @@ flowchart LR
 ### 7.0 当前实施状态与硬依赖
 
 - Wave 1A 已完成；其范围外的 Pack、Desktop Resolver、clean-machine 与分发仍待实现。
-- Wave 0 已于 2026-07-21 通过：权威文档基线 `3a75d0e` 已以来源标记集成到实现分支 `066884d`，集成后 full backend、Windows smoke 与 `git diff --check` 均通过。
-- X0-A 已进入 Task 1 基线冻结阶段；X0-B pending，且必须由 Video 与真实 Document/PPT 第二消费者共同驱动，不能以伪消费者或纸面抽象代替。
+- Wave 0 已于 2026-07-21 通过；实际权威基线为 `3a75d0eb921acd2f5eac75d2033ae4d4e0e00cc3`，实现集成提交为 `066884da43105e000e00e389ab213274ca2fd6c5`。实现提交 trailer 中的 `3a75d0e410...` 是不可解析的抄录错误，验收记录已显式更正，不改写历史。
+- X0-A Tasks 1–8 已完成并通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；X0-A 只建立 submission/control-plane 接缝，不提供同 Workspace 多 Job 并发、detach、Engine 或 AgentExecutor，也未完成 Job/Repository/Bundle 数据面去 Video 化。X0-B pending，且必须由 Video 与真实 Document/PPT 第二消费者共同驱动，不能以伪消费者或纸面抽象代替。
 - Review/Publisher、AgentExecutor 与 Thin Desktop 均 pending；旧 BiliNote UI 不等于 Thin Desktop 完成。
 - Engine 的高并行、批量后台执行和本地 Agent 调度需求已经触发，但生产实现被 Wave 0-4 阻塞。
 - 固定硬依赖链为：`Wave 0 -> X0-A -> C0 -> 真实 Document/PPT + X0-B -> Artifact/Review/Publisher -> Engine`。不再使用 Engine 触发决策菱形。
@@ -379,15 +379,15 @@ flowchart LR
 
 ## 9. 当前仓库事实
 
-截至 2026-07-21：
+截至 2026-07-30：
 
-- 文档主工作树：`G:\AllToNote`，分支 `codex/alltonote-wave0-baseline`，权威文档基线提交为 `3a75d0e4101460b1924a4be2a47736efb4b29ed5`。
+- 文档主工作树：`G:\AllToNote`，分支 `codex/alltonote-wave0-baseline`，实际权威文档基线提交为 `3a75d0eb921acd2f5eac75d2033ae4d4e0e00cc3`。
 - Video Recipe 实现工作树（历史目录名 `AllToNote-video-producer`）：`G:\AllToNote-video-producer`，分支 `codex/alltonote-x0a`。
 - Video Recipe 的既有实现与测试已在本地 checkpoint `2b9e2b066e38d50ce040436d6b1995b845c61c28` 固化；实现侧 handoff/X0-A/Local Parallel 文档已在 `ff5e5de679771f21e089ae5d72cf72378b1a32be` 固化。
-- 权威文档基线已以 `Authority-Baseline: 3a75d0e4101460b1924a4be2a47736efb4b29ed5` 来源标记集成到实现分支提交 `066884da43105e000e00e389ab213274ca2fd6c5`。
+- 权威文档基线已集成到实现分支提交 `066884da43105e000e00e389ab213274ca2fd6c5`；实际来源提交与集成提交的 stable patch-id 均为 `9ca7ee7109ecdbbba7ba24526355e36a6ca7fabd`。实现提交 trailer 中的 `3a75d0e410...` 是不可解析的抄录错误，已在验收报告中更正而未改写历史。
 - 集成后 backend 全量测试为 `1820 passed, 2 skipped, 1 warning, 3 subtests passed`；Windows 本地视频 smoke 为 `1 passed, 14 deselected, 1 warning`；`git diff --check` 通过。
 - `.superpowers/` 与 `config/downloader.json` 仍是明确排除的本地未跟踪资产；未被清理、覆盖或纳入提交。
-- 本轮没有 push、tag 或 release；Wave 0 已关闭，当前允许的主线是 Recipe X0-A Task 1。
-- 当前正式设计覆盖 18 个 ID；Wave 1A 已完成，Wave 0 仍在关闭 G0-3/G0-4/G0-5/G0-6，后续按固定硬依赖链实施，不得提前宣称 Wave 0 PASS 或启动 Engine production implementation。
+- Wave 0 与 X0-A 已关闭；X0-A 的最终验收见 `acceptance/2026-07-30-recipe-x0a-task-8.md`。下一条允许的实现主线是并发正确性 C0。
+- 当前正式设计覆盖 18 个 ID；不得把 X0-A 解释为多 Recipe 数据面或并发 Engine 已完成，也不得跳过 C0 提前启动 X0-B 或 Engine production implementation。
 
 下一个执行者必须先读取总任务清单中的 `HANDOFF-01`，再从“推荐执行波次”选择一个实际开发任务。
