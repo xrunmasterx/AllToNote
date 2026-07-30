@@ -1,8 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
 import queue
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -254,6 +256,82 @@ class _FakeProcess:
         self._terminated = True
 
 
+class _BarrierStdin(_RecordingStdin):
+    def __init__(self, barrier):
+        super().__init__()
+        self._barrier = barrier
+
+    def write(self, text):
+        written = super().write(text)
+        if len(self.messages) == 1:
+            self._barrier.wait(timeout=5)
+        return written
+
+
+class _BarrierStderr:
+    def __init__(self, line, barrier):
+        self._line = line
+        self._barrier = barrier
+
+    def __iter__(self):
+        self._barrier.wait(timeout=5)
+        yield self._line + "\n"
+
+
+class _ConcurrentFakeProcess(_FakeProcess):
+    def __init__(self, label, request_barrier, stderr_barrier):
+        super().__init__(
+            (
+                {"jsonrpc": "2.0", "id": 1, "result": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"thread": {"id": f"thread-{label}"}},
+                },
+                {"jsonrpc": "2.0", "id": 3, "result": {}},
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"delta": f"# {label}"},
+                },
+                {"method": "turn/completed", "params": {"status": "completed"}},
+            )
+        )
+        self.stdin = _BarrierStdin(request_barrier)
+        self.stderr = _BarrierStderr(f"stderr-{label}", stderr_barrier)
+
+
+class _BlockingStdout:
+    def __init__(self, messages, terminated):
+        self._messages = messages
+        self._terminated = terminated
+
+    def __iter__(self):
+        for message in self._messages:
+            yield json.dumps(message) + "\n"
+        self._terminated.wait(timeout=5)
+
+
+class _TimeoutFakeProcess(_FakeProcess):
+    def __init__(self, request_barrier):
+        messages = (
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"thread": {"id": "thread-timeout"}},
+            },
+            {"jsonrpc": "2.0", "id": 3, "result": {}},
+        )
+        super().__init__(())
+        self._terminated_event = threading.Event()
+        self.stdin = _BarrierStdin(request_barrier)
+        self.stdout = _BlockingStdout(messages, self._terminated_event)
+
+    def terminate(self):
+        super().terminate()
+        self._terminated_event.set()
+
+
 class _FakeRunningProcess:
     pid = 1234
 
@@ -413,3 +491,100 @@ def test_run_markdown_turn_rejects_legacy_thread_start_response(monkeypatch):
             "gpt-5",
             cwd="E:\\VideoToNote",
         )
+
+
+@pytest.mark.parametrize("worker_count", (2, 4, 8))
+def test_shared_client_isolates_concurrent_turn_state(monkeypatch, worker_count):
+    request_barrier = threading.Barrier(worker_count)
+    stderr_barrier = threading.Barrier(worker_count)
+    creation_lock = threading.Lock()
+    fake_processes = []
+
+    def fake_popen(*args, **kwargs):
+        del args, kwargs
+        with creation_lock:
+            label = f"turn-{len(fake_processes)}"
+            process = _ConcurrentFakeProcess(
+                label,
+                request_barrier,
+                stderr_barrier,
+            )
+            fake_processes.append(process)
+            return process
+
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
+        lambda: None,
+    )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
+    monkeypatch.setattr("app.gpt.codex_app_server_client.subprocess.Popen", fake_popen)
+    client = CodexAppServerClient(codex_bin="codex", timeout_seconds=2)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = tuple(
+            executor.map(
+                lambda index: client.run_markdown_turn(
+                    f"prompt-{index}",
+                    "gpt-5",
+                ),
+                range(worker_count),
+            )
+        )
+
+    assert set(results) == {f"# turn-{index}" for index in range(worker_count)}
+    assert len(fake_processes) == worker_count
+    assert all(
+        [message["id"] for message in process.stdin.messages if "id" in message]
+        == [1, 2, 3]
+        for process in fake_processes
+    )
+    assert client.stderr_logs in (
+        [f"stderr-turn-{index}"] for index in range(worker_count)
+    )
+
+
+def test_shared_client_timeout_only_terminates_target_turn(monkeypatch):
+    request_barrier = threading.Barrier(2)
+    timeout_process_created = threading.Event()
+    fast_process = _ConcurrentFakeProcess(
+        "fast",
+        request_barrier,
+        threading.Barrier(1),
+    )
+    timeout_process = _TimeoutFakeProcess(request_barrier)
+    processes = iter((timeout_process, fast_process))
+
+    def fake_popen(*args, **kwargs):
+        del args, kwargs
+        process = next(processes)
+        if process is timeout_process:
+            timeout_process_created.set()
+        return process
+
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
+        lambda: None,
+    )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.subprocess.Popen",
+        fake_popen,
+    )
+    client = CodexAppServerClient(codex_bin="codex", timeout_seconds=1)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        timeout_future = executor.submit(
+            client.run_markdown_turn,
+            "timeout",
+            "gpt-5",
+            timeout_seconds=0.05,
+        )
+        assert timeout_process_created.wait(timeout=1)
+        fast_future = executor.submit(client.run_markdown_turn, "fast", "gpt-5")
+
+        with pytest.raises(CodexAppServerError, match="Timed out"):
+            timeout_future.result()
+        assert fast_future.result() == "# fast"
+
+    assert timeout_process._terminated is True
+    assert fast_process._terminated is True

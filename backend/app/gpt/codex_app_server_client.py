@@ -34,7 +34,7 @@ class CodexAppServerClient:
             )
         self.timeout_seconds = timeout_seconds
         self.stderr_logs: list[str] = []
-        self._next_id = 1
+        self._stderr_lock = threading.Lock()
 
     @staticmethod
     def clean_markdown(text: str) -> str:
@@ -125,7 +125,7 @@ class CodexAppServerClient:
             raise CodexAppServerError(str(exc)) from exc
 
         stdout_queue: queue.Queue[dict[str, Any] | Exception] = queue.Queue()
-        self.stderr_logs = []
+        stderr_logs: list[str] = []
         process = subprocess.Popen(
             [self.codex_bin, "app-server", "--stdio"],
             cwd=cwd,
@@ -144,7 +144,7 @@ class CodexAppServerClient:
         )
         stderr_thread = threading.Thread(
             target=self._read_stderr_logs,
-            args=(process,),
+            args=(process, stderr_logs),
             daemon=True,
         )
         stdout_thread.start()
@@ -155,6 +155,7 @@ class CodexAppServerClient:
         try:
             self._send_request(
                 process,
+                1,
                 "initialize",
                 {
                     "clientInfo": {
@@ -168,7 +169,7 @@ class CodexAppServerClient:
                     },
                 },
             )
-            self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
+            self._wait_for_response(stdout_queue, state, 1, deadline)
             self._send_notification(process, "initialized")
 
             thread_params = {
@@ -183,8 +184,8 @@ class CodexAppServerClient:
                     "run commands, inspect files, or modify files."
                 ),
             }
-            self._send_request(process, "thread/start", thread_params)
-            thread_response = self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
+            self._send_request(process, 2, "thread/start", thread_params)
+            thread_response = self._wait_for_response(stdout_queue, state, 2, deadline)
             thread_id = self._extract_thread_id(thread_response)
             if not thread_id:
                 raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
@@ -199,8 +200,8 @@ class CodexAppServerClient:
                 turn_params["outputSchema"] = output_schema
             if reasoning_effort is not None:
                 turn_params["effort"] = reasoning_effort
-            self._send_request(process, "turn/start", turn_params)
-            self._wait_for_response(stdout_queue, state, self._next_id - 1, deadline)
+            self._send_request(process, 3, "turn/start", turn_params)
+            self._wait_for_response(stdout_queue, state, 3, deadline)
 
             while not state.done:
                 self._consume_next_message(stdout_queue, state, deadline)
@@ -210,18 +211,22 @@ class CodexAppServerClient:
             return self.clean_markdown(state.text)
         finally:
             self._terminate_process(process)
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+            with self._stderr_lock:
+                self.stderr_logs = list(stderr_logs)
 
     def _send_request(
         self,
         process: subprocess.Popen[str],
+        request_id: int,
         method: str,
         params: dict[str, Any],
     ) -> None:
         if process.stdin is None:
             raise CodexAppServerError("Codex app-server stdin is unavailable")
 
-        message = {"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params}
-        self._next_id += 1
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()
 
@@ -303,12 +308,16 @@ class CodexAppServerClient:
                 return
         stdout_queue.put(CodexAppServerError("Codex app-server stdout closed"))
 
-    def _read_stderr_logs(self, process: subprocess.Popen[str]) -> None:
+    @staticmethod
+    def _read_stderr_logs(
+        process: subprocess.Popen[str],
+        stderr_logs: list[str],
+    ) -> None:
         if process.stderr is None:
             return
 
         for line in process.stderr:
-            self.stderr_logs.append(line.rstrip())
+            stderr_logs.append(line.rstrip())
 
     @staticmethod
     def _extract_error_message(value: Any) -> str:
