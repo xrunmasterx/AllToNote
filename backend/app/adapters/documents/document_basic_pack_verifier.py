@@ -41,11 +41,16 @@ _ENTRYPOINT_KEYS = frozenset({"name", "type", "relative_path"})
 _LICENSE_KEYS = frozenset({"component", "spdx", "file"})
 _SBOM_KEYS = frozenset({"format", "file", "sha256"})
 _RUNTIME_KEYS = frozenset({"min", "max"})
+_RECEIPT_KEYS = frozenset(
+    {"schema_version", "pack_id", "pack_version", "manifest_sha256", "verified"}
+)
 _MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 _MAX_FILE_COUNT = 100_000
+_MAX_TREE_ENTRY_COUNT = 2 * _MAX_FILE_COUNT + 2
 _MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_RELATIVE_PATH_LENGTH = 512
+_MAX_CONTROL_FILE_BYTES = 16 * 1024
 _SHA256_PREFIX = "sha256:"
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -108,6 +113,21 @@ def canonical_manifest_bytes(payload: Mapping[str, object]) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise _manifest_invalid() from error
+
+
+def canonical_receipt_bytes(manifest_sha256: str) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "pack_id": PACK_ID,
+            "pack_version": PACK_VERSION,
+            "manifest_sha256": manifest_sha256,
+            "verified": True,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _manifest_invalid() -> DomainError:
@@ -184,6 +204,8 @@ def _load_manifest(path: Path) -> tuple[dict[str, object], bytes]:
     except (OSError, UnicodeError, ValueError) as error:
         raise _manifest_invalid() from error
     if type(payload) is not dict or frozenset(payload) != _MANIFEST_KEYS:
+        raise _manifest_invalid()
+    if content != canonical_manifest_bytes(payload):
         raise _manifest_invalid()
     return payload, content
 
@@ -398,16 +420,35 @@ def _verify_signature(
 
 def _source_files(root: Path) -> dict[str, Path]:
     discovered: dict[str, Path] = {}
+    entry_count = 0
+    total_bytes = 0
     try:
         root_metadata = root.lstat()
-        if (
-            _is_link_or_reparse(root_metadata)
-            or not stat.S_ISDIR(root_metadata.st_mode)
-        ):
-            raise OSError("unsafe_source_root")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise DomainError(
+            "pack_source_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source is unavailable",
+        ) from error
+    if _is_link_or_reparse(root_metadata):
+        raise DomainError(
+            "pack_archive_unsafe",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source contains unsafe filesystem entries",
+        )
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise DomainError(
+            "pack_source_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source must be a directory",
+        )
+    try:
         for current, directories, filenames in os.walk(root, followlinks=False):
             current_path = Path(current)
             for name in (*directories, *filenames):
+                entry_count += 1
+                if entry_count > _MAX_TREE_ENTRY_COUNT:
+                    raise OSError("source_entry_limit")
                 target = current_path / name
                 metadata = target.lstat()
                 if _is_link_or_reparse(metadata):
@@ -417,6 +458,9 @@ def _source_files(root: Path) -> dict[str, Path]:
                 metadata = target.lstat()
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise OSError("unsafe_source_file")
+                total_bytes += metadata.st_size
+                if total_bytes > _MAX_TOTAL_BYTES + _MAX_MANIFEST_BYTES + _MAX_CONTROL_FILE_BYTES:
+                    raise OSError("source_total_limit")
                 relative_path = target.relative_to(root).as_posix()
                 _normalized_relative_path(relative_path)
                 discovered[relative_path] = target
@@ -429,6 +473,30 @@ def _source_files(root: Path) -> dict[str, Path]:
             "The document-basic Pack source contains unsafe filesystem entries",
         ) from error
     return discovered
+
+
+def _validate_receipt(path: Path, manifest_sha256: str) -> None:
+    try:
+        content = _read_regular_file(path, _MAX_CONTROL_FILE_BYTES)
+        payload = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise _manifest_invalid() from error
+    if (
+        type(payload) is not dict
+        or frozenset(payload) != _RECEIPT_KEYS
+        or type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("pack_id") != PACK_ID
+        or payload.get("pack_version") != PACK_VERSION
+        or payload.get("manifest_sha256") != manifest_sha256
+        or payload.get("verified") is not True
+        or content != canonical_receipt_bytes(manifest_sha256)
+    ):
+        raise _manifest_invalid()
 
 
 def _sha256(path: Path, expected_size: int) -> str:
@@ -455,11 +523,12 @@ def _sha256(path: Path, expected_size: int) -> str:
     return _SHA256_PREFIX + digest.hexdigest()
 
 
-def verify_document_basic_pack_source(
+def _verify_document_basic_pack_tree(
     source: Path,
     *,
     trusted_keys: Mapping[str, DocumentPackTrustKey],
     platform_tag: str | None = None,
+    receipt_required: bool,
 ) -> VerifiedDocumentPack:
     try:
         root = Path(os.path.abspath(os.fspath(Path(source).expanduser())))
@@ -476,7 +545,10 @@ def verify_document_basic_pack_source(
     python_relative_path = _validate_contract(manifest, files, expected_platform)
     signature_key_id = _verify_signature(manifest, trusted_keys)
 
+    manifest_sha256 = _SHA256_PREFIX + hashlib.sha256(manifest_bytes).hexdigest()
     expected_files = {item.relative_path for item in files} | {"manifest.json"}
+    if receipt_required:
+        expected_files.add("receipt.json")
     if set(source_files) != expected_files:
         raise _manifest_invalid()
     for item in files:
@@ -498,6 +570,8 @@ def verify_document_basic_pack_source(
                 "The document-basic Pack file could not be verified",
                 {"component": item.relative_path},
             ) from error
+    if receipt_required:
+        _validate_receipt(source_files["receipt.json"], manifest_sha256)
 
     return VerifiedDocumentPack(
         source_root=root,
@@ -506,9 +580,37 @@ def verify_document_basic_pack_source(
         platform=expected_platform,
         publisher=str(manifest["publisher"]),
         signature_key_id=signature_key_id,
-        manifest_sha256=_SHA256_PREFIX + hashlib.sha256(manifest_bytes).hexdigest(),
+        manifest_sha256=manifest_sha256,
         python_relative_path=python_relative_path,
         files=files,
+    )
+
+
+def verify_document_basic_pack_source(
+    source: Path,
+    *,
+    trusted_keys: Mapping[str, DocumentPackTrustKey],
+    platform_tag: str | None = None,
+) -> VerifiedDocumentPack:
+    return _verify_document_basic_pack_tree(
+        source,
+        trusted_keys=trusted_keys,
+        platform_tag=platform_tag,
+        receipt_required=False,
+    )
+
+
+def verify_document_basic_pack_generation(
+    source: Path,
+    *,
+    trusted_keys: Mapping[str, DocumentPackTrustKey],
+    platform_tag: str | None = None,
+) -> VerifiedDocumentPack:
+    return _verify_document_basic_pack_tree(
+        source,
+        trusted_keys=trusted_keys,
+        platform_tag=platform_tag,
+        receipt_required=True,
     )
 
 
@@ -517,6 +619,8 @@ __all__ = [
     "DocumentPackTrustKey",
     "VerifiedDocumentPack",
     "canonical_manifest_bytes",
+    "canonical_receipt_bytes",
     "current_pack_platform",
+    "verify_document_basic_pack_generation",
     "verify_document_basic_pack_source",
 ]

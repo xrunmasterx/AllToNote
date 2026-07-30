@@ -98,6 +98,36 @@ def test_cli_version_does_not_import_web_or_video_modules():
     } & set(report["imported_modules"])
 
 
+def test_static_pack_doctor_does_not_import_verifier_or_heavy_modules() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "pack",
+            "doctor",
+            "document-basic",
+            "--json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(result.stdout)
+    envelope = json.loads(report["stdout"])
+
+    assert report["exit_code"] == 0
+    assert envelope["command"] == "pack doctor"
+    assert not {
+        "app.runtime",
+        "app.adapters.documents.document_basic_pack_installer",
+        "app.adapters.documents.document_basic_pack_verifier",
+        "app.adapters.documents.docling_worker_parser",
+        "cryptography",
+        "docling",
+        "torch",
+    } & set(report["imported_modules"])
+
+
 def test_runtime_lock_is_available_as_a_package_resource():
     lock_resource = resources.files("app").joinpath("runtime-lock.json")
 

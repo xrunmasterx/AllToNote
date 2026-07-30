@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from app.core.application.artifact_query_service import ArtifactQueryService
     from app.core.config.model import JobConfigSnapshot
     from app.job_runtime import JobRuntime
+    from app.cli.pack_commands import PackService
     from app.runtime_config import EffectiveRuntimeConfig, RuntimeConfigService
 
 
@@ -138,6 +139,17 @@ def _build_parser(
     credential_delete_parser = credential_subparsers.add_parser("delete")
     credential_delete_parser.add_argument("profile")
     credential_delete_parser.add_argument("--json", action="store_true")
+    pack_parser = subparsers.add_parser("pack")
+    pack_subparsers = pack_parser.add_subparsers(dest="pack_command", required=True)
+    pack_doctor_parser = pack_subparsers.add_parser("doctor")
+    pack_doctor_parser.add_argument("pack_id", choices=("document-basic",))
+    pack_doctor_parser.add_argument("--dynamic", action="store_true")
+    pack_doctor_parser.add_argument("--json", action="store_true")
+    pack_install_parser = pack_subparsers.add_parser("install")
+    pack_install_parser.add_argument("pack_id", choices=("document-basic",))
+    pack_install_parser.add_argument("--source", type=Path, required=True)
+    pack_install_parser.add_argument("--repair", action="store_true")
+    pack_install_parser.add_argument("--json", action="store_true")
     if include_job_commands:
         from app.cli.commands.jobs import add_job_parsers
 
@@ -216,6 +228,7 @@ def main(
     credential_broker: CredentialBroker | None = None,
     job_runtime: JobRuntime | None = None,
     artifact_query_service: ArtifactQueryService | None = None,
+    pack_service: PackService | None = None,
     input_stream: TextIO | None = None,
 ) -> int:
     arguments = tuple(argv) if argv is not None else tuple(sys.argv[1:])
@@ -324,6 +337,51 @@ def main(
                 mapped=mapped,
             )
             exit_code = mapped.exit_code
+        except Exception:
+            mapped = internal_error()
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        render_result(result, json_mode=args.json)
+        return int(exit_code)
+
+    if args.command == "pack":
+        command = f"pack {args.pack_command}"
+        try:
+            from app.cli.pack_commands import pack_command_result
+
+            result = pack_command_result(
+                args,
+                correlation_id,
+                service=pack_service,
+                versions=_versions(),
+            )
+            exit_code = ExitCode.SUCCESS
+        except DomainError as error:
+            mapped = map_domain_error(error)
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        except KeyboardInterrupt:
+            mapped = map_domain_error(
+                DomainError(
+                    "interrupted",
+                    ErrorCategory.CANCELLED,
+                    "Command was interrupted",
+                )
+            )
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = ExitCode.INTERRUPTED
         except Exception:
             mapped = internal_error()
             result = _failure_result(
@@ -1484,6 +1542,8 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
         return f"credential {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "workspace":
         return f"workspace {arguments[1]}"
+    if len(arguments) >= 2 and arguments[0] == "pack":
+        return f"pack {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "job":
         return f"job {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] in {"artifact", "draft"}:

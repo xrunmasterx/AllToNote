@@ -105,6 +105,14 @@ def map_error(
         next_actions = (
             "Inspect the unknown external operation before confirming a new retry",
         )
+    elif code == "pack_trust_unconfigured":
+        next_actions = ("Install a Runtime release with official Pack trust roots",)
+    elif code == "pack_install_busy":
+        next_actions = ("Wait for the current Pack installation to finish and retry",)
+    elif code == "pack_override_active":
+        next_actions = ("Remove both document-basic development overrides and retry",)
+    elif code.startswith("pack_"):
+        next_actions = ("Inspect document-basic with pack doctor before retrying",)
     return MappedCliError(
         error=CliError(
             code=code,

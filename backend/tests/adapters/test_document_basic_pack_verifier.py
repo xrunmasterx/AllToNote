@@ -15,6 +15,7 @@ from app.adapters.documents.document_basic_pack_verifier import (
     DocumentPackTrustKey,
     canonical_manifest_bytes,
     current_pack_platform,
+    verify_document_basic_pack_generation,
     verify_document_basic_pack_source,
 )
 from app.core.errors import DomainError
@@ -103,7 +104,7 @@ def _source(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         "value": base64.b64encode(signature).decode("ascii"),
     }
     (root / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+        canonical_manifest_bytes(manifest).decode("utf-8"),
         encoding="utf-8",
     )
     return root, manifest
@@ -119,7 +120,7 @@ def _write_manifest(root: Path, manifest: dict[str, object]) -> None:
         "value": base64.b64encode(signature).decode("ascii"),
     }
     (root / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+        canonical_manifest_bytes(manifest).decode("utf-8"),
         encoding="utf-8",
     )
 
@@ -139,6 +140,57 @@ def test_verifier_accepts_exact_signed_document_pack_directory(
     assert len(verified.files) == 5
 
 
+def test_verifier_rejects_noncanonical_manifest_bytes(tmp_path: Path) -> None:
+    root, manifest = _source(tmp_path)
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DomainError) as raised:
+        verify_document_basic_pack_source(root, trusted_keys=_trust())
+
+    assert raised.value.code == "pack_manifest_invalid"
+
+
+def test_generation_verifier_requires_exact_verified_receipt(tmp_path: Path) -> None:
+    root, _manifest = _source(tmp_path)
+    verified = verify_document_basic_pack_source(root, trusted_keys=_trust())
+    (root / "receipt.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pack_id": PACK_ID,
+                "pack_version": PACK_VERSION,
+                "manifest_sha256": verified.manifest_sha256,
+                "verified": True,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    generation = verify_document_basic_pack_generation(root, trusted_keys=_trust())
+
+    assert generation.manifest_sha256 == verified.manifest_sha256
+
+    receipt = json.loads((root / "receipt.json").read_text(encoding="utf-8"))
+    receipt["verified"] = False
+    (root / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(DomainError) as raised:
+        verify_document_basic_pack_generation(root, trusted_keys=_trust())
+    assert raised.value.code == "pack_manifest_invalid"
+
+    receipt["verified"] = True
+    (root / "receipt.json").write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    with pytest.raises(DomainError) as raised:
+        verify_document_basic_pack_generation(root, trusted_keys=_trust())
+    assert raised.value.code == "pack_manifest_invalid"
+
+
 def test_verifier_rejects_tampered_file_with_policy_error(tmp_path: Path) -> None:
     root, _manifest = _source(tmp_path)
     (root / "artifacts" / "model.bin").write_bytes(b"tampered")
@@ -154,7 +206,7 @@ def test_verifier_rejects_invalid_signature(tmp_path: Path) -> None:
     signature = dict(manifest["signature"])
     signature["value"] = base64.b64encode(b"x" * 64).decode("ascii")
     manifest["signature"] = signature
-    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "manifest.json").write_bytes(canonical_manifest_bytes(manifest))
 
     with pytest.raises(DomainError) as raised:
         verify_document_basic_pack_source(root, trusted_keys=_trust())
@@ -165,7 +217,7 @@ def test_verifier_rejects_invalid_signature(tmp_path: Path) -> None:
 def test_verifier_rejects_untrusted_publisher(tmp_path: Path) -> None:
     root, manifest = _source(tmp_path)
     manifest["publisher"] = "other-publisher"
-    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "manifest.json").write_bytes(canonical_manifest_bytes(manifest))
 
     with pytest.raises(DomainError) as raised:
         verify_document_basic_pack_source(root, trusted_keys=_trust())
