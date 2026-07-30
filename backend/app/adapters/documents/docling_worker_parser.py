@@ -26,6 +26,26 @@ from app.core.errors import DomainError, ErrorCategory
 
 
 _MAX_FIRST_SLICE_BYTES = 64 * 1024 * 1024
+_WORKER_ENVIRONMENT_KEYS = (
+    "APPDATA",
+    "COMSPEC",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -204,15 +224,15 @@ class DoclingWorkerParser:
 
     @staticmethod
     def _environment(backend_root: Path) -> dict[str, str]:
-        environment = dict(os.environ)
+        environment = {
+            key: value
+            for key in _WORKER_ENVIRONMENT_KEYS
+            if (value := os.environ.get(key)) is not None
+        }
         environment["HF_HUB_OFFLINE"] = "1"
         environment["TRANSFORMERS_OFFLINE"] = "1"
-        existing_python_path = environment.get("PYTHONPATH")
-        environment["PYTHONPATH"] = (
-            str(backend_root)
-            if not existing_python_path
-            else str(backend_root) + os.pathsep + existing_python_path
-        )
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONPATH"] = str(backend_root)
         return environment
 
 

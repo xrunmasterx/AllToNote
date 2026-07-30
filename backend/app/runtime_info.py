@@ -1,19 +1,43 @@
 from __future__ import annotations
 
+import os
 import platform
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable
 
+from app.adapters.documents.document_basic_pack import (
+    PACK_ID,
+    PACK_VERSION,
+    document_basic_pack_installed,
+)
 from app.cli.contracts import CLI_PROTOCOL_VERSION
 from app.core.errors import DomainError
 from app.runtime_capabilities import CapabilityRegistry, RuntimeCapability
 from app.runtime_lock import RuntimeLock, load_runtime_lock
+from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
 
 RUNTIME_VERSION = "0.1.0"
 CORE_API_VERSION = 1
 CLI_API_VERSION = CLI_PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class RuntimePack:
+    pack_id: str
+    version: str
+    installed: bool
+    probe: str = "static"
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "pack_id": self.pack_id,
+            "version": self.version,
+            "installed": self.installed,
+            "probe": self.probe,
+        }
 
 
 @dataclass(frozen=True)
@@ -28,6 +52,7 @@ class RuntimeInfo:
     engine_supported: bool
     engine_running: bool
     capabilities: tuple[RuntimeCapability, ...]
+    packs: tuple[RuntimePack, ...]
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -52,7 +77,7 @@ class RuntimeInfo:
                 "supported": self.engine_supported,
                 "running": self.engine_running,
             },
-            "packs": (),
+            "packs": tuple(pack.to_mapping() for pack in self.packs),
         }
 
 
@@ -93,9 +118,13 @@ def build_runtime_info(
     *,
     registry: CapabilityRegistry | None = None,
     lock_loader: Callable[[], RuntimeLock] = load_runtime_lock,
+    paths: RuntimePaths | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> RuntimeInfo:
     runtime_lock = lock_loader()
     operating_system, architecture = _normalized_platform()
+    active_paths = paths or resolve_runtime_paths()
+    active_environ = os.environ if environ is None else environ
     return RuntimeInfo(
         runtime_version=RUNTIME_VERSION,
         core_api_version=CORE_API_VERSION,
@@ -107,11 +136,25 @@ def build_runtime_info(
         engine_supported=False,
         engine_running=False,
         capabilities=(registry or CapabilityRegistry()).snapshot(),
+        packs=(
+            RuntimePack(
+                PACK_ID,
+                PACK_VERSION,
+                document_basic_pack_installed(active_paths, active_environ),
+            ),
+        ),
     )
 
 
-def runtime_doctor(*, dynamic: bool) -> tuple[RuntimeCheck, ...]:
+def runtime_doctor(
+    *,
+    dynamic: bool,
+    paths: RuntimePaths | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[RuntimeCheck, ...]:
     checks: list[RuntimeCheck] = []
+    active_paths = paths or resolve_runtime_paths()
+    active_environ = os.environ if environ is None else environ
     try:
         load_runtime_lock()
         checks.append(RuntimeCheck("runtime.contract", "pass", None, False))
@@ -138,6 +181,20 @@ def runtime_doctor(*, dynamic: bool) -> tuple[RuntimeCheck, ...]:
                 False,
             )
         )
+
+    pack_installed = document_basic_pack_installed(active_paths, active_environ)
+    checks.append(
+        RuntimeCheck(
+            "pack.document-basic",
+            "pass" if pack_installed else "warn",
+            (
+                None
+                if pack_installed
+                else "Install or repair the compatible document-basic Pack"
+            ),
+            False,
+        )
+    )
 
     if dynamic:
         checks.extend(_dynamic_checks())
@@ -172,6 +229,7 @@ __all__ = [
     "RUNTIME_VERSION",
     "RuntimeCheck",
     "RuntimeInfo",
+    "RuntimePack",
     "build_runtime_info",
     "runtime_doctor",
 ]

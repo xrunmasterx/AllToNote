@@ -87,6 +87,16 @@
 - [x] 中文表格与英文双栏 PDF 均生成新 Bundle，安全验证、Portable inspection、无噪声检查、raw text/hash 往返与源文件 hash 检查通过；
 - [x] 聚焦回归 `298 passed`、完整 backend 回归 `1940 passed, 2 skipped, 1 warning, 3 subtests passed`，独立只读复审无剩余 P0/P1，`git diff --check` 通过。
 
+## Task 9：[x] CLI 可达性、Pack 可见性与抽取完整性
+
+- [x] 使用正式 `alltonote` CLI 和默认 Document Recipe 跑通英文双栏、中文路径且表格密集的两份真实 PDF；
+- [x] `runtime info` 与 `runtime doctor` 显式报告固定 `document-basic` Pack 是否安装及缺失时的修复动作；
+- [x] 主 Runtime 和 readiness probe 复用同一 Pack 路径解析规则；
+- [x] Docling worker 只继承运行必需的系统环境，不再透传父进程秘密或外部 `PYTHONPATH`；
+- [x] 空文档、空页、partial status 或 parser warning 均 fail closed，不再标记为可发布；
+- [x] 两份真实 PDF 的页数、块数、表格、Artifact、干净 Draft 与源文件 hash 回归保持不变；
+- [x] 明确保留发布缺口：clean-user Pack 安装、Workspace 初始化、正式发行物、OS 级 worker sandbox 与全局资源调度尚未完成。
+
 ## Stop conditions
 
 - 必须把 `DoclingDocument` 或 page/bbox 放进通用 Job schema 才能继续；

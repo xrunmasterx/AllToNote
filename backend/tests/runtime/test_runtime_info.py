@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -10,19 +11,26 @@ import pytest
 
 import app.runtime_info as runtime_info_module
 import app.runtime_lock as runtime_lock_module
+from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
 from app.cli.main import main
 from app.core.errors import DomainError
 from app.runtime_capabilities import CapabilityRegistry, CapabilitySpec
 from app.runtime_info import RuntimeCheck, build_runtime_info, runtime_doctor
 from app.runtime_lock import load_runtime_lock
+from app.runtime_paths import resolve_runtime_paths
 
 
 HELPER = Path(__file__).parents[1] / "helpers" / "report_cli_imports.py"
 
 
 def test_runtime_info_reports_pinned_versions_without_private_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    monkeypatch.setattr(runtime_info_module, "resolve_runtime_paths", lambda: paths)
+
     assert main(["runtime", "info", "--json"]) == 0
     output = capsys.readouterr()
     envelope = json.loads(output.out)
@@ -44,7 +52,14 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
         "schema_hash": "sha256:f8ded2d23197685dc0046e3949e573097fa4ae13e12cfbba240ff0544ca2c9d9",
     }
     assert data["engine"] == {"supported": False, "running": False}
-    assert data["packs"] == []
+    assert data["packs"] == [
+        {
+            "pack_id": PACK_ID,
+            "version": PACK_VERSION,
+            "installed": False,
+            "probe": "static",
+        }
+    ]
     assert data["platform"]["os"] in {"windows", "macos", "linux"}
     assert data["platform"]["arch"] in {"x86_64", "arm64"}
     assert [item["key"] for item in envelope["capabilities"]] == sorted(
@@ -59,6 +74,7 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
 
 
 def test_runtime_info_does_not_call_network_or_subprocess(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -72,9 +88,45 @@ def test_runtime_info_does_not_call_network_or_subprocess(
         lambda *_args, **_kwargs: pytest.fail("runtime info started a subprocess"),
     )
 
-    info = build_runtime_info()
+    info = build_runtime_info(
+        paths=resolve_runtime_paths(local_data_parent=tmp_path / "local"),
+        environ={},
+    )
 
     assert info.runtime_version == "0.1.0"
+
+
+def test_runtime_info_and_doctor_report_installed_document_pack(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+    python = pack_root / (
+        "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
+    )
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    (pack_root / "artifacts").mkdir()
+
+    info = build_runtime_info(paths=paths, environ={})
+    checks = runtime_doctor(dynamic=False, paths=paths, environ={})
+
+    assert info.packs[0].installed is True
+    assert next(check for check in checks if check.code == "pack.document-basic") == (
+        RuntimeCheck("pack.document-basic", "pass", None, False)
+    )
+
+
+def test_runtime_doctor_explains_missing_document_pack(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+
+    checks = runtime_doctor(dynamic=False, paths=paths, environ={})
+
+    pack = next(check for check in checks if check.code == "pack.document-basic")
+    assert pack.status == "warn"
+    assert pack.action == "Install or repair the compatible document-basic Pack"
 
 
 def test_runtime_info_cold_path_does_not_import_heavy_recipe_modules() -> None:

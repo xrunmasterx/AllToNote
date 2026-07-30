@@ -286,11 +286,28 @@ class DocumentBundleAssembler:
                 "The extracted content could not be rendered safely.\n"
             )
         draft = draft_text.encode("utf-8")
-        quality_overall = "pass" if markdown_safe else "fail"
-        publish_eligible = markdown_safe
+        has_native_text = bool(blocks)
+        pages_have_content = all(page.blocks for page in parsed.pages)
+        parser_status = parsed.metadata.get("status", "").strip().casefold()
+        parser_complete = (
+            parser_status in {"", "success"} and not parsed.warnings
+        )
+        publish_eligible = (
+            markdown_safe
+            and has_native_text
+            and pages_have_content
+            and parser_complete
+        )
+        quality_overall = "pass" if publish_eligible else "fail"
         quality_messages = list(parsed.warnings)
         if not markdown_safe:
             quality_messages.append("markdown-safety")
+        if not has_native_text:
+            quality_messages.append("empty-document")
+        if not pages_have_content:
+            quality_messages.append("empty-page")
+        if not parser_complete:
+            quality_messages.append("partial-extraction")
         quality = encode_json(
             {
                 "quality_report_schema_version": 1,
@@ -302,7 +319,18 @@ class DocumentBundleAssembler:
                 "profile": {"id": "alltonote.document-note", "version": 1},
                 "overall": quality_overall,
                 "checks": [
-                    {"id": "native-text", "status": "pass"},
+                    {
+                        "id": "native-text",
+                        "status": "pass" if has_native_text else "fail",
+                    },
+                    {
+                        "id": "page-coverage",
+                        "status": "pass" if pages_have_content else "fail",
+                    },
+                    {
+                        "id": "parser-completeness",
+                        "status": "pass" if parser_complete else "fail",
+                    },
                     {"id": "page-bbox", "status": "pass"},
                     {"id": "source-hash", "status": "pass"},
                     {

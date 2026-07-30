@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,29 @@ from app.adapters.documents.docling_worker_parser import (
     DoclingWorkerParser,
 )
 from app.core.errors import DomainError
+
+
+def test_document_pack_identity_imports_without_runtime_dependencies() -> None:
+    backend_root = Path(__file__).parents[2]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            (
+                "from app.adapters.documents.document_basic_pack import PACK_ID; "
+                "print(PACK_ID)"
+            ),
+        ],
+        cwd=backend_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "document-basic"
 
 
 def _parser(
@@ -77,7 +101,10 @@ def _result(source: Path) -> dict[str, object]:
 
 def test_adapter_uses_argument_list_offline_worker_and_validates_source(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ALLTONOTE_TEST_SECRET", "must-not-reach-worker")
+    monkeypatch.setenv("PYTHONPATH", "untrusted-parent-path")
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"%PDF-born-digital")
     work = tmp_path / "work"
@@ -97,6 +124,9 @@ def test_adapter_uses_argument_list_offline_worker_and_validates_source(
     assert isinstance(captured["command"], list)
     assert captured["env"]["HF_HUB_OFFLINE"] == "1"
     assert captured["env"]["TRANSFORMERS_OFFLINE"] == "1"
+    assert captured["env"]["PYTHONPATH"] == str(tmp_path / "backend")
+    assert captured["env"]["PYTHONNOUSERSITE"] == "1"
+    assert "ALLTONOTE_TEST_SECRET" not in captured["env"]
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.DEVNULL
     assert "capture_output" not in captured

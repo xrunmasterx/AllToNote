@@ -14,7 +14,11 @@ from app.adapters.documents.docling_worker_parser import (
     DoclingWorkerConfig,
     DoclingWorkerParser,
 )
-from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.adapters.documents.document_basic_pack import (
+    PACK_ID,
+    PACK_VERSION,
+    resolve_document_basic_pack_paths,
+)
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
@@ -1521,23 +1525,14 @@ def _resolve_document_worker_config(
     paths: RuntimePaths,
     environ: Mapping[str, str],
 ) -> DoclingWorkerConfig:
-    python_override = environ.get("ALLTONOTE_DOCUMENT_BASIC_PYTHON")
-    artifacts_override = environ.get("ALLTONOTE_DOCUMENT_BASIC_ARTIFACTS")
-    if bool(python_override) != bool(artifacts_override):
+    resolved = resolve_document_basic_pack_paths(paths, environ)
+    if resolved is None:
         raise DomainError(
             "document_pack_unavailable",
             ErrorCategory.WORKSPACE_INCOMPATIBLE,
             "The document-basic Pack installation is incomplete",
         )
-    if python_override and artifacts_override:
-        python_executable = Path(python_override).expanduser().resolve(strict=False)
-        artifacts_path = Path(artifacts_override).expanduser().resolve(strict=False)
-    else:
-        pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
-        python_executable = pack_root / (
-            "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
-        )
-        artifacts_path = pack_root / "artifacts"
+    python_executable, artifacts_path = resolved
     if not python_executable.is_file() or not artifacts_path.is_dir():
         raise DomainError(
             "document_pack_unavailable",

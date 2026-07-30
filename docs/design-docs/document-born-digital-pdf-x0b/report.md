@@ -169,3 +169,15 @@ Task 7 去除了系统 Evidence 噪声，但同时暴露出更基础的信任边
 | 英文双栏 PDF | `job_019fb443-e458-75d4-9cd7-bce1336a0d38` / `bnd_019fb443-e458-7027-a054-a5f9d056d917` | 82 / 82 | safety pass；Evidence 脚注 0；`Document page` 0；6 个 URL/邮箱为行内代码；raw text/hash 往返一致 | `pass` / publishable |
 
 本轮没有解决 Document 默认 CLI/Pack 可达性、扫描件/OCR、figure/page 覆盖质量、Docling worker 的 OS/网络/环境权限隔离、SQLite/Job 全局权威或高并发资源调度。这些仍是后续产品与发布 Gate，不能由本次 Markdown 安全通过外推为已完成。
+
+## 13. 默认 CLI 可达性与质量 fail-closed
+
+2026-07-31 使用正式 `.venv\\Scripts\\alltonote.exe`、默认 `alltonote.document-note@1` Recipe 和仓库外固定 `document-basic` Pack，再次从临时 Workspace 跑通两份真实 PDF。英文双栏论文得到 4 页、82 块、1 张表和 5 类 Artifact；中文路径且表格密集的文档得到 6 页、109 块、8 张表和 5 类 Artifact。两者均为 `quality=pass`、`publish_eligible=true`，主 Draft 的系统 Evidence 标记为 0，源文件 SHA-256 前后不变。
+
+本轮只补齐直接影响可用性和结果可信度的最小缺口：
+
+1. `runtime info` 静态报告固定 Pack identity 与安装状态；`runtime doctor` 在缺失时给出明确修复动作。readiness 与实际 Runtime 复用同一套标准安装目录及成对环境覆盖规则，避免“诊断说可用、执行却找不到”的分叉。
+2. Docling 子进程不再复制完整父环境，只保留 Windows/POSIX 启动所需的有限系统变量，并强制离线、禁用用户 site-packages、覆盖 `PYTHONPATH`。这阻止普通 API key 和调用方路径进入 worker，但不等同于 Windows Job Object、网络 ACL 或完整 OS sandbox。
+3. Quality Gate 现在把零原生文本、任一空页、非 `success` parser status 或任何 parser warning 判为 `fail` 且不可发布；已成功抽取的两份真实样本保持通过。
+
+这仍不是 clean-user 发布通过：仓库尚未提供 `document-basic` Pack 安装/修复命令、Workspace/Vault 初始化、包含 AllToNote CLI 的正式发行物，也未完成跨 Workspace 的重任务资源准入。上述缺口继续作为后续 release Gate，不用本次真实输入成功替代。

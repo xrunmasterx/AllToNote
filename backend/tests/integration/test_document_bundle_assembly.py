@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from markdown_it import MarkdownIt
@@ -338,6 +339,82 @@ def test_document_candidate_fails_closed_when_final_markdown_validation_fails(
     assert quality["subject"]["sha256"] == (
         "sha256:" + hashlib.sha256(draft.encode()).hexdigest()
     )
+
+
+def test_document_candidate_is_not_publishable_when_extraction_is_empty(
+    tmp_path: Path,
+) -> None:
+    workspace = _candidate_workspace(tmp_path)
+    parsed = ParsedDocument(
+        source_sha256="sha256:" + "a" * 64,
+        source_name="empty.pdf",
+        parser_id="docling",
+        parser_version="2.117.0",
+        model_revision="fixture-model",
+        pages=(DocumentPage(1, 612.0, 792.0, ()),),
+        metadata={"status": "success"},
+        warnings=(),
+    )
+
+    candidate = DocumentBundleAssembler().assemble(
+        parsed,
+        job_id=new_typed_id("job"),
+        created_at="2026-07-31T00:00:00.000Z",
+        location=IWikiPortableGateway().candidate_location(
+            workspace,
+            local_instance_id="document-empty-quality",
+            nonce="fixture",
+        ),
+    )
+    quality = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "quality"
+            / f"{candidate.quality_report_artifact_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert candidate.quality_overall == "fail"
+    assert candidate.publish_eligible is False
+    checks = {check["id"]: check["status"] for check in quality["checks"]}
+    assert checks["native-text"] == "fail"
+    assert checks["page-coverage"] == "fail"
+    assert "empty-document" in quality["messages"]
+
+
+def test_document_candidate_is_not_publishable_for_partial_extraction(
+    tmp_path: Path,
+) -> None:
+    workspace = _candidate_workspace(tmp_path)
+    parsed = replace(
+        _document_with_blocks(("paragraph", "Only the recovered page")),
+        metadata={"status": "partial_success"},
+        warnings=("A page could not be converted",),
+    )
+
+    candidate = DocumentBundleAssembler().assemble(
+        parsed,
+        job_id=new_typed_id("job"),
+        created_at="2026-07-31T00:00:00.000Z",
+        location=IWikiPortableGateway().candidate_location(
+            workspace,
+            local_instance_id="document-partial-quality",
+            nonce="fixture",
+        ),
+    )
+    quality = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "quality"
+            / f"{candidate.quality_report_artifact_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert candidate.quality_overall == "fail"
+    assert candidate.publish_eligible is False
+    checks = {check["id"]: check["status"] for check in quality["checks"]}
+    assert checks["parser-completeness"] == "fail"
+    assert "partial-extraction" in quality["messages"]
 
 
 def test_document_literal_projection_blocks_gfm_autolinks_and_setext_headings(
