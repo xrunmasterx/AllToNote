@@ -69,6 +69,14 @@ class RuntimePaths:
     def pack_registry_file(self) -> Path:
         return self.data_dir / "packs" / "installed.json"
 
+    @property
+    def engine_dir(self) -> Path:
+        return self.state_dir / "engine" / "v1"
+
+    @property
+    def engine_log_dir(self) -> Path:
+        return self.log_dir / "engine"
+
     def role_records(self) -> tuple[dict[str, str], ...]:
         return tuple(
             {"role": role, "path": str(getattr(self, f"{role}_dir"))}

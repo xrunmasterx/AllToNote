@@ -63,6 +63,7 @@ class RuntimeInfo:
     sqlite_parallel_jobs_supported: bool
     engine_supported: bool
     engine_running: bool
+    engine_state: str
     capabilities: tuple[RuntimeCapability, ...]
     packs: tuple[RuntimePack, ...]
 
@@ -98,6 +99,7 @@ class RuntimeInfo:
             "engine": {
                 "supported": self.engine_supported,
                 "running": self.engine_running,
+                "state": self.engine_state,
             },
             "packs": tuple(pack.to_mapping() for pack in self.packs),
         }
@@ -198,6 +200,22 @@ def build_runtime_info(
         media_basic_installed=media_basic_installed,
         transcribe_cpu_installed=transcribe_cpu_installed,
     )
+    from app.engine.instance import engine_lifecycle_supported
+
+    engine_supported = engine_lifecycle_supported()
+    engine_running = False
+    engine_state = "unsupported"
+    if engine_supported:
+        try:
+            from app.engine.client import LocalEngineClient
+
+            status = LocalEngineClient(active_paths).status()
+            engine_running = status.running
+            engine_state = status.state.value
+        except DomainError:
+            engine_state = "unavailable"
+        except Exception:
+            engine_state = "unknown"
     return RuntimeInfo(
         runtime_version=RUNTIME_VERSION,
         core_api_version=CORE_API_VERSION,
@@ -215,8 +233,9 @@ def build_runtime_info(
             threadsafety=sqlite3.threadsafety,
             compile_options=sqlite_compile_options,
         ),
-        engine_supported=False,
-        engine_running=False,
+        engine_supported=engine_supported,
+        engine_running=engine_running,
+        engine_state=engine_state,
         capabilities=capabilities,
         packs=(
             RuntimePack(

@@ -131,6 +131,20 @@ def test_platformdirs_roles_are_resolved_without_creating_directories(
     assert not paths.data_dir.exists()
 
 
+def test_engine_paths_are_derived_without_creating_machine_state(tmp_path: Path) -> None:
+    root = tmp_path / "machine state"
+
+    paths = resolve_runtime_paths(machine_state_root=root)
+
+    assert paths.engine_dir == (
+        root / "state" / "AllToNote" / "engine" / "v1"
+    ).resolve()
+    assert paths.engine_log_dir == (
+        root / "log" / "AllToNote" / "engine"
+    ).resolve()
+    assert not root.exists()
+
+
 def test_machine_state_override_supports_chinese_and_spaces_without_io(
     tmp_path: Path,
 ) -> None:

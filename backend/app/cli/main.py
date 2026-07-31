@@ -89,6 +89,13 @@ def _build_parser(
     sqlite_wal_gate_parser = runtime_subparsers.add_parser("sqlite-wal-gate")
     sqlite_wal_gate_parser.add_argument("--root", required=True, type=Path)
     sqlite_wal_gate_parser.add_argument("--json", action="store_true")
+    engine_parser = subparsers.add_parser("engine")
+    engine_subparsers = engine_parser.add_subparsers(
+        dest="engine_command", required=True
+    )
+    for engine_command in ("status", "start", "ensure", "stop"):
+        engine_command_parser = engine_subparsers.add_parser(engine_command)
+        engine_command_parser.add_argument("--json", action="store_true")
     config_parser = subparsers.add_parser("config")
     config_subparsers = config_parser.add_subparsers(
         dest="config_command", required=True
@@ -239,6 +246,7 @@ def main(
     job_runtime: JobRuntime | None = None,
     artifact_query_service: ArtifactQueryService | None = None,
     pack_service: PackService | None = None,
+    engine_client: object | None = None,
     input_stream: TextIO | None = None,
 ) -> int:
     arguments = tuple(argv) if argv is not None else tuple(sys.argv[1:])
@@ -325,6 +333,37 @@ def main(
         )
         render_result(result, json_mode=args.json)
         return int(ExitCode.SUCCESS)
+
+    if args.command == "engine":
+        command = f"engine {args.engine_command}"
+        try:
+            from app.cli.engine_commands import engine_command_result
+
+            result = engine_command_result(
+                args.engine_command,
+                correlation_id,
+                client=engine_client,
+                paths=(config_service.paths if config_service is not None else None),
+            )
+            exit_code = ExitCode.SUCCESS
+        except DomainError as error:
+            mapped = map_domain_error(error)
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        except Exception:
+            mapped = internal_error()
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        render_result(result, json_mode=args.json)
+        return int(exit_code)
 
     if args.command == "workspace":
         command = f"workspace {args.workspace_command}"
@@ -1634,6 +1673,8 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
         return "version"
     if len(arguments) >= 2 and arguments[0] == "runtime":
         return f"runtime {arguments[1]}"
+    if len(arguments) >= 2 and arguments[0] == "engine":
+        return f"engine {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "config":
         return f"config {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "credential":

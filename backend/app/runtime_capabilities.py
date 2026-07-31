@@ -85,6 +85,7 @@ _CAPABILITY_SPECS = (
         ("app.transcriber.whisper", "faster_whisper"),
     ),
     CapabilitySpec("transport.cli.v1", ("app.cli.main",)),
+    CapabilitySpec("engine.lifecycle.v1", ("app.engine.client",)),
 )
 
 

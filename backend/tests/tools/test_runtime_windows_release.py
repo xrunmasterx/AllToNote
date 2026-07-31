@@ -5,12 +5,14 @@ import json
 import os
 import sqlite3
 import stat
+import threading
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+import tools.runtime_windows_release as release_module
 
 from tools.runtime_windows_release import (
     ReleaseError,
@@ -23,6 +25,7 @@ from tools.runtime_windows_release import (
     _parser,
     _remove_direct_url_metadata,
     _remove_pip_console_scripts,
+    _run_engine_lifecycle_gate,
     _verify_inputs,
 )
 
@@ -70,6 +73,131 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, object], Path, Path]:
         ],
     }
     return lock, inputs, wheelhouse
+
+
+def test_engine_lifecycle_gate_reconnects_and_stops_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    state = {"running": False, "generation": 0}
+    state_lock = threading.Lock()
+
+    def engine_id() -> str:
+        return f"018f0000-0000-7000-8000-{state['generation']:012d}"
+
+    def fake_run_cli(_root, arguments, _environment, **_kwargs):
+        command = tuple(arguments)
+        calls.append(command)
+        with state_lock:
+            if command == ("runtime", "info"):
+                return {
+                    "data": {
+                        "engine": {
+                            "supported": True,
+                            "running": state["running"],
+                            "state": "running" if state["running"] else "stopped",
+                        }
+                    }
+                }
+            if command == ("engine", "ensure"):
+                started = not state["running"]
+                if started:
+                    state["running"] = True
+                    state["generation"] += 1
+                return {
+                    "data": {
+                        "running": True,
+                        "state": "running",
+                        "started": started,
+                        "engine_id": engine_id(),
+                    }
+                }
+            if command == ("engine", "stop"):
+                state["running"] = False
+                return {
+                    "data": {
+                        "running": False,
+                        "state": "stopped",
+                        "stopped": True,
+                        "engine_id": None,
+                    }
+                }
+            return {
+                "data": {
+                    "running": state["running"],
+                    "state": "running" if state["running"] else "stopped",
+                    "engine_id": engine_id() if state["running"] else None,
+                }
+            }
+
+    def fake_process_probe(_root, _environment, operation):
+        with state_lock:
+            if operation == "inspect":
+                return {"engine_id": engine_id(), "rss_bytes": 24 * 1024 * 1024}
+            terminated_id = engine_id()
+            state["running"] = False
+            return {"engine_id": terminated_id}
+
+    monkeypatch.setattr(release_module, "_run_cli", fake_run_cli)
+    monkeypatch.setattr(
+        release_module,
+        "_run_engine_process_probe",
+        fake_process_probe,
+    )
+    monkeypatch.setattr(
+        release_module,
+        "_run_engine_idle_probe",
+        lambda _root, _environment: {"descriptor_exists": False, "exit_code": 0},
+    )
+    monkeypatch.setattr(release_module, "_ENGINE_START_SAMPLES", 2)
+    monkeypatch.setattr(release_module, "_ENGINE_ENSURE_CONCURRENCY", 4)
+
+    report = _run_engine_lifecycle_gate(tmp_path, {})
+
+    assert report["supported"] is True
+    assert report["parent_exit_reconnect"] is True
+    assert len(report["cold_start_samples_milliseconds"]) == 2
+    assert report["idle_rss_bytes"] == 24 * 1024 * 1024
+    assert report["ensure_concurrency"] == 4
+    assert report["forced_death_reensure"] is True
+    assert report["idle_exit"] is True
+    assert report["stopped_cleanly"] is True
+    assert calls.count(("engine", "ensure")) >= 2 + 4 + 1
+    assert calls[-1] == ("engine", "stop")
+
+
+def test_engine_lifecycle_gate_stops_partial_start_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    running = False
+
+    def fake_run_cli(_root, arguments, _environment, **_kwargs):
+        nonlocal running
+        command = tuple(arguments)
+        calls.append(command)
+        if command == ("engine", "ensure"):
+            running = True
+            raise ReleaseError("candidate failed after launch")
+        if command == ("engine", "stop"):
+            running = False
+            return {"data": {"running": False, "state": "stopped"}}
+        return {
+            "data": {
+                "running": running,
+                "state": "running" if running else "stopped",
+            }
+        }
+
+    monkeypatch.setattr(release_module, "_run_cli", fake_run_cli)
+
+    with pytest.raises(ReleaseError, match="failed after launch"):
+        _run_engine_lifecycle_gate(tmp_path, {})
+
+    assert running is False
+    assert calls[-1] == ("engine", "stop")
 
 
 def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:

@@ -11,8 +11,10 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +27,10 @@ _MAX_ARCHIVE_ENTRIES = 10_000
 _MAX_ARCHIVE_FILE_BYTES = 128 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 _PROCESS_TIMEOUT_SECONDS = 180
+_ENGINE_START_SAMPLES = 20
+_ENGINE_ENSURE_CONCURRENCY = 32
+_ENGINE_START_P95_LIMIT_MILLISECONDS = 2000.0
+_ENGINE_IDLE_RSS_LIMIT_BYTES = 100 * 1024 * 1024
 _PIP_CONSOLE_SCRIPTS = {
     "alltonote.exe",
     "cffi-gen-src.exe",
@@ -150,6 +156,97 @@ print(json.dumps({
     },
     "reopened_same_binding": reopened_binding == binding,
     "reopened_data_preserved": reopened_data_preserved,
+}, sort_keys=True))
+"""
+
+_ENGINE_PROCESS_PROBE = r"""
+import ctypes
+import json
+import os
+import signal
+import sys
+
+from ctypes import wintypes
+from app.engine.instance import EngineInstancePaths, process_start_identity, read_descriptor
+from app.runtime_paths import resolve_runtime_paths
+
+instance = EngineInstancePaths.from_runtime_paths(resolve_runtime_paths())
+descriptor = read_descriptor(instance.descriptor)
+if descriptor is None:
+    raise SystemExit("Engine descriptor is absent")
+if process_start_identity(descriptor.pid) != descriptor.process_start_identity:
+    raise SystemExit("Engine process identity changed")
+
+operation = sys.argv[1]
+if operation == "terminate":
+    os.kill(descriptor.pid, signal.SIGTERM)
+    print(json.dumps({"engine_id": descriptor.engine_id}, sort_keys=True))
+elif operation == "inspect":
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("page_fault_count", wintypes.DWORD),
+            ("peak_working_set_size", ctypes.c_size_t),
+            ("working_set_size", ctypes.c_size_t),
+            ("quota_peak_paged_pool_usage", ctypes.c_size_t),
+            ("quota_paged_pool_usage", ctypes.c_size_t),
+            ("quota_peak_non_paged_pool_usage", ctypes.c_size_t),
+            ("quota_non_paged_pool_usage", ctypes.c_size_t),
+            ("pagefile_usage", ctypes.c_size_t),
+            ("peak_pagefile_usage", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    psapi.GetProcessMemoryInfo.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCounters),
+        wintypes.DWORD,
+    )
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x0410, False, descriptor.pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(
+            handle,
+            ctypes.byref(counters),
+            ctypes.sizeof(counters),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+    print(json.dumps({
+        "engine_id": descriptor.engine_id,
+        "rss_bytes": counters.working_set_size,
+    }, sort_keys=True))
+else:
+    raise SystemExit("Unknown Engine probe operation")
+"""
+
+_ENGINE_IDLE_PROBE = r"""
+import json
+
+from app.engine.host import run_engine_host
+from app.engine.instance import EngineInstancePaths
+from app.runtime_paths import resolve_runtime_paths
+
+instance = EngineInstancePaths.from_runtime_paths(resolve_runtime_paths())
+exit_code = run_engine_host(
+    engine_root=instance.root,
+    log_root=instance.log_root,
+    scope_id=instance.scope_id,
+    idle_seconds=0.25,
+)
+print(json.dumps({
+    "descriptor_exists": instance.descriptor.exists(),
+    "exit_code": exit_code,
 }, sort_keys=True))
 """
 
@@ -545,6 +642,195 @@ def _run_cli(
     return payload
 
 
+def _run_engine_process_probe(
+    root: Path,
+    environment: Mapping[str, str],
+    operation: str,
+) -> dict[str, Any]:
+    output = _run(
+        (
+            str(root / "python.exe"),
+            "-I",
+            "-B",
+            "-c",
+            _ENGINE_PROCESS_PROBE,
+            operation,
+        ),
+        environment=environment,
+        timeout=30,
+    )
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ReleaseError("Runtime Engine process probe returned invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise ReleaseError("Runtime Engine process probe returned invalid data")
+    return payload
+
+
+def _run_engine_idle_probe(
+    root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    output = _run(
+        (
+            str(root / "python.exe"),
+            "-I",
+            "-B",
+            "-c",
+            _ENGINE_IDLE_PROBE,
+        ),
+        environment=environment,
+        timeout=30,
+    )
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ReleaseError("Runtime Engine idle probe returned invalid JSON") from error
+    if payload != {"descriptor_exists": False, "exit_code": 0}:
+        raise ReleaseError("Runtime Engine idle shutdown Gate failed")
+    return payload
+
+
+def _engine_status(
+    root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    return _run_cli(root, ("engine", "status"), environment)["data"]
+
+
+def _require_engine_stopped(status: Mapping[str, Any]) -> None:
+    if status.get("running") is not False or status.get("state") != "stopped":
+        raise ReleaseError("Runtime Engine did not stop cleanly")
+
+
+def _run_engine_lifecycle_gate(
+    root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    primary_error: Exception | None = None
+    try:
+        initial = _engine_status(root, environment)
+        if initial.get("running") is True:
+            _run_cli(root, ("engine", "stop"), environment)
+        elif initial.get("state") != "stopped":
+            _run_cli(root, ("engine", "ensure"), environment)
+            _run_cli(root, ("engine", "stop"), environment)
+        _require_engine_stopped(_engine_status(root, environment))
+
+        cold_samples: list[float] = []
+        maximum_rss_bytes = 0
+        for _sample in range(_ENGINE_START_SAMPLES):
+            started_at = time.perf_counter()
+            ensured = _run_cli(root, ("engine", "ensure"), environment)["data"]
+            cold_samples.append((time.perf_counter() - started_at) * 1000)
+            if ensured.get("running") is not True or ensured.get("started") is not True:
+                raise ReleaseError("Runtime Engine cold start Gate is inconsistent")
+            repeated = _run_cli(root, ("engine", "ensure"), environment)["data"]
+            running = _engine_status(root, environment)
+            if (
+                repeated.get("started") is not False
+                or repeated.get("engine_id") != ensured.get("engine_id")
+                or running.get("engine_id") != ensured.get("engine_id")
+            ):
+                raise ReleaseError("Runtime Engine idempotent ensure Gate failed")
+            probe = _run_engine_process_probe(root, environment, "inspect")
+            rss_bytes = probe.get("rss_bytes")
+            if type(rss_bytes) is not int or rss_bytes <= 0:
+                raise ReleaseError("Runtime Engine memory probe is invalid")
+            maximum_rss_bytes = max(maximum_rss_bytes, rss_bytes)
+            _run_cli(root, ("engine", "stop"), environment)
+            _require_engine_stopped(_engine_status(root, environment))
+
+        percentile_index = max(0, (95 * len(cold_samples) + 99) // 100 - 1)
+        cold_p95 = sorted(cold_samples)[percentile_index]
+        if cold_p95 >= _ENGINE_START_P95_LIMIT_MILLISECONDS:
+            raise ReleaseError("Runtime Engine cold-start p95 exceeds the release budget")
+        if maximum_rss_bytes >= _ENGINE_IDLE_RSS_LIMIT_BYTES:
+            raise ReleaseError("Runtime Engine idle RSS exceeds the release budget")
+
+        with ThreadPoolExecutor(
+            max_workers=_ENGINE_ENSURE_CONCURRENCY
+        ) as executor:
+            concurrent = tuple(
+                executor.map(
+                    lambda _index: _run_cli(
+                        root,
+                        ("engine", "ensure"),
+                        environment,
+                    )["data"],
+                    range(_ENGINE_ENSURE_CONCURRENCY),
+                )
+            )
+        engine_ids = {item.get("engine_id") for item in concurrent}
+        if (
+            len(engine_ids) != 1
+            or None in engine_ids
+            or sum(item.get("started") is True for item in concurrent) != 1
+        ):
+            raise ReleaseError("Runtime Engine concurrent ensure Gate failed")
+        concurrent_engine_id = next(iter(engine_ids))
+        info = _run_cli(root, ("runtime", "info"), environment)
+        if info["data"].get("engine") != {
+            "supported": True,
+            "running": True,
+            "state": "running",
+        }:
+            raise ReleaseError("Runtime Engine runtime-info Gate is inconsistent")
+
+        terminated = _run_engine_process_probe(root, environment, "terminate")
+        if terminated.get("engine_id") != concurrent_engine_id:
+            raise ReleaseError("Runtime Engine termination probe changed identity")
+        replacement: dict[str, Any] | None = None
+        recovery_deadline = time.monotonic() + 10
+        while time.monotonic() < recovery_deadline:
+            if _engine_status(root, environment).get("running") is False:
+                try:
+                    replacement = _run_cli(
+                        root,
+                        ("engine", "ensure"),
+                        environment,
+                    )["data"]
+                    break
+                except ReleaseError:
+                    pass
+            time.sleep(0.05)
+        if (
+            replacement is None
+            or replacement.get("started") is not True
+            or replacement.get("engine_id") in {None, concurrent_engine_id}
+        ):
+            raise ReleaseError("Runtime Engine forced-death recovery Gate failed")
+        _run_cli(root, ("engine", "stop"), environment)
+        _require_engine_stopped(_engine_status(root, environment))
+
+        _run_engine_idle_probe(root, environment)
+        _require_engine_stopped(_engine_status(root, environment))
+        return {
+            "supported": True,
+            "parent_exit_reconnect": True,
+            "cold_start_samples_milliseconds": [
+                round(sample, 3) for sample in cold_samples
+            ],
+            "cold_start_p95_milliseconds": round(cold_p95, 3),
+            "idle_rss_bytes": maximum_rss_bytes,
+            "ensure_concurrency": _ENGINE_ENSURE_CONCURRENCY,
+            "single_instance": True,
+            "forced_death_reensure": True,
+            "idle_exit": True,
+            "stopped_cleanly": True,
+        }
+    except Exception as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            _run_cli(root, ("engine", "stop"), environment)
+        except ReleaseError:
+            if primary_error is None:
+                raise
+
+
 def _run_legacy_jobstore_migration(
     root: Path,
     fixture: Path,
@@ -710,6 +996,10 @@ def assemble_runtime(
             _run_cli(stage, ("version",), isolated_environment)
             info = _run_cli(stage, ("runtime", "info"), isolated_environment)
             _run_cli(stage, ("runtime", "doctor"), isolated_environment)
+            engine_lifecycle = _run_engine_lifecycle_gate(
+                stage,
+                isolated_environment,
+            )
             _run_cli(
                 stage,
                 (
@@ -775,6 +1065,7 @@ def assemble_runtime(
                     "version": True,
                     "runtime_info": True,
                     "runtime_doctor": True,
+                    "engine_lifecycle": True,
                     "unicode_workspace_init": True,
                     "sqlite_wal_gate": True,
                     "legacy_jobstore_migration": True,
@@ -786,6 +1077,7 @@ def assemble_runtime(
                     "integrity": gate_data["integrity"],
                 },
                 "legacy_jobstore": legacy_jobstore,
+                "engine_lifecycle": engine_lifecycle,
                 "limits": [
                     "unsigned portable candidate; not a public installer",
                     "clean non-admin VM, Defender, update, rollback, and uninstall remain release gates",

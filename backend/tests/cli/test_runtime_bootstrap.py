@@ -128,6 +128,33 @@ def test_static_pack_doctor_does_not_import_verifier_or_heavy_modules() -> None:
     } & set(report["imported_modules"])
 
 
+def test_engine_status_is_cold_and_does_not_import_execution_modules() -> None:
+    result = subprocess.run(
+        [sys.executable, str(HELPER), "engine", "status", "--json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(result.stdout)
+    envelope = json.loads(report["stdout"])
+
+    assert report["exit_code"] == 0
+    assert envelope["command"] == "engine status"
+    assert envelope["data"]["running"] is False
+    assert not {
+        "app.runtime",
+        "app.job_runtime",
+        "app.engine.host",
+        "app.core.application.video_service",
+        "app.core.application.document_service",
+        "app.adapters.documents.docling_worker_parser",
+        "torch",
+        "faster_whisper",
+        "yt_dlp",
+        "openai",
+    } & set(report["imported_modules"])
+
+
 def test_runtime_lock_is_available_as_a_package_resource():
     lock_resource = resources.files("app").joinpath("runtime-lock.json")
 

@@ -20,7 +20,7 @@ from app.adapters.video_packs.official_video_pack import (
     OfficialVideoPackContract,
 )
 from app.cli.main import main
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.runtime_capabilities import CapabilityRegistry, CapabilitySpec
 from app.runtime_info import (
     RuntimeCheck,
@@ -119,7 +119,11 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
         "schema_id": "2026-07-portable-v1",
         "schema_hash": "sha256:f8ded2d23197685dc0046e3949e573097fa4ae13e12cfbba240ff0544ca2c9d9",
     }
-    assert data["engine"] == {"supported": False, "running": False}
+    assert data["engine"] == {
+        "supported": True,
+        "running": False,
+        "state": "stopped",
+    }
     with closing(runtime_info_module.sqlite3.connect(":memory:")) as connection:
         sqlite_source_id = connection.execute(
             "SELECT sqlite_source_id()"
@@ -170,6 +174,52 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
     assert "api_key" not in lowered
     assert "cookie" not in lowered
     assert "prompt" not in lowered
+
+
+def test_runtime_info_reports_engine_unavailable_without_claiming_stopped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.engine.client as engine_client_module
+
+    class UnavailableClient:
+        def __init__(self, _paths) -> None:
+            raise DomainError(
+                "engine_state_root_unsafe",
+                ErrorCategory.POLICY_DENIED,
+                "Engine state is unsafe",
+            )
+
+    monkeypatch.setattr(engine_client_module, "LocalEngineClient", UnavailableClient)
+
+    info = build_runtime_info(
+        paths=resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    )
+
+    assert info.engine_supported is True
+    assert info.engine_running is False
+    assert info.engine_state == "unavailable"
+
+
+def test_runtime_info_preserves_unknown_engine_probe_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.engine.client as engine_client_module
+
+    class BrokenClient:
+        def __init__(self, _paths) -> None:
+            raise RuntimeError("unexpected probe failure")
+
+    monkeypatch.setattr(engine_client_module, "LocalEngineClient", BrokenClient)
+
+    info = build_runtime_info(
+        paths=resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    )
+
+    assert info.engine_supported is True
+    assert info.engine_running is False
+    assert info.engine_state == "unknown"
 
 
 def test_loaded_sqlite_identity_closes_its_memory_connection(
