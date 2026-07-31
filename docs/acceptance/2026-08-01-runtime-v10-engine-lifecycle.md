@@ -22,7 +22,7 @@
 - Engine 生命周期源码提交：`54019ea58a280dea6b508044fc0dbe0558684203`
 - 前置主功能提交：`d516c429865a722e318ef8ad9b353164a9367bb8`
 - stop 线性化修复提交：`e1b28ee2f5ed87e645e172a5fa4099c98a75d930`
-- 对应 `git archive --format=zip` SHA-256：`3201e9c731d0e1072a989c3e3d3e9f74d9373c05aba3e4c06a7c3abadb88d119`
+- 构建用 backend source snapshot ZIP SHA-256：`3201e9c731d0e1072a989c3e3d3e9f74d9373c05aba3e4c06a7c3abadb88d119`
 - 候选目录：`G:\.alltonote-release\runtime-portable-engine-v10`
 - Runtime wheel：`alltonote_runtime-0.1.0-py3-none-any.whl`
 - Runtime wheel byte length：`551199`
