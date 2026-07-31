@@ -205,7 +205,11 @@ class LocalEngineClient:
             self._request(descriptor, "shutdown")
             deadline = time.monotonic() + self._shutdown_timeout
             while time.monotonic() < deadline:
-                if not self._identity_matches(descriptor):
+                if (
+                    not self._identity_matches(descriptor)
+                    and self._lifetime_lock_is_free()
+                ):
+                    self._remove_stale_descriptor()
                     return EngineStatus(EngineState.STOPPED, False, stopped=True)
                 time.sleep(0.02)
             raise DomainError(

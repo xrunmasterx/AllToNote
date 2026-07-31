@@ -8,14 +8,21 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from multiprocessing import get_context
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from app.core.errors import DomainError
 from app.engine.client import LocalEngineClient
-from app.engine.contracts import EngineDescriptor
+from app.engine.contracts import ENGINE_PROTOCOL_VERSION, EngineDescriptor
 from app.engine.host import run_engine_host
-from app.engine.instance import EngineInstancePaths, publish_descriptor
+from app.engine.instance import (
+    EngineInstancePaths,
+    EngineState,
+    EngineStatus,
+    ensure_instance_root,
+    publish_descriptor,
+)
 from app.runtime_paths import resolve_runtime_paths
 
 
@@ -74,6 +81,59 @@ def test_engine_ensure_is_idempotent_and_stop_is_bounded(tmp_path: Path) -> None
     assert stopped.state.value == "stopped"
     assert stopped.stopped is True
     assert client.status().running is False
+
+
+def test_stop_waits_for_lifetime_release_after_identity_disappears(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = _client(tmp_path)
+    ensure_instance_root(client._paths)
+    descriptor = EngineDescriptor(
+        descriptor_version=1,
+        engine_protocol_version=ENGINE_PROTOCOL_VERSION,
+        runtime_major=0,
+        scope_id=client._paths.scope_id,
+        engine_id=str(uuid4()),
+        pid=os.getpid(),
+        process_start_identity="test-process-start",
+        endpoint_kind=client._paths.endpoint_kind,
+        endpoint_name=client._paths.endpoint_name,
+        nonce="A" * 43,
+        started_at="2026-08-01T00:00:00Z",
+    )
+    identity_checks = iter((True, False, False, False))
+    lifetime_checks = iter((False, False, True))
+    monkeypatch.setattr(
+        client,
+        "status",
+        lambda: EngineStatus(
+            EngineState.RUNNING,
+            True,
+            engine_id=descriptor.engine_id,
+            started_at=descriptor.started_at,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.engine.client.read_descriptor",
+        lambda _path: descriptor,
+    )
+    monkeypatch.setattr(
+        client,
+        "_identity_matches",
+        lambda _descriptor: next(identity_checks),
+    )
+    monkeypatch.setattr(client, "_request", lambda _descriptor, _method: {})
+    monkeypatch.setattr(
+        client,
+        "_lifetime_lock_is_free",
+        lambda: next(lifetime_checks),
+    )
+
+    stopped = client.stop()
+
+    assert stopped.state is EngineState.STOPPED
+    assert stopped.stopped is True
 
 
 def test_concurrent_ensure_calls_converge_on_one_engine(tmp_path: Path) -> None:
