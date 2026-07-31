@@ -590,7 +590,7 @@ def _knowledge_request(
     )
 
 
-def test_document_v2_compiles_publishable_note_with_separate_knowledge_map(
+def test_document_v2_compiles_note_but_requires_semantic_quality_verification(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -634,8 +634,8 @@ def test_document_v2_compiles_publishable_note_with_separate_knowledge_map(
     assert stored_request["model_override"] == "fixture/model-v1"
     assert completed.state is JobState.SUCCEEDED
     assert completed.result is not None
-    assert completed.result.publish_eligible is True
-    assert completed.result.quality_overall == "pass"
+    assert completed.result.publish_eligible is False
+    assert completed.result.quality_overall == "fail"
     assert set(completed.result.artifacts) == {
         "evidence_set",
         "knowledge_map",

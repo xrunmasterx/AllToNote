@@ -407,11 +407,11 @@ class DocumentBundleAssembler:
             and page_reference_coverage_ratio >= 0.60
         )
         quality_overall = (
-            "pass"
-            if extraction_passed and source_coverage_passed
-            else "fail"
-        ) if compiled is not None else ("pass" if extraction_passed else "fail")
-        publish_eligible = compiled is not None and quality_overall == "pass"
+            "fail"
+            if compiled is not None
+            else ("pass" if extraction_passed else "fail")
+        )
+        publish_eligible = False
         quality_messages = list(parsed.warnings)
         if not markdown_safe:
             quality_messages.append("markdown-safety")
@@ -423,8 +423,10 @@ class DocumentBundleAssembler:
             quality_messages.append("partial-extraction")
         if compiled is None:
             quality_messages.append("knowledge-note-quality-not-evaluated")
-        elif not source_coverage_passed:
-            quality_messages.append("knowledge-note-source-coverage")
+        else:
+            quality_messages.append("knowledge-note-semantic-quality-not-evaluated")
+            if not source_coverage_passed:
+                quality_messages.append("knowledge-note-source-coverage")
         checks: list[dict[str, object]] = [
             {
                 "id": "native-text",
@@ -458,7 +460,11 @@ class DocumentBundleAssembler:
         else:
             checks.extend(
                 (
-                    {"id": "knowledge-note-quality", "status": "pass"},
+                    {
+                        "id": "knowledge-note-quality",
+                        "status": "skipped",
+                        "reason": "semantic-not-evaluated",
+                    },
                     {
                         "id": "source-coverage",
                         "status": "pass" if source_coverage_passed else "fail",

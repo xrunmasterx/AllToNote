@@ -607,7 +607,7 @@ def _compiled_note(
     )
 
 
-def test_compiled_document_renders_clean_note_and_separate_knowledge_map(
+def test_compiled_document_is_not_publishable_without_semantic_verification(
     tmp_path: Path,
 ) -> None:
     workspace = _candidate_workspace(tmp_path)
@@ -670,15 +670,20 @@ def test_compiled_document_renders_clean_note_and_separate_knowledge_map(
         "source_block_ids": ["blk_1", "blk_2"],
     }
     assert candidate.knowledge_map_artifact_id is not None
-    assert candidate.quality_overall == "pass"
-    assert candidate.publish_eligible is True
+    assert candidate.quality_overall == "fail"
+    assert candidate.publish_eligible is False
     assert quality["profile"] == {
         "id": "alltonote.document-knowledge-note",
         "version": 1,
     }
-    checks = {value["id"]: value["status"] for value in quality["checks"]}
-    assert checks["knowledge-note-quality"] == "pass"
-    assert checks["source-coverage"] == "pass"
+    checks = {value["id"]: value for value in quality["checks"]}
+    assert checks["knowledge-note-quality"] == {
+        "id": "knowledge-note-quality",
+        "status": "skipped",
+        "reason": "semantic-not-evaluated",
+    }
+    assert checks["source-coverage"]["status"] == "pass"
+    assert "knowledge-note-semantic-quality-not-evaluated" in quality["messages"]
     assert quality["metrics"]["referenced_block_count"] == 2
 
 
@@ -720,6 +725,10 @@ def test_compiled_document_low_source_coverage_is_not_publishable(
 
     assert candidate.quality_overall == "fail"
     assert candidate.publish_eligible is False
-    checks = {value["id"]: value["status"] for value in quality["checks"]}
-    assert checks["knowledge-note-quality"] == "pass"
-    assert checks["source-coverage"] == "fail"
+    checks = {value["id"]: value for value in quality["checks"]}
+    assert checks["knowledge-note-quality"] == {
+        "id": "knowledge-note-quality",
+        "status": "skipped",
+        "reason": "semantic-not-evaluated",
+    }
+    assert checks["source-coverage"]["status"] == "fail"

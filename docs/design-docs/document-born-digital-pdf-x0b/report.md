@@ -181,3 +181,17 @@ Task 7 去除了系统 Evidence 噪声，但同时暴露出更基础的信任边
 3. Quality Gate 现在把零原生文本、任一空页、非 `success` parser status 或任何 parser warning 判为 `fail` 且不可发布；已成功抽取的两份真实样本保持通过。
 
 这仍不是 clean-user 发布通过：仓库尚未提供 `document-basic` Pack 安装/修复命令、Workspace/Vault 初始化、包含 AllToNote CLI 的正式发行物，也未完成跨 Workspace 的重任务资源准入。上述缺口继续作为后续 release Gate，不用本次真实输入成功替代。
+
+## 14. Knowledge Note 语义质量口径修正
+
+第 12、13 节记录的真实运行结果是当时实现的历史事实，但其中
+`knowledge-note-quality=pass / publish_eligible=true` 的判断依据只包含引用
+ID 存在、来源 bytes 覆盖率和页面覆盖率。它能够证明引用可解析，却不能证明
+生成的每条主张被所引用原文语义支持。
+
+当前合同已经按第一性原理改为 fail closed：已编译的 Knowledge Note 仍可
+作为成功 Job 的 Candidate Bundle 原子保存，但在独立 claim-level 语义验证
+实现并通过之前，报告 `knowledge-note-quality=skipped /
+semantic-not-evaluated`、`quality.overall=fail`、`publish_eligible=false`；
+`source-coverage` 继续单独报告。此修正不回写历史 Bundle，只约束新生成结果。
+完整边界与回归见 [`Document Knowledge Note 语义质量边界`](../../acceptance/2026-07-31-document-semantic-quality-boundary.md)。
