@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -118,8 +120,18 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
         "schema_hash": "sha256:f8ded2d23197685dc0046e3949e573097fa4ae13e12cfbba240ff0544ca2c9d9",
     }
     assert data["engine"] == {"supported": False, "running": False}
+    with closing(runtime_info_module.sqlite3.connect(":memory:")) as connection:
+        sqlite_source_id = connection.execute(
+            "SELECT sqlite_source_id()"
+        ).fetchone()[0]
+        sqlite_compile_options = sorted(
+            row[0] for row in connection.execute("PRAGMA compile_options")
+        )
     assert data["storage"] == {
         "sqlite_version": runtime_info_module.sqlite3.sqlite_version,
+        "sqlite_source_id": sqlite_source_id,
+        "sqlite_compile_options": sqlite_compile_options,
+        "sqlite_threadsafety": runtime_info_module.sqlite3.threadsafety,
         "parallel_job_execution_supported": _sqlite_parallel_jobs_supported(
             runtime_info_module.sqlite3.sqlite_version
         ),
@@ -155,6 +167,30 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
     assert "api_key" not in lowered
     assert "cookie" not in lowered
     assert "prompt" not in lowered
+
+
+def test_loaded_sqlite_identity_closes_its_memory_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_connect = runtime_info_module.sqlite3.connect
+    arguments: list[str] = []
+    connections: list[sqlite3.Connection] = []
+
+    def tracked_connect(database: str) -> sqlite3.Connection:
+        arguments.append(database)
+        connection = real_connect(database)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(runtime_info_module.sqlite3, "connect", tracked_connect)
+
+    source_id, compile_options = runtime_info_module._loaded_sqlite_identity()
+
+    assert arguments == [":memory:"]
+    assert source_id
+    assert compile_options == tuple(sorted(compile_options))
+    with pytest.raises(runtime_info_module.sqlite3.ProgrammingError):
+        connections[0].execute("SELECT 1")
 
 
 def test_runtime_info_does_not_call_network_or_subprocess(

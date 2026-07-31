@@ -109,6 +109,10 @@ def map_error(
         next_actions = (
             "Free space in the AllToNote machine-state location and retry",
         )
+    elif code == "sqlite_wal_gate_version_ineligible":
+        next_actions = (
+            "Run the Gate from a Runtime with an explicitly admitted SQLite build",
+        )
     elif code == "pack_trust_unconfigured":
         next_actions = ("Install a Runtime release with official Pack trust roots",)
     elif code == "pack_install_busy":

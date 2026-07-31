@@ -86,6 +86,9 @@ def _build_parser(
     runtime_doctor_parser = runtime_subparsers.add_parser("doctor")
     runtime_doctor_parser.add_argument("--dynamic", action="store_true")
     runtime_doctor_parser.add_argument("--json", action="store_true")
+    sqlite_wal_gate_parser = runtime_subparsers.add_parser("sqlite-wal-gate")
+    sqlite_wal_gate_parser.add_argument("--root", required=True, type=Path)
+    sqlite_wal_gate_parser.add_argument("--json", action="store_true")
     config_parser = subparsers.add_parser("config")
     config_subparsers = config_parser.add_subparsers(
         dest="config_command", required=True
@@ -1234,6 +1237,22 @@ def _runtime_command_result(
             versions=_versions(),
             human_lines=tuple(
                 f"{record['role']}: {record['path']}" for record in records
+            ),
+        )
+
+    if args.runtime_command == "sqlite-wal-gate":
+        from app.runtime_sqlite_gate import run_sqlite_wal_gate
+
+        report = run_sqlite_wal_gate(args.root)
+        return ApplicationResult(
+            command=command,
+            correlation_id=correlation_id,
+            ok=True,
+            data=report,
+            versions=_versions(),
+            human_lines=(
+                "SQLite WAL gate: scenarios passed; "
+                "parallel Job execution remains disabled",
             ),
         )
 

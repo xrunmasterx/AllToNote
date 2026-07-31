@@ -5,6 +5,7 @@ import platform
 import shutil
 import sqlite3
 from collections.abc import Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Callable
 
@@ -56,6 +57,9 @@ class RuntimeInfo:
     operating_system: str
     architecture: str
     sqlite_version: str
+    sqlite_source_id: str
+    sqlite_compile_options: tuple[str, ...]
+    sqlite_threadsafety: int
     sqlite_parallel_jobs_supported: bool
     engine_supported: bool
     engine_running: bool
@@ -83,6 +87,9 @@ class RuntimeInfo:
             },
             "storage": {
                 "sqlite_version": self.sqlite_version,
+                "sqlite_source_id": self.sqlite_source_id,
+                "sqlite_compile_options": self.sqlite_compile_options,
+                "sqlite_threadsafety": self.sqlite_threadsafety,
                 "parallel_job_execution_supported": (
                     self.sqlite_parallel_jobs_supported
                 ),
@@ -143,6 +150,15 @@ def _sqlite_parallel_jobs_supported(version: str) -> bool:
     )
 
 
+def _loaded_sqlite_identity() -> tuple[str, tuple[str, ...]]:
+    with closing(sqlite3.connect(":memory:")) as connection:
+        source_id = connection.execute("SELECT sqlite_source_id()").fetchone()[0]
+        compile_options = tuple(
+            sorted(row[0] for row in connection.execute("PRAGMA compile_options"))
+        )
+    return source_id, compile_options
+
+
 def build_runtime_info(
     *,
     registry: CapabilityRegistry | None = None,
@@ -152,6 +168,7 @@ def build_runtime_info(
 ) -> RuntimeInfo:
     runtime_lock = lock_loader()
     operating_system, architecture = _normalized_platform()
+    sqlite_source_id, sqlite_compile_options = _loaded_sqlite_identity()
     active_paths = paths or resolve_runtime_paths()
     active_environ = os.environ if environ is None else environ
     media_basic_installed = official_video_pack_installed(
@@ -174,6 +191,9 @@ def build_runtime_info(
         operating_system=operating_system,
         architecture=architecture,
         sqlite_version=sqlite3.sqlite_version,
+        sqlite_source_id=sqlite_source_id,
+        sqlite_compile_options=sqlite_compile_options,
+        sqlite_threadsafety=sqlite3.threadsafety,
         sqlite_parallel_jobs_supported=_sqlite_parallel_jobs_supported(
             sqlite3.sqlite_version
         ),

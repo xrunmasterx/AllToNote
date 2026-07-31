@@ -67,11 +67,13 @@ Stop condition：
 
 当前进展（2026-07-31，Task 2 尚未完成）：
 
-- `runtime info` 已报告实际 SQLite 版本与 `parallel_job_execution_supported`；
+- `runtime info` 已报告当前进程实际加载的 SQLite 版本、source id、compile options、DB-API threadsafety 与 `parallel_job_execution_supported`；这些是运行时诊断，不是安装包二进制来源证明；
 - `runtime doctor` 对未进入项目验证白名单的版本给出结构化 warn，现有单 Job/单 writer 保护保持不变；
 - 当前白名单仅含已知修复并按本项目版本线确认的 3.44.6+、3.50.7+、3.51.3+；3.52/3.53 即使上游版本包含修复，也要等对应开发、CI、安装包完成多连接 WAL Gate 后才可加入，不能只凭版本大小放行；
 - JobStore 已按 SQLite primary result code 将 `SQLITE_BUSY`/`SQLITE_LOCKED`（含 extended code）映射为脱敏、可重试的 `job_store_busy`，Video/Document 不再把该临时争用永久写成失败；没有加入事务自动重放，也没有解除现有串行保护；
-- 1/4/8/16 connection、checkpoint/crash-reopen、writer-lock 测量与安装包 SQLite 身份验证仍待完成。
+- 已增加显式 `runtime sqlite-wal-gate`：使用隔离临时 JobStore、spawn 子进程与 1/4/8/16 connection 覆盖短写、混合读写、在线 PASSIVE checkpoint、forced busy 后显式重试、portable commit writer-lock、进程崩溃/重开、最终 TRUNCATE/integrity/foreign-key 检查；子进程 SQLite version/source id 必须与父进程一致；
+- Gate 对未进入项目白名单的 SQLite 在创建临时状态和 spawn 前 fail closed。当前开发进程仍是 SQLite 3.50.4，因此只保留缩小配置的注入式 Gate 回归和一次非准入开发诊断，不能记为发布通过；
+- Task 2 仍待：升级并锁定开发、CI 与正式安装包的 SQLite，使用最终安装包解释器运行完整 Gate，绑定安装包内实际 SQLite 二进制清单/哈希，并补齐 legacy JobStore 的安装包回归证据。
 
 ## Task 3: [ ] 实现按需 Engine 单实例生命周期
 
