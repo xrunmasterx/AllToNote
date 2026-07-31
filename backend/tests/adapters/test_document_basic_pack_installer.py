@@ -10,7 +10,11 @@ import pytest
 from filelock import Timeout
 
 from app.adapters.documents import document_basic_pack_installer as installer
-from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.adapters.documents.document_basic_pack import (
+    PACK_ID,
+    PACK_VERSION,
+    resolve_document_basic_pack_paths,
+)
 from app.adapters.documents.document_basic_pack_installer import (
     install_document_basic_pack,
 )
@@ -73,7 +77,10 @@ def test_installer_publishes_verified_generation_then_active_pointer(
         pointer,
         separators=(",", ":"),
     ).encode("utf-8")
-    assert (generation.parent.parent / "install.lock").is_file()
+    assert (result.active_pointer.parent / "install.lock").is_file()
+    assert generation.parent == (
+        result.active_pointer.parents[3] / "pack-store-v1" / "d"
+    )
 
 
 def test_installer_is_idempotent_without_rewriting_active_pointer(
@@ -131,6 +138,43 @@ def test_installer_repair_keeps_full_materialize_and_probe_path(
     assert result.result == "already_active"
     assert len(materializations) == 1
     assert len(probes) == 1
+
+
+def test_repair_migrates_verified_legacy_generation_to_short_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(tmp_path)
+    first = _install(tmp_path, source)
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    legacy_root = (
+        paths.data_dir / "packs" / PACK_ID / PACK_VERSION / "installs"
+    )
+    legacy_root.mkdir()
+    legacy_generation = legacy_root / first.generation.name
+    first.generation.rename(legacy_generation)
+    active_bytes = first.active_pointer.read_bytes()
+    short_store = paths.data_dir / "pack-store-v1" / "d"
+    original_sync = installer._sync_directory
+
+    def fail_post_migration_sync(path: Path) -> None:
+        if path == short_store:
+            raise OSError("injected post-migration sync failure")
+        original_sync(path)
+
+    monkeypatch.setattr(installer, "_sync_directory", fail_post_migration_sync)
+
+    repaired = _install(tmp_path, source, repair=True)
+
+    assert repaired.result == "repaired"
+    assert repaired.generation.parent == short_store
+    assert repaired.generation.is_dir()
+    assert legacy_generation.is_dir()
+    assert repaired.active_pointer.read_bytes() == active_bytes
+    resolved = resolve_document_basic_pack_paths(paths, {})
+    assert resolved is not None
+    assert resolved[0].is_relative_to(repaired.generation)
+    assert resolved[1].is_relative_to(repaired.generation)
 
 
 def test_installer_already_active_does_not_require_source_payload(tmp_path: Path) -> None:
@@ -358,7 +402,13 @@ def test_installer_preserves_inactive_generation_when_activation_fails(
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
     digest = hashlib.sha256((source / "manifest.json").read_bytes()).hexdigest()
     assert not (pack_root / "active.json").exists()
-    assert (pack_root / "installs" / digest / "receipt.json").is_file()
+    assert (
+        paths.data_dir
+        / "pack-store-v1"
+        / "d"
+        / digest
+        / "receipt.json"
+    ).is_file()
 
 
 def test_installer_treats_replace_as_activation_commit_point(

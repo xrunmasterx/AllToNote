@@ -284,6 +284,9 @@ def test_pack_domain_error_uses_frozen_exit_mapping(
 
     assert exit_code == expected_exit
     assert envelope["error"]["code"] == "pack_test_failure"
+    assert envelope["error"]["next_actions"] == [
+        "Run pack doctor for the affected Pack before retrying"
+    ]
 
 
 def test_pack_unexpected_failure_is_safe_internal_error(capsys) -> None:

@@ -35,6 +35,11 @@ from app.adapters.documents.document_basic_pack_verifier import (
     verify_document_basic_pack_manifest,
     verify_document_basic_pack_source,
 )
+from app.adapters.pack_layout import (
+    legacy_generation_root,
+    managed_generation_root,
+    managed_pack_root,
+)
 from app.core.errors import DomainError, ErrorCategory
 from app.runtime_paths import RuntimePaths
 
@@ -191,18 +196,22 @@ def _lexically_exists(path: Path) -> bool:
 
 
 def _ensure_managed_roots(paths: RuntimePaths) -> tuple[Path, Path]:
-    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
-    installs_root = pack_root / "installs"
+    pack_root = managed_pack_root(paths.data_dir, PACK_ID, PACK_VERSION)
+    installs_root = managed_generation_root(paths.data_dir, PACK_ID)
     try:
         paths.data_dir.mkdir(parents=True, exist_ok=True)
         if not _ordinary_directory(paths.data_dir):
             raise _install_conflict()
-        current = paths.data_dir
-        for part in ("packs", PACK_ID, PACK_VERSION, "installs"):
-            current /= part
-            current.mkdir(exist_ok=True)
-            if not _ordinary_directory(current):
-                raise _install_conflict()
+        for relative_parts in (
+            ("packs", PACK_ID, PACK_VERSION),
+            ("pack-store-v1", installs_root.name),
+        ):
+            current = paths.data_dir
+            for part in relative_parts:
+                current /= part
+                current.mkdir(exist_ok=True)
+                if not _ordinary_directory(current):
+                    raise _install_conflict()
     except DomainError:
         raise
     except OSError as error:
@@ -558,8 +567,8 @@ def install_document_basic_pack(
             "Managed document-basic Pack installation is blocked by an active override",
         )
 
-    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
-    source_root = _validate_source_location(Path(source), pack_root)
+    pack_root = managed_pack_root(paths.data_dir, PACK_ID, PACK_VERSION)
+    source_root = _validate_source_location(Path(source), paths.data_dir)
     pack_root, installs_root = _ensure_managed_roots(paths)
     lock_path = pack_root / "install.lock"
     try:
@@ -568,6 +577,11 @@ def install_document_basic_pack(
             if not _ordinary_file(lock_path):
                 raise _install_conflict()
             _cleanup_orphans(pack_root, installs_root)
+            legacy_root = legacy_generation_root(
+                paths.data_dir, PACK_ID, PACK_VERSION
+            )
+            if _ordinary_directory(legacy_root):
+                _cleanup_orphans(pack_root, legacy_root)
             active_path = pack_root / "active.json"
             active = _read_active_state(active_path)
             if active.kind == "valid" and not repair:
@@ -585,6 +599,18 @@ def install_document_basic_pack(
                         trusted_keys=trusted_keys,
                         platform_tag=platform_tag,
                     )
+                    if installed is None and not _lexically_exists(generation):
+                        legacy_generation = legacy_generation_root(
+                            paths.data_dir, PACK_ID, PACK_VERSION
+                        ) / digest
+                        installed = _verified_existing_generation(
+                            legacy_generation,
+                            manifest_sha256=requested.manifest_sha256,
+                            trusted_keys=trusted_keys,
+                            platform_tag=platform_tag,
+                        )
+                        if installed is not None:
+                            generation = legacy_generation
                     if installed is not None:
                         if _read_active_state(active_path) != active:
                             raise _install_conflict()
@@ -633,12 +659,36 @@ def install_document_basic_pack(
                     trusted_keys=trusted_keys,
                     platform_tag=platform_tag,
                 )
+                if (
+                    existing_generation is None
+                    and not _lexically_exists(generation)
+                    and not repair
+                    and active.kind == "valid"
+                    and active.digest == digest
+                ):
+                    legacy_generation = legacy_generation_root(
+                        paths.data_dir, PACK_ID, PACK_VERSION
+                    ) / digest
+                    existing_generation = _verified_existing_generation(
+                        legacy_generation,
+                        manifest_sha256=verified.manifest_sha256,
+                        trusted_keys=trusted_keys,
+                        platform_tag=platform_tag,
+                    )
+                    if existing_generation is not None:
+                        generation = legacy_generation
                 generation_exists = existing_generation is not None
                 if active.kind == "valid" and not generation_exists and not repair:
                     raise _install_conflict()
                 if not generation_exists:
                     stage.rename(generation)
-                    _sync_directory(installs_root)
+                    try:
+                        _sync_directory(installs_root)
+                    except OSError:
+                        if not (
+                            active.kind == "valid" and active.digest == digest
+                        ):
+                            raise
 
                 if active.kind == "absent":
                     _write_active_pointer(

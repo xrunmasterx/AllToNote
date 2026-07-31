@@ -9,6 +9,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from app.adapters.pack_layout import (
+    legacy_generation_root,
+    managed_generation_root,
+    managed_pack_root,
+)
+
 
 _CONTROL_FILE_LIMIT = 16 * 1024
 _ACTIVE_KEYS = frozenset(
@@ -156,7 +162,9 @@ def official_video_pack_installed(
 ) -> bool:
     """Return a bounded, non-executing readiness hint for Runtime info."""
 
-    pack_root = Path(data_dir) / "packs" / contract.pack_id / contract.pack_version
+    pack_root = managed_pack_root(
+        data_dir, contract.pack_id, contract.pack_version
+    )
     try:
         active_bytes = _read_regular_file(
             pack_root / "active.json", _CONTROL_FILE_LIMIT
@@ -186,14 +194,23 @@ def official_video_pack_installed(
         or match is None
     ):
         return False
-    installs_root = pack_root / "installs"
-    generation = installs_root / match.group(1)
+    generation_root = managed_generation_root(data_dir, contract.pack_id)
+    generation = generation_root / match.group(1)
+    try:
+        generation.lstat()
+    except FileNotFoundError:
+        generation_root = legacy_generation_root(
+            data_dir, contract.pack_id, contract.pack_version
+        )
+        generation = generation_root / match.group(1)
+    except OSError:
+        return False
     controlled_directories = (
         Path(data_dir),
         Path(data_dir) / "packs",
         Path(data_dir) / "packs" / contract.pack_id,
         pack_root,
-        installs_root,
+        generation_root,
         generation,
     )
     if not all(_ordinary_directory(path) for path in controlled_directories):

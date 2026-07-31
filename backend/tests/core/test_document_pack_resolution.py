@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.adapters.pack_layout import (
+    legacy_generation_root,
+    managed_generation_root,
+)
 from app.adapters.video_packs.official_video_pack import MEDIA_BASIC
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError
@@ -45,7 +49,8 @@ def _managed_python_relative_path() -> Path:
 def _create_managed_install(paths: RuntimePaths) -> tuple[Path, Path]:
     digest = "a" * 64
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
-    generation = pack_root / "installs" / digest
+    pack_root.mkdir(parents=True)
+    generation = managed_generation_root(paths.data_dir, PACK_ID) / digest
     python = generation / _managed_python_relative_path()
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
@@ -114,7 +119,7 @@ def test_document_pack_managed_generation_fails_closed_when_invalid(
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
     pointer_path = pack_root / "active.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    generation = pack_root / "installs" / ("a" * 64)
+    generation = managed_generation_root(paths.data_dir, PACK_ID) / ("a" * 64)
     receipt_path = generation / "receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
 
@@ -161,6 +166,25 @@ def test_document_pack_invalid_active_pointer_never_falls_back_to_legacy(
         _resolve_document_worker_config(paths, {})
 
     assert raised.value.code == "document_pack_unavailable"
+
+
+def test_document_pack_keeps_read_only_legacy_generation_compatibility(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    python, artifacts = _create_managed_install(paths)
+    digest = "a" * 64
+    legacy_root = legacy_generation_root(paths.data_dir, PACK_ID, PACK_VERSION)
+    legacy_root.mkdir(parents=True)
+    legacy_generation = legacy_root / digest
+    python.parents[1].rename(legacy_generation)
+
+    config = _resolve_document_worker_config(paths, {})
+
+    assert config.python_executable == (
+        legacy_generation / _managed_python_relative_path()
+    )
+    assert config.artifacts_path == legacy_generation / "artifacts"
 
 
 @pytest.mark.parametrize("schema_version", (True, False))

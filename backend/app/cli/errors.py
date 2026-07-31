@@ -118,9 +118,9 @@ def map_error(
     elif code == "pack_install_busy":
         next_actions = ("Wait for the current Pack installation to finish and retry",)
     elif code == "pack_override_active":
-        next_actions = ("Remove both document-basic development overrides and retry",)
+        next_actions = ("Remove the active development Pack override and retry",)
     elif code.startswith("pack_"):
-        next_actions = ("Inspect document-basic with pack doctor before retrying",)
+        next_actions = ("Run pack doctor for the affected Pack before retrying",)
     return MappedCliError(
         error=CliError(
             code=code,

@@ -10,6 +10,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app.adapters.pack_layout import (
+    legacy_generation_root,
+    managed_generation_root,
+    managed_pack_root,
+)
+
 if TYPE_CHECKING:
     from app.runtime_paths import RuntimePaths
 
@@ -181,8 +187,13 @@ def _managed_pack_paths(
     ):
         return None
 
-    installs_root = pack_root / "installs"
+    installs_root = managed_generation_root(trusted_data_root, PACK_ID)
     generation = installs_root / match.group(1)
+    if not _lexically_exists(generation):
+        installs_root = legacy_generation_root(
+            trusted_data_root, PACK_ID, PACK_VERSION
+        )
+        generation = installs_root / match.group(1)
     receipt = _read_control_file(generation / "receipt.json")
     if (
         not _ordinary_directory(installs_root)
@@ -212,7 +223,7 @@ def _managed_pack_paths(
         resolved_artifacts = artifacts_path.resolve(strict=True)
         if (
             not resolved_pack_root.is_relative_to(resolved_data_root)
-            or not resolved_installs_root.is_relative_to(resolved_pack_root)
+            or not resolved_installs_root.is_relative_to(resolved_data_root)
             or not resolved_generation.is_relative_to(resolved_installs_root)
             or not resolved_python.is_relative_to(resolved_generation)
             or not resolved_artifacts.is_relative_to(resolved_generation)
@@ -245,7 +256,7 @@ def resolve_document_basic_pack_paths(
             Path(python_override).expanduser().resolve(strict=False),
             Path(artifacts_override).expanduser().resolve(strict=False),
         )
-    pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
+    pack_root = managed_pack_root(paths.data_dir, PACK_ID, PACK_VERSION)
     active_pointer = pack_root / "active.json"
     if _lexically_exists(active_pointer):
         return _managed_pack_paths(pack_root, paths.data_dir)

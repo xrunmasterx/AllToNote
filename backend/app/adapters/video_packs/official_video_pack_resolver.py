@@ -6,8 +6,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from app.adapters.pack_layout import (
+    legacy_generation_root,
+    managed_generation_root,
+    managed_pack_root,
+)
 from app.adapters.video_packs.official_video_pack import OfficialVideoPackContract
-from app.adapters.video_packs.official_video_pack_installer import _read_active_state
+from app.adapters.video_packs.official_video_pack_installer import (
+    _lexically_exists,
+    _read_active_state,
+)
 from app.adapters.video_packs.official_video_pack_verifier import (
     PackTrustKey,
     verify_official_video_pack_generation,
@@ -56,11 +64,8 @@ class OfficialVideoPackResolver:
         self,
         contract: OfficialVideoPackContract,
     ) -> ResolvedOfficialVideoPack:
-        pack_root = (
-            self._paths.data_dir
-            / "packs"
-            / contract.pack_id
-            / contract.pack_version
+        pack_root = managed_pack_root(
+            self._paths.data_dir, contract.pack_id, contract.pack_version
         )
         state = _read_active_state(pack_root / "active.json", contract)
         if state.kind == "absent":
@@ -117,14 +122,17 @@ class OfficialVideoPackResolver:
         contract: OfficialVideoPackContract,
         manifest_sha256: str,
     ) -> ResolvedOfficialVideoPack:
-        installs_root = (
-            self._paths.data_dir
-            / "packs"
-            / contract.pack_id
-            / contract.pack_version
-            / "installs"
+        installs_root = managed_generation_root(
+            self._paths.data_dir, contract.pack_id
         )
         generation = installs_root / manifest_sha256.removeprefix("sha256:")
+        if not _lexically_exists(generation):
+            installs_root = legacy_generation_root(
+                self._paths.data_dir,
+                contract.pack_id,
+                contract.pack_version,
+            )
+            generation = installs_root / manifest_sha256.removeprefix("sha256:")
         try:
             resolved_data = self._paths.data_dir.resolve(strict=True)
             resolved_installs = installs_root.resolve(strict=True)

@@ -28,6 +28,11 @@ from app.adapters.documents.document_basic_pack_verifier import (
     _is_link_or_reparse,
     _read_regular_file,
 )
+from app.adapters.pack_layout import (
+    legacy_generation_root,
+    managed_generation_root,
+    managed_pack_root,
+)
 from app.adapters.video_packs.official_video_pack import OfficialVideoPackContract
 from app.adapters.video_packs.official_video_pack_verifier import (
     PackTrustKey,
@@ -85,23 +90,24 @@ def _ensure_managed_roots(
     paths: RuntimePaths,
     contract: OfficialVideoPackContract,
 ) -> tuple[Path, Path]:
-    pack_root = paths.data_dir / "packs" / contract.pack_id / contract.pack_version
-    installs_root = pack_root / "installs"
+    pack_root = managed_pack_root(
+        paths.data_dir, contract.pack_id, contract.pack_version
+    )
+    installs_root = managed_generation_root(paths.data_dir, contract.pack_id)
     try:
         paths.data_dir.mkdir(parents=True, exist_ok=True)
         if not _ordinary_directory(paths.data_dir):
             raise _install_conflict(contract)
-        current = paths.data_dir
-        for part in (
-            "packs",
-            contract.pack_id,
-            contract.pack_version,
-            "installs",
+        for relative_parts in (
+            ("packs", contract.pack_id, contract.pack_version),
+            ("pack-store-v1", installs_root.name),
         ):
-            current /= part
-            current.mkdir(exist_ok=True)
-            if not _ordinary_directory(current):
-                raise _install_conflict(contract)
+            current = paths.data_dir
+            for part in relative_parts:
+                current /= part
+                current.mkdir(exist_ok=True)
+                if not _ordinary_directory(current):
+                    raise _install_conflict(contract)
     except DomainError:
         raise
     except OSError as error:
@@ -268,8 +274,10 @@ def install_official_video_pack(
             f"Managed {contract.pack_id} Pack installation is blocked by an active override",
         )
 
-    pack_root = paths.data_dir / "packs" / contract.pack_id / contract.pack_version
-    source_root = _validate_source_location(Path(source), pack_root)
+    pack_root = managed_pack_root(
+        paths.data_dir, contract.pack_id, contract.pack_version
+    )
+    source_root = _validate_source_location(Path(source), paths.data_dir)
     pack_root, installs_root = _ensure_managed_roots(paths, contract)
     lock_path = pack_root / "install.lock"
     try:
@@ -278,6 +286,11 @@ def install_official_video_pack(
             if not _ordinary_file(lock_path):
                 raise _install_conflict(contract)
             _cleanup_orphans(pack_root, installs_root)
+            legacy_root = legacy_generation_root(
+                paths.data_dir, contract.pack_id, contract.pack_version
+            )
+            if _ordinary_directory(legacy_root):
+                _cleanup_orphans(pack_root, legacy_root)
             stage = installs_root / f".stage-{uuid4().hex}"
             stage.mkdir()
             if not _ordinary_directory(stage):
@@ -321,11 +334,40 @@ def install_official_video_pack(
                     trusted_keys=trusted_keys,
                     platform_tag=platform_tag,
                 )
+                if (
+                    not generation_exists
+                    and not repair
+                    and active.kind == "valid"
+                    and active.digest == digest
+                ):
+                    legacy_generation = (
+                        legacy_generation_root(
+                            paths.data_dir,
+                            contract.pack_id,
+                            contract.pack_version,
+                        )
+                        / digest
+                    )
+                    if _verified_existing_generation(
+                        legacy_generation,
+                        contract=contract,
+                        manifest_sha256=verified.manifest_sha256,
+                        trusted_keys=trusted_keys,
+                        platform_tag=platform_tag,
+                    ):
+                        generation = legacy_generation
+                        generation_exists = True
                 if active.kind == "valid" and not generation_exists and not repair:
                     raise _install_conflict(contract)
                 if not generation_exists:
                     stage.rename(generation)
-                    _sync_directory(installs_root)
+                    try:
+                        _sync_directory(installs_root)
+                    except OSError:
+                        if not (
+                            active.kind == "valid" and active.digest == digest
+                        ):
+                            raise
 
                 if active.kind == "absent":
                     _write_active_pointer(
