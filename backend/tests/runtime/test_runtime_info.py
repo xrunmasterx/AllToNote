@@ -327,6 +327,8 @@ def test_runtime_doctor_explains_missing_document_pack(
         ("3.51.4", True),
         ("3.52.0", False),
         ("3.53.3", False),
+        ("3.53.4", True),
+        ("3.53.5", True),
         ("4.0.0", False),
         ("invalid", False),
     ),
@@ -352,7 +354,8 @@ def test_runtime_doctor_warns_when_sqlite_is_unsafe_for_parallel_wal(
     assert check.status == "warn"
     assert check.action == (
         "Use an AllToNote Runtime validated with SQLite 3.44.6+, 3.50.7+, "
-        "or 3.51.3+ on the same release line before enabling parallel Job execution"
+        "3.51.3+, or 3.53.4+ on the same release line before enabling parallel "
+        "Job execution"
     )
 
 

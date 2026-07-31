@@ -147,6 +147,7 @@ def _sqlite_parallel_jobs_supported(version: str) -> bool:
         (minor == 44 and patch >= 6)
         or (minor == 50 and patch >= 7)
         or (minor == 51 and patch >= 3)
+        or (minor == 53 and patch >= 4)
     )
 
 
@@ -333,8 +334,8 @@ def runtime_doctor(
                 if sqlite_safe
                 else (
                     "Use an AllToNote Runtime validated with SQLite 3.44.6+, "
-                    "3.50.7+, or 3.51.3+ on the same release line before "
-                    "enabling parallel Job execution"
+                    "3.50.7+, 3.51.3+, or 3.53.4+ on the same release line "
+                    "before enabling parallel Job execution"
                 )
             ),
             False,

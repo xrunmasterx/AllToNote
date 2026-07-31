@@ -51,11 +51,11 @@ Stop condition：
 验收：
 
 - [ ] 开发、CI 和安装包报告实际 SQLite 版本；
-- [ ] 最低版本为 3.50.7、3.51.3 或更高兼容修复版本；
+- [ ] 最低版本为 3.50.7、3.51.3、3.53.4 或项目实测的同版本线后续修复版本；
 - [ ] 不满足最低版本时高并发模式 fail closed 或明确降级；
-- [ ] 记录 1、4、8、16 connection 的短写、读写、checkpoint 和 busy 延迟；
-- [ ] 记录 portable commit writer-lock 持有时间；
-- [ ] busy/locked 被映射为稳定、可诊断的运行时错误或重试策略；
+- [x] 记录 1、4、8、16 connection 的短写、读写、checkpoint 和 busy 延迟；
+- [x] 记录 portable commit writer-lock 持有时间；
+- [x] busy/locked 被映射为稳定、可诊断的运行时错误或重试策略；
 - [ ] 不因预期未来压力迁移到 PostgreSQL/Redis；
 - [ ] legacy JobStore 可无损打开。
 
@@ -69,10 +69,11 @@ Stop condition：
 
 - `runtime info` 已报告当前进程实际加载的 SQLite 版本、source id、compile options、DB-API threadsafety 与 `parallel_job_execution_supported`；这些是运行时诊断，不是安装包二进制来源证明；
 - `runtime doctor` 对未进入项目验证白名单的版本给出结构化 warn，现有单 Job/单 writer 保护保持不变；
-- 当前白名单仅含已知修复并按本项目版本线确认的 3.44.6+、3.50.7+、3.51.3+；3.52/3.53 即使上游版本包含修复，也要等对应开发、CI、安装包完成多连接 WAL Gate 后才可加入，不能只凭版本大小放行；
+- 当前白名单仅含已知修复并按本项目版本线确认的 3.44.6+、3.50.7+、3.51.3+、3.53.4+；仍不按版本大小自动放行未知的新版本线；
 - JobStore 已按 SQLite primary result code 将 `SQLITE_BUSY`/`SQLITE_LOCKED`（含 extended code）映射为脱敏、可重试的 `job_store_busy`，Video/Document 不再把该临时争用永久写成失败；没有加入事务自动重放，也没有解除现有串行保护；
 - 已增加显式 `runtime sqlite-wal-gate`：使用隔离临时 JobStore、spawn 子进程与 1/4/8/16 connection 覆盖短写、混合读写、在线 PASSIVE checkpoint、forced busy 后显式重试、portable commit writer-lock、进程崩溃/重开、最终 TRUNCATE/integrity/foreign-key 检查；子进程 SQLite version/source id 必须与父进程一致；
-- Gate 对未进入项目白名单的 SQLite 在创建临时状态和 spawn 前 fail closed。当前开发进程仍是 SQLite 3.50.4，因此只保留缩小配置的注入式 Gate 回归和一次非准入开发诊断，不能记为发布通过；
+- Gate 对未进入项目白名单的 SQLite 在创建临时状态和 spawn 前 fail closed。2026-07-31 使用 SHA-256 为 `df901e84a896ff1ee720ad03377e0c8d8c2244fda79808aeeaff6316df1cb75c` 的官方 CPython 3.14.6 embeddable x64 与 SHA3-256 为 `deddee963c810d1eeac3ce5e15c7c41da21a1c54d7a39cf54fbf577d2f50de3a` 的官方 SQLite 3.53.4 x64 DLL 完成 ABI 探针；实际加载 source id 为 `2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc`；
+- 同一 SQLite 3.53.4 二进制随后通过完整 1/4/8/16 connection WAL Gate：短写、混合读写、在线 PASSIVE checkpoint、forced busy 后调用方显式重试、portable commit writer-lock、未提交/已确认崩溃恢复、最终 TRUNCATE、integrity、foreign-key 与 schema 版本检查均通过；Gate 仍明确报告 `parallel_job_execution_enabled=false`，尚未打开服务并行；
 - Task 2 仍待：升级并锁定开发、CI 与正式安装包的 SQLite，使用最终安装包解释器运行完整 Gate，绑定安装包内实际 SQLite 二进制清单/哈希，并补齐 legacy JobStore 的安装包回归证据。
 
 ## Task 3: [ ] 实现按需 Engine 单实例生命周期
