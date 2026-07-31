@@ -34,7 +34,7 @@ def _document_result(job_id: str) -> RecipeProduceResult:
             "source_metadata": new_typed_id("art"),
         },
         quality_overall="pass",
-        publish_eligible=True,
+        publish_eligible=False,
         usage={"pages": 4, "blocks": 82},
         warnings=(),
         idempotent=False,
@@ -124,7 +124,7 @@ def test_generic_document_produce_uses_file_contract_and_projects_result(
     assert envelope["data"]["result_kind"] == "document-note"
     assert envelope["data"]["quality"] == {
         "overall": "pass",
-        "publish_eligible": True,
+        "publish_eligible": False,
     }
     assert envelope["data"]["usage"] == {"blocks": 82, "pages": 4}
     assert envelope["data"]["primary_draft_artifact_id"] == (
@@ -265,5 +265,5 @@ def test_generic_job_result_refs_support_document_result() -> None:
         "artifacts": dict(result.artifacts),
         "primary_draft_artifact_id": result.artifacts["primary_draft"],
         "quality_overall": "pass",
-        "publish_eligible": True,
+        "publish_eligible": False,
     }

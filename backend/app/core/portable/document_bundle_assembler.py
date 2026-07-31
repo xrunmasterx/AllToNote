@@ -292,13 +292,14 @@ class DocumentBundleAssembler:
         parser_complete = (
             parser_status in {"", "success"} and not parsed.warnings
         )
-        publish_eligible = (
+        extraction_passed = (
             markdown_safe
             and has_native_text
             and pages_have_content
             and parser_complete
         )
-        quality_overall = "pass" if publish_eligible else "fail"
+        quality_overall = "pass" if extraction_passed else "fail"
+        publish_eligible = False
         quality_messages = list(parsed.warnings)
         if not markdown_safe:
             quality_messages.append("markdown-safety")
@@ -308,6 +309,7 @@ class DocumentBundleAssembler:
             quality_messages.append("empty-page")
         if not parser_complete:
             quality_messages.append("partial-extraction")
+        quality_messages.append("knowledge-note-quality-not-evaluated")
         quality = encode_json(
             {
                 "quality_report_schema_version": 1,
@@ -316,7 +318,10 @@ class DocumentBundleAssembler:
                     "artifact_id": ids["draft"],
                     "sha256": sha256_digest(draft),
                 },
-                "profile": {"id": "alltonote.document-note", "version": 1},
+                "profile": {
+                    "id": "alltonote.document-native-extraction",
+                    "version": 1,
+                },
                 "overall": quality_overall,
                 "checks": [
                     {
@@ -336,6 +341,11 @@ class DocumentBundleAssembler:
                     {
                         "id": "markdown-safety",
                         "status": "pass" if markdown_safe else "fail",
+                    },
+                    {
+                        "id": "knowledge-note-quality",
+                        "status": "skipped",
+                        "reason": "not-evaluated",
                     },
                 ],
                 "method": {"kind": "deterministic"},

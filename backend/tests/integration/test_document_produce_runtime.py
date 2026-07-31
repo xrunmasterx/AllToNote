@@ -194,6 +194,8 @@ def test_document_recipe_uses_generic_submit_and_survives_reopen(tmp_path: Path)
     assert isinstance(completed.result, RecipeProduceResult)
     assert completed.result.result_kind == "document-note"
     assert completed.result.usage == {"pages": 1, "blocks": 1}
+    assert completed.result.quality_overall == "pass"
+    assert completed.result.publish_eligible is False
     assert set(completed.result.artifacts) == {
         "evidence_set",
         "normalized_content",

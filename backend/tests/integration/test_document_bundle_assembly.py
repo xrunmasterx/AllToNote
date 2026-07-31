@@ -232,6 +232,9 @@ def test_document_candidate_renders_untrusted_pdf_text_without_markdown_authorit
             / f"{candidate.quality_report_artifact_id}.json"
         ).read_text(encoding="utf-8")
     )
+    receipt = json.loads(
+        (candidate.candidate.absolute_path / "receipt.json").read_text(encoding="utf-8")
+    )
     normalized_records = [
         json.loads(line)
         for line in (
@@ -263,10 +266,24 @@ def test_document_candidate_renders_untrusted_pdf_text_without_markdown_authorit
         table,
     ]
     assert candidate.quality_overall == "pass"
-    assert candidate.publish_eligible is True
-    assert {check["id"]: check["status"] for check in quality["checks"]}[
-        "markdown-safety"
-    ] == "pass"
+    assert candidate.publish_eligible is False
+    assert quality["profile"] == {
+        "id": "alltonote.document-native-extraction",
+        "version": 1,
+    }
+    checks = {check["id"]: check for check in quality["checks"]}
+    assert checks["markdown-safety"]["status"] == "pass"
+    assert checks["knowledge-note-quality"] == {
+        "id": "knowledge-note-quality",
+        "status": "skipped",
+        "reason": "not-evaluated",
+    }
+    assert "knowledge-note-quality-not-evaluated" in quality["messages"]
+    assert receipt["quality"] == {
+        "overall": "pass",
+        "publish_eligible": False,
+        "repair_attempts": 0,
+    }
 
 
 def test_document_candidate_fails_closed_when_final_markdown_validation_fails(
@@ -483,7 +500,7 @@ def test_document_literal_projection_blocks_gfm_autolinks_and_setext_headings(
     assert "<code>www.tracker.invalid/page</code>" in rendered
     assert "_<code>www.tracker.invalid/under</code>" in rendered
     assert "<code>reviewer@tracker.invalid</code>" in rendered
-    assert candidate.publish_eligible is True
+    assert candidate.publish_eligible is False
 
 
 def test_document_candidate_preserves_safe_docling_table_structure(
@@ -530,4 +547,4 @@ def test_document_candidate_preserves_safe_docling_table_structure(
     rendered = MarkdownIt("commonmark").enable("table").render(draft)
     assert "<table>" in rendered
     assert "A | B" in rendered
-    assert candidate.publish_eligible is True
+    assert candidate.publish_eligible is False

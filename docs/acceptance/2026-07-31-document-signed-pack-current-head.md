@@ -107,8 +107,9 @@ CLI 完成后给出 `alltonote draft show <draft-id>` 的明确阅读入口。
 - 为相同已激活 Pack 提供可信且快速的 no-op 安装路径；
 - 把 Document 的逻辑 Source 身份与内容 Revision 身份分开，避免相同内容的
   不同文件被误合并、同一路径修改后历史断裂；
-- 收紧 `publish_eligible` 的含义，使“解析安全通过”不被误读为“知识笔记质量
-  已经充分”；
+- 实现真正的 Document Knowledge Note 编译与语义质量 Gate；后续语义收紧已
+  将当前 native-extraction 结果固定为 `publish_eligible=false`，见
+  [`Document 原生提取质量边界`](2026-07-31-document-native-extraction-quality-boundary.md)；
 - Document worker 的取消、超时进程树收束，以及 SQLite 并发/锁竞争 Gate；
 - 扫描 PDF、OCR、混合文档、长文档和 PPTX 仍未进入支持声明。
 
