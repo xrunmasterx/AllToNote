@@ -311,6 +311,38 @@ def test_fake_recipe_commits_once_and_returns_bundle(
         ) is not None
 
 
+def test_wait_returns_cancelled_snapshot_when_job_changes_before_claim(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, calls = runtime_factory()
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="cancel-before-claim")
+    )
+    repository = runtime.job_repository
+    original_claim = repository.claim_job
+
+    def cancel_then_claim(
+        job_id: str,
+        owner_id: str,
+        *,
+        ttl_seconds: int,
+    ):
+        repository.cancel_job(job_id)
+        return original_claim(job_id, owner_id, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(repository, "claim_job", cancel_then_claim)
+
+    snapshot = runtime.wait_job(submitted.job_id)
+
+    assert snapshot.state is JobState.CANCELLED
+    assert calls.download == 0
+    assert calls.transcribe == 0
+    assert calls.model == 0
+    assert calls.commit == 0
+
+
 def test_v2_single_knowledge_note_uses_injected_compiler_and_draft_checkpoint(
     runtime_factory: Callable[..., tuple[object, object]],
     workspace_root: Path,

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import Attempt, Job, JobExecutionBinding
 
 
 MIN_LEASE_TTL_SECONDS = 1
@@ -42,6 +43,28 @@ class ExecutionAuthority:
                 ErrorCategory.INVALID_REQUEST,
                 "Execution authority requires a process-instance owner and token",
             )
+
+
+@dataclass(frozen=True)
+class JobExecutionAuthority(ExecutionAuthority):
+    job_id: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if type(self.job_id) is not str or not self.job_id.strip():
+            raise DomainError(
+                "execution_authority_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job execution authority requires a durable Job identity",
+            )
+
+
+@dataclass(frozen=True)
+class PersistedJobClaim:
+    job: Job
+    binding: JobExecutionBinding
+    authority: JobExecutionAuthority
+    active_attempt: Attempt | None
 
 
 @dataclass(frozen=True)
@@ -99,8 +122,10 @@ class ResourceLeaseStorePort(Protocol):
 __all__ = [
     "ExecutionAuthority",
     "HEAVY_PRODUCTION_RESOURCE_NAME",
+    "JobExecutionAuthority",
     "MAX_LEASE_TTL_SECONDS",
     "MIN_LEASE_TTL_SECONDS",
+    "PersistedJobClaim",
     "ResourceLease",
     "ResourceLeaseStorePort",
     "ResourceOwner",

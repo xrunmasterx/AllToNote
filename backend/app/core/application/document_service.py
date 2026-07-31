@@ -43,6 +43,7 @@ from app.core.jobs.model import (
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
     ExecutionAuthority,
+    JobExecutionAuthority,
     ResourceLease,
     ResourceLeaseStorePort,
     ResourceOwner,
@@ -51,6 +52,7 @@ from app.core.portable.document_bundle_assembler import DocumentBundleAssembler
 from app.core.ports.document import DocumentParserPort
 from app.core.ports.jobs import (
     AttemptStoragePort,
+    JobClaimRepositoryPort,
     PortableCommitReceipt,
     RecipeResultPlan,
     SourceIdentityBinding,
@@ -138,10 +140,18 @@ class DocumentKnowledgeCompilerPort(Protocol):
     ) -> DocumentKnowledgeVerificationV1: ...
 
 
+class _DocumentServiceRepositoryPort(
+    JobExecutionRepositoryPort,
+    JobClaimRepositoryPort,
+    Protocol,
+):
+    pass
+
+
 class DocumentService:
     def __init__(
         self,
-        repository: JobExecutionRepositoryPort,
+        repository: _DocumentServiceRepositoryPort,
         attempt_storage: AttemptStoragePort,
         parser: DocumentParserPort,
         portable: PortableWorkspacePort,
@@ -238,10 +248,25 @@ class DocumentService:
             return snapshot
         self._acquire_resource_lease()
         try:
-            authority = self._repository.acquire_scheduler_lease(
-                self._owner_id,
-                ttl_seconds=_LEASE_TTL_SECONDS,
-            )
+            try:
+                claim = self._repository.claim_job(
+                    job_id,
+                    self._owner_id,
+                    ttl_seconds=_LEASE_TTL_SECONDS,
+                )
+            except DomainError as error:
+                if error.code != "job_not_claimable":
+                    raise
+                snapshot = self.get_job(job_id)
+                if snapshot.state in {
+                    JobState.SUCCEEDED,
+                    JobState.FAILED,
+                    JobState.CANCELLED,
+                    JobState.WAITING_FOR_INPUT,
+                }:
+                    return snapshot
+                raise
+            authority = claim.authority
             try:
                 snapshot = self.get_job(job_id)
                 if snapshot.state in {
@@ -251,9 +276,7 @@ class DocumentService:
                     JobState.WAITING_FOR_INPUT,
                 }:
                     return snapshot
-                if snapshot.state is JobState.QUEUED:
-                    self._repository.transition_job(job_id, JobState.RUNNING)
-                _, active_attempt, _ = self._repository.get_job_details(job_id)
+                active_attempt = claim.active_attempt
                 try:
                     request = self._load_request(job_id)
                     if (
@@ -266,6 +289,8 @@ class DocumentService:
                             active_attempt.attempt_id,
                             authority,
                         )
+                        if active_attempt.state is AttemptState.CANCELLED:
+                            return self.get_job(job_id)
                         unknown = (
                             self._repository.reconcile_external_operations_after_process_loss(
                                 job_id,
@@ -293,7 +318,12 @@ class DocumentService:
                         "machine_lease_store_busy",
                     }:
                         raise
-                    self._fail_job(job_id, active_attempt, authority, error)
+                    try:
+                        self._fail_job(job_id, active_attempt, authority, error)
+                    except DomainError as convergence_error:
+                        if convergence_error.code == "job_claim_fenced":
+                            raise error from convergence_error
+                        raise
                     return self.get_job(job_id)
             finally:
                 try:
@@ -376,7 +406,11 @@ class DocumentService:
             lambda _execution: self._validate(request, checkpoint),
             resumed_attempt=resumed_attempt,
         )
-        attempt = self._repository.create_attempt(job_id, "commit")
+        attempt = self._repository.create_attempt(
+            job_id,
+            "commit",
+            authority=authority,
+        )
         attempt = self._repository.start_attempt(attempt.attempt_id, authority)
         return self._commit(request, checkpoint, attempt, authority)
 
@@ -749,7 +783,7 @@ class DocumentService:
         self,
         job_id: str,
         active_attempt: Attempt | None,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
         error: DomainError,
     ) -> None:
         job, current_attempt, _ = self._repository.get_job_details(job_id)
@@ -767,7 +801,7 @@ class DocumentService:
             job_id,
             ErrorDetail(error.code, error.category, error.message, error.details),
             attempt_id=running.attempt_id if running is not None else None,
-            authority=authority if running is not None else None,
+            authority=authority,
         )
 
 

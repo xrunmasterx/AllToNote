@@ -667,6 +667,100 @@ def test_document_cancellation_interrupts_parser_and_settles_job(
     assert active_attempt is None
 
 
+def test_document_wait_returns_cancelled_when_job_changes_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    service, repository = _service(
+        tmp_path / "machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    job_id, _ = _submit(service, repository, workspace, source)
+    original_claim = repository.claim_job
+
+    def cancel_then_claim(
+        claimed_job_id: str,
+        owner_id: str,
+        *,
+        ttl_seconds: int,
+    ):
+        repository.cancel_job(claimed_job_id)
+        return original_claim(
+            claimed_job_id,
+            owner_id,
+            ttl_seconds=ttl_seconds,
+        )
+
+    monkeypatch.setattr(repository, "claim_job", cancel_then_claim)
+
+    completed = service.wait_job(job_id)
+
+    assert completed.state is JobState.CANCELLED
+    assert parser.calls == 0
+
+
+def test_document_fenced_heartbeat_preserves_authority_loss_error(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    heartbeat_failed = threading.Event()
+    repository: SqliteJobRepository
+
+    class FencingParser(_Parser):
+        def parse(
+            self,
+            source: Path,
+            *,
+            work_root: Path,
+            cancellation_token,
+        ) -> ParsedDocument:
+            repository._clock = lambda: 302_000
+            repository.acquire_scheduler_lease(
+                "replacement-owner",
+                ttl_seconds=300,
+            )
+            assert heartbeat_failed.wait(timeout=2)
+            return super().parse(
+                source,
+                work_root=work_root,
+                cancellation_token=cancellation_token,
+            )
+
+    service, repository = _service(
+        tmp_path / "machine",
+        FencingParser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    repository._clock = lambda: 1_000
+    service._checkpoint_runner.heartbeat_interval_seconds = 0.01
+    original_heartbeat = repository.heartbeat_scheduler_lease
+
+    def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
+        try:
+            return original_heartbeat(authority, ttl_seconds=ttl_seconds)
+        except BaseException:
+            if threading.current_thread() is not threading.main_thread():
+                heartbeat_failed.set()
+            raise
+
+    repository.heartbeat_scheduler_lease = observe_heartbeat  # type: ignore[method-assign]
+    job_id, router = _submit(service, repository, workspace, source)
+
+    with pytest.raises(DomainError, match="scheduler_lease_lost"):
+        router.wait_job(job_id)
+
+    assert repository.latest_checkpoint(job_id, "parse") is None
+
+
 def test_document_source_identity_tracks_path_while_revision_tracks_bytes(
     tmp_path: Path,
 ) -> None:

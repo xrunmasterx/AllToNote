@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
+from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,9 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.cancellation import CancellationToken
-from app.core.jobs.model import AttemptState, JobExecutionBinding
+from app.core.jobs.external_operation import ExternalOutcome
+from app.core.jobs.model import AttemptState, Job, JobExecutionBinding
+from app.core.jobs.resource_lease import JobExecutionAuthority
 from app.core.jobs.state_machine import (
     LEGAL_ATTEMPT_TRANSITIONS,
     LEGAL_JOB_TRANSITIONS,
@@ -613,6 +616,25 @@ def test_authorize_attempt_storage_maps_busy_statement(
     assert "private" not in str(raised.value)
 
 
+def _claim_job_in_process(
+    machine_root: str,
+    job_id: str,
+    owner_id: str,
+    barrier,
+    results,
+) -> None:
+    repository = SqliteJobRepository.open(Path(machine_root))
+    barrier.wait()
+    try:
+        claim = repository.claim_job(job_id, owner_id, ttl_seconds=30)
+    except DomainError as error:
+        results.put(("error", error.code, None))
+    else:
+        results.put(
+            ("claimed", claim.authority.owner_id, claim.authority.fencing_token)
+        )
+
+
 def test_version_one_database_migrates_execution_binding_and_reopens(
     tmp_path: Path,
 ) -> None:
@@ -740,6 +762,418 @@ def test_new_job_persists_exact_execution_binding(repo: SqliteJobRepository) -> 
     )
 
     assert repo.get_job_execution_binding(job.job_id) == binding
+
+
+def _claim_fixture_job(
+    repo: SqliteJobRepository,
+    *,
+    client_request_id: str,
+) -> tuple[Job, JobExecutionBinding]:
+    binding = JobExecutionBinding(
+        recipe_id="alltonote.video-course-note",
+        recipe_version=1,
+        executor_id="alltonote.video",
+        executor_version=1,
+        pack_id="media-basic",
+        pack_version="builtin-v1",
+    )
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local-user",
+        client_request_id=client_request_id,
+        execution_binding=binding,
+    )
+    return job, binding
+
+
+def test_claim_job_atomically_binds_scheduler_and_transitions_same_job(
+    tmp_path: Path,
+) -> None:
+    now_ms = 10_000
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-store",
+        clock=lambda: now_ms,
+    )
+    job, binding = _claim_fixture_job(repo, client_request_id="claim-one")
+
+    claim = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=30)
+
+    assert claim.job.job_id == job.job_id
+    assert claim.job.state is JobState.RUNNING
+    assert claim.binding == binding
+    assert claim.authority.job_id == job.job_id
+    assert claim.authority.owner_id == "engine-owner-a"
+    assert claim.authority.fencing_token == 1
+    with repo._connect() as connection:
+        lease = connection.execute(
+            "SELECT job_id, owner, fencing_token, expires_at FROM leases "
+            "WHERE lease_name = 'scheduler'"
+        ).fetchone()
+    assert tuple(lease) == (job.job_id, "engine-owner-a", 1, "40000")
+
+
+def test_claim_job_is_idempotent_for_same_owner_and_busy_for_other_work(
+    tmp_path: Path,
+) -> None:
+    now_ms = 20_000
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-idempotency-store",
+        clock=lambda: now_ms,
+    )
+    first, _ = _claim_fixture_job(repo, client_request_id="claim-first")
+    second, _ = _claim_fixture_job(repo, client_request_id="claim-second")
+    original = repo.claim_job(first.job_id, "engine-owner-a", ttl_seconds=30)
+
+    repeated = repo.claim_job(first.job_id, "engine-owner-a", ttl_seconds=60)
+
+    assert repeated.authority == original.authority
+    with pytest.raises(DomainError, match="scheduler_busy"):
+        repo.claim_job(first.job_id, "engine-owner-b", ttl_seconds=30)
+    with pytest.raises(DomainError, match="scheduler_busy"):
+        repo.claim_job(second.job_id, "engine-owner-a", ttl_seconds=30)
+    assert repo.get_job_details(second.job_id)[0].state is JobState.QUEUED
+
+
+def test_expired_job_claim_is_taken_over_with_a_new_fencing_token(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 30_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-takeover-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-takeover")
+    first = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    now["value"] = 31_001
+
+    second = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+
+    assert second.authority.job_id == job.job_id
+    assert second.authority.fencing_token == first.authority.fencing_token + 1
+    assert repo.release_scheduler_lease(first.authority) is False
+    with pytest.raises(DomainError, match="scheduler_lease_lost"):
+        repo.heartbeat_scheduler_lease(first.authority, ttl_seconds=30)
+    assert repo.heartbeat_scheduler_lease(second.authority, ttl_seconds=60) == (
+        second.authority
+    )
+
+
+def test_cancelled_running_job_takeover_settles_without_replacement_or_work(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 32_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-cancel-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-cancel")
+    first = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    attempt = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=first.authority,
+    )
+    attempt = repo.start_attempt(attempt.attempt_id, first.authority)
+    assert repo.cancel_job(job.job_id).state is JobState.RUNNING
+    now["value"] = 33_001
+
+    cancelled = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+
+    assert cancelled.job.state is JobState.CANCELLED
+    assert cancelled.active_attempt is None
+    attempts = repo.list_attempts(job.job_id)
+    assert len(attempts) == 1
+    assert attempts[0].attempt_id == attempt.attempt_id
+    assert attempts[0].state is AttemptState.CANCELLED
+
+
+def test_cancel_race_after_claim_before_takeover_settles_without_replacement(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 33_500}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-cancel-race-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-cancel-race")
+    first = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    attempt = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=first.authority,
+    )
+    attempt = repo.start_attempt(attempt.attempt_id, first.authority)
+    now["value"] = 34_501
+    successor = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+    assert successor.active_attempt == attempt
+    assert repo.cancel_job(job.job_id).state is JobState.RUNNING
+
+    settled = repo.take_over_running_attempt(
+        job.job_id,
+        attempt.attempt_id,
+        successor.authority,
+    )
+
+    assert settled.attempt_id == attempt.attempt_id
+    assert settled.state is AttemptState.CANCELLED
+    assert repo.get_job(job.job_id).state is JobState.CANCELLED
+    assert len(repo.list_attempts(job.job_id)) == 1
+
+
+def test_claim_after_crash_between_create_and_start_reuses_single_pending_attempt(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 34_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-pending-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-pending")
+    first = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    pending = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=first.authority,
+    )
+    now["value"] = 35_001
+
+    resumed = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+
+    assert resumed.active_attempt is not None
+    assert resumed.active_attempt.attempt_id == pending.attempt_id
+    assert resumed.active_attempt.state is AttemptState.RUNNING
+    assert resumed.active_attempt.fencing_token == resumed.authority.fencing_token
+    assert len(repo.list_attempts(job.job_id)) == 1
+
+
+def test_legacy_acquire_during_live_job_claim_returns_usable_bound_authority(
+    tmp_path: Path,
+) -> None:
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-legacy-store",
+        clock=lambda: 36_000,
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-legacy")
+    claim = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=30)
+
+    renewed = repo.acquire_scheduler_lease(
+        "engine-owner-a",
+        ttl_seconds=60,
+    )
+
+    assert isinstance(renewed, JobExecutionAuthority)
+    assert renewed == claim.authority
+    assert repo.heartbeat_scheduler_lease(renewed, ttl_seconds=60) == renewed
+    assert repo.release_scheduler_lease(renewed) is True
+
+
+def test_claim_job_failure_rolls_back_lease_binding_and_running_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine_root = tmp_path / "claim-rollback-store"
+    repo = SqliteJobRepository.open(machine_root, clock=lambda: 35_000)
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-rollback")
+    original_get_job = repo._get_job
+    calls = 0
+
+    def fail_after_transition(connection, job_id: str):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected claim commit failure")
+        return original_get_job(connection, job_id)
+
+    monkeypatch.setattr(repo, "_get_job", fail_after_transition)
+
+    with pytest.raises(RuntimeError, match="injected claim commit failure"):
+        repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=30)
+
+    reopened = SqliteJobRepository.open(machine_root)
+    assert reopened.get_job_details(job.job_id)[0].state is JobState.QUEUED
+    with reopened._connect() as connection:
+        assert connection.execute("SELECT 1 FROM leases").fetchone() is None
+
+
+def test_stale_job_claim_cannot_transition_or_create_attempt(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 40_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-fencing-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-fencing")
+    stale = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    now["value"] = 41_001
+    current = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.transition_job(
+            job.job_id,
+            JobState.FAILED,
+            authority=stale.authority,
+        )
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.create_attempt(
+            job.job_id,
+            "resolve",
+            authority=stale.authority,
+        )
+    assert repo.get_job_details(job.job_id)[0].state is JobState.RUNNING
+    assert repo.list_attempts(job.job_id) == ()
+
+    attempt = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=current.authority,
+    )
+    assert attempt.job_id == job.job_id
+
+
+def test_live_job_claim_cannot_be_bypassed_by_authorityless_mutation(
+    tmp_path: Path,
+) -> None:
+    repo = SqliteJobRepository.open(tmp_path / "claim-omission-store")
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-omission")
+    claim = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=30)
+
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.transition_job(job.job_id, JobState.FAILED)
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.create_attempt(job.job_id, "resolve")
+
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
+    assert repo.list_attempts(job.job_id) == ()
+    attempt = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=claim.authority,
+    )
+    assert attempt.job_id == job.job_id
+
+
+def test_stale_or_omitted_claim_cannot_settle_successor_pending_attempt(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 42_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-pending-fencing-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-pending-fencing")
+    stale = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    now["value"] = 43_001
+    current = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+    pending = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=current.authority,
+    )
+
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.transition_attempt(
+            pending.attempt_id,
+            AttemptState.CANCELLED,
+            authority=stale.authority,
+        )
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.transition_attempt(
+            pending.attempt_id,
+            AttemptState.CANCELLED,
+        )
+
+    assert repo.get_job_details(job.job_id)[1] == pending
+    cancelled = repo.transition_attempt(
+        pending.attempt_id,
+        AttemptState.CANCELLED,
+        authority=current.authority,
+    )
+    assert cancelled.state is AttemptState.CANCELLED
+
+
+def test_stale_claim_cannot_fail_successor_owned_job_without_active_attempt(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 45_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "claim-failure-fencing-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-failure-fencing")
+    stale = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    now["value"] = 46_001
+    current = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+    error = ErrorDetail(
+        "stale_worker_failed",
+        ErrorCategory.INTERNAL,
+        "Stale worker failure must not overwrite its successor",
+    )
+
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.fail_job_atomic(
+            job.job_id,
+            error,
+            authority=stale.authority,
+        )
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.fail_job_atomic(job.job_id, error)
+
+    observed = repo.get_job(job.job_id)
+    assert observed.state is JobState.RUNNING
+    assert repo.get_job_error(job.job_id) is None
+    attempt = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=current.authority,
+    )
+    assert attempt.job_id == job.job_id
+
+
+def test_two_processes_claim_the_same_persisted_job_exactly_once(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "multiprocess-claim-store"
+    repo = SqliteJobRepository.open(machine_root)
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-multiprocess")
+    context = get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = tuple(
+        context.Process(
+            target=_claim_job_in_process,
+            args=(
+                str(machine_root),
+                job.job_id,
+                f"engine-owner-{index}",
+                barrier,
+                results,
+            ),
+        )
+        for index in range(2)
+    )
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    outcomes = tuple(results.get(timeout=2) for _process in processes)
+    assert sorted(outcome[0] for outcome in outcomes) == ["claimed", "error"]
+    assert {outcome[1] for outcome in outcomes if outcome[0] == "error"} == {
+        "scheduler_busy"
+    }
+    claimed = next(outcome for outcome in outcomes if outcome[0] == "claimed")
+    reopened = SqliteJobRepository.open(machine_root)
+    assert reopened.get_job_details(job.job_id)[0].state is JobState.RUNNING
+    assert reopened.list_attempts(job.job_id) == ()
+    with reopened._connect() as connection:
+        lease = connection.execute(
+            "SELECT job_id, owner, fencing_token FROM leases "
+            "WHERE lease_name = 'scheduler'"
+        ).fetchone()
+    assert tuple(lease) == (job.job_id, claimed[1], claimed[2])
 
 
 def test_json_columns_are_utf8_text_and_schema_has_no_secret_columns(
@@ -1969,6 +2403,66 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
             "SELECT state FROM attempts WHERE attempt_id = ?", (replacement.attempt_id,)
         ).fetchone()[0]
     assert state == AttemptState.NEEDS_INPUT.value
+
+
+def test_cancel_between_reconcile_and_pause_wins_without_challenge(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 50_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "pause-cancel-race-store",
+        clock=lambda: now["value"],
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="pause-cancel-race")
+    first = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+    attempt = repo.create_attempt(
+        job.job_id,
+        "generate_draft",
+        authority=first.authority,
+    )
+    attempt = repo.start_attempt(attempt.attempt_id, first.authority)
+    operation = repo.prepare_external_operation(
+        job_id=job.job_id,
+        step_id=attempt.step_id,
+        attempt_id=attempt.attempt_id,
+        provider="fixture/provider-v1",
+        request_hash=HASH_A,
+        operation_idempotency_key=None,
+        summary_json="{}",
+        authority=first.authority,
+    )
+    repo.start_external_operation(operation.operation_id, first.authority)
+    now["value"] = 51_001
+    successor = repo.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+    replacement = repo.take_over_running_attempt(
+        job.job_id,
+        attempt.attempt_id,
+        successor.authority,
+    )
+    assert repo.cancel_job(job.job_id).state is JobState.RUNNING
+    unknown = repo.reconcile_external_operations_after_process_loss(
+        job.job_id,
+        successor.authority,
+    )
+    assert tuple(item.operation_id for item in unknown) == (
+        operation.operation_id,
+    )
+
+    challenge = repo.pause_for_external_outcome_atomic(
+        job.job_id,
+        replacement.attempt_id,
+        successor.authority,
+    )
+
+    cancelled, active_attempt, pending_challenge = repo.get_job_details(job.job_id)
+    assert challenge is None
+    assert cancelled.state is JobState.CANCELLED
+    assert active_attempt is None
+    assert pending_challenge is None
+    assert (
+        repo.get_external_operation(operation.operation_id).outcome
+        is ExternalOutcome.UNKNOWN
+    )
 
 
 def test_pause_for_external_outcome_rolls_back_without_unknown_operation(

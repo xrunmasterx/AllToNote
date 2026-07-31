@@ -24,7 +24,11 @@ from app.core.jobs.model import (
     JobEvent,
     JobState,
 )
-from app.core.jobs.resource_lease import ExecutionAuthority
+from app.core.jobs.resource_lease import (
+    ExecutionAuthority,
+    JobExecutionAuthority,
+    PersistedJobClaim,
+)
 from app.core.ports.source import CancellationTokenPort
 
 
@@ -214,9 +218,21 @@ class JobRepositoryPort(Protocol):
 class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
     """Narrow execution surface used by sequential Recipe executors."""
 
-    def transition_job(self, job_id: str, state: JobState) -> Job: ...
+    def transition_job(
+        self,
+        job_id: str,
+        state: JobState,
+        *,
+        authority: JobExecutionAuthority | None = None,
+    ) -> Job: ...
 
-    def create_attempt(self, job_id: str, step_id: str) -> Attempt: ...
+    def create_attempt(
+        self,
+        job_id: str,
+        step_id: str,
+        *,
+        authority: JobExecutionAuthority | None = None,
+    ) -> Attempt: ...
 
     def acquire_scheduler_lease(
         self, owner_id: str, *, ttl_seconds: int
@@ -264,7 +280,19 @@ class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
         job_id: str,
         attempt_id: str,
         authority: ExecutionAuthority,
-    ) -> Challenge: ...
+    ) -> Challenge | None: ...
+
+
+class JobClaimRepositoryPort(Protocol):
+    """Job-bound claim surface layered over the frozen execution port."""
+
+    def claim_job(
+        self,
+        job_id: str,
+        owner_id: str,
+        *,
+        ttl_seconds: int,
+    ) -> PersistedJobClaim: ...
 
 
 VideoExecutionRepositoryPort = JobExecutionRepositoryPort

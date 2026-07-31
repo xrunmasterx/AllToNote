@@ -63,6 +63,7 @@ from app.core.jobs.model import (
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
     ExecutionAuthority,
+    JobExecutionAuthority,
     ResourceLease,
     ResourceLeaseStorePort,
     ResourceOwner,
@@ -99,6 +100,7 @@ from app.core.ports.jobs import (
     AttemptMetadataRepositoryPort,
     AttemptQueryRepositoryPort,
     AttemptStoragePort,
+    JobClaimRepositoryPort,
     PortableCommitReceipt,
     SourceIdentityBinding,
     VideoResultPlan,
@@ -132,7 +134,9 @@ _SUPPORTED_VIDEO_RECIPE_KEYS = frozenset(
 )
 _SCHEDULER_LEASE_TTL_SECONDS = 300
 _SCHEDULER_HEARTBEAT_INTERVAL_SECONDS = 30.0
-_AUTHORITY_LOSS_CODES = frozenset({"attempt_fenced", "scheduler_lease_lost"})
+_AUTHORITY_LOSS_CODES = frozenset(
+    {"attempt_fenced", "job_claim_fenced", "scheduler_lease_lost"}
+)
 PREFLIGHT_CHECKS = (
     "request_schema",
     "workspace_contract",
@@ -371,6 +375,7 @@ class VideoFaithfulCompilerPort(Protocol):
 
 class _VideoServiceRepositoryPort(
     VideoExecutionRepositoryPort,
+    JobClaimRepositoryPort,
     AttemptMetadataRepositoryPort,
     AttemptQueryRepositoryPort,
     Protocol,
@@ -539,9 +544,25 @@ class VideoService:
         request = self._load_request(job_id)
         self._acquire_resource_lease()
         try:
-            authority = self._repository.acquire_scheduler_lease(
-                self._owner_id, ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS
-            )
+            try:
+                claim = self._repository.claim_job(
+                    job_id,
+                    self._owner_id,
+                    ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
+                )
+            except DomainError as error:
+                if error.code != "job_not_claimable":
+                    raise
+                snapshot = self._snapshot(job_id)
+                if snapshot.state in {
+                    JobState.SUCCEEDED,
+                    JobState.FAILED,
+                    JobState.CANCELLED,
+                    JobState.WAITING_FOR_INPUT,
+                }:
+                    return snapshot
+                raise
+            authority = claim.authority
             try:
                 snapshot = self._snapshot(job_id)
                 if snapshot.state in {
@@ -551,9 +572,7 @@ class VideoService:
                     JobState.WAITING_FOR_INPUT,
                 }:
                     return snapshot
-                if snapshot.state is JobState.QUEUED:
-                    self._repository.transition_job(job_id, JobState.RUNNING)
-                _, active_attempt, _ = self._repository.get_job_details(job_id)
+                active_attempt = claim.active_attempt
                 try:
                     if (
                         active_attempt is not None
@@ -563,6 +582,8 @@ class VideoService:
                         active_attempt = self._repository.take_over_running_attempt(
                             job_id, active_attempt.attempt_id, authority
                         )
+                        if active_attempt.state is AttemptState.CANCELLED:
+                            return self._snapshot(job_id)
                         unknown = self._repository.reconcile_external_operations_after_process_loss(
                             job_id, authority
                         )
@@ -761,7 +782,11 @@ class VideoService:
             decode=lambda payload: _decode_validation(payload, checkpoint),
             resumed_attempt=resumed_attempt,
         )
-        commit_attempt = self._repository.create_attempt(job_id, "commit")
+        commit_attempt = self._repository.create_attempt(
+            job_id,
+            "commit",
+            authority=authority,
+        )
         commit_attempt = self._repository.start_attempt(
             commit_attempt.attempt_id, authority
         )
@@ -2190,7 +2215,7 @@ class VideoService:
         self,
         job_id: str,
         active_attempt: Attempt | None,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
         error: DomainError,
     ) -> None:
         current_job, current_attempt, _ = self._repository.get_job_details(job_id)
@@ -2210,7 +2235,7 @@ class VideoService:
             attempt_id=(
                 running_attempt.attempt_id if running_attempt is not None else None
             ),
-            authority=authority if running_attempt is not None else None,
+            authority=authority,
         )
 
     def _snapshot(self, job_id: str) -> JobSnapshot:

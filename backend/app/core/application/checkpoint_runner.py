@@ -8,7 +8,7 @@ from typing import TypeVar
 
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata, CheckpointRecord
-from app.core.jobs.resource_lease import ExecutionAuthority
+from app.core.jobs.resource_lease import ExecutionAuthority, JobExecutionAuthority
 from app.core.ports.jobs import AttemptStoragePort, JobExecutionRepositoryPort
 
 
@@ -108,6 +108,13 @@ class CheckpointedStepRunner:
                 return value
         if self._is_resumed_step(resumed_attempt, job_id, step_id):
             attempt = resumed_attempt
+        elif isinstance(authority, JobExecutionAuthority):
+            attempt = self._repository.create_attempt(
+                job_id,
+                step_id,
+                authority=authority,
+            )
+            attempt = self._repository.start_attempt(attempt.attempt_id, authority)
         else:
             attempt = self._repository.create_attempt(job_id, step_id)
             attempt = self._repository.start_attempt(attempt.attempt_id, authority)
