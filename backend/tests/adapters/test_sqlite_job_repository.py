@@ -624,6 +624,66 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
     )
 
 
+def test_version_one_migration_failure_rolls_back_and_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v1-rollback")
+    request_json = '{"recipe_id":"alltonote.video-course-note","recipe_version":2}'
+    with sqlite3.connect(database_path) as connection:
+        for statement in repository_module._SCHEMA_STATEMENTS_V1:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_id, request_hash, request_json, principal,
+                client_request_id, state, cancellation_requested,
+                retry_of_job_id, result_json, error_json, created_at, updated_at
+            ) VALUES ('job_legacy_rollback', ?, ?, 'local', 'legacy-rollback',
+                      'queued', 0, NULL, NULL, NULL, '1', '1')
+            """,
+            (sha256_digest(request_json), request_json),
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    def fail_after_schema_change(
+        _self: SqliteJobRepository,
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(repository_module._EXECUTION_BINDING_SCHEMA)
+        raise RuntimeError("injected migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SqliteJobRepository,
+            "_migrate_v1_to_v2",
+            fail_after_schema_change,
+        )
+        with pytest.raises(RuntimeError, match="injected migration failure"):
+            SqliteJobRepository.open(machine_root)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'job_execution_bindings'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT request_json FROM jobs WHERE job_id = 'job_legacy_rollback'"
+        ).fetchone()[0] == request_json
+
+    migrated = SqliteJobRepository.open(machine_root)
+    assert migrated.get_job_execution_binding("job_legacy_rollback") == (
+        JobExecutionBinding(
+            recipe_id="alltonote.video-course-note",
+            recipe_version=2,
+            executor_id="alltonote.video",
+            executor_version=1,
+            pack_id="media-basic",
+            pack_version="legacy-v1",
+        )
+    )
+
+
 def test_new_job_persists_exact_execution_binding(repo: SqliteJobRepository) -> None:
     binding = JobExecutionBinding(
         recipe_id="alltonote.document-note",

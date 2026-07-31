@@ -18,6 +18,12 @@
     "sha3_256": "deddee963c810d1eeac3ce5e15c7c41da21a1c54d7a39cf54fbf577d2f50de3a",
     "source_id": "2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc"
   },
+  "legacy_jobstore_fixture": {
+    "path": "tools/fixtures/job-store-v1.sql",
+    "sha256": "32564983c5443be51ef9c0073792975ec20e6d92aeb8eaa1427121522d79daa9",
+    "schema_version": 1,
+    "source_commit": "b862f564880974fea12f4b4b3d2b8bcd5b0cc019"
+  },
   "wheels": [
     {"filename": "alltonote_runtime-0.1.0-py3-none-any.whl", "byte_length": 533760, "sha256": "e7282cd7744b363d149a900d4f19d484ad705dee56eda49b678b45d952c8acd7"},
     {"filename": "cffi-2.1.0-cp314-cp314-win_amd64.whl", "byte_length": 187937, "sha256": "1b96bfe2c4bd825681b7d311ad6d9b7280a091f43e8f63da5729638083cd3bfb"},

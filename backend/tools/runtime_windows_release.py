@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -81,6 +82,77 @@ print(json.dumps({
 }, sort_keys=True))
 """
 
+_LEGACY_JOB_STORE_PROBE = r"""
+import json
+import pathlib
+import sqlite3
+import sys
+
+from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+
+fixture = pathlib.Path(sys.argv[1])
+machine_root = pathlib.Path(sys.argv[2])
+machine_root.mkdir(parents=True, exist_ok=False)
+database = machine_root / "jobs.sqlite"
+with sqlite3.connect(database) as connection:
+    connection.executescript(fixture.read_text(encoding="utf-8"))
+    before = connection.execute("pragma user_version").fetchone()[0]
+
+repository = SqliteJobRepository.open(machine_root)
+binding = repository.get_job_execution_binding("job_legacy_release_fixture")
+job = repository.get_job("job_legacy_release_fixture")
+result = repository.get_job_result("job_legacy_release_fixture")
+attempts = repository.list_attempts("job_legacy_release_fixture")
+events = repository.list_events("job_legacy_release_fixture")
+checkpoint = repository.latest_checkpoint("job_legacy_release_fixture", "publish")
+source_identity = repository.read_source_identity_candidate(
+    "fixture", "legacy-release-source"
+)
+with sqlite3.connect(database) as connection:
+    after = connection.execute("pragma user_version").fetchone()[0]
+    integrity = connection.execute("pragma integrity_check").fetchone()[0]
+    foreign_key_errors = len(connection.execute("pragma foreign_key_check").fetchall())
+
+reopened = SqliteJobRepository.open(machine_root)
+reopened_binding = reopened.get_job_execution_binding("job_legacy_release_fixture")
+reopened_data_preserved = (
+    reopened.get_job_result("job_legacy_release_fixture") == result
+    and reopened.list_attempts("job_legacy_release_fixture") == attempts
+    and reopened.list_events("job_legacy_release_fixture") == events
+    and reopened.latest_checkpoint("job_legacy_release_fixture", "publish")
+        == checkpoint
+    and reopened.read_source_identity_candidate(
+        "fixture", "legacy-release-source"
+    ) == source_identity
+)
+print(json.dumps({
+    "schema_before": before,
+    "schema_after": after,
+    "integrity": integrity,
+    "foreign_key_errors": foreign_key_errors,
+    "job_id": job.job_id,
+    "job_state": job.state.value,
+    "result_bundle_id": result.bundle_id if result is not None else None,
+    "result_quality": (
+        result.quality_overall.value if result is not None else None
+    ),
+    "attempt_states": [attempt.state.value for attempt in attempts],
+    "event_types": [event.event_type for event in events],
+    "checkpoint_id": checkpoint.checkpoint_id if checkpoint is not None else None,
+    "source_identity_preserved": source_identity is not None,
+    "binding": {
+        "recipe_id": binding.recipe_id,
+        "recipe_version": binding.recipe_version,
+        "executor_id": binding.executor_id,
+        "executor_version": binding.executor_version,
+        "pack_id": binding.pack_id,
+        "pack_version": binding.pack_version,
+    },
+    "reopened_same_binding": reopened_binding == binding,
+    "reopened_data_preserved": reopened_data_preserved,
+}, sort_keys=True))
+"""
+
 
 def _hash(path: Path, algorithm: str = "sha256") -> str:
     digest = hashlib.new(algorithm)
@@ -117,6 +189,40 @@ def _load_lock(path: Path) -> dict[str, Any]:
     if payload.get("platform") != "windows-x86_64":
         raise ReleaseError("Runtime release lock has the wrong platform")
     return payload
+
+
+def _legacy_jobstore_fixture(
+    lock_path: Path,
+    lock: Mapping[str, Any],
+) -> Path:
+    fixture = lock.get("legacy_jobstore_fixture")
+    if (
+        not isinstance(fixture, dict)
+        or set(fixture) != {"path", "sha256", "schema_version", "source_commit"}
+        or not isinstance(fixture.get("path"), str)
+        or not isinstance(fixture.get("sha256"), str)
+        or type(fixture.get("schema_version")) is not int
+        or fixture["schema_version"] != 1
+        or not isinstance(fixture.get("source_commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", fixture["source_commit"]) is None
+    ):
+        raise ReleaseError("Runtime release lock is missing the legacy JobStore fixture")
+    relative = fixture["path"]
+    candidate = PurePosixPath(relative)
+    if (
+        "\\" in relative
+        or ":" in relative
+        or candidate.is_absolute()
+        or any(part in ("", ".", "..") for part in candidate.parts)
+    ):
+        raise ReleaseError("legacy JobStore fixture path is invalid")
+    path = _ordinary_file(
+        lock_path.parent.joinpath(*candidate.parts),
+        "legacy JobStore fixture",
+    )
+    if _hash(path) != fixture["sha256"]:
+        raise ReleaseError("legacy JobStore fixture hash does not match the release lock")
+    return path
 
 
 def _ordinary_file(path: Path, label: str) -> Path:
@@ -439,6 +545,58 @@ def _run_cli(
     return payload
 
 
+def _run_legacy_jobstore_migration(
+    root: Path,
+    fixture: Path,
+    machine_root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    output = _run(
+        (
+            str(root / "python.exe"),
+            "-I",
+            "-B",
+            "-c",
+            _LEGACY_JOB_STORE_PROBE,
+            str(fixture),
+            str(machine_root),
+        ),
+        environment=environment,
+        timeout=30,
+    )
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ReleaseError("legacy JobStore Gate returned invalid JSON") from error
+    expected_binding = {
+        "recipe_id": "alltonote.video-course-note",
+        "recipe_version": 2,
+        "executor_id": "alltonote.video",
+        "executor_version": 1,
+        "pack_id": "media-basic",
+        "pack_version": "legacy-v1",
+    }
+    if payload != {
+        "schema_before": 1,
+        "schema_after": 2,
+        "integrity": "ok",
+        "foreign_key_errors": 0,
+        "job_id": "job_legacy_release_fixture",
+        "job_state": "succeeded",
+        "result_bundle_id": "bnd_018cc251-f400-7000-8000-000000000005",
+        "result_quality": "pass",
+        "attempt_states": ["succeeded"],
+        "event_types": ["portable.commit.completed.v1"],
+        "checkpoint_id": "chk_legacy_release_fixture",
+        "source_identity_preserved": True,
+        "binding": expected_binding,
+        "reopened_same_binding": True,
+        "reopened_data_preserved": True,
+    }:
+        raise ReleaseError("legacy JobStore Gate did not preserve the release contract")
+    return payload
+
+
 def _file_manifest(root: Path) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for path in sorted((item for item in root.rglob("*") if item.is_file()), key=lambda item: item.as_posix()):
@@ -470,7 +628,9 @@ def assemble_runtime(
     output: Path,
     gate_root: Path,
 ) -> dict[str, Any]:
-    lock = _load_lock(_ordinary_file(lock_path, "Runtime release lock"))
+    lock_path = _ordinary_file(lock_path, "Runtime release lock")
+    lock = _load_lock(lock_path)
+    legacy_jobstore_fixture = _legacy_jobstore_fixture(lock_path, lock)
     inputs = _ordinary_directory(inputs, "Runtime input directory")
     wheelhouse = _ordinary_directory(wheelhouse, "Runtime wheelhouse")
     gate_root = _ordinary_directory(gate_root, "Runtime Gate root")
@@ -479,7 +639,13 @@ def assemble_runtime(
     parent = _ordinary_directory(output.parent, "Runtime output parent")
     if os.path.lexists(output):
         raise ReleaseError("Runtime output already exists")
-    for source in (inputs, wheelhouse, gate_root, builder_python):
+    for source in (
+        inputs,
+        wheelhouse,
+        gate_root,
+        builder_python,
+        legacy_jobstore_fixture,
+    ):
         try:
             source.relative_to(output)
             overlaps = True
@@ -561,6 +727,12 @@ def assemble_runtime(
                 isolated_environment,
                 timeout=_PROCESS_TIMEOUT_SECONDS,
             )
+            legacy_jobstore = _run_legacy_jobstore_migration(
+                stage,
+                legacy_jobstore_fixture,
+                smoke / "legacy-jobstore",
+                isolated_environment,
+            )
         storage = info["data"]["storage"]
         gate_data = gate["data"]
         if (
@@ -580,6 +752,7 @@ def assemble_runtime(
                 "platform": lock["platform"],
                 "python": lock["python"],
                 "sqlite": lock["sqlite"],
+                "legacy_jobstore_fixture": lock["legacy_jobstore_fixture"],
             },
         )
         _write_json(
@@ -604,6 +777,7 @@ def assemble_runtime(
                     "runtime_doctor": True,
                     "unicode_workspace_init": True,
                     "sqlite_wal_gate": True,
+                    "legacy_jobstore_migration": True,
                 },
                 "wal_gate": {
                     "connection_counts": gate_data["connection_counts"],
@@ -611,6 +785,7 @@ def assemble_runtime(
                     "parallel_job_execution_enabled": False,
                     "integrity": gate_data["integrity"],
                 },
+                "legacy_jobstore": legacy_jobstore,
                 "limits": [
                     "unsigned portable candidate; not a public installer",
                     "clean non-admin VM, Defender, update, rollback, and uninstall remain release gates",
