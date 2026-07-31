@@ -203,7 +203,7 @@ def test_engine_lifecycle_gate_stops_partial_start_on_failure(
 def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     lock = _load_lock(LOCK)
 
-    assert lock["runtime_source_commit"] == "86290c1efdcbd6d52deca909175284e0335a1edd"
+    assert lock["runtime_source_commit"] == "54019ea58a280dea6b508044fc0dbe0558684203"
     assert lock["python"]["version"] == "3.14.6"
     assert lock["sqlite"] == {
         "version": "3.53.4",

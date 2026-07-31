@@ -90,23 +90,30 @@ Stop condition：
 
 验收：
 
-- [ ] foreground 单次 wait 在无 Engine 时仍可直接执行；
+- [x] foreground 单次 wait 在无 Engine 时仍可直接执行；
 - [ ] detach、batch 或 Desktop 原子 ensure Engine；
-- [ ] 并发 ensure 最终只有一个 leader；
+- [x] 并发 ensure 最终只有一个 leader；
 - [ ] 已有 Engine 时 CLI 提交并观察同一 Job，不抢 leadership；
 - [ ] Job 在返回前 durable；
-- [ ] Engine 不 eager load Recipe、Whisper、Torch、Agent 或模型；
-- [ ] Engine 冷启动 p95 小于 2 秒；
-- [ ] idle 内存目标小于 100 MB；
-- [ ] idle grace 后退出；
+- [x] Engine 不 eager load Recipe、Whisper、Torch、Agent 或模型；
+- [x] Engine 冷启动 p95 小于 2 秒；
+- [x] idle 内存目标小于 100 MB；
+- [x] idle grace 后退出；
 - [ ] Engine 被杀后可重新 ensure 和 reconcile；
-- [ ] 不监听 LAN/Internet。
+- [x] 不监听 LAN/Internet。
 
 Stop condition：
 
 - Engine 需要成为所有 CLI 命令的强制前置；
 - 出现第二套 ProduceService、JobStore 或 Recipe Runner；
 - 单实例只能靠不可靠的进程名扫描实现。
+
+当前进展（2026-08-01，Task 3 仍未完成）：
+
+- 已交付显式 `engine start|ensure|status|stop` 生命周期控制面；按用户身份、canonical state-root 与 Runtime major 派生 scope，使用稳定 launch/lifetime lock、PID 创建身份和仅本机 IPC，不依赖进程名扫描；
+- Windows V10 真实候选使用 20 次冷启动、32 路并发 ensure、强杀恢复、idle 退出和最终清理完成 Gate：冷启动 p95 `559.301 ms`，最大 idle RSS `38,539,264 bytes`，单实例、父进程退出后重连、强杀后新 identity 与 descriptor 清理均通过；
+- 候选绑定源码提交 `54019ea58a280dea6b508044fc0dbe0558684203`，完整证据见 [`Runtime Windows V10 Engine 生命周期验收`](../../../acceptance/2026-08-01-runtime-v10-engine-lifecycle.md)；
+- `runtime info` 明确保持 `parallel_job_execution_enabled=false`；没有接入 Job 执行、detach、batch、Desktop、scheduler、reconcile 或 worker，因此“已有 Engine 时提交并观察同一 Job”“Job durable-before-return”“被杀后 reconcile”等验收项仍未完成，Task 3 不得勾选完成。
 
 ## Task 4: [ ] 分离 scheduler leadership 与 Job-scoped generation authority
 
