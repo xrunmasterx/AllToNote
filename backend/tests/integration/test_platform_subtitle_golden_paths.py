@@ -1029,6 +1029,42 @@ def test_recovery_rebinds_to_exact_recorded_pack_generations(
     ]
 
 
+def test_same_canonical_video_can_be_produced_again_with_stable_source_identity(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime = _create_runtime(
+        tmp_path / "machine",
+        "bilibili",
+        Calls(),
+    )
+
+    first = runtime.wait_job(
+        runtime.submit_video(
+            request(
+                "bilibili",
+                workspace_root,
+                client_request_id="repeat-video-one",
+            )
+        ).job_id
+    )
+    second = runtime.wait_job(
+        runtime.submit_video(
+            request(
+                "bilibili",
+                workspace_root,
+                client_request_id="repeat-video-two",
+            )
+        ).job_id
+    )
+
+    assert first.state is JobState.SUCCEEDED
+    assert second.state is JobState.SUCCEEDED
+    assert first.result.bundle_id != second.result.bundle_id
+    assert first.result.source_id == second.result.source_id
+    assert first.result.source_revision_id != second.result.source_revision_id
+
+
 def _decode_acquisition_checkpoint(runtime: object, job_id: str) -> object:
     metadata = runtime.job_repository.latest_checkpoint(job_id, "acquire")
     assert metadata is not None

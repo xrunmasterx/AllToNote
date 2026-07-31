@@ -304,6 +304,10 @@ PackEnvironmentActivator = Callable[
     [JobPackEnvironmentSnapshot],
     tuple[VideoRecipeOperations, str],
 ]
+SourceIdentityResolver = Callable[
+    [Path, ResolvedVideoSource],
+    SourceIdentityBinding | None,
+]
 
 
 @dataclass(frozen=True)
@@ -389,6 +393,7 @@ class VideoService:
         generated_transcriber_identity: str = "fake/transcriber-v1",
         pack_environment: JobPackEnvironmentSnapshot | None = None,
         pack_environment_activator: PackEnvironmentActivator | None = None,
+        source_identity_resolver: SourceIdentityResolver | None = None,
         resource_lease_store: ResourceLeaseStorePort | None = None,
         resource_owner: ResourceOwner | None = None,
     ) -> None:
@@ -420,6 +425,7 @@ class VideoService:
         self._submission_pack_environment = pack_environment
         self._execution_pack_environment = pack_environment
         self._pack_environment_activator = pack_environment_activator
+        self._source_identity_resolver = source_identity_resolver
         self._resource_lease_store = resource_lease_store
         self._resource_owner = resource_owner
         self._active_resource_lease: ResourceLease | None = None
@@ -654,6 +660,23 @@ class VideoService:
             decode=_decode_source,
             resumed_attempt=resumed_attempt,
         )
+        source_id = ids["source"]
+        if self._source_identity_resolver is not None:
+            binding = self._source_identity_resolver(
+                Path(request.workspace_root),
+                source,
+            )
+            if binding is not None:
+                if (
+                    binding.connector_id != source.connector_id
+                    or binding.canonical_identity != source.canonical_identity
+                ):
+                    raise DomainError(
+                        "source_identity_resolution_invalid",
+                        ErrorCategory.INTERNAL,
+                        "Resolved source identity does not match the video source",
+                    )
+                source_id = binding.source_id
         acquired = self._checkpointed(
             job_id,
             "acquire",
@@ -662,7 +685,7 @@ class VideoService:
             lambda execution: self._operations.acquire(
                 request,
                 source,
-                source_id=ids["source"],
+                source_id=source_id,
                 source_revision_id=ids["revision"],
                 execution=execution,
             ),
@@ -2681,6 +2704,7 @@ __all__ = [
     "PREFLIGHT_CHECKS",
     "RUNTIME_VERSION",
     "PackEnvironmentActivator",
+    "SourceIdentityResolver",
     "VideoKnowledgeCompilationInput",
     "VideoKnowledgeCompilerPort",
     "VideoRecipeOperations",

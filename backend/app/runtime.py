@@ -40,6 +40,7 @@ from app.adapters.models.codex_app_server_bridge import (
 from app.adapters.models.legacy_model_executor import LegacyModelExecutor
 from app.adapters.models.model_result_store import ModelOperationResultStore
 from app.adapters.sources.legacy_video import LegacyVideoSourceAdapter
+from app.adapters.sources.legacy_video import VerifiedSourceIdentityRegistry
 from app.adapters.transcription.legacy_transcriber import (
     LegacyTranscriberAdapter,
     normalize_platform_subtitle,
@@ -1468,6 +1469,21 @@ def _create_platform_video_runtime_components(
         storage=storage,
         transcriber=transcriber,
     )
+    portable = IWikiPortableGateway()
+
+    def resolve_source_identity(
+        workspace_root: Path,
+        resolved_source: ResolvedVideoSource,
+    ):
+        return VerifiedSourceIdentityRegistry(
+            workspace_root,
+            cache=repository,
+            truth=portable,
+        ).resolve_verified(
+            resolved_source.connector_id,
+            resolved_source.canonical_identity,
+        )
+
     pack_environment_activator = None
     if pack_port_resolver is not None:
         def activate_pack_environment(
@@ -1500,7 +1516,7 @@ def _create_platform_video_runtime_components(
     service = VideoService(
         repository,
         storage,
-        IWikiPortableGateway(),
+        portable,
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
         owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
@@ -1515,6 +1531,7 @@ def _create_platform_video_runtime_components(
         ),
         pack_environment=pack_environment,
         pack_environment_activator=pack_environment_activator,
+        source_identity_resolver=resolve_source_identity,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
