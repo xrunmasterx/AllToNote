@@ -71,7 +71,7 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, object], Path, Path]:
 def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     lock = _load_lock(LOCK)
 
-    assert lock["runtime_source_commit"] == "8d59ac5b38460649426d5472789b8a1d5b4aeedc"
+    assert lock["runtime_source_commit"] == "9b77912e9186c4b8007fe4e6c0118c25980b8846"
     assert lock["python"]["version"] == "3.14.6"
     assert lock["sqlite"] == {
         "version": "3.53.4",

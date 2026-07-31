@@ -14,6 +14,10 @@ from app.core.domain.video import JobState, VideoProduceRequest
 from app.core.errors import ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState
+from app.core.packs.events import (
+    JOB_PACK_ENVIRONMENT_EVENT,
+    parse_job_pack_environment_payload,
+)
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
@@ -392,13 +396,34 @@ def test_job_wait_keyboard_interrupt_does_not_cancel_job(
     assert persisted.cancellation_requested is False
 
 
-def test_job_cancel_then_retry_creates_new_job_and_config_snapshot(
+def test_job_cancel_then_retry_creates_new_job_with_frozen_snapshots(
     runtime: object,
     workspace_root: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     original = runtime.submit_video(_request(workspace_root, "cancel-retry"))
+    runtime.job_repository.append_event(
+        original.job_id,
+        JOB_PACK_ENVIRONMENT_EVENT,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "packs": [
+                    {
+                        "pack_id": "media-basic",
+                        "pack_version": "fixture-v1",
+                        "platform": "windows-x86_64",
+                        "manifest_sha256": "sha256:" + "a" * 64,
+                    }
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+    )
 
     code = _job_json(runtime, workspace_root, "cancel", original.job_id)
     cancelled = json.loads(capsys.readouterr().out)
@@ -433,10 +458,13 @@ def test_job_cancel_then_retry_creates_new_job_and_config_snapshot(
     assert retry_job["job_id"] != original.job_id
     assert retry_job["retry_of_job_id"] == original.job_id
     assert runtime.get_job(original.job_id).state is JobState.CANCELLED
-    assert [
-        event.event_type
-        for event in runtime.job_repository.list_events(retry_job["job_id"])
-    ] == ["configuration.snapshot.v1"]
+    events = runtime.job_repository.list_events(retry_job["job_id"])
+    assert [event.event_type for event in events] == [
+        "configuration.snapshot.v1",
+        JOB_PACK_ENVIRONMENT_EVENT,
+    ]
+    inherited = parse_job_pack_environment_payload(events[1].payload_json)
+    assert inherited.pack("media-basic").manifest_sha256 == "sha256:" + "a" * 64
 
 
 def test_job_retry_requires_exact_unknown_operation_confirmation(

@@ -56,6 +56,7 @@ class JobRuntime:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        self._repository = repository
         self._query = JobQueryService(repository)
         self._jobs = JobService(repository)
         self._wait_job = wait_job
@@ -205,15 +206,40 @@ class JobRuntime:
         request: RetryJobRequest,
     ) -> JobView:
         self.get_job(job_id)
-        initial_events = (
-            ((JOB_CONFIG_SNAPSHOT_EVENT, self._current_config_snapshot),)
-            if self._current_config_snapshot is not None
-            else ()
+        initial_events: list[tuple[str, object]] = []
+        if self._current_config_snapshot is not None:
+            initial_events.append(
+                (JOB_CONFIG_SNAPSHOT_EVENT, self._current_config_snapshot)
+            )
+        pack_events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == JOB_PACK_ENVIRONMENT_EVENT
         )
+        if len(pack_events) > 1:
+            raise DomainError(
+                "execution_pack_snapshot_invalid",
+                ErrorCategory.CONFLICT,
+                "The Job execution Pack environment is unavailable or invalid",
+            )
+        if pack_events:
+            try:
+                pack_environment = parse_job_pack_environment_payload(
+                    pack_events[0].payload_json
+                )
+            except (TypeError, ValueError) as error:
+                raise DomainError(
+                    "execution_pack_snapshot_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored Job execution Pack environment is invalid",
+                ) from error
+            initial_events.append(
+                (JOB_PACK_ENVIRONMENT_EVENT, pack_environment)
+            )
         retried = self._jobs.retry(
             job_id,
             request,
-            initial_events=initial_events,
+            initial_events=tuple(initial_events),
         )
         return self.get_job(retried.job_id)
 
