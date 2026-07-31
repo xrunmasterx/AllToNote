@@ -14,7 +14,10 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.adapters.models.codex_app_server_bridge import (
     CodexAppServerCompletionBridge,
 )
-from app.adapters.models.legacy_gpt import LegacyReturnedInvalidResponse
+from app.adapters.models.legacy_gpt import (
+    LegacyKnownRetryableModelFailure,
+    LegacyReturnedInvalidResponse,
+)
 from app.adapters.models.legacy_model_executor import LegacyModelExecutor
 from app.core.errors import DomainError, ErrorCategory
 from app.core.ports.model_executor import (
@@ -268,6 +271,26 @@ def test_codex_app_server_error_is_propagated_without_reclassification() -> None
         bridge.complete_once("compile this transcript")
 
     assert exc_info.value is failure
+    assert len(client.calls) == 1
+
+
+def test_complete_once_maps_known_provider_failure_for_video_retry() -> None:
+    def fail(_prompt: str, _model: str) -> object:
+        raise CodexAppServerError(
+            "provider rejected the turn",
+            code="provider_error",
+            outcome_known=True,
+        )
+
+    client = _FakeClient(fail)
+    bridge = CodexAppServerCompletionBridge(
+        model_identity="gpt-5.5-codex",
+        client=client,
+    )
+
+    with pytest.raises(LegacyKnownRetryableModelFailure):
+        bridge.complete_once("compile this transcript")
+
     assert len(client.calls) == 1
 
 

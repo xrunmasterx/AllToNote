@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 
 JOB_PACK_ENVIRONMENT_EVENT = "execution.pack-environment.v1"
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Job Pack environment payload contains duplicate keys")
+        value[key] = item
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +52,8 @@ class JobPackEnvironmentSnapshot:
     def __post_init__(self) -> None:
         object.__setattr__(self, "packs", tuple(self.packs))
         if (
-            self.schema_version != 1
+            type(self.schema_version) is not int
+            or self.schema_version != 1
             or not self.packs
             or any(
                 not isinstance(pack, ExecutionPackIdentity)
@@ -59,8 +70,47 @@ class JobPackEnvironmentSnapshot:
         raise ValueError("Required execution Pack is not frozen")
 
 
+def parse_job_pack_environment_payload(
+    payload_json: str,
+) -> JobPackEnvironmentSnapshot:
+    payload = json.loads(payload_json, object_pairs_hook=_unique_object)
+    if (
+        type(payload) is not dict
+        or frozenset(payload) != frozenset({"schema_version", "packs"})
+        or type(payload.get("packs")) is not list
+        or not payload["packs"]
+        or any(
+            type(value) is not dict
+            or frozenset(value)
+            != frozenset(
+                {
+                    "pack_id",
+                    "pack_version",
+                    "platform",
+                    "manifest_sha256",
+                }
+            )
+            for value in payload["packs"]
+        )
+    ):
+        raise ValueError("Job Pack environment payload is invalid")
+    return JobPackEnvironmentSnapshot(
+        schema_version=payload["schema_version"],
+        packs=tuple(
+            ExecutionPackIdentity(
+                pack_id=value["pack_id"],
+                pack_version=value["pack_version"],
+                platform=value["platform"],
+                manifest_sha256=value["manifest_sha256"],
+            )
+            for value in payload["packs"]
+        ),
+    )
+
+
 __all__ = [
     "ExecutionPackIdentity",
     "JOB_PACK_ENVIRONMENT_EVENT",
     "JobPackEnvironmentSnapshot",
+    "parse_job_pack_environment_payload",
 ]

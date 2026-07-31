@@ -471,6 +471,33 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
     assert turn_start["params"]["effort"] == "medium"
 
 
+def test_completed_turn_with_empty_markdown_has_known_outcome(monkeypatch):
+    stdout_messages = [
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"thread": {"id": "thread-123"}}},
+        {"jsonrpc": "2.0", "id": 3, "result": {}},
+        {"method": "turn/completed", "params": {"status": "completed"}},
+    ]
+
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
+        lambda: None,
+    )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.subprocess.Popen",
+        lambda *_args, **_kwargs: _FakeProcess(stdout_messages),
+    )
+
+    with pytest.raises(CodexAppServerError, match="empty Markdown") as raised:
+        CodexAppServerClient(
+            codex_bin="codex",
+            timeout_seconds=1,
+        ).run_markdown_turn("make note", "gpt-5")
+
+    assert raised.value.outcome_known is True
+
+
 def test_run_markdown_turn_sends_initialized_notification_after_initialize(monkeypatch):
     stdout_messages = [
         {"jsonrpc": "2.0", "id": 1, "result": {}},

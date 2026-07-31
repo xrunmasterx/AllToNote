@@ -22,6 +22,7 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError
 from app.core.jobs.model import Attempt, AttemptState
+from app.core.packs.events import parse_job_pack_environment_payload
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest
 from app.core.recipes.registry import RecipeRegistry
 from app.core.recipes.video.adapter import (
@@ -44,6 +45,60 @@ def _service(tmp_path: Path) -> tuple[VideoService, SqliteJobRepository]:
         local_instance_id="request-persistence-test",
     )
     return service, repository
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "duplicate_top_level_key",
+        "duplicate_pack_key",
+        "duplicate_pack_id",
+        "boolean_schema_version",
+        "extra_top_level_key",
+        "extra_pack_key",
+    ),
+)
+def test_pack_environment_event_parser_rejects_ambiguous_or_extended_schema(
+    case: str,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    pack = (
+        '{"manifest_sha256":"'
+        + digest
+        + '","pack_id":"media-basic","pack_version":"version-1",'
+        '"platform":"windows-x86_64"}'
+    )
+    payloads = {
+        "duplicate_top_level_key": (
+            '{"schema_version":999,"schema_version":1,"packs":['
+            + pack
+            + "]}"
+        ),
+        "duplicate_pack_key": (
+            '{"schema_version":1,"packs":[{"manifest_sha256":"'
+            + digest
+            + '","pack_id":"ignored","pack_id":"media-basic",'
+            '"pack_version":"version-1","platform":"windows-x86_64"}]}'
+        ),
+        "duplicate_pack_id": (
+            '{"schema_version":1,"packs":[' + pack + "," + pack + "]}"
+        ),
+        "boolean_schema_version": (
+            '{"schema_version":true,"packs":[' + pack + "]}"
+        ),
+        "extra_top_level_key": (
+            '{"schema_version":1,"packs":[' + pack + '],"extra":null}'
+        ),
+        "extra_pack_key": (
+            '{"schema_version":1,"packs":[{"manifest_sha256":"'
+            + digest
+            + '","pack_id":"media-basic","pack_version":"version-1",'
+            '"platform":"windows-x86_64","extra":null}]}'
+        ),
+    }
+
+    with pytest.raises(ValueError):
+        parse_job_pack_environment_payload(payloads[case])
 
 
 def test_portable_timestamps_are_stably_ordered_after_source_observation() -> None:

@@ -67,7 +67,10 @@ class CodexAppServerClient:
                 cleaned = "\n".join(lines[1:-1]).strip()
 
         if not cleaned:
-            raise CodexAppServerError("Codex app-server returned empty Markdown")
+            raise CodexAppServerError(
+                "Codex app-server returned empty Markdown",
+                outcome_known=True,
+            )
         return cleaned
 
     @staticmethod

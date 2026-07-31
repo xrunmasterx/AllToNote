@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
 from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.adapters.video_packs.official_video_pack import MEDIA_BASIC
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError
 from app.core.jobs.model import JobExecutionBinding, JobSnapshot, JobState
+from app.core.packs.events import (
+    JOB_PACK_ENVIRONMENT_EVENT,
+    ExecutionPackIdentity,
+    JobPackEnvironmentSnapshot,
+)
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.job_runtime import create_job_runtime_for_workspace
@@ -354,4 +362,179 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             "fixture/frozen-model",
             "fixture/frozen-profile",
         )
+    ]
+
+
+def test_public_job_wait_routes_frozen_video_binding_to_exact_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    shutil.copytree(FIXTURE_ROOT, workspace)
+    local_data = tmp_path / "local-data"
+    local_data.mkdir()
+    registry = WorkspaceInstanceRegistry(
+        local_data,
+        inspect_workspace=lambda root: open_workspace(
+            root, writable=False
+        ).manifest.workspace_id,
+    )
+    instance = registry.resolve(workspace)
+    repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    frozen = JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=(
+            ExecutionPackIdentity(
+                pack_id=MEDIA_BASIC.pack_id,
+                pack_version=MEDIA_BASIC.pack_version,
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + "a" * 64,
+            ),
+        ),
+    )
+    frozen_payload = json.dumps(
+        {
+            "schema_version": frozen.schema_version,
+            "packs": [
+                {
+                    "pack_id": pack.pack_id,
+                    "pack_version": pack.pack_version,
+                    "platform": pack.platform,
+                    "manifest_sha256": pack.manifest_sha256,
+                }
+                for pack in frozen.packs
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    request_json = "{}"
+    job = repository.create_job(
+        request_hash=sha256_digest(request_json),
+        request_json=request_json,
+        principal="local-user",
+        client_request_id="video-public-reconnect",
+        initial_events=((JOB_PACK_ENVIRONMENT_EVENT, frozen_payload),),
+        execution_binding=JobExecutionBinding(
+            recipe_id="alltonote.video-producer",
+            recipe_version=2,
+            executor_id="alltonote.video",
+            executor_version=1,
+            pack_id=MEDIA_BASIC.pack_id,
+            pack_version=MEDIA_BASIC.pack_version,
+        ),
+    )
+    runtime_module = importlib.import_module("app.runtime")
+    monkeypatch.setattr(
+        runtime_module.CodexAppServerStatusService,
+        "get_status",
+        staticmethod(
+            lambda: SimpleNamespace(ready=True, default_model="codex-test-model")
+        ),
+    )
+
+    class Bridge:
+        @staticmethod
+        def complete_once(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("model execution is outside this routing test")
+
+        @staticmethod
+        def complete_request(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("model execution is outside this routing test")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "CodexAppServerCompletionBridge",
+        lambda **_kwargs: Bridge(),
+    )
+    generation = tmp_path / "media-generation"
+    entrypoints: dict[str, Path] = {}
+    for name, relative in MEDIA_BASIC.entrypoints("windows-x86_64").items():
+        path = generation.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+        entrypoints[name] = path.resolve()
+    resolved = runtime_module.ResolvedOfficialVideoPack(
+        pack_id=MEDIA_BASIC.pack_id,
+        pack_version=MEDIA_BASIC.pack_version,
+        platform="windows-x86_64",
+        manifest_sha256=frozen.packs[0].manifest_sha256,
+        generation=generation.resolve(),
+        entrypoints=entrypoints,
+    )
+    exact_resolutions: list[tuple[str, str]] = []
+
+    class Resolver:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def resolve_active(_contract: object) -> object:
+            raise AssertionError("public recovery must not read active Pack state")
+
+        @staticmethod
+        def resolve_exact(contract, manifest_sha256: str):
+            exact_resolutions.append((contract.pack_id, manifest_sha256))
+            return resolved
+
+    monkeypatch.setattr(runtime_module, "OfficialVideoPackResolver", Resolver)
+    routed: list[str] = []
+
+    def wait_job(service, job_id: str) -> JobSnapshot:
+        routed.append(job_id)
+        return service.get_job(job_id)
+
+    monkeypatch.setattr(runtime_module.VideoService, "wait_job", wait_job)
+    runtime = create_job_runtime_for_workspace(
+        workspace,
+        local_app_data=local_data,
+        current_config_snapshot=None,
+    )
+
+    assert runtime.wait_for_job(job.job_id).snapshot.state is JobState.QUEUED
+    assert routed == [job.job_id]
+    assert exact_resolutions == [
+        (MEDIA_BASIC.pack_id, frozen.packs[0].manifest_sha256)
+    ]
+
+    missing_request = '{"case":"missing-pack-event"}'
+    missing = repository.create_job(
+        request_hash=sha256_digest(missing_request),
+        request_json=missing_request,
+        principal="local-user",
+        client_request_id="video-pack-missing-event",
+        execution_binding=JobExecutionBinding(
+            recipe_id="alltonote.video-producer",
+            recipe_version=2,
+            executor_id="alltonote.video",
+            executor_version=1,
+            pack_id=MEDIA_BASIC.pack_id,
+            pack_version=MEDIA_BASIC.pack_version,
+        ),
+    )
+    with pytest.raises(DomainError, match="execution_pack_snapshot_missing"):
+        runtime.wait_for_job(missing.job_id)
+
+    mismatch_request = '{"case":"pack-binding-mismatch"}'
+    mismatch = repository.create_job(
+        request_hash=sha256_digest(mismatch_request),
+        request_json=mismatch_request,
+        principal="local-user",
+        client_request_id="video-pack-binding-mismatch",
+        initial_events=((JOB_PACK_ENVIRONMENT_EVENT, frozen_payload),),
+        execution_binding=JobExecutionBinding(
+            recipe_id="alltonote.video-producer",
+            recipe_version=2,
+            executor_id="alltonote.video",
+            executor_version=1,
+            pack_id=MEDIA_BASIC.pack_id,
+            pack_version="unsupported-version",
+        ),
+    )
+    with pytest.raises(DomainError, match="execution_pack_snapshot_invalid"):
+        runtime.wait_for_job(mismatch.job_id)
+
+    assert routed == [job.job_id]
+    assert exact_resolutions == [
+        (MEDIA_BASIC.pack_id, frozen.packs[0].manifest_sha256)
     ]

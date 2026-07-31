@@ -2153,6 +2153,7 @@ def create_codex_app_server_runtime_for_workspace(
     *,
     local_app_data: Path | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
 ) -> AllToNoteRuntime:
     """Create the real URL producer using the locally authenticated Codex CLI."""
 
@@ -2198,35 +2199,60 @@ def create_codex_app_server_runtime_for_workspace(
         paths,
         trusted_keys=official_video_pack_trust_keys(),
     )
-    media_pack = pack_resolver.resolve_active(MEDIA_BASIC)
-    try:
-        transcribe_pack = pack_resolver.resolve_active(TRANSCRIBE_CPU)
-    except DomainError as error:
-        if error.code != "pack_unavailable":
-            raise
-        transcribe_pack = None
-    source = PackedBilibiliVideoSourceAdapter(
-        LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
-        media_pack,
-        cookie_resolver=_bilibili_cookie,
-    )
-    transcriber = (
-        PackedCpuTranscriber(transcribe_pack)
-        if transcribe_pack is not None
-        else None
-    )
-    pack_identities = (_pack_identity(media_pack),)
-    if transcribe_pack is not None:
-        pack_identities += (_pack_identity(transcribe_pack),)
-    pack_environment = JobPackEnvironmentSnapshot(
-        schema_version=1,
-        packs=pack_identities,
-    )
+    if execution_pack_environment is None:
+        media_pack = pack_resolver.resolve_active(MEDIA_BASIC)
+        try:
+            transcribe_pack = pack_resolver.resolve_active(TRANSCRIBE_CPU)
+        except DomainError as error:
+            if error.code != "pack_unavailable":
+                raise
+            transcribe_pack = None
+        source = PackedBilibiliVideoSourceAdapter(
+            LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
+            media_pack,
+            cookie_resolver=_bilibili_cookie,
+        )
+        transcriber = (
+            PackedCpuTranscriber(transcribe_pack)
+            if transcribe_pack is not None
+            else None
+        )
+        pack_identities = (_pack_identity(media_pack),)
+        if transcribe_pack is not None:
+            pack_identities += (_pack_identity(transcribe_pack),)
+        pack_environment = JobPackEnvironmentSnapshot(
+            schema_version=1,
+            packs=pack_identities,
+        )
+        generated_transcriber_identity = (
+            transcriber.identity
+            if transcriber is not None
+            else "transcribe-cpu/unavailable"
+        )
+    else:
+        pack_environment = execution_pack_environment
 
     def resolve_pack_ports(
         snapshot: JobPackEnvironmentSnapshot,
     ) -> tuple[VideoSourcePort, TranscriptPort | None, str]:
-        media_identity = snapshot.pack(MEDIA_BASIC.pack_id)
+        pack_ids = frozenset(pack.pack_id for pack in snapshot.packs)
+        if pack_ids not in (
+            frozenset({MEDIA_BASIC.pack_id}),
+            frozenset({MEDIA_BASIC.pack_id, TRANSCRIBE_CPU.pack_id}),
+        ):
+            raise DomainError(
+                "pack_generation_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The frozen Video Pack environment is unsupported",
+            )
+        try:
+            media_identity = snapshot.pack(MEDIA_BASIC.pack_id)
+        except ValueError as error:
+            raise DomainError(
+                "pack_generation_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The exact Video Pack generation is unavailable",
+            ) from error
         transcribe_identity = next(
             (
                 pack
@@ -2288,6 +2314,11 @@ def create_codex_app_server_runtime_for_workspace(
             ),
         )
 
+    if execution_pack_environment is not None:
+        source, transcriber, generated_transcriber_identity = (
+            resolve_pack_ports(pack_environment)
+        )
+
     process_instance_id, resource_lease_store, resource_owner = (
         _workspace_resource_admission(paths, instance)
     )
@@ -2296,11 +2327,7 @@ def create_codex_app_server_runtime_for_workspace(
         source=source,
         source_metadata={},
         transcriber=transcriber,
-        generated_transcriber_identity=(
-            transcriber.identity
-            if transcriber is not None
-            else "transcribe-cpu/unavailable"
-        ),
+        generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=binding,
         model_execution_profile="default",

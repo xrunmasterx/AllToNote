@@ -19,6 +19,10 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
+from app.core.packs.events import (
+    ExecutionPackIdentity,
+    JobPackEnvironmentSnapshot,
+)
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
 
 
@@ -1379,18 +1383,24 @@ def test_default_runtime_uses_real_codex_factory_and_never_fake(
     assert calls.commit == 1
 
 
+@pytest.mark.parametrize(
+    "recovery_mode",
+    ("active", "frozen", "frozen_with_unknown_pack"),
+)
 @pytest.mark.parametrize("transcribe_available", [True, False])
 def test_codex_runtime_factory_uses_workspace_instance_machine_root(
     tmp_path: Path,
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     transcribe_available: bool,
+    recovery_mode: str,
 ) -> None:
     runtime_module = importlib.import_module("app.runtime")
     local_app_data = tmp_path / "local-app-data"
     local_app_data.mkdir()
     captured: dict[str, object] = {}
     sentinel = object()
+    recover_frozen = recovery_mode != "active"
 
     monkeypatch.setattr(
         runtime_module.CodexAppServerStatusService,
@@ -1431,6 +1441,8 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
             pass
 
         def resolve_active(self, contract):
+            if recover_frozen:
+                raise AssertionError("recovery must not read the active pointer")
             if contract.pack_id == "transcribe-cpu" and not transcribe_available:
                 raise DomainError(
                     "pack_unavailable",
@@ -1456,9 +1468,48 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
         runtime_module, "create_platform_video_runtime", capture_runtime
     )
 
+    frozen_packs = [
+        ExecutionPackIdentity(
+            pack_id=pack.pack_id,
+            pack_version=pack.pack_version,
+            platform=pack.platform,
+            manifest_sha256=pack.manifest_sha256,
+        )
+        for pack in (
+            (resolved["media-basic"], resolved["transcribe-cpu"])
+            if transcribe_available
+            else (resolved["media-basic"],)
+        )
+    ]
+    if recovery_mode == "frozen_with_unknown_pack":
+        frozen_packs.append(
+            ExecutionPackIdentity(
+                pack_id="future-video-pack",
+                pack_version="future-v1",
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + "c" * 64,
+            )
+        )
+    frozen_environment = JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=tuple(frozen_packs),
+    )
+    if recovery_mode == "frozen_with_unknown_pack":
+        with pytest.raises(DomainError, match="pack_generation_unavailable"):
+            runtime_module.create_codex_app_server_runtime_for_workspace(
+                workspace_root,
+                local_app_data=local_app_data,
+                execution_pack_environment=frozen_environment,
+            )
+        assert exact_resolutions == []
+        assert captured == {}
+        return
     created = runtime_module.create_codex_app_server_runtime_for_workspace(
         workspace_root,
         local_app_data=local_app_data,
+        execution_pack_environment=(
+            frozen_environment if recover_frozen else None
+        ),
     )
 
     registry = json.loads(
@@ -1492,22 +1543,48 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
         if transcribe_available
         else ["media-basic"]
     )
+    expected_exact_resolutions = [
+        ("media-basic", "sha256:" + "a" * 64),
+    ]
+    if transcribe_available:
+        expected_exact_resolutions.append(
+            ("transcribe-cpu", "sha256:" + "b" * 64)
+        )
+    assert exact_resolutions == (
+        expected_exact_resolutions if recover_frozen else []
+    )
+    exact_resolutions.clear()
     pack_port_resolver = captured["pack_port_resolver"]
     _source, transcriber, transcriber_identity = pack_port_resolver(
         captured["pack_environment"]
     )
     if transcribe_available:
         assert transcriber_identity == transcriber.identity
-        assert exact_resolutions == [
-            ("media-basic", "sha256:" + "a" * 64),
-            ("transcribe-cpu", "sha256:" + "b" * 64),
-        ]
+        assert exact_resolutions == expected_exact_resolutions
     else:
         assert transcriber is None
         assert transcriber_identity == "transcribe-cpu/unavailable"
         assert exact_resolutions == [
             ("media-basic", "sha256:" + "a" * 64),
         ]
+    media_identity = frozen_environment.pack("media-basic")
+    for incompatible_media in (
+        replace(media_identity, pack_version="unsupported-version"),
+        replace(media_identity, platform="other-platform"),
+    ):
+        incompatible = replace(
+            frozen_environment,
+            packs=(
+                incompatible_media,
+                *tuple(
+                    pack
+                    for pack in frozen_environment.packs
+                    if pack.pack_id != "media-basic"
+                ),
+            ),
+        )
+        with pytest.raises(DomainError, match="pack_generation_unavailable"):
+            pack_port_resolver(incompatible)
     assert captured["model_execution_profile"] == "default"
     assert model.provider_kind == "codex-app-server"
     assert model.model_identity == "codex-test-model"

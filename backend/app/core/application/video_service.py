@@ -69,8 +69,8 @@ from app.core.jobs.resource_lease import (
 )
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
-    ExecutionPackIdentity,
     JobPackEnvironmentSnapshot,
+    parse_job_pack_environment_payload,
 )
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.bundle_assembler import (
@@ -2273,76 +2273,27 @@ class VideoService:
                     "The Job does not contain a frozen execution Pack environment",
                 )
             return
-        if len(events) != 1 or self._execution_pack_environment is None:
+        if len(events) != 1:
             raise DomainError(
                 "execution_pack_snapshot_invalid",
                 ErrorCategory.CONFLICT,
                 "The Job execution Pack environment is unavailable or invalid",
             )
         try:
-            payload = json.loads(events[0].payload_json)
-            raw_packs = payload["packs"]
-            if (
-                type(payload) is not dict
-                or frozenset(payload)
-                != frozenset({"schema_version", "packs"})
-                or type(raw_packs) is not list
-                or not raw_packs
-                or any(
-                    type(value) is not dict
-                    or frozenset(value)
-                    != frozenset(
-                        {
-                            "pack_id",
-                            "pack_version",
-                            "platform",
-                            "manifest_sha256",
-                        }
-                    )
-                    for value in raw_packs
-                )
-            ):
-                raise ValueError
-            stored = JobPackEnvironmentSnapshot(
-                schema_version=payload["schema_version"],
-                packs=tuple(
-                    ExecutionPackIdentity(
-                        pack_id=value["pack_id"],
-                        pack_version=value["pack_version"],
-                        platform=value["platform"],
-                        manifest_sha256=value["manifest_sha256"],
-                    )
-                    for value in raw_packs
-                ),
+            stored = parse_job_pack_environment_payload(
+                events[0].payload_json
             )
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise DomainError(
                 "execution_pack_snapshot_invalid",
                 ErrorCategory.INTERNAL,
                 "Stored Job execution Pack environment is invalid",
             ) from error
-        if stored == self._execution_pack_environment:
-            return
         if self._pack_environment_activator is None:
             raise DomainError(
-                "execution_pack_drift",
-                ErrorCategory.CONFLICT,
-                "The exact execution Pack environment is unavailable; reinstall it or create a new Job",
-                {
-                    "submitted_packs": tuple(
-                        f"{pack.pack_id}@{pack.pack_version}:{pack.manifest_sha256}"
-                        for pack in stored.packs
-                    ),
-                    "current_packs": tuple(
-                        f"{pack.pack_id}@{pack.pack_version}:{pack.manifest_sha256}"
-                        for pack in self._execution_pack_environment.packs
-                    ),
-                },
+                "pack_generation_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The exact Video Pack generation is unavailable",
             )
         operations, transcriber_identity = self._pack_environment_activator(stored)
         if type(transcriber_identity) is not str or not transcriber_identity:

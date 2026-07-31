@@ -38,7 +38,7 @@ from app.core.domain.video import (
     VideoDocumentKind,
     VideoProduceRequest,
 )
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import AttemptState
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
@@ -326,6 +326,7 @@ def _create_runtime(
     media_fallback: bool = False,
     pack_environment: JobPackEnvironmentSnapshot | None = None,
     resolved_pack_environments: list[JobPackEnvironmentSnapshot] | None = None,
+    pack_resolution_error: DomainError | None = None,
 ) -> object:
     downloader = _FixtureDownloader(
         platform,
@@ -347,8 +348,10 @@ def _create_runtime(
     def resolve_pack_ports(
         snapshot: JobPackEnvironmentSnapshot,
     ) -> tuple[object, object | None, str]:
-        assert resolved_pack_environments is not None
-        resolved_pack_environments.append(snapshot)
+        if resolved_pack_environments is not None:
+            resolved_pack_environments.append(snapshot)
+        if pack_resolution_error is not None:
+            raise pack_resolution_error
         return source, transcriber, "fixture/transcriber-v1"
 
     runtime, service = runtime_module._create_platform_video_runtime_components(
@@ -362,7 +365,9 @@ def _create_runtime(
         pack_environment=pack_environment,
         pack_port_resolver=(
             resolve_pack_ports
-            if resolved_pack_environments is not None
+            if pack_environment is not None
+            or resolved_pack_environments is not None
+            or pack_resolution_error is not None
             else None
         ),
         model=model,
@@ -965,29 +970,44 @@ def test_job_freezes_both_official_video_pack_generations(
     }
 
 
-def test_recovery_refuses_same_version_with_different_pack_digest(
+@pytest.mark.parametrize(
+    "error_code",
+    ("pack_generation_unavailable", "pack_generation_invalid"),
+)
+def test_recovery_fails_closed_when_exact_pack_generation_cannot_be_resolved(
     tmp_path: Path,
     workspace_root: Path,
+    error_code: str,
 ) -> None:
     machine = tmp_path / "machine"
+    submitted_environment = _pack_environment()
     first = _create_runtime(
         machine,
         "bilibili",
         Calls(),
-        pack_environment=_pack_environment(),
+        pack_environment=submitted_environment,
     )
     submitted = first.submit_video(request("bilibili", workspace_root))
+    resolved: list[JobPackEnvironmentSnapshot] = []
     restarted = _create_runtime(
         machine,
         "bilibili",
         Calls(),
         pack_environment=_pack_environment(media_digest="c"),
+        resolved_pack_environments=resolved,
+        pack_resolution_error=DomainError(
+            error_code,
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The exact Video Pack generation cannot be resolved",
+        ),
     )
 
     with pytest.raises(DomainError) as caught:
         restarted.wait_job(submitted.job_id)
 
-    assert caught.value.code == "execution_pack_drift"
+    assert caught.value.code == error_code
+    assert resolved == [submitted_environment]
+    assert restarted.get_job(submitted.job_id).state is JobState.QUEUED
 
 
 def test_recovery_rebinds_to_exact_recorded_pack_generations(
@@ -1027,6 +1047,55 @@ def test_recovery_rebinds_to_exact_recorded_pack_generations(
         "sha256:" + "a" * 64,
         "sha256:" + "b" * 64,
     ]
+
+
+def test_execution_resolves_frozen_pack_generations_when_active_matches(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    environment = _pack_environment()
+    resolved: list[JobPackEnvironmentSnapshot] = []
+    runtime = _create_runtime(
+        tmp_path / "machine",
+        "bilibili",
+        Calls(),
+        pack_environment=environment,
+        resolved_pack_environments=resolved,
+    )
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert resolved == [environment]
+
+
+def test_recovery_resolves_frozen_pack_generations_without_current_active(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    machine = tmp_path / "machine"
+    submitted_environment = _pack_environment()
+    first = _create_runtime(
+        machine,
+        "bilibili",
+        Calls(),
+        pack_environment=submitted_environment,
+    )
+    submitted = first.submit_video(request("bilibili", workspace_root))
+    resolved: list[JobPackEnvironmentSnapshot] = []
+    restarted = _create_runtime(
+        machine,
+        "bilibili",
+        Calls(),
+        pack_environment=submitted_environment,
+        resolved_pack_environments=resolved,
+    )
+
+    completed = restarted.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert resolved == [submitted_environment]
 
 
 def test_same_canonical_video_can_be_produced_again_with_stable_source_identity(

@@ -74,14 +74,19 @@ class CodexAppServerCompletionBridge:
     ) -> LegacyModelResponse:
         """Compatibility entry point for the v1 Markdown generator."""
 
-        # CodexAppServerError intentionally crosses this boundary unchanged. The
-        # application coordinator owns outcome-unknown handling and replay policy.
-        returned_text = self._client.run_markdown_turn(
-            prompt,
-            self._model_identity,
-            cwd=None,
-            check_cancelled=check_cancelled,
-        )
+        try:
+            returned_text = self._client.run_markdown_turn(
+                prompt,
+                self._model_identity,
+                cwd=None,
+                check_cancelled=check_cancelled,
+            )
+        except CodexAppServerError as error:
+            if error.outcome_known:
+                raise LegacyKnownRetryableModelFailure(
+                    "The model provider returned a known failure"
+                ) from None
+            raise
         return self._normalized_response(returned_text)
 
     def complete_request(

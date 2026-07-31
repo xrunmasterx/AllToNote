@@ -20,7 +20,13 @@ from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
 from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionBinding
 from app.core.jobs.state_machine import TERMINAL_JOB_STATES
+from app.core.packs.events import (
+    JOB_PACK_ENVIRONMENT_EVENT,
+    JobPackEnvironmentSnapshot,
+    parse_job_pack_environment_payload,
+)
 from app.runtime_paths import resolve_runtime_paths
 
 
@@ -286,6 +292,11 @@ def create_job_runtime_for_workspace(
                 workspace_root,
                 local_app_data=trusted_root,
                 current_config_snapshot=current_config_snapshot,
+                execution_pack_environment=_job_pack_environment(
+                    repository,
+                    job_id,
+                    binding,
+                ),
             )
         return runtime.wait_job(job_id)
 
@@ -294,6 +305,53 @@ def create_job_runtime_for_workspace(
         wait_job=execute,
         current_config_snapshot=current_config_snapshot,
     )
+
+
+def _job_pack_environment(
+    repository: SqliteJobRepository,
+    job_id: str,
+    binding: JobExecutionBinding,
+) -> JobPackEnvironmentSnapshot:
+    events = tuple(
+        event
+        for event in repository.list_events(job_id)
+        if event.event_type == JOB_PACK_ENVIRONMENT_EVENT
+    )
+    if not events:
+        raise DomainError(
+            "execution_pack_snapshot_missing",
+            ErrorCategory.CONFLICT,
+            "The Job does not contain a frozen execution Pack environment",
+        )
+    if len(events) != 1:
+        raise DomainError(
+            "execution_pack_snapshot_invalid",
+            ErrorCategory.CONFLICT,
+            "The Job execution Pack environment is unavailable or invalid",
+        )
+    try:
+        snapshot = parse_job_pack_environment_payload(events[0].payload_json)
+    except (KeyError, TypeError, ValueError) as error:
+        raise DomainError(
+            "execution_pack_snapshot_invalid",
+            ErrorCategory.INTERNAL,
+            "Stored Job execution Pack environment is invalid",
+        ) from error
+    try:
+        bound_pack = snapshot.pack(binding.pack_id)
+    except ValueError as error:
+        raise DomainError(
+            "execution_pack_snapshot_invalid",
+            ErrorCategory.CONFLICT,
+            "The Job execution Pack environment does not match its executor binding",
+        ) from error
+    if bound_pack.pack_version != binding.pack_version:
+        raise DomainError(
+            "execution_pack_snapshot_invalid",
+            ErrorCategory.CONFLICT,
+            "The Job execution Pack environment does not match its executor binding",
+        )
+    return snapshot
 
 
 def _is_wait_boundary(state: JobState) -> bool:
