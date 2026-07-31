@@ -93,6 +93,7 @@ class RuntimeInfo:
                 "parallel_job_execution_supported": (
                     self.sqlite_parallel_jobs_supported
                 ),
+                "parallel_job_execution_enabled": False,
             },
             "engine": {
                 "supported": self.engine_supported,
@@ -135,7 +136,12 @@ def _normalized_platform() -> tuple[str, str]:
     return operating_system, architecture
 
 
-def _sqlite_parallel_jobs_supported(version: str) -> bool:
+def _sqlite_parallel_jobs_supported(
+    version: str,
+    *,
+    threadsafety: int | None = None,
+    compile_options: tuple[str, ...] = (),
+) -> bool:
     try:
         parts = tuple(int(part) for part in version.split("."))
     except (AttributeError, ValueError):
@@ -143,11 +149,20 @@ def _sqlite_parallel_jobs_supported(version: str) -> bool:
     if len(parts) != 3 or parts[0] != 3:
         return False
     _major, minor, patch = parts
-    return (
+    version_admitted = (
         (minor == 44 and patch >= 6)
         or (minor == 50 and patch >= 7)
         or (minor == 51 and patch >= 3)
         or (minor == 53 and patch >= 4)
+    )
+    if not version_admitted:
+        return False
+    if threadsafety is not None and threadsafety < 1:
+        return False
+    normalized_options = {option.upper() for option in compile_options}
+    return (
+        "OMIT_WAL" not in normalized_options
+        and "THREADSAFE=0" not in normalized_options
     )
 
 
@@ -196,7 +211,9 @@ def build_runtime_info(
         sqlite_compile_options=sqlite_compile_options,
         sqlite_threadsafety=sqlite3.threadsafety,
         sqlite_parallel_jobs_supported=_sqlite_parallel_jobs_supported(
-            sqlite3.sqlite_version
+            sqlite3.sqlite_version,
+            threadsafety=sqlite3.threadsafety,
+            compile_options=sqlite_compile_options,
         ),
         engine_supported=False,
         engine_running=False,
@@ -324,7 +341,12 @@ def runtime_doctor(
             )
         )
 
-    sqlite_safe = _sqlite_parallel_jobs_supported(sqlite3.sqlite_version)
+    _sqlite_source_id, sqlite_compile_options = _loaded_sqlite_identity()
+    sqlite_safe = _sqlite_parallel_jobs_supported(
+        sqlite3.sqlite_version,
+        threadsafety=sqlite3.threadsafety,
+        compile_options=sqlite_compile_options,
+    )
     checks.append(
         RuntimeCheck(
             "storage.sqlite.parallel-jobs",

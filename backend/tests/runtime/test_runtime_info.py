@@ -133,8 +133,11 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
         "sqlite_compile_options": sqlite_compile_options,
         "sqlite_threadsafety": runtime_info_module.sqlite3.threadsafety,
         "parallel_job_execution_supported": _sqlite_parallel_jobs_supported(
-            runtime_info_module.sqlite3.sqlite_version
+            runtime_info_module.sqlite3.sqlite_version,
+            threadsafety=runtime_info_module.sqlite3.threadsafety,
+            compile_options=sqlite_compile_options,
         ),
+        "parallel_job_execution_enabled": False,
     }
     assert data["packs"] == [
         {
@@ -338,6 +341,24 @@ def test_sqlite_parallel_job_gate_uses_only_project_validated_release_lines(
     expected: bool,
 ) -> None:
     assert _sqlite_parallel_jobs_supported(version) is expected
+
+
+def test_sqlite_parallel_job_support_requires_serialized_wal_build() -> None:
+    assert not _sqlite_parallel_jobs_supported(
+        "3.53.4",
+        threadsafety=0,
+        compile_options=("THREADSAFE=0",),
+    )
+    assert not _sqlite_parallel_jobs_supported(
+        "3.53.4",
+        threadsafety=3,
+        compile_options=("OMIT_WAL", "THREADSAFE=1"),
+    )
+    assert _sqlite_parallel_jobs_supported(
+        "3.53.4",
+        threadsafety=3,
+        compile_options=("THREADSAFE=1",),
+    )
 
 
 def test_runtime_doctor_warns_when_sqlite_is_unsafe_for_parallel_wal(

@@ -67,6 +67,46 @@ def _raise_store_invalid(error: BaseException) -> None:
     ) from error
 
 
+def _raise_if_store_busy(error: sqlite3.DatabaseError) -> None:
+    result_code = getattr(error, "sqlite_errorcode", None)
+    if type(result_code) is not int:
+        return
+    result_name = {
+        sqlite3.SQLITE_BUSY: "busy",
+        sqlite3.SQLITE_LOCKED: "locked",
+    }.get(result_code & 0xFF)
+    if result_name is None:
+        return
+    raise DomainError(
+        "machine_lease_store_busy",
+        ErrorCategory.RETRYABLE_RUNTIME,
+        "The machine resource lease store is busy; retry the operation",
+        {
+            "sqlite_result": result_name,
+            "busy_timeout_ms": _BUSY_TIMEOUT_MS,
+        },
+    ) from error
+
+
+def _configure_connection(connection: sqlite3.Connection) -> None:
+    connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+    if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
+        raise DomainError(
+            "machine_lease_wal_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The machine resource lease store requires SQLite WAL mode",
+        )
+    connection.execute("PRAGMA synchronous = FULL")
+    synchronous = connection.execute("PRAGMA synchronous").fetchone()
+    if synchronous is None or synchronous[0] != 2:
+        raise DomainError(
+            "machine_lease_wal_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The machine resource lease store requires SQLite FULL durability",
+        )
+
+
 class MachineResourceLeaseStore:
     def __init__(
         self,
@@ -92,6 +132,8 @@ class MachineResourceLeaseStore:
             clock=clock or (lambda: time.time_ns() // 1_000_000),
         )
         store._initialize_schema()
+        with store._transaction():
+            pass
         return store
 
     def _initialize_schema(self) -> None:
@@ -127,9 +169,10 @@ class MachineResourceLeaseStore:
                 isolation_level=None,
             )
             connection.row_factory = sqlite3.Row
-            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            if not schema_operation:
-                connection.execute("PRAGMA journal_mode = WAL")
+            if schema_operation:
+                connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            else:
+                _configure_connection(connection)
             connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
@@ -146,6 +189,7 @@ class MachineResourceLeaseStore:
                     connection.rollback()
                 except sqlite3.DatabaseError:
                     pass
+            _raise_if_store_busy(error)
             if schema_operation:
                 _raise_schema_invalid(error)
             _raise_store_invalid(error)

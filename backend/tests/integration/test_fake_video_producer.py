@@ -1653,6 +1653,47 @@ def test_job_store_busy_does_not_fail_video_job(
     assert calls.download == calls.transcribe == calls.model == calls.commit == 0
 
 
+def test_machine_lease_store_busy_does_not_fail_video_job(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    store = MachineResourceLeaseStore.open(tmp_path / "lease-store-busy")
+    calls = runtime_module.FakeCallCounts()
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "lease-store-busy-machine",
+        calls=calls,
+        resource_lease_store=store,
+        resource_owner=ResourceOwner(
+            "video-workspace",
+            "video-process",
+            process_id=101,
+        ),
+    )
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="lease-store-busy")
+    )
+
+    def busy_heartbeat(*_args: object, **_kwargs: object) -> object:
+        raise DomainError(
+            "machine_lease_store_busy",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "The machine resource lease store is busy; retry the operation",
+        )
+
+    store._heartbeat = busy_heartbeat  # type: ignore[method-assign]
+    runtime.video_service._execute = (
+        lambda *_args, **_kwargs: runtime.video_service._heartbeat_resource_lease()
+    )
+
+    with pytest.raises(DomainError, match="machine_lease_store_busy"):
+        runtime.wait_job(submitted.job_id)
+
+    assert runtime.get_job(submitted.job_id).state is JobState.RUNNING
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+
+
 def test_distinct_jobs_on_one_runtime_execute_serially(
     tmp_path: Path,
     runtime_factory: Callable[..., tuple[object, object]],

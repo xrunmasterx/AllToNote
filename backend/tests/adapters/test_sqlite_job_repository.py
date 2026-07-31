@@ -448,6 +448,7 @@ def test_open_creates_version_two_database_with_exact_schema_and_pragmas(
         }
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
         foreign_key_violations = connection.execute(
@@ -457,9 +458,46 @@ def test_open_creates_version_two_database_with_exact_schema_and_pragmas(
     assert tables == EXPECTED_TABLES
     assert foreign_keys == 1
     assert journal_mode == "wal"
+    assert synchronous == 2
     assert busy_timeout == 5_000
     assert user_version == 2
     assert foreign_key_violations == []
+
+
+def test_job_store_fails_closed_when_wal_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def fetchone(self):
+            return ("delete",)
+
+    class FakeConnection:
+        row_factory = None
+
+        def execute(self, statement: str):
+            if statement in {"PRAGMA foreign_keys = ON"} or statement.startswith(
+                "PRAGMA busy_timeout"
+            ):
+                return FakeResult()
+            if statement == "PRAGMA journal_mode = WAL":
+                return FakeResult()
+            pytest.fail(f"unexpected statement after rejected WAL mode: {statement}")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        repository_module.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: FakeConnection(),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        SqliteJobRepository.open(tmp_path / "wal-unavailable")
+
+    assert raised.value.code == "job_store_wal_unavailable"
+    assert raised.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
 
 
 def test_busy_begin_immediate_is_stable_retryable_error(

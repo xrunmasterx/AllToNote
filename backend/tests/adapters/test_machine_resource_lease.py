@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app.adapters.jobs import machine_resource_lease as lease_module
 from app.core.errors import DomainError, ErrorCategory
 
 
@@ -155,6 +156,8 @@ def test_machine_lease_version_zero_empty_database_creates_exact_v1_schema(
 
     with sqlite3.connect(store.database_path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
         objects = connection.execute(
             """
             SELECT type, name, sql FROM sqlite_master
@@ -163,6 +166,8 @@ def test_machine_lease_version_zero_empty_database_creates_exact_v1_schema(
         ).fetchall()
 
     assert version == 1
+    assert journal_mode == "wal"
+    assert synchronous == 2
     assert len(objects) == 1
     assert objects[0][0:2] == ("table", "resource_leases")
     assert _normalized_sql(objects[0][2]) == _normalized_sql(
@@ -280,3 +285,112 @@ def test_machine_lease_corrupt_database_and_runtime_sqlite_errors_are_sanitized(
         )
     assert marker not in str(caught.value)
     assert str(store.database_path) not in str(caught.value)
+
+
+def test_machine_lease_open_busy_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    MachineResourceLeaseStore, _ = _task7_lease_api()
+    monkeypatch.setattr(lease_module, "_BUSY_TIMEOUT_MS", 25)
+    machine_root = tmp_path / "busy-open"
+    store = MachineResourceLeaseStore.open(machine_root)
+    holder = sqlite3.connect(store.database_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(DomainError) as raised:
+            MachineResourceLeaseStore.open(machine_root)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert raised.value.code == "machine_lease_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert dict(raised.value.details) == {
+        "sqlite_result": "busy",
+        "busy_timeout_ms": 25,
+    }
+    assert str(store.database_path) not in str(raised.value)
+
+
+def test_machine_lease_acquire_busy_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    MachineResourceLeaseStore, ResourceOwner = _task7_lease_api()
+    monkeypatch.setattr(lease_module, "_BUSY_TIMEOUT_MS", 25)
+    store = MachineResourceLeaseStore.open(tmp_path / "busy-acquire")
+    holder = sqlite3.connect(store.database_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(DomainError) as raised:
+            store.acquire(
+                "gpu",
+                ResourceOwner("workspace", "process", process_id=1),
+                ttl_seconds=10,
+            )
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert raised.value.code == "machine_lease_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert dict(raised.value.details) == {
+        "sqlite_result": "busy",
+        "busy_timeout_ms": 25,
+    }
+
+
+@pytest.mark.parametrize(
+    ("result_code", "result_name"),
+    (
+        (sqlite3.SQLITE_BUSY, "busy"),
+        (sqlite3.SQLITE_LOCKED, "locked"),
+        (sqlite3.SQLITE_BUSY | (2 << 8), "busy"),
+    ),
+)
+def test_machine_lease_busy_result_codes_are_stable_and_sanitized(
+    result_code: int,
+    result_name: str,
+) -> None:
+    error = sqlite3.OperationalError("private SQLite detail")
+    error.sqlite_errorcode = result_code
+
+    with pytest.raises(DomainError) as raised:
+        lease_module._raise_if_store_busy(error)
+
+    assert raised.value.code == "machine_lease_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert dict(raised.value.details) == {
+        "sqlite_result": result_name,
+        "busy_timeout_ms": lease_module._BUSY_TIMEOUT_MS,
+    }
+    assert "private" not in str(raised.value)
+
+
+def test_machine_lease_fails_closed_when_wal_is_unavailable() -> None:
+    class FakeResult:
+        def fetchone(self):
+            return ("delete",)
+
+    class FakeConnection:
+        row_factory = None
+
+        def execute(self, statement: str):
+            if statement.startswith("PRAGMA busy_timeout"):
+                return FakeResult()
+            if statement == "PRAGMA journal_mode = WAL":
+                return FakeResult()
+            pytest.fail(f"unexpected statement after rejected WAL mode: {statement}")
+
+        def rollback(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    with pytest.raises(DomainError) as raised:
+        lease_module._configure_connection(FakeConnection())
+
+    assert raised.value.code == "machine_lease_wal_unavailable"
+    assert raised.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE

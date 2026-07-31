@@ -255,6 +255,26 @@ def _raise_if_job_store_busy(error: sqlite3.DatabaseError) -> None:
     ) from error
 
 
+def _configure_connection(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+    if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
+        raise DomainError(
+            "job_store_wal_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The workspace job store requires SQLite WAL mode",
+        )
+    connection.execute("PRAGMA synchronous = FULL")
+    synchronous = connection.execute("PRAGMA synchronous").fetchone()
+    if synchronous is None or synchronous[0] != 2:
+        raise DomainError(
+            "job_store_wal_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The workspace job store requires SQLite FULL durability",
+        )
+
+
 class SqliteJobRepository:
     def __init__(
         self, machine_root: Path, *, clock: Callable[[], int]
@@ -293,9 +313,7 @@ class SqliteJobRepository:
                 isolation_level=None,
             )
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            connection.execute("PRAGMA journal_mode = WAL")
+            _configure_connection(connection)
         except sqlite3.DatabaseError as error:
             if connection is not None:
                 connection.close()

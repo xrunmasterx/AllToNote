@@ -1548,6 +1548,47 @@ def test_job_store_busy_does_not_fail_document_job(tmp_path: Path) -> None:
     assert parser.calls == 0
 
 
+def test_machine_lease_store_busy_does_not_fail_document_job(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    store = MachineResourceLeaseStore.open(tmp_path / "document-lease-store-busy")
+    service, repository = _service(
+        tmp_path / "document-lease-store-busy-machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="document-process",
+        resource_lease_store=store,
+        resource_owner=ResourceOwner(
+            "document-workspace",
+            "document-process",
+            process_id=101,
+        ),
+    )
+    job_id, router = _submit(service, repository, workspace, source)
+
+    def busy_heartbeat(*_args: object, **_kwargs: object) -> object:
+        raise DomainError(
+            "machine_lease_store_busy",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "The machine resource lease store is busy; retry the operation",
+        )
+
+    store._heartbeat = busy_heartbeat  # type: ignore[method-assign]
+    service._execute = (
+        lambda *_args, **_kwargs: service._heartbeat_resource_lease()
+    )
+
+    with pytest.raises(DomainError, match="machine_lease_store_busy"):
+        router.wait_job(job_id)
+
+    assert router.get_job(job_id).state is JobState.RUNNING
+    assert parser.calls == 0
+
+
 def test_video_blocks_document_in_another_workspace_without_starting_parser(
     tmp_path: Path,
 ) -> None:
