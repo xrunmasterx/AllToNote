@@ -49,7 +49,14 @@ class _Parser:
     def __init__(self) -> None:
         self.calls = 0
 
-    def parse(self, source: Path, *, work_root: Path) -> ParsedDocument:
+    def parse(
+        self,
+        source: Path,
+        *,
+        work_root: Path,
+        cancellation_token,
+    ) -> ParsedDocument:
+        cancellation_token.raise_if_cancelled()
         del work_root
         self.calls += 1
         raw = source.read_bytes()
@@ -84,7 +91,14 @@ class _Parser:
 
 
 class _CrashParser(_Parser):
-    def parse(self, source: Path, *, work_root: Path) -> ParsedDocument:
+    def parse(
+        self,
+        source: Path,
+        *,
+        work_root: Path,
+        cancellation_token,
+    ) -> ParsedDocument:
+        cancellation_token.raise_if_cancelled()
         self.calls += 1
         raise RuntimeError("injected parser crash")
 
@@ -253,6 +267,47 @@ def test_document_recipe_uses_generic_submit_and_survives_reopen(tmp_path: Path)
     assert second.result.source_revision_id != completed.result.source_revision_id
     assert second.result.bundle_id != completed.result.bundle_id
     assert parser.calls == 2
+
+
+def test_document_cancellation_interrupts_parser_and_settles_job(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    started = threading.Event()
+    poll = threading.Event()
+
+    class BlockingParser(_Parser):
+        def parse(
+            self,
+            source: Path,
+            *,
+            work_root: Path,
+            cancellation_token,
+        ) -> ParsedDocument:
+            started.set()
+            while True:
+                cancellation_token.raise_if_cancelled()
+                poll.wait(0.01)
+
+    service, repository = _service(
+        tmp_path / "machine",
+        BlockingParser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    job_id, _ = _submit(service, repository, workspace, source)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(service.wait_job, job_id)
+        assert started.wait(timeout=2)
+        service.cancel_job(job_id)
+        completed = result.result(timeout=2)
+
+    assert completed.state is JobState.CANCELLED
+    _, active_attempt, _ = repository.get_job_details(job_id)
+    assert active_attempt is None
 
 
 def test_document_source_identity_tracks_path_while_revision_tracks_bytes(
@@ -674,7 +729,14 @@ def test_blocking_document_parser_renews_machine_admission_beyond_ttl(
     store._heartbeat = observe_heartbeat  # type: ignore[method-assign]
 
     class BlockingParser(_Parser):
-        def parse(self, source: Path, *, work_root: Path) -> ParsedDocument:
+        def parse(
+            self,
+            source: Path,
+            *,
+            work_root: Path,
+            cancellation_token,
+        ) -> ParsedDocument:
+            cancellation_token.raise_if_cancelled()
             machine_now_ms[0] = 200_000
             assert heartbeat_observed.wait(timeout=2)
             machine_now_ms[0] = 400_000
@@ -688,7 +750,11 @@ def test_blocking_document_parser_renews_machine_admission_beyond_ttl(
                     ),
                     ttl_seconds=300,
                 )
-            return super().parse(source, work_root=work_root)
+            return super().parse(
+                source,
+                work_root=work_root,
+                cancellation_token=cancellation_token,
+            )
 
     parser = BlockingParser()
     service, repository = _service(

@@ -167,3 +167,30 @@ def test_external_outcome_unknown_pauses_job_atomically(tmp_path: Path) -> None:
     assert _attempt_state(repository, attempt_ids[0]) is AttemptState.NEEDS_INPUT
     assert challenge is not None
     assert repository.latest_checkpoint(job.job_id, "knowledge-map") is None
+
+
+def test_cancelled_action_settles_attempt_as_cancelled(tmp_path: Path) -> None:
+    _, repository, job, authority, runner = _fixture(tmp_path)
+    attempt_ids: list[str] = []
+
+    def cancel(execution):
+        attempt_ids.append(execution.attempt_id)
+        repository.cancel_job(job.job_id)
+        raise DomainError(
+            "job_cancelled",
+            ErrorCategory.CANCELLED,
+            "Job cancellation was requested",
+        )
+
+    with pytest.raises(DomainError, match="job_cancelled"):
+        runner.run(
+            job.job_id,
+            "parse-document",
+            _INPUT_HASH,
+            authority,
+            cancel,
+        )
+
+    assert _attempt_state(repository, attempt_ids[0]) is AttemptState.CANCELLED
+    assert repository.get_job_details(job.job_id)[0].state is JobState.CANCELLED
+    assert repository.latest_checkpoint(job.job_id, "parse-document") is None

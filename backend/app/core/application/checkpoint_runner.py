@@ -154,7 +154,11 @@ class CheckpointedStepRunner:
                 else:
                     self._repository.transition_attempt(
                         attempt.attempt_id,
-                        AttemptState.FAILED,
+                        (
+                            AttemptState.CANCELLED
+                            if error.category is ErrorCategory.CANCELLED
+                            else AttemptState.FAILED
+                        ),
                         authority=authority,
                     )
             except DomainError as convergence_error:

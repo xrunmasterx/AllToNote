@@ -16,6 +16,7 @@ from app.core.application.job_service import JobService
 from app.core.domain.document import DocumentProduceRequest, ParsedDocument
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
+from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.model import (
     Attempt,
     AttemptState,
@@ -271,7 +272,11 @@ class DocumentService:
         return self._commit(request, checkpoint, attempt, authority)
 
     def _parse(self, request: DocumentProduceRequest, job_id: str) -> ParsedDocument:
-        parsed = self._parser.parse(request.input_path, work_root=self._work_root)
+        parsed = self._parser.parse(
+            request.input_path,
+            work_root=self._work_root,
+            cancellation_token=CancellationToken(self._repository, job_id),
+        )
         self._verify_source_stat(request)
         if parsed.source_sha256 != request.expected_source_sha256:
             raise DomainError(

@@ -16,7 +16,12 @@ from app.adapters.documents.docling_worker_parser import (
     DoclingWorkerConfig,
     DoclingWorkerParser,
 )
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
+
+
+class _NeverCancelled:
+    def raise_if_cancelled(self) -> None:
+        pass
 
 
 def test_document_pack_identity_imports_without_runtime_dependencies() -> None:
@@ -116,18 +121,22 @@ def test_adapter_uses_argument_list_offline_worker_and_validates_source(
         captured.update(kwargs)
         output = Path(command[command.index("--output") + 1])
         output.write_text(json.dumps(_result(source)), encoding="utf-8")
-        return subprocess.CompletedProcess(command, 0, "", "")
+        return 0
 
-    parsed = _parser(tmp_path, runner).parse(source, work_root=work)
+    parsed = _parser(tmp_path, runner).parse(
+        source,
+        work_root=work,
+        cancellation_token=_NeverCancelled(),
+    )
 
     assert parsed.pages[0].blocks[0].text == "Document title"
     assert isinstance(captured["command"], list)
-    assert captured["env"]["HF_HUB_OFFLINE"] == "1"
-    assert captured["env"]["TRANSFORMERS_OFFLINE"] == "1"
-    assert captured["env"]["PYTHONPATH"] == str(tmp_path / "backend")
-    assert captured["env"]["PYTHONNOUSERSITE"] == "1"
-    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
-    assert "ALLTONOTE_TEST_SECRET" not in captured["env"]
+    assert captured["environment"]["HF_HUB_OFFLINE"] == "1"
+    assert captured["environment"]["TRANSFORMERS_OFFLINE"] == "1"
+    assert captured["environment"]["PYTHONPATH"] == str(tmp_path / "backend")
+    assert captured["environment"]["PYTHONNOUSERSITE"] == "1"
+    assert captured["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert "ALLTONOTE_TEST_SECRET" not in captured["environment"]
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.DEVNULL
     assert "capture_output" not in captured
@@ -156,7 +165,7 @@ def test_doctor_checks_locked_pack_in_offline_worker(tmp_path: Path) -> None:
             ),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(command, 0)
+        return 0
 
     _parser(tmp_path, runner).doctor()
 
@@ -165,9 +174,9 @@ def test_doctor_checks_locked_pack_in_offline_worker(tmp_path: Path) -> None:
         "-m",
         "app.adapters.documents.docling_worker_doctor",
     ]
-    assert captured["env"]["HF_HUB_OFFLINE"] == "1"
-    assert captured["env"]["TRANSFORMERS_OFFLINE"] == "1"
-    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert captured["environment"]["HF_HUB_OFFLINE"] == "1"
+    assert captured["environment"]["TRANSFORMERS_OFFLINE"] == "1"
+    assert captured["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.DEVNULL
 
@@ -186,7 +195,7 @@ def test_doctor_rejects_dependency_mismatch(tmp_path: Path) -> None:
             ),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(command, 1)
+        return 1
 
     with pytest.raises(
         DomainError,
@@ -206,10 +215,14 @@ def test_adapter_rejects_worker_identity_mismatch(tmp_path: Path) -> None:
         payload = _result(source)
         payload["model_revision"] = "wrong"
         output.write_text(json.dumps(payload), encoding="utf-8")
-        return subprocess.CompletedProcess(command, 0, "", "")
+        return 0
 
     with pytest.raises(DomainError, match="document_parser_identity_mismatch"):
-        _parser(tmp_path, runner).parse(source, work_root=work)
+        _parser(tmp_path, runner).parse(
+            source,
+            work_root=work,
+            cancellation_token=_NeverCancelled(),
+        )
 
 
 def test_adapter_stages_non_ascii_source_for_worker_and_keeps_original_name(
@@ -229,9 +242,13 @@ def test_adapter_stages_non_ascii_source_for_worker_and_keeps_original_name(
         payload["source_name"] = staged.name
         output = Path(command[command.index("--output") + 1])
         output.write_text(json.dumps(payload), encoding="utf-8")
-        return subprocess.CompletedProcess(command, 0)
+        return 0
 
-    parsed = _parser(tmp_path, runner).parse(source, work_root=work)
+    parsed = _parser(tmp_path, runner).parse(
+        source,
+        work_root=work,
+        cancellation_token=_NeverCancelled(),
+    )
 
     assert parsed.source_name == source.name
 
@@ -246,4 +263,43 @@ def test_adapter_rejects_non_pdf_before_worker(tmp_path: Path) -> None:
         _parser(tmp_path, lambda *_args, **_kwargs: None).parse(
             source,
             work_root=work,
+            cancellation_token=_NeverCancelled(),
         )
+
+
+def test_adapter_propagates_cancellation_and_cleans_private_snapshot(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-born-digital")
+    work = tmp_path / "work"
+    work.mkdir()
+
+    class _Cancellation:
+        cancelled = False
+
+        def raise_if_cancelled(self) -> None:
+            if self.cancelled:
+                raise DomainError(
+                    "job_cancelled",
+                    ErrorCategory.CANCELLED,
+                    "Job cancellation was requested",
+                )
+
+    cancellation = _Cancellation()
+
+    def runner(_command, **kwargs):
+        cancellation.cancelled = True
+        kwargs["check_running"]()
+        raise AssertionError("unreachable")
+
+    with pytest.raises(DomainError) as caught:
+        _parser(tmp_path, runner).parse(
+            source,
+            work_root=work,
+            cancellation_token=cancellation,
+        )
+
+    assert caught.value.code == "job_cancelled"
+    assert caught.value.category is ErrorCategory.CANCELLED
+    assert tuple(work.iterdir()) == ()

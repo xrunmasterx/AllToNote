@@ -16,6 +16,11 @@ from app.adapters.documents.document_basic_pack import (
     PACK_VERSION,
     PARSER_MODEL_REVISION,
 )
+from app.adapters.worker_process import (
+    WorkerProcessTimeout,
+    WorkerProcessUnavailable,
+    run_worker_process,
+)
 from app.core.domain.document import (
     DocumentBlock,
     DocumentBoundingBox,
@@ -23,9 +28,12 @@ from app.core.domain.document import (
     ParsedDocument,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.ports.source import CancellationTokenPort
 
 
 _MAX_FIRST_SLICE_BYTES = 64 * 1024 * 1024
+_MAX_DOCTOR_RESULT_BYTES = 64 * 1024
+_MAX_PARSER_RESULT_BYTES = 128 * 1024 * 1024
 _WORKER_ENVIRONMENT_KEYS = (
     "APPDATA",
     "COMSPEC",
@@ -48,10 +56,15 @@ _WORKER_ENVIRONMENT_KEYS = (
 )
 
 
-def _sha256(path: Path) -> str:
+def _sha256(
+    path: Path,
+    check_cancelled: Callable[[], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if check_cancelled is not None:
+                check_cancelled()
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
 
@@ -77,7 +90,7 @@ class DoclingWorkerParser:
         self,
         config: DoclingWorkerConfig,
         *,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        runner: Callable[..., int] = run_worker_process,
     ) -> None:
         self._config = config
         self._runner = runner
@@ -96,30 +109,52 @@ class DoclingWorkerParser:
                 "--output",
                 str(output),
             ]
+
+            def check_running() -> None:
+                if output.is_file() and output.stat().st_size > _MAX_DOCTOR_RESULT_BYTES:
+                    raise _failed(
+                        "document_pack_invalid",
+                        "document-basic Pack doctor returned an oversized result",
+                    )
+
             try:
-                completed = self._runner(
+                return_code = self._runner(
                     command,
                     cwd=backend_root,
-                    env=self._environment(backend_root),
-                    check=False,
+                    environment=self._environment(backend_root),
+                    timeout_seconds=self._config.timeout_seconds,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=self._config.timeout_seconds,
+                    check_running=check_running,
                 )
-            except subprocess.TimeoutExpired as error:
+            except WorkerProcessTimeout as error:
                 raise _failed(
                     "document_pack_invalid",
                     "document-basic Pack doctor timed out",
                 ) from error
-            problem = _decode_doctor_result(output)
-            if completed.returncode != 0 or problem is not None:
+            except WorkerProcessUnavailable as error:
+                raise _failed(
+                    "document_pack_invalid",
+                    "document-basic Pack doctor could not be started",
+                ) from error
+            problem = _decode_doctor_result(
+                _read_bounded_text(output, _MAX_DOCTOR_RESULT_BYTES)
+            )
+            if return_code != 0 or problem is not None:
                 detail = problem or "unknown check"
                 raise _failed(
                     "document_pack_invalid",
                     f"document-basic Pack doctor failed: {detail}",
                 )
 
-    def parse(self, source: Path, *, work_root: Path) -> ParsedDocument:
+    def parse(
+        self,
+        source: Path,
+        *,
+        work_root: Path,
+        cancellation_token: CancellationTokenPort,
+    ) -> ParsedDocument:
+        cancellation_token.raise_if_cancelled()
         source = Path(source).resolve(strict=True)
         work_root = Path(work_root).resolve(strict=True)
         python_executable, artifacts_path, backend_root = self._installation()
@@ -137,12 +172,17 @@ class DoclingWorkerParser:
                 "document_input_unsupported",
                 "The first Document slice requires a bounded born-digital PDF",
             )
-        before_hash = _sha256(source)
+        before_hash = _sha256(source, cancellation_token.raise_if_cancelled)
         before_identity = (stat.st_size, stat.st_mtime_ns)
         with tempfile.TemporaryDirectory(prefix="docling-", dir=work_root) as directory:
             staged_source = Path(directory) / "input.pdf"
+            cancellation_token.raise_if_cancelled()
             shutil.copyfile(source, staged_source)
-            if _sha256(staged_source) != before_hash:
+            cancellation_token.raise_if_cancelled()
+            if (
+                _sha256(staged_source, cancellation_token.raise_if_cancelled)
+                != before_hash
+            ):
                 raise DomainError(
                     "document_input_changed",
                     ErrorCategory.CONFLICT,
@@ -165,34 +205,51 @@ class DoclingWorkerParser:
                 "--expected-model-revision",
                 PARSER_MODEL_REVISION,
             ]
+
+            def check_running() -> None:
+                cancellation_token.raise_if_cancelled()
+                if output.is_file() and output.stat().st_size > _MAX_PARSER_RESULT_BYTES:
+                    raise _failed(
+                        "document_parser_result_invalid",
+                        "The isolated Document parser result is too large",
+                    )
+
             try:
-                completed = self._runner(
+                return_code = self._runner(
                     command,
                     cwd=backend_root,
-                    env=self._environment(backend_root),
-                    check=False,
+                    environment=self._environment(backend_root),
+                    timeout_seconds=self._config.timeout_seconds,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=self._config.timeout_seconds,
+                    check_running=check_running,
                 )
-            except subprocess.TimeoutExpired as error:
+            except WorkerProcessTimeout as error:
                 raise _failed(
                     "document_parser_timeout",
                     "The isolated Document parser exceeded its time budget",
                 ) from error
-            if completed.returncode != 0 or not output.is_file():
+            except WorkerProcessUnavailable as error:
+                raise _failed(
+                    "document_parser_failed",
+                    "The isolated Document parser could not be started",
+                ) from error
+            cancellation_token.raise_if_cancelled()
+            if return_code != 0 or not output.is_file():
                 raise _failed(
                     "document_parser_failed",
                     "The isolated Document parser did not produce a result",
                 )
             parsed = replace(
-                _decode_result(output.read_text(encoding="utf-8")),
+                _decode_result(
+                    _read_bounded_text(output, _MAX_PARSER_RESULT_BYTES)
+                ),
                 source_name=source.name,
             )
         after = source.stat()
         if (
             (after.st_size, after.st_mtime_ns) != before_identity
-            or _sha256(source) != before_hash
+            or _sha256(source, cancellation_token.raise_if_cancelled) != before_hash
             or parsed.source_sha256 != before_hash
             or parsed.parser_version != DOCLING_SLIM_VERSION
             or parsed.model_revision != PARSER_MODEL_REVISION
@@ -239,10 +296,24 @@ class DoclingWorkerParser:
         return environment
 
 
-def _decode_doctor_result(output: Path) -> str | None:
+def _read_bounded_text(path: Path, maximum_bytes: int) -> str:
     try:
-        value = json.loads(output.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        with path.open("rb") as stream:
+            payload = stream.read(maximum_bytes + 1)
+    except OSError:
+        return ""
+    if len(payload) > maximum_bytes:
+        return ""
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError:
+        return ""
+
+
+def _decode_doctor_result(payload: str) -> str | None:
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
         return "invalid doctor result"
     if type(value) is not dict or value.get("schema_version") != 1:
         return "invalid doctor result"

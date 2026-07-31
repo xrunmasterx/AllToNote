@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import tempfile
-import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from app.adapters.worker_process import (
+    WorkerProcessTimeout,
+    WorkerProcessUnavailable,
+    run_worker_process,
+)
 from app.core.errors import DomainError, ErrorCategory
 
 
@@ -30,7 +33,6 @@ _ENVIRONMENT_KEYS = frozenset(
     }
 )
 _MAXIMUM_REQUEST_BYTES = 64 * 1024
-_POLL_SECONDS = 0.05
 
 
 def minimal_worker_environment(
@@ -68,34 +70,6 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("duplicate_json_key")
         result[key] = value
     return result
-
-
-def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ("taskkill", "/PID", str(process.pid), "/T", "/F"),
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            process.kill()
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            process.kill()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
 
 
 def run_json_worker(
@@ -140,70 +114,38 @@ def run_json_worker(
     if check_cancelled is not None:
         check_cancelled()
 
-    popen_kwargs: dict[str, object] = {}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(
-            subprocess,
-            "CREATE_NEW_PROCESS_GROUP",
-            0,
-        ) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    else:
-        popen_kwargs["start_new_session"] = True
     with tempfile.TemporaryFile() as output_file:
+        def check_running() -> None:
+            if check_cancelled is not None:
+                check_cancelled()
+            if os.fstat(output_file.fileno()).st_size > maximum_output_bytes:
+                raise _result_invalid()
+
         try:
-            process = subprocess.Popen(
-                tuple(command),
+            return_code = run_worker_process(
+                command,
                 cwd=work_directory,
-                env=dict(environment),
-                stdin=subprocess.PIPE,
+                environment=environment,
+                timeout_seconds=timeout_seconds,
+                stdin_payload=payload,
                 stdout=output_file,
                 stderr=subprocess.DEVNULL,
-                **popen_kwargs,
+                check_running=check_running,
             )
-        except OSError as error:
+        except WorkerProcessUnavailable as error:
             raise DomainError(
                 "pack_worker_unavailable",
                 ErrorCategory.WORKSPACE_INCOMPATIBLE,
                 "The isolated Pack worker could not be started",
             ) from error
-
-        try:
-            assert process.stdin is not None
-            try:
-                process.stdin.write(payload)
-                process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
-
-            deadline = time.monotonic() + float(timeout_seconds)
-            while True:
-                if check_cancelled is not None:
-                    check_cancelled()
-                if os.fstat(output_file.fileno()).st_size > maximum_output_bytes:
-                    raise _result_invalid()
-                if process.poll() is not None:
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError
-                time.sleep(min(_POLL_SECONDS, remaining))
-        except TimeoutError as error:
-            _terminate_process_tree(process)
+        except WorkerProcessTimeout as error:
             raise DomainError(
                 "pack_worker_timeout",
                 ErrorCategory.RETRYABLE_RUNTIME,
                 "The isolated Pack worker exceeded its time budget",
             ) from error
-        except BaseException:
-            _terminate_process_tree(process)
-            raise
 
-        if process.returncode != 0:
+        if return_code != 0:
             raise DomainError(
                 "pack_worker_failed",
                 ErrorCategory.RECIPE_FAILED,
