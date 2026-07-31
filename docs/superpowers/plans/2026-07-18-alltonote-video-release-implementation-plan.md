@@ -9,8 +9,8 @@ upstream:
   - ../specs/2026-07-16-alltonote-long-video-knowledge-compilation-design.md
   - ../specs/2026-07-18-alltonote-runtime-cli-feature-pack-design.md
   - ../specs/2026-07-14-alltonote-portable-artifact-source-bundle-design.md
-implementation_status: vrel-00-01-completed-vrel-02-through-11-pending
-last_verified_at: 2026-07-18
+implementation_status: vrel-00-03-evidence-recorded-vrel-04-through-11-open
+last_verified_at: 2026-07-31
 ```
 
 ## 0. 已完成、不得重做
@@ -286,4 +286,13 @@ YouTube 保持外部阻塞时，跳过实时成功 Gate并继续其余任务；�
 - `VREL-00` 和 `VREL-01` 已完成；逐项 release matrix、调用链、runtime-lock、CLI compatibility、request hash、profile refs、Ctrl+C/cancel 和测试证据见 [`Runtime/CLI Wave 1A acceptance`](../../acceptance/2026-07-18-runtime-cli-wave-1a-baseline.md)。
 - canonical 命令为 `alltonote produce video --input ... --workspace ...`；位置参数作为带 deprecation warning 的同链 alias 保留。
 - Video v1/v2、normalized `requested_outputs`、Faithful language policy、Job request persistence/hash、checkpoint/recovery、ModelExecutor 和 Portable/iwiki 合同均无退化。
-- `VREL-02` 至 `VREL-11` 未在 Wave 1A 执行。YouTube 实时 acquisition 继续明确 `blocked`；其余项目为 `not-run`，不得冒充正式 Video release。
+- 截至 Wave 1A，`VREL-02` 至 `VREL-11` 尚未执行。后续进展见下一节；YouTube 实时 acquisition 继续明确 `blocked`，不得用缓存或其他平台结果冒充成功。
+
+## 18. 2026-07-31 发布候选接缝记录
+
+- `VREL-02`：三条用户提供的真实 Bilibili 输入已通过签名 `media-basic` / `transcribe-cpu` 组合、Portable commit 和用户结果 Gate，证据见 [`Official Video Packs 与真实视频验收`](../../acceptance/2026-07-31-official-video-packs.md)。
+- `VREL-03`：项目自建 12 秒英文语音 MP4 已在提交 `34cbf9550edae6fabae1fd13c04cc623bd5c401b` 导出的 Runtime wheel 中，通过签名 Pack 的真实 `ffprobe`、`faster-whisper small/cpu-int8`、Codex、semantic validate、commit 与新进程零重放；源文件哈希保持不变。
+- `VREL-03` 尚未关闭完整发布 Gate：仍需独立非管理员 Windows 用户或 VM、受控较长本地文件，以及取消、磁盘不足、模型缺失和 FFmpeg crash 的真实发布环境矩阵。
+- `VREL-09` 的当前版本签名 Pack 安装、解析、动态 doctor、Job 精确 digest 冻结与恢复已通过；通用更新、rollback、卸载、Desktop Resolver 和公开分发仍在后续 Runtime/平台发布范围。
+- `VREL-11` 当前完整 backend 为 `2230 passed, 2 skipped, 3 warnings`；这只证明当前代码回归和上述有限真实输入，不等于 VREL-04 至 VREL-10 全矩阵完成。
+- 新 Workspace 的 strict validate 仍会报告缺少 `wiki/common/index.md`；本次提交的 Portable Bundle semantic validate 为 `valid=true, issues=[]`。Workspace 严格初始化属于 Workspace-init 后续合同，不在 Video Produce 中隐式修补。

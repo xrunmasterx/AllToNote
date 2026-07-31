@@ -11,7 +11,7 @@ upstream:
 downstream:
   - ../superpowers/plans/
 implementation_status: live-handoff-and-progress-source
-last_verified_at: 2026-07-30
+last_verified_at: 2026-07-31
 ```
 
 - 文档类型：跨阶段总任务与交接入口
@@ -111,11 +111,11 @@ git diff --check
 | 产品与架构基线 | `confirmed` | AllToNote 是上层知识编译/积累平台；Production 是用例，Video/Article/Document/Codebase/Personal 是并列 Recipe；CLI/Desktop/MCP 共享 ProduceService；所有当前路线阶段已有下位设计 |
 | iwiki Portable 消费/提交基础 | `implemented foundation` | AllToNote Bundle 已通过真实 iwiki semantic validation 和 commit |
 | Knowledge Compiler Core | `implemented foundation` | Job、Attempt、Checkpoint、ExternalOperation、ModelExecutor、Quality、Bundle 基础已建立 |
-| Video Producer v1/v2 Core | `mostly completed` | Wave 1A Runtime/CLI 基础、Portable Bundle、Knowledge/Faithful 多 Draft Core 已实现；VREL-02..11 与正式 Video/Desktop/Pack 发布矩阵未闭合 |
+| Video Producer v1/v2 Core | `mostly completed` | Wave 1A Runtime/CLI、Portable Bundle、Knowledge/Faithful 多 Draft Core 已实现；VREL-02 真实 Bilibili 与 VREL-03 本地短夹具正式链路已有证据，VREL-04..11 与完整发布矩阵仍未闭合 |
 | 65 分钟长视频知识编译 | `completed after acquisition` | 7 Map + 1 Compose，Quality/commit/恢复通过 |
 | 实时 YouTube acquisition | `blocked` | 当前 IP 与最新 Cookie 仍被 YouTube anti-bot 拦截 |
-| Bilibili/本地视频正式发布矩阵 | `partially verified` | 有 Adapter/测试基础，仍需真实发布 Gate 汇总 |
-| Runtime CLI / Feature Pack 产品面 | `Wave 1A complete; later waves pending` | RCP-00..07 / Wave 1A 已完成；`document-basic` 已固定 layout+TableFormer 依赖/模型并有离线 doctor；通用 Pack 安装/repair、Desktop Resolver、clean-machine/分发仍待实现 |
+| Bilibili/本地视频正式发布矩阵 | `release-candidate evidence` | 三条真实 Bilibili 与一条项目自建本地 MP4 已通过签名 Pack、semantic validate、commit 和重启零重放；独立非管理员 Windows VM、较长本地文件和故障矩阵仍待完成 |
+| Runtime CLI / Feature Pack 产品面 | `signed local Packs verified; distribution pending` | `document-basic`、`media-basic`、`transcribe-cpu` 均有固定身份与动态 doctor；Video Job 冻结精确 digest。通用更新/rollback/卸载、Desktop Resolver、安装器和 clean-machine 公开分发仍待实现 |
 | Wave 0 基线与权威收敛 | `complete` | 2026-07-21：实际权威基线 `3a75d0eb921...` 已集成到实现提交 `066884da431...`；原 trailer 的 `3a75d0e410...` 为已记录的抄录错误；集成后 full backend、Windows smoke 与 `git diff --check` 通过 |
 | Recipe X0-A | `complete` | Tasks 1–8 已通过架构、兼容、冷路径、全量 backend 与 Windows smoke Gate；范围止于 submission/control-plane 接缝，不包含数据面迁移或多 Job 并发 |
 | Video 三样本 Pilot | `reliability gap; repaired system/user value 3/3` | 原用户结果 V01/V02 PASS、V03 FAIL；Evidence 默认呈现与跨拓扑术语修正后新 V03 用户 PASS；不能外推为 10 样本、字幕、本地文件、长视频或干净安装已验证 |
@@ -305,7 +305,7 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 
 ### RELEASE-VIDEO-01：收敛 Video Producer 发布矩阵
 
-- 状态：`pending`
+- 状态：`in progress`（2026-07-31：VREL-02 真实 Bilibili 与 VREL-03 项目本地短夹具链路已形成发布候选证据）
 - 优先级：P1，作为 `VALUE-VIDEO-01` 暴露真实发布缺口时的受控技术收敛来源，不再独立于产品证据自动启动
 - 依赖：`HANDOFF-01` 至 `HANDOFF-03`、Wave 0 PASS，以及 `VALUE-VIDEO-01` 的真实基线证据
 - 设计：
@@ -332,6 +332,16 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 - 重启零重放；
 - 完整回归无退化；
 - YouTube 若仍被外部阻塞，独立报告而不阻断其他两条发布证据。
+
+当前证据：
+
+- 三条真实 Bilibili 输入与项目自建本地 MP4 均产生 committed、quality `pass`、publishable Bundle；
+- 本地路径收据固定 `media-basic`、`transcribe-cpu` 与 `faster-whisper/1.1.1/small/cpu-int8`，源 MP4 SHA-256 前后不变；
+- Bundle semantic validate 为 `valid=true, issues=[]`；新进程 `job wait` 前后事件序列、Bundle 哈希与源哈希不变；
+- 最终完整 backend 回归为 `2230 passed, 2 skipped, 3 warnings`，独立 Gate Review 为 0 P0 / 0 P1；
+- 权威摘要：[`Official Video Packs 与真实视频验收`](../acceptance/2026-07-31-official-video-packs.md)。
+
+剩余 Gate：独立非管理员 Windows 用户/VM、受控较长本地视频、VREL-03 故障矩阵，以及 VREL-04 至 VREL-11 尚未关闭的发布项。新 Workspace 缺 `wiki/common/index.md` 的 strict validate 问题属于 Workspace-init 后续合同，不在 Video Produce 中隐式修补。
 
 ### RELEASE-CLI-01：补齐 Headless CLI 自动化面
 

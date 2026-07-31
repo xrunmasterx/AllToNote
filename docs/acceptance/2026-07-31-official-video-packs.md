@@ -2,9 +2,9 @@
 
 日期：2026-07-31
 
-范围：`media-basic`、`transcribe-cpu` 的固定合同、签名发布、安装解析、Video Recipe 运行时装配，以及 V01/V02/V03 三条真实 Bilibili 输入
+范围：`media-basic`、`transcribe-cpu` 的固定合同、签名发布、安装解析、Video Recipe 运行时装配，V01/V02/V03 三条真实 Bilibili 输入，以及项目自建本地视频夹具
 
-结论：实现 Gate 与三条真实输入 Gate 均通过。当前证据支持 Windows x86_64 本地 dogfood；不扩张为安装器、自动更新或跨平台公开发布声明。
+结论：实现 Gate、三条真实 Bilibili 输入和项目自建本地视频正式链路均通过。当前证据支持 Windows x86_64 本机发布候选 dogfood；不扩张为独立非管理员 clean-machine、安装器、自动更新或跨平台公开发布声明。
 
 ## 固定合同
 
@@ -37,6 +37,23 @@
 
 三个 Bundle 的收据均绑定上表两个签名 Pack digest。Evidence 采用正文内可读引用，Draft 不再附带面向机器的逐段脚注列表。
 
+## 本地视频正式链路
+
+运行输入为仓库内项目自建夹具 `backend/tests/fixtures/video/local-course.mp4`，12 秒、83,228 字节，SHA-256 为 `sha256:4493bc26df912798b56a754ede158f229970d2ecb81d2892c13aed058b2ac08e`。它不包含第三方视频字节。
+
+- Runtime 来源提交：`34cbf9550edae6fabae1fd13c04cc623bd5c401b`
+- Runtime wheel SHA-256：`sha256:ee310bec3e54ab6fd79e11c7b1fc53cedc8c456fdba86d6b810d4c9fb4c23edc`
+- Job / Bundle：`job_019fb7db-24bf-77d5-bb1e-ef66e58a4958` / `bnd_019fb7db-24bf-7ccf-afed-606009582202`
+- 首次 Produce：54.798 秒，quality `pass`、publishable
+- Source：`canonical_uri=null`、`materialization.kind=external_local`、`duration_ms=12000`
+- Transcript：`faster-whisper/1.1.1/small/cpu-int8@536b0662742c02347bc0e980a01041f333bce120`
+- Pack：收据固定 `media-basic` 与 `transcribe-cpu` 的上述签名 manifest digest
+- Portable：semantic validate `valid=true`、`issues=[]`；manifest SHA-256 为 `sha256:f1ee8bd1b023c05d4155b0de51c9b62a606c941a6e49ff27e51b096fe3507b9d`
+- Evidence：最终 Markdown 只有正文引用和一个可读时间范围脚注，没有面向机器的逐段 Evidence 列表
+- Restart：新 CLI 进程 `job wait` 用时 0.355 秒；前后事件数均为 2、末序号均为 2，Bundle 与源文件哈希均不变
+
+该链路使用独立源码快照、独立 Runtime wheel/venv、离线依赖仓和已安装签名 Packs，但仍运行在同一 Windows 用户/机器上。因此它关闭实现与本机发布候选 Gate，不冒充独立非管理员用户或干净 VM Gate。新建 Workspace 的 strict validate 仍报告缺少 `wiki/common/index.md`；Bundle semantic validate 与 commit 不受影响，该问题归属 Workspace-init 后续合同。
+
 ## 验证证据
 
 - 请求持久化、Runtime 工厂、恢复收据与 media-only 字幕路径：`13 passed`
@@ -44,7 +61,7 @@
 - Video Producer 与 Portable Bundle 集成：`289 passed`
 - Video CLI 与请求持久化：`48 passed`
 - SQLite JobStore：`205 passed`
-- 完整 backend：`2169 passed, 2 skipped, 3 warnings, 3 subtests passed`
+- 完整 backend（本地正式链路修复后）：`2230 passed, 2 skipped, 3 warnings`
 - `git diff --check`：通过
 
 三个 warning 分别来自两个既有下载器正则表达式转义弃用提示，以及 `ctranslate2` 对上游 `pkg_resources` 的弃用提示；不是本轮引入的测试失败。
@@ -56,5 +73,6 @@
 - `G:\.alltonote-release\video-packs-v1\media-basic-signed`
 - `G:\.alltonote-release\video-packs-v1\transcribe-cpu-signed`
 - `G:\.alltonote-release\video-packs-v1\clean-machine`
+- `G:\.alltonote-release\video-packs-v1\local-video-34cbf95\测试 User`
 
 Git 仓库不追踪 Pack、模型、clean-machine 虚拟环境、下载缓存或用户生成的 Bundle。公开发行仍需单独完成正式安装器、自动更新、完整离线依赖 wheelhouse、非管理员 Windows VM 和支持矩阵 Gate。
