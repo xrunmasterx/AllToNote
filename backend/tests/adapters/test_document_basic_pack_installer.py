@@ -27,11 +27,12 @@ def _source(tmp_path: Path) -> Path:
 
 def _install(tmp_path: Path, source: Path, **kwargs: object):
     paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    probe = kwargs.pop("probe", lambda _python, _artifacts: None)
     return install_document_basic_pack(
         source,
         paths=paths,
         trusted_keys=trust_keys(),
-        probe=lambda _python, _artifacts: None,
+        probe=probe,
         **kwargs,
     )
 
@@ -75,18 +76,129 @@ def test_installer_publishes_verified_generation_then_active_pointer(
     assert (generation.parent.parent / "install.lock").is_file()
 
 
-def test_installer_is_idempotent_without_rewriting_active_pointer(tmp_path: Path) -> None:
+def test_installer_is_idempotent_without_rewriting_active_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source = _source(tmp_path)
     first = _install(tmp_path, source)
     pointer_bytes = first.active_pointer.read_bytes()
     pointer_mtime = first.active_pointer.stat().st_mtime_ns
 
-    second = _install(tmp_path, source)
+    def unexpected_materialization(_source: Path, _stage: Path) -> None:
+        pytest.fail("an already-active install must not materialize the source")
+
+    monkeypatch.setattr(installer, "_materialize_source", unexpected_materialization)
+
+    second = _install(
+        tmp_path,
+        source,
+        probe=lambda _python, _artifacts: pytest.fail(
+            "an already-active install must not rerun the dynamic probe"
+        ),
+    )
 
     assert second.result == "already_active"
     assert second.generation == first.generation
     assert second.active_pointer.read_bytes() == pointer_bytes
     assert second.active_pointer.stat().st_mtime_ns == pointer_mtime
+    assert not tuple(first.generation.parent.glob(".stage-*"))
+
+
+def test_installer_repair_keeps_full_materialize_and_probe_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(tmp_path)
+    _install(tmp_path, source)
+    materializations: list[tuple[Path, Path]] = []
+    probes: list[tuple[Path, Path]] = []
+    original_materialize = installer._materialize_source
+
+    def record_materialization(source_root: Path, stage: Path) -> None:
+        materializations.append((source_root, stage))
+        original_materialize(source_root, stage)
+
+    monkeypatch.setattr(installer, "_materialize_source", record_materialization)
+
+    result = _install(
+        tmp_path,
+        source,
+        repair=True,
+        probe=lambda python, artifacts: probes.append((python, artifacts)),
+    )
+
+    assert result.result == "already_active"
+    assert len(materializations) == 1
+    assert len(probes) == 1
+
+
+def test_installer_already_active_does_not_require_source_payload(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    first = _install(tmp_path, source)
+    for path in sorted(source.rglob("*"), reverse=True):
+        if path == source / "manifest.json":
+            continue
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+
+    second = _install(tmp_path, source)
+
+    assert second.result == "already_active"
+    assert second.generation == first.generation
+
+
+def test_installer_already_active_still_rejects_untrusted_source_manifest(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    first = _install(tmp_path, source)
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["signature"]["value"] = "eA=="
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DomainError) as raised:
+        _install(tmp_path, source)
+
+    assert raised.value.code == "pack_signature_invalid"
+    assert first.active_pointer.is_file()
+
+
+def test_installer_already_active_rejects_pointer_drift_during_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(tmp_path)
+    first = _install(tmp_path, source)
+    original_verify = installer._verified_existing_generation
+
+    def verify_then_change_pointer(*args: object, **kwargs: object):
+        result = original_verify(*args, **kwargs)
+        first.active_pointer.write_bytes(b"changed")
+        return result
+
+    monkeypatch.setattr(
+        installer,
+        "_verified_existing_generation",
+        verify_then_change_pointer,
+    )
+
+    with pytest.raises(DomainError) as raised:
+        _install(tmp_path, source)
+
+    assert raised.value.code == "pack_install_conflict"
 
 
 def test_installer_preserves_active_pointer_when_probe_fails(tmp_path: Path) -> None:

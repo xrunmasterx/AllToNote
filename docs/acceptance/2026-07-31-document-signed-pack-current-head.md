@@ -104,7 +104,8 @@ CLI 完成后给出 `alltonote draft show <draft-id>` 的明确阅读入口。
   checkout、现有 Python 或测试注入；
 - 修复并证明 iWiki build-source provenance，使完整 Runtime wheelhouse
   verifier 通过；
-- 为相同已激活 Pack 提供可信且快速的 no-op 安装路径；
+- 相同已激活 Pack 的可信快速 no-op 已在后续切片关闭，见
+  [`Document Pack 可信快速 no-op 验收`](2026-07-31-document-pack-fast-noop.md)；
 - 把 Document 的逻辑 Source 身份与内容 Revision 身份分开，避免相同内容的
   不同文件被误合并、同一路径修改后历史断裂；
 - 实现真正的 Document Knowledge Note 编译与语义质量 Gate；后续语义收紧已

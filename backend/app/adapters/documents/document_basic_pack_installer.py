@@ -32,6 +32,7 @@ from app.adapters.documents.document_basic_pack_verifier import (
     _same_open_file,
     canonical_receipt_bytes,
     verify_document_basic_pack_generation,
+    verify_document_basic_pack_manifest,
     verify_document_basic_pack_source,
 )
 from app.core.errors import DomainError, ErrorCategory
@@ -519,9 +520,9 @@ def _verified_existing_generation(
     manifest_sha256: str,
     trusted_keys: Mapping[str, DocumentPackTrustKey],
     platform_tag: str | None,
-) -> bool:
+) -> VerifiedDocumentPack | None:
     if not _lexically_exists(generation):
-        return False
+        return None
     if not _ordinary_directory(generation):
         raise _install_conflict()
     try:
@@ -534,7 +535,7 @@ def _verified_existing_generation(
         raise _install_conflict() from error
     if verified.manifest_sha256 != manifest_sha256:
         raise _install_conflict()
-    return True
+    return verified
 
 
 def install_document_basic_pack(
@@ -567,6 +568,33 @@ def install_document_basic_pack(
             if not _ordinary_file(lock_path):
                 raise _install_conflict()
             _cleanup_orphans(pack_root, installs_root)
+            active_path = pack_root / "active.json"
+            active = _read_active_state(active_path)
+            if active.kind == "valid" and not repair:
+                requested = verify_document_basic_pack_manifest(
+                    source_root,
+                    trusted_keys=trusted_keys,
+                    platform_tag=platform_tag,
+                )
+                digest = requested.manifest_sha256.removeprefix("sha256:")
+                if active.digest == digest:
+                    generation = installs_root / digest
+                    installed = _verified_existing_generation(
+                        generation,
+                        manifest_sha256=requested.manifest_sha256,
+                        trusted_keys=trusted_keys,
+                        platform_tag=platform_tag,
+                    )
+                    if installed is not None:
+                        if _read_active_state(active_path) != active:
+                            raise _install_conflict()
+                        return DocumentPackInstallResult(
+                            manifest_sha256=installed.manifest_sha256,
+                            generation=generation,
+                            active_pointer=active_path,
+                            result="already_active",
+                        )
+
             stage = installs_root / f".stage-{uuid4().hex}"
             stage.mkdir()
             if not _ordinary_directory(stage):
@@ -591,7 +619,6 @@ def install_document_basic_pack(
 
                 digest = verified.manifest_sha256.removeprefix("sha256:")
                 generation = installs_root / digest
-                active_path = pack_root / "active.json"
                 active = _read_active_state(active_path)
                 if active.kind == "unsafe":
                     raise _install_conflict()
@@ -600,12 +627,13 @@ def install_document_basic_pack(
                 if active.kind == "valid" and active.digest != digest:
                     raise _install_conflict()
 
-                generation_exists = _verified_existing_generation(
+                existing_generation = _verified_existing_generation(
                     generation,
                     manifest_sha256=verified.manifest_sha256,
                     trusted_keys=trusted_keys,
                     platform_tag=platform_tag,
                 )
+                generation_exists = existing_generation is not None
                 if active.kind == "valid" and not generation_exists and not repair:
                     raise _install_conflict()
                 if not generation_exists:

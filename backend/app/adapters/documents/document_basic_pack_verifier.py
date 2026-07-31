@@ -523,6 +523,30 @@ def _sha256(path: Path, expected_size: int) -> str:
     return _SHA256_PREFIX + digest.hexdigest()
 
 
+def _verify_document_basic_pack_manifest(
+    root: Path,
+    *,
+    trusted_keys: Mapping[str, DocumentPackTrustKey],
+    platform_tag: str | None,
+) -> VerifiedDocumentPack:
+    manifest, manifest_bytes = _load_manifest(root / "manifest.json")
+    files = _manifest_files(manifest.get("files"))
+    expected_platform = platform_tag or current_pack_platform()
+    python_relative_path = _validate_contract(manifest, files, expected_platform)
+    signature_key_id = _verify_signature(manifest, trusted_keys)
+    return VerifiedDocumentPack(
+        source_root=root,
+        pack_id=PACK_ID,
+        pack_version=PACK_VERSION,
+        platform=expected_platform,
+        publisher=str(manifest["publisher"]),
+        signature_key_id=signature_key_id,
+        manifest_sha256=_SHA256_PREFIX + hashlib.sha256(manifest_bytes).hexdigest(),
+        python_relative_path=python_relative_path,
+        files=files,
+    )
+
+
 def _verify_document_basic_pack_tree(
     source: Path,
     *,
@@ -539,19 +563,17 @@ def _verify_document_basic_pack_tree(
             "The document-basic Pack source is unavailable",
         ) from error
     source_files = _source_files(root)
-    manifest, manifest_bytes = _load_manifest(root / "manifest.json")
-    files = _manifest_files(manifest.get("files"))
-    expected_platform = platform_tag or current_pack_platform()
-    python_relative_path = _validate_contract(manifest, files, expected_platform)
-    signature_key_id = _verify_signature(manifest, trusted_keys)
-
-    manifest_sha256 = _SHA256_PREFIX + hashlib.sha256(manifest_bytes).hexdigest()
-    expected_files = {item.relative_path for item in files} | {"manifest.json"}
+    verified = _verify_document_basic_pack_manifest(
+        root,
+        trusted_keys=trusted_keys,
+        platform_tag=platform_tag,
+    )
+    expected_files = {item.relative_path for item in verified.files} | {"manifest.json"}
     if receipt_required:
         expected_files.add("receipt.json")
     if set(source_files) != expected_files:
         raise _manifest_invalid()
-    for item in files:
+    for item in verified.files:
         path = source_files[item.relative_path]
         try:
             if _sha256(path, item.byte_length) != item.sha256:
@@ -571,18 +593,43 @@ def _verify_document_basic_pack_tree(
                 {"component": item.relative_path},
             ) from error
     if receipt_required:
-        _validate_receipt(source_files["receipt.json"], manifest_sha256)
+        _validate_receipt(source_files["receipt.json"], verified.manifest_sha256)
+    return verified
 
-    return VerifiedDocumentPack(
-        source_root=root,
-        pack_id=PACK_ID,
-        pack_version=PACK_VERSION,
-        platform=expected_platform,
-        publisher=str(manifest["publisher"]),
-        signature_key_id=signature_key_id,
-        manifest_sha256=manifest_sha256,
-        python_relative_path=python_relative_path,
-        files=files,
+
+def verify_document_basic_pack_manifest(
+    source: Path,
+    *,
+    trusted_keys: Mapping[str, DocumentPackTrustKey],
+    platform_tag: str | None = None,
+) -> VerifiedDocumentPack:
+    """Authenticate Pack identity without consuming its listed payload files."""
+
+    try:
+        root = Path(os.path.abspath(os.fspath(Path(source).expanduser())))
+        root_metadata = root.lstat()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise DomainError(
+            "pack_source_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source is unavailable",
+        ) from error
+    if _is_link_or_reparse(root_metadata):
+        raise DomainError(
+            "pack_archive_unsafe",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source contains unsafe filesystem entries",
+        )
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise DomainError(
+            "pack_source_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source must be a directory",
+        )
+    return _verify_document_basic_pack_manifest(
+        root,
+        trusted_keys=trusted_keys,
+        platform_tag=platform_tag,
     )
 
 
@@ -622,5 +669,6 @@ __all__ = [
     "canonical_receipt_bytes",
     "current_pack_platform",
     "verify_document_basic_pack_generation",
+    "verify_document_basic_pack_manifest",
     "verify_document_basic_pack_source",
 ]

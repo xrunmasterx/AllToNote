@@ -129,6 +129,32 @@ def test_pack_install_projects_no_source_or_destination_path(
     assert service.install_calls == [(source, True)]
 
 
+def test_pack_install_projects_already_active_as_success(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    service = FakePackService()
+    service.install_result["result"] = "already_active"
+
+    exit_code = main(
+        [
+            "pack",
+            "install",
+            "document-basic",
+            "--source",
+            str(tmp_path / "signed source"),
+            "--json",
+        ],
+        pack_service=service,
+    )
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert envelope["data"]["result"] == "already_active"
+
+
 def test_default_pack_install_rejects_non_official_signature(
     tmp_path: Path,
     capsys,

@@ -16,6 +16,7 @@ from app.adapters.documents.document_basic_pack_verifier import (
     canonical_manifest_bytes,
     current_pack_platform,
     verify_document_basic_pack_generation,
+    verify_document_basic_pack_manifest,
     verify_document_basic_pack_source,
 )
 from app.core.errors import DomainError
@@ -138,6 +139,43 @@ def test_verifier_accepts_exact_signed_document_pack_directory(
     assert verified.manifest_sha256.startswith("sha256:")
     assert verified.python_relative_path in {"python/python.exe", "python/bin/python"}
     assert len(verified.files) == 5
+
+
+def test_manifest_verifier_authenticates_identity_without_reading_payload(
+    tmp_path: Path,
+) -> None:
+    root, _manifest = _source(tmp_path)
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path == root / "manifest.json":
+            continue
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+
+    verified = verify_document_basic_pack_manifest(root, trusted_keys=_trust())
+
+    assert verified.pack_id == PACK_ID
+    assert verified.pack_version == PACK_VERSION
+    assert verified.manifest_sha256.startswith("sha256:")
+    assert len(verified.files) == 5
+
+
+def test_manifest_verifier_rejects_linked_manifest(tmp_path: Path) -> None:
+    root, _manifest = _source(tmp_path)
+    manifest = root / "manifest.json"
+    external = tmp_path / "external-manifest.json"
+    external.write_bytes(manifest.read_bytes())
+    manifest.unlink()
+    try:
+        manifest.symlink_to(external)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this host")
+
+    with pytest.raises(DomainError) as raised:
+        verify_document_basic_pack_manifest(root, trusted_keys=_trust())
+
+    assert raised.value.code == "pack_manifest_invalid"
 
 
 def test_verifier_rejects_noncanonical_manifest_bytes(tmp_path: Path) -> None:
