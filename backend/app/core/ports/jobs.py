@@ -21,6 +21,7 @@ from app.core.jobs.model import (
     CheckpointRecord,
     Job,
     JobExecutionBinding,
+    JobExecutionOwner,
     JobEvent,
     JobState,
 )
@@ -140,6 +141,7 @@ class JobRepositoryPort(Protocol):
         retry_of_job_id: str | None = None,
         initial_events: tuple[tuple[str, str], ...] = (),
         execution_binding: JobExecutionBinding | None = None,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
     ) -> Job: ...
 
     def get_job_execution_binding(self, job_id: str) -> JobExecutionBinding: ...

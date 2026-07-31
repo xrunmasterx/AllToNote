@@ -26,6 +26,7 @@ from app.core.jobs.model import (
     CheckpointMetadata,
     Job,
     JobExecutionBinding,
+    JobExecutionOwner,
     JobEvent,
     JobState,
 )
@@ -52,11 +53,10 @@ from app.core.ports.job_queries import JobListRecord, JobQueryRecord
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = 5_000
 _RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
-_SCHEMA_STATEMENTS_V1 = (
-    """
+_JOBS_SCHEMA_V1 = """
     CREATE TABLE jobs (
         job_id TEXT PRIMARY KEY,
         request_hash TEXT NOT NULL,
@@ -73,7 +73,9 @@ _SCHEMA_STATEMENTS_V1 = (
         updated_at TEXT NOT NULL,
         UNIQUE(principal, client_request_id)
     )
-    """,
+    """
+_SCHEMA_STATEMENTS_V1 = (
+    _JOBS_SCHEMA_V1,
     """
     CREATE TABLE steps (
         job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -193,7 +195,37 @@ _EXECUTION_BINDING_SCHEMA = """
         pack_version TEXT NOT NULL
     )
     """
-_SCHEMA_STATEMENTS = (*_SCHEMA_STATEMENTS_V1, _EXECUTION_BINDING_SCHEMA)
+_SCHEMA_STATEMENTS_V2 = (*_SCHEMA_STATEMENTS_V1, _EXECUTION_BINDING_SCHEMA)
+_JOBS_SCHEMA_V3 = """
+    CREATE TABLE jobs (
+        job_id TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        request_json TEXT,
+        principal TEXT NOT NULL,
+        client_request_id TEXT,
+        state TEXT NOT NULL,
+        cancellation_requested INTEGER NOT NULL
+            CHECK (cancellation_requested IN (0, 1)),
+        retry_of_job_id TEXT REFERENCES jobs(job_id),
+        result_json TEXT,
+        error_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        execution_owner TEXT NOT NULL DEFAULT 'foreground'
+            CHECK (execution_owner IN ('foreground', 'engine')),
+        UNIQUE(principal, client_request_id)
+    )
+    """
+_EXECUTION_OWNER_MIGRATION = """
+    ALTER TABLE jobs ADD COLUMN
+        execution_owner TEXT NOT NULL DEFAULT 'foreground'
+        CHECK (execution_owner IN ('foreground', 'engine'))
+    """
+_SCHEMA_STATEMENTS = (
+    _JOBS_SCHEMA_V3,
+    *_SCHEMA_STATEMENTS_V1[1:],
+    _EXECUTION_BINDING_SCHEMA,
+)
 _DEFAULT_EXECUTION_BINDING = JobExecutionBinding(
     recipe_id="alltonote.legacy",
     recipe_version=1,
@@ -358,7 +390,7 @@ class SqliteJobRepository:
     def _initialize_schema(self) -> None:
         with self._transaction(immediate=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, _SCHEMA_VERSION):
+            if version not in (0, 1, 2, _SCHEMA_VERSION):
                 raise DomainError(
                     "job_store_schema_unsupported",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
@@ -376,6 +408,13 @@ class SqliteJobRepository:
                 if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V1):
                     _raise_schema_invalid()
                 self._migrate_v1_to_v2(connection)
+                self._migrate_v2_to_v3(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
+            elif version == 2:
+                if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V2):
+                    _raise_schema_invalid()
+                self._migrate_v2_to_v3(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             if actual_schema != _expected_schema():
@@ -389,6 +428,10 @@ class SqliteJobRepository:
         for row in rows:
             binding = self._legacy_execution_binding(row["request_json"])
             self._insert_execution_binding(connection, row["job_id"], binding)
+
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        connection.execute(_EXECUTION_OWNER_MIGRATION)
 
     @staticmethod
     def _legacy_execution_binding(request_json: str | None) -> JobExecutionBinding:
@@ -425,11 +468,18 @@ class SqliteJobRepository:
         retry_of_job_id: str | None = None,
         initial_events: tuple[tuple[str, str], ...] = (),
         execution_binding: JobExecutionBinding | None = None,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
     ) -> Job:
         self._validate_request_json(request_hash, request_json)
         self._validate_initial_events(initial_events)
         binding = execution_binding or _DEFAULT_EXECUTION_BINDING
         self._validate_execution_binding(binding)
+        if type(execution_owner) is not JobExecutionOwner:
+            raise DomainError(
+                "job_execution_owner_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Job execution owner is invalid",
+            )
         with self._transaction(immediate=True) as connection:
             job, created = self._create_job(
                 connection,
@@ -438,6 +488,7 @@ class SqliteJobRepository:
                 principal=principal,
                 client_request_id=client_request_id,
                 retry_of_job_id=retry_of_job_id,
+                execution_owner=execution_owner,
             )
             if created:
                 self._insert_execution_binding(connection, job.job_id, binding)
@@ -449,6 +500,12 @@ class SqliteJobRepository:
                         payload_json,
                     )
             else:
+                if job.execution_owner is not execution_owner:
+                    raise DomainError(
+                        "idempotency_conflict",
+                        ErrorCategory.CONFLICT,
+                        "Idempotency key is already bound to another execution owner",
+                    )
                 if self._get_execution_binding(connection, job.job_id) != binding:
                     raise DomainError(
                         "idempotency_conflict",
@@ -1447,6 +1504,7 @@ class SqliteJobRepository:
                 principal=original.principal,
                 client_request_id=client_request_id,
                 retry_of_job_id=original.job_id,
+                execution_owner=original.execution_owner,
             )
             if created:
                 self._insert_execution_binding(
@@ -3185,6 +3243,7 @@ class SqliteJobRepository:
         principal: str,
         client_request_id: str | None,
         retry_of_job_id: str | None,
+        execution_owner: JobExecutionOwner,
     ) -> tuple[Job, bool]:
         if client_request_id is not None:
             existing = connection.execute(
@@ -3214,8 +3273,8 @@ class SqliteJobRepository:
                 job_id, request_hash, request_json, principal,
                 client_request_id, state,
                 cancellation_requested, retry_of_job_id, result_json,
-                error_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+                error_json, created_at, updated_at, execution_owner
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?, ?)
             """,
             (
                 job_id,
@@ -3227,6 +3286,7 @@ class SqliteJobRepository:
                 retry_of_job_id,
                 now,
                 now,
+                execution_owner.value,
             ),
         )
         return self._get_job(connection, job_id), True
@@ -3519,6 +3579,7 @@ class SqliteJobRepository:
             request_hash=row["request_hash"],
             principal=row["principal"],
             client_request_id=row["client_request_id"],
+            execution_owner=JobExecutionOwner(row["execution_owner"]),
             state=JobState(row["state"]),
             cancellation_requested=bool(row["cancellation_requested"]),
             retry_of_job_id=row["retry_of_job_id"],

@@ -12,7 +12,7 @@ import pytest
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.domain.video import JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
-from app.core.jobs.model import AttemptState
+from app.core.jobs.model import AttemptState, JobExecutionOwner
 
 
 @dataclass(frozen=True)
@@ -162,6 +162,20 @@ def test_submit_hashes_sorted_compact_utf8_canonical_request(
 
     assert repo.get_job(snapshot.job_id).request_hash == expected_hash
     assert repo.get_job_request(snapshot.job_id) == expected_json
+
+
+def test_submit_persists_explicit_execution_owner(
+    repo: SqliteJobRepository,
+    tmp_path: Path,
+) -> None:
+    service = _new_service(repo)
+
+    snapshot = service.submit(
+        _request(tmp_path),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    assert repo.get_job(snapshot.job_id).execution_owner is JobExecutionOwner.ENGINE
 
 
 def test_get_restores_persisted_failure_detail(

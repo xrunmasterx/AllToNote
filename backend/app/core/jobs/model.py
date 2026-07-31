@@ -15,6 +15,11 @@ class JobState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class JobExecutionOwner(StrEnum):
+    FOREGROUND = "foreground"
+    ENGINE = "engine"
+
+
 class AttemptState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -63,6 +68,7 @@ class Job:
     request_hash: str
     principal: str
     client_request_id: str | None
+    execution_owner: JobExecutionOwner
     state: JobState
     cancellation_requested: bool
     retry_of_job_id: str | None
@@ -171,6 +177,7 @@ __all__ = [
     "CheckpointRecord",
     "Job",
     "JobExecutionBinding",
+    "JobExecutionOwner",
     "JobSnapshot",
     "JobEvent",
     "JobState",

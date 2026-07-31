@@ -26,6 +26,7 @@ from tools.runtime_windows_release import (
     _remove_direct_url_metadata,
     _remove_pip_console_scripts,
     _run_engine_lifecycle_gate,
+    _run_legacy_jobstore_migration,
     _verify_inputs,
 )
 
@@ -313,7 +314,7 @@ def test_legacy_jobstore_fixture_migrates_and_reopens(tmp_path: Path) -> None:
     assert source_identity is not None
     assert source_identity.source_id == "src_018cc251-f400-7000-8000-000000000006"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -330,6 +331,57 @@ def test_legacy_jobstore_fixture_migrates_and_reopens(tmp_path: Path) -> None:
     ) == source_identity
 
 
+def test_release_gate_accepts_only_current_jobstore_migration_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "schema_before": 1,
+        "schema_after": 3,
+        "integrity": "ok",
+        "foreign_key_errors": 0,
+        "job_id": "job_legacy_release_fixture",
+        "job_state": "succeeded",
+        "result_bundle_id": "bnd_018cc251-f400-7000-8000-000000000005",
+        "result_quality": "pass",
+        "attempt_states": ["succeeded"],
+        "event_types": ["portable.commit.completed.v1"],
+        "checkpoint_id": "chk_legacy_release_fixture",
+        "source_identity_preserved": True,
+        "binding": {
+            "recipe_id": "alltonote.video-course-note",
+            "recipe_version": 2,
+            "executor_id": "alltonote.video",
+            "executor_version": 1,
+            "pack_id": "media-basic",
+            "pack_version": "legacy-v1",
+        },
+        "reopened_same_binding": True,
+        "reopened_data_preserved": True,
+    }
+    monkeypatch.setattr(
+        release_module,
+        "_run",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = _run_legacy_jobstore_migration(
+        tmp_path,
+        tmp_path / "fixture.sql",
+        tmp_path / "machine",
+        {},
+    )
+
+    assert result == payload
+
+    payload["schema_after"] = 2
+    with pytest.raises(ReleaseError, match="legacy JobStore Gate"):
+        _run_legacy_jobstore_migration(
+            tmp_path,
+            tmp_path / "fixture.sql",
+            tmp_path / "machine",
+            {},
+        )
 def test_cli_lock_option_maps_to_the_assembler_parameter(tmp_path: Path) -> None:
     arguments = _parser().parse_args(
         [

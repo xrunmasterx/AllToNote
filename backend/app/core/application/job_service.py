@@ -10,6 +10,7 @@ from pathlib import Path
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import (
     JobExecutionBinding,
+    JobExecutionOwner,
     JobSnapshot,
     JobState,
     RetryJobRequest,
@@ -113,6 +114,7 @@ class JobService:
         *,
         initial_events: tuple[tuple[str, object], ...] = (),
         execution_binding: JobExecutionBinding | None = None,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
     ) -> JobSnapshot:
         principal = _request_field(request, "principal")
         client_request_id = _request_field(request, "client_request_id")
@@ -144,6 +146,7 @@ class JobService:
             client_request_id=client_request_id,
             initial_events=serialized_events,
             execution_binding=execution_binding,
+            execution_owner=execution_owner,
         )
         return self.get(job.job_id)
 

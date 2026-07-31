@@ -20,7 +20,12 @@ from app.core.domain.video import (
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.external_operation import ExternalOutcome
-from app.core.jobs.model import AttemptState, Job, JobExecutionBinding
+from app.core.jobs.model import (
+    AttemptState,
+    Job,
+    JobExecutionBinding,
+    JobExecutionOwner,
+)
 from app.core.jobs.resource_lease import JobExecutionAuthority
 from app.core.jobs.state_machine import (
     LEGAL_ATTEMPT_TRANSITIONS,
@@ -436,7 +441,7 @@ def test_corrupt_database_is_rejected_without_overwrite(tmp_path: Path) -> None:
     assert database_path.read_bytes() == corrupt_bytes
 
 
-def test_open_creates_version_two_database_with_exact_schema_and_pragmas(
+def test_open_creates_version_three_database_with_exact_schema_and_pragmas(
     repo: SqliteJobRepository,
 ) -> None:
     assert repo.database_path == repo.machine_root / "jobs.sqlite"
@@ -463,7 +468,7 @@ def test_open_creates_version_two_database_with_exact_schema_and_pragmas(
     assert journal_mode == "wal"
     assert synchronous == 2
     assert busy_timeout == 5_000
-    assert user_version == 2
+    assert user_version == 3
     assert foreign_key_violations == []
 
 
@@ -665,6 +670,9 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
 
     migrated = SqliteJobRepository.open(machine_root)
 
+    assert migrated.get_job("job_legacy").execution_owner is (
+        JobExecutionOwner.FOREGROUND
+    )
     assert migrated.get_job_execution_binding("job_legacy") == JobExecutionBinding(
         recipe_id="alltonote.video-course-note",
         recipe_version=2,
@@ -674,7 +682,7 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
         pack_version="legacy-v1",
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -682,6 +690,85 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
     assert reopened.get_job_execution_binding("job_legacy") == (
         migrated.get_job_execution_binding("job_legacy")
     )
+
+
+def test_version_two_database_migrates_jobs_to_foreground_owner(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v2")
+    with sqlite3.connect(database_path) as connection:
+        for statement in repository_module._SCHEMA_STATEMENTS_V1:
+            connection.execute(statement)
+        connection.execute(repository_module._EXECUTION_BINDING_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_id, request_hash, request_json, principal,
+                client_request_id, state, cancellation_requested,
+                retry_of_job_id, result_json, error_json, created_at, updated_at
+            ) VALUES ('job_v2', ?, NULL, 'local', 'v2', 'queued', 0,
+                      NULL, NULL, NULL, '1', '1')
+            """,
+            (HASH_A,),
+        )
+        connection.execute(
+            """
+            INSERT INTO job_execution_bindings (
+                job_id, recipe_id, recipe_version, executor_id,
+                executor_version, pack_id, pack_version
+            ) VALUES ('job_v2', 'alltonote.video-producer', 1,
+                      'alltonote.video', 1, 'media-basic', 'legacy-v1')
+            """
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    migrated = SqliteJobRepository.open(machine_root)
+
+    assert migrated.get_job("job_v2").execution_owner is (
+        JobExecutionOwner.FOREGROUND
+    )
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_version_two_migration_failure_rolls_back_and_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v2-rollback")
+    with sqlite3.connect(database_path) as connection:
+        for statement in repository_module._SCHEMA_STATEMENTS_V1:
+            connection.execute(statement)
+        connection.execute(repository_module._EXECUTION_BINDING_SCHEMA)
+        connection.execute("PRAGMA user_version = 2")
+
+    def fail_after_schema_change(
+        _self: SqliteJobRepository,
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(repository_module._EXECUTION_OWNER_MIGRATION)
+        raise RuntimeError("injected owner migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SqliteJobRepository,
+            "_migrate_v2_to_v3",
+            fail_after_schema_change,
+        )
+        with pytest.raises(RuntimeError, match="injected owner migration failure"):
+            SqliteJobRepository.open(machine_root)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+        assert "execution_owner" not in columns
+
+    migrated = SqliteJobRepository.open(machine_root)
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_version_one_migration_failure_rolls_back_and_retry_succeeds(
@@ -1224,6 +1311,12 @@ def test_schema_rejects_non_boolean_cancellation_and_non_scheduler_lease(
     with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
         with repo._transaction(immediate=True) as connection:
             connection.execute(
+                "UPDATE jobs SET execution_owner = 'other' WHERE job_id = ?",
+                (job.job_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        with repo._transaction(immediate=True) as connection:
+            connection.execute(
                 """
                 INSERT INTO leases (
                     lease_name, job_id, owner, fencing_token,
@@ -1407,6 +1500,45 @@ def test_idempotency_replay_returns_existing_job(repo: SqliteJobRepository) -> N
 
     assert replay == first
     assert repo.get_job(first.job_id) == first
+
+
+def test_new_job_persists_explicit_execution_owner(
+    repo: SqliteJobRepository,
+) -> None:
+    foreground = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="foreground",
+    )
+    engine = repo.create_job(
+        request_hash=HASH_B,
+        principal="agent",
+        client_request_id="engine",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    assert foreground.execution_owner is JobExecutionOwner.FOREGROUND
+    assert engine.execution_owner is JobExecutionOwner.ENGINE
+    assert repo.get_job(engine.job_id).execution_owner is JobExecutionOwner.ENGINE
+
+
+def test_idempotency_key_cannot_change_execution_owner(
+    repo: SqliteJobRepository,
+) -> None:
+    repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="owner-bound",
+        execution_owner=JobExecutionOwner.FOREGROUND,
+    )
+
+    with pytest.raises(DomainError, match="idempotency_conflict"):
+        repo.create_job(
+            request_hash=HASH_A,
+            principal="agent",
+            client_request_id="owner-bound",
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
 
 
 def test_idempotency_key_cannot_bind_different_request(
@@ -2533,11 +2665,14 @@ def _record_unknown_operation(
 def _create_failed_job_with_unknown_operations(
     repo: SqliteJobRepository,
     operation_ids: tuple[str, ...] = ("op_unknown_a", "op_unknown_b"),
+    *,
+    execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
 ):
     job = repo.create_job(
         request_hash=HASH_A,
         principal="agent",
         client_request_id="original-request",
+        execution_owner=execution_owner,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
     authority = _authority(repo)
@@ -2857,7 +2992,10 @@ def test_retry_atomically_creates_new_job_and_replays_after_reopen(
 ) -> None:
     machine_root = tmp_path / "machine-root"
     repo = SqliteJobRepository.open(machine_root)
-    original, _ = _create_failed_job_with_unknown_operations(repo)
+    original, _ = _create_failed_job_with_unknown_operations(
+        repo,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
 
     retry = repo.create_retry_job_atomic(
         original.job_id,
@@ -2876,6 +3014,7 @@ def test_retry_atomically_creates_new_job_and_replays_after_reopen(
     assert retry.job_id != original.job_id
     assert retry.request_hash == original.request_hash
     assert retry.principal == original.principal
+    assert retry.execution_owner is JobExecutionOwner.ENGINE
     assert retry.retry_of_job_id == original.job_id
     assert replay == retry
     assert reopened.get_job(original.job_id) == original

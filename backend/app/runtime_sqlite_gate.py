@@ -16,6 +16,7 @@ from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import JobState
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionOwner
 
 
 DEFAULT_CONNECTION_COUNTS = (1, 4, 8, 16)
@@ -441,7 +442,7 @@ def _database_invariants_pass(invariants: Mapping[str, object]) -> bool:
         "checkpoint_busy": 0,
         "wal_frames_remaining": 0,
         "journal_mode": "wal",
-        "user_version": 2,
+        "user_version": 3,
     }
 
 
@@ -840,6 +841,7 @@ def _crash_uncommitted_worker(machine_root: str, busy_timeout_ms: int) -> None:
                 principal="gate-crash",
                 client_request_id="uncommitted",
                 retry_of_job_id=None,
+                execution_owner=JobExecutionOwner.FOREGROUND,
             )
             os._exit(_UNCOMMITTED_EXIT_CODE)
     except BaseException:
