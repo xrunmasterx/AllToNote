@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -104,7 +105,12 @@ class LegacyCompletionBridge(Protocol):
     imports nor wraps the legacy multi-call ``GPT.summarize`` workflow.
     """
 
-    def complete_once(self, prompt: str) -> LegacyModelResponse: ...
+    def complete_once(
+        self,
+        prompt: str,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> LegacyModelResponse: ...
 
 
 @dataclass(frozen=True)
@@ -450,7 +456,10 @@ class LegacyKnowledgeModelAdapter:
         token.raise_if_cancelled()
         binding.guard.start(operation.operation_id)
         try:
-            response = bridge.complete_once(prompt)
+            response = bridge.complete_once(
+                prompt,
+                check_cancelled=token.raise_if_cancelled,
+            )
         except LegacyKnownRetryableModelFailure:
             binding.guard.fail(operation.operation_id, summary_json=prepared_summary)
             raise _model_error(
@@ -464,6 +473,22 @@ class LegacyKnowledgeModelAdapter:
                 "model_response_invalid",
                 ErrorCategory.RECIPE_FAILED,
                 "The model provider returned an invalid response",
+            ) from None
+        except DomainError as error:
+            if error.category is ErrorCategory.CANCELLED:
+                binding.guard.unknown(
+                    operation.operation_id,
+                    summary_json=prepared_summary,
+                )
+                raise
+            binding.guard.unknown(
+                operation.operation_id,
+                summary_json=prepared_summary,
+            )
+            raise _model_error(
+                "external_outcome_unknown",
+                ErrorCategory.CONFLICT,
+                "The model provider outcome is unknown",
             ) from None
         except Exception:
             binding.guard.unknown(operation.operation_id, summary_json=prepared_summary)

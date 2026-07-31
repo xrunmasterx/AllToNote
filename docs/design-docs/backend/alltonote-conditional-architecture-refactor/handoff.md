@@ -47,7 +47,7 @@ Review/Publish 按目标治理
 2. Job 查询、结果和原子提交仍存在 Video 反向依赖；
 3. 同一 Runtime 和同一 Workspace 当前基本只能完整执行一个 Job；
 4. 没有按需后台领取者，CLI 退出后 queued Job 不会自行推进；
-5. Codex client 的并发重入正确性尚未证明；
+5. Codex client 的并发重入基线已于 2026-07-31 通过 2/4/8 路受控测试与双路真实 app-server 探针，但这不授权开启多 Job worker；
 6. 当前 SQLite 3.50.4 不应作为多连接 WAL 的生产并发基线；
 7. 当前 bridge 是结构化 ModelExecutor，不是完整 AgentExecutor；
 8. 开放 Draft/Artifact 的独立可读、可迁移和删除 JobStore 验证尚未形成独立 Gate；
@@ -204,7 +204,7 @@ Wave 1A 的 RCP-00 至 RCP-07 已完成并有既有验收记录。后续 Agent �
 | P-05 | 已验证 | video_service.py 的 _execution_lock 覆盖完整执行 | Parallel Production |
 | P-06 | 已验证 | SQLite 只有一个 scheduler lease，leadership 被等同于单执行者 | Engine / per-job claim |
 | P-07 | 已验证 | submit without wait 只创建 queued Job，没有后台领取者 | 按需 Engine |
-| P-08 | 高置信风险，未证实 | codex_app_server_client.py 共享 next_id、stderr 和基于 next_id - 1 的关联逻辑 | 并发 C0，先复现后修 |
+| P-08 | 已验证并修复 | app-server 每 turn 的 request ID、response、timeout、subprocess 与 stderr 已隔离，cancel/timeout 只清理目标 turn | 保留 2/4/8 路与真实双路探针回归 |
 | P-09 | 已验证 | 当前 Python sqlite3.sqlite_version 为 3.50.4 | 并发 C0 |
 | P-10 | 已验证 | 现有 bridge 是一次结构化 completion，不是完整 Agent CLI runtime | AgentExecutor |
 | P-11 | 已验证 | 开放 Draft/Artifact 删除 JobStore 后独立可读未形成任务 | Artifact 产品闭环 |

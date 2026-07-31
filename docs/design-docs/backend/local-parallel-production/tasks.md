@@ -7,7 +7,7 @@
 
 当前阶段入口：[`Video 三样本 Pilot`](../../video-dogfood-validation/spec.md)。本任务清单保留为后续技术规格，不得把“历史需求已触发”解释为当前自动开工授权。
 
-## Task 1: [ ] 修复模型客户端并发正确性基线
+## Task 1: [x] 修复模型客户端并发正确性基线
 
 - 风险：高
 - 目标：在增加 Job 并发前，证明同一 Runtime 内多个模型 turn 不会串号、串日志或死等。
@@ -18,13 +18,20 @@
 
 验收：
 
-- [ ] 先写两个真实并发 turn 的失败测试；
-- [ ] request ID 为单次 turn 局部状态，不通过共享 next_id - 1 推断；
-- [ ] stderr、response buffer、timeout 与 subprocess handle 每 turn 隔离；
-- [ ] 单 turn 兼容行为、错误映射和 receipt 不变；
-- [ ] 2、4、8 个受控并发 turn 无串号、死锁或状态污染；
-- [ ] cancel/timeout 只终止目标 turn；
-- [ ] 不在本 Task 增加 Job worker pool。
+- [x] 先写并发 turn 的失败测试，再实现修复；
+- [x] request ID 为单次 turn 局部状态，不通过共享 next_id - 1 推断；
+- [x] stderr、response buffer、timeout 与 subprocess handle 每 turn 隔离；
+- [x] 单 turn 兼容行为、错误映射和 receipt 不变；
+- [x] 2、4、8 个受控并发 turn 无串号、死锁或状态污染；
+- [x] cancel/timeout 只终止目标 turn；
+- [x] 不在本 Task 增加 Job worker pool。
+
+完成证据（2026-07-31）：
+
+- 自动化测试先失败后修复；共享 client 的 2/4/8 路 JSON-RPC 交错、per-turn stderr、目标 turn cancel 与 timeout 均通过；
+- v1/v2 ProduceService 的 `CancellationTokenPort` 均通过内部 legacy bridge 传入 app-server 等待循环，50ms 有界轮询后只清理目标 subprocess；Core `ModelExecutor` 公共契约未改变；
+- 使用真实 Codex CLI 0.146.0 / `gpt-5.6-sol` 同时运行两路固定标记探针，两路均返回各自标记，stderr 均为空；
+- 全量后端回归：`2105 passed, 2 skipped, 3 subtests passed`。
 
 Stop condition：
 
@@ -57,6 +64,13 @@ Stop condition：
 - 只能通过未维护的 SQLite fork 修复；
 - 打包环境无法确定实际 SQLite 动态库；
 - schema/transaction 变更会破坏现有 atomic commit。
+
+当前进展（2026-07-31，Task 2 尚未完成）：
+
+- `runtime info` 已报告实际 SQLite 版本与 `parallel_job_execution_supported`；
+- `runtime doctor` 对未进入项目验证白名单的版本给出结构化 warn，现有单 Job/单 writer 保护保持不变；
+- 当前白名单仅含已知修复并按本项目版本线确认的 3.44.6+、3.50.7+、3.51.3+；3.52/3.53 即使上游版本包含修复，也要等对应开发、CI、安装包完成多连接 WAL Gate 后才可加入，不能只凭版本大小放行；
+- 1/4/8/16 connection、busy/checkpoint/crash-reopen 与安装包 SQLite 验证仍待完成。
 
 ## Task 3: [ ] 实现按需 Engine 单实例生命周期
 

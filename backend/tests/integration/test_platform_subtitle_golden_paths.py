@@ -131,7 +131,9 @@ class _Completion:
         self._calls = calls
         self._failure = failure
 
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
+    def complete_once(self, prompt: str, *, check_cancelled=None) -> LegacyModelResponse:
+        if check_cancelled is not None:
+            check_cancelled()
         assert "seg_000001" in prompt
         self._calls.model += 1
         if self._failure == "known":
@@ -178,7 +180,9 @@ class _V2Completion:
         self._calls = calls
         self._failure = failure
 
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
+    def complete_once(self, prompt: str, *, check_cancelled=None) -> LegacyModelResponse:
+        if check_cancelled is not None:
+            check_cancelled()
         self._calls.model_prompts.append(prompt)
         user_content = prompt.split("<user_content>\n", 1)[1].split(
             "\n</user_content>", 1
@@ -249,7 +253,11 @@ class _V2Completion:
         self,
         prompt: str,
         request: ModelExecutionRequest,
+        *,
+        check_cancelled=None,
     ) -> LegacyModelResponse:
+        if check_cancelled is not None:
+            check_cancelled()
         assert request.max_output_tokens > 0
         assert request.timeout_seconds > 0
         return self.complete_once(prompt)

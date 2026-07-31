@@ -71,7 +71,9 @@ class _TimedTranscriber:
 
 
 class _SmokeCompletion:
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
+    def complete_once(self, prompt: str, *, check_cancelled=None) -> LegacyModelResponse:
+        if check_cancelled is not None:
+            check_cancelled()
         assert "seg_000001" in prompt
         return LegacyModelResponse(
             markdown=(

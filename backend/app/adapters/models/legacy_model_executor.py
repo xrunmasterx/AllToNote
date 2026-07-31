@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 from app.adapters.models.legacy_gpt import (
@@ -33,6 +34,8 @@ class LegacyRequestCompletionBridge(Protocol):
         self,
         prompt: str,
         request: ModelExecutionRequest,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> LegacyModelResponse: ...
 
 
@@ -70,7 +73,11 @@ class LegacyModelExecutor:
         prompt = self._build_prompt(request)
 
         try:
-            response = self._bridge.complete_request(prompt, request)
+            response = self._bridge.complete_request(
+                prompt,
+                request,
+                check_cancelled=token.raise_if_cancelled,
+            )
         except LegacyAuthenticationFailure:
             raise DomainError(
                 "model_authentication_failed",

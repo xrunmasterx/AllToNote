@@ -107,11 +107,11 @@ SQLite leases schema 只允许 scheduler 一条记录。另一进程持有时，
 
 机器资源 lease 已有局部实现和测试，但生产 Runtime 没有组装它。不同 Workspace 可同时运行，却不会统一协调 GPU、Whisper、Agent CLI、Provider、CPU 或磁盘。
 
-### 2.5 Codex client 并发正确性未证明
+### 2.5 Codex client 并发正确性基线已通过
 
-现有 CodexAppServerClient 共享 request ID 和 stderr 状态，而每次调用启动独立 subprocess。两个线程交错时可能在各自 subprocess 中等待错误 request ID。
+2026-07-31 已完成 Task 1：每次 turn 使用独立 subprocess、request ID、response buffer、timeout、handle 与线程局部 stderr；v1/v2 ProduceService 的 Job cancellation 均已穿透到 app-server 等待循环，并只终止目标 turn。2/4/8 路受控交错测试与双路真实 Codex app-server 探针均通过。
 
-这是基于代码的高置信风险，必须先写双并发 turn 测试并修复；不能在未验证 client reentrancy 时直接提高 Model 并发。
+这只证明 Model client 的可重入基线，不授权增加 Job worker pool，也不解除 SQLite、generation authority、资源租约和 publish 串行化 Gate。
 
 ### 2.6 SQLite writer 与长事务
 
@@ -133,6 +133,8 @@ SQLite 官方在 2026 年披露 WAL-reset bug：多连接、并发 write/checkpo
 - 启动时报告实际版本；
 - 对不满足最低版本的高并发模式 fail closed 或降级为单 writer 安全模式；
 - 在安装包而不只是开发机中验证。
+
+版本准入采用项目验证白名单而不是简单的 `>=`。因此 3.52/3.53 等后续版本即使从上游继承修复，在开发、CI 与安装包的多连接 WAL Gate 完成前仍保持 fail-closed；通过 Gate 后再显式加入兼容版本线。
 
 ## 3. 设计原则
 

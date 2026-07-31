@@ -223,7 +223,9 @@ class _Completion:
         self._calls = calls
         self._call_log = call_log
 
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
+    def complete_once(self, prompt: str, *, check_cancelled=None) -> LegacyModelResponse:
+        if check_cancelled is not None:
+            check_cancelled()
         assert "seg_000001" in prompt
         self._calls.model += 1
         _record(self._call_log, "model")
@@ -240,8 +242,11 @@ class _Completion:
 
 
 class _ScreenshotCompletion(_Completion):
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
-        response = super().complete_once(prompt)
+    def complete_once(self, prompt: str, *, check_cancelled=None) -> LegacyModelResponse:
+        response = super().complete_once(
+            prompt,
+            check_cancelled=check_cancelled,
+        )
         return replace(
             response,
             markdown=(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import math
@@ -18,6 +19,9 @@ class CodexAppServerError(RuntimeError):
     pass
 
 
+_CANCELLATION_POLL_SECONDS = 0.05
+
+
 @dataclass
 class CodexTurnState:
     text: str = ""
@@ -33,8 +37,11 @@ class CodexAppServerClient:
                 "Codex CLI is not installed or not on PATH. Install Codex CLI and sign in before using app-server."
             )
         self.timeout_seconds = timeout_seconds
-        self.stderr_logs: list[str] = []
-        self._stderr_lock = threading.Lock()
+        self._turn_local = threading.local()
+
+    @property
+    def stderr_logs(self) -> list[str]:
+        return list(getattr(self._turn_local, "stderr_logs", ()))
 
     @staticmethod
     def clean_markdown(text: str) -> str:
@@ -101,7 +108,9 @@ class CodexAppServerClient:
         timeout_seconds: int | float | None = None,
         output_schema: dict[str, object] | None = None,
         reasoning_effort: str | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> str:
+        self._turn_local.stderr_logs = ()
         resolved_timeout = (
             self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
@@ -119,6 +128,8 @@ class CodexAppServerClient:
             )
         ):
             raise CodexAppServerError("Codex app-server turn options are invalid")
+        if check_cancelled is not None:
+            check_cancelled()
         try:
             CodexAppServerStatusService.assert_ready()
         except RuntimeError as exc:
@@ -169,7 +180,13 @@ class CodexAppServerClient:
                     },
                 },
             )
-            self._wait_for_response(stdout_queue, state, 1, deadline)
+            self._wait_for_response(
+                stdout_queue,
+                state,
+                1,
+                deadline,
+                check_cancelled,
+            )
             self._send_notification(process, "initialized")
 
             thread_params = {
@@ -185,7 +202,13 @@ class CodexAppServerClient:
                 ),
             }
             self._send_request(process, 2, "thread/start", thread_params)
-            thread_response = self._wait_for_response(stdout_queue, state, 2, deadline)
+            thread_response = self._wait_for_response(
+                stdout_queue,
+                state,
+                2,
+                deadline,
+                check_cancelled,
+            )
             thread_id = self._extract_thread_id(thread_response)
             if not thread_id:
                 raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
@@ -201,10 +224,21 @@ class CodexAppServerClient:
             if reasoning_effort is not None:
                 turn_params["effort"] = reasoning_effort
             self._send_request(process, 3, "turn/start", turn_params)
-            self._wait_for_response(stdout_queue, state, 3, deadline)
+            self._wait_for_response(
+                stdout_queue,
+                state,
+                3,
+                deadline,
+                check_cancelled,
+            )
 
             while not state.done:
-                self._consume_next_message(stdout_queue, state, deadline)
+                self._consume_next_message(
+                    stdout_queue,
+                    state,
+                    deadline,
+                    check_cancelled,
+                )
 
             if state.error:
                 raise CodexAppServerError(state.error)
@@ -213,8 +247,7 @@ class CodexAppServerClient:
             self._terminate_process(process)
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
-            with self._stderr_lock:
-                self.stderr_logs = list(stderr_logs)
+            self._turn_local.stderr_logs = tuple(stderr_logs)
 
     def _send_request(
         self,
@@ -249,9 +282,15 @@ class CodexAppServerClient:
         state: CodexTurnState,
         request_id: int,
         deadline: float,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         while True:
-            message = self._consume_next_message(stdout_queue, state, deadline)
+            message = self._consume_next_message(
+                stdout_queue,
+                state,
+                deadline,
+                check_cancelled,
+            )
             if message.get("id") != request_id:
                 continue
             if "error" in message:
@@ -263,15 +302,24 @@ class CodexAppServerClient:
         stdout_queue: queue.Queue[dict[str, Any] | Exception],
         state: CodexTurnState,
         deadline: float,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise CodexAppServerError("Timed out waiting for Codex app-server")
-
-        try:
-            message = stdout_queue.get(timeout=remaining)
-        except queue.Empty as exc:
-            raise CodexAppServerError("Timed out waiting for Codex app-server") from exc
+        while True:
+            if check_cancelled is not None:
+                check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexAppServerError("Timed out waiting for Codex app-server")
+            wait_seconds = (
+                min(remaining, _CANCELLATION_POLL_SECONDS)
+                if check_cancelled is not None
+                else remaining
+            )
+            try:
+                message = stdout_queue.get(timeout=wait_seconds)
+                break
+            except queue.Empty:
+                continue
 
         if isinstance(message, Exception):
             raise CodexAppServerError(str(message)) from message

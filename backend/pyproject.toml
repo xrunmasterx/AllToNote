@@ -16,7 +16,7 @@ where = ["."]
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["runtime-lock.json"]
+app = ["runtime-lock.json", "db/builtin_providers.json"]
 
 [tool.pytest.ini_options]
 markers = [

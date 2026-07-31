@@ -15,7 +15,12 @@ from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
 from app.cli.main import main
 from app.core.errors import DomainError
 from app.runtime_capabilities import CapabilityRegistry, CapabilitySpec
-from app.runtime_info import RuntimeCheck, build_runtime_info, runtime_doctor
+from app.runtime_info import (
+    RuntimeCheck,
+    _sqlite_parallel_jobs_supported,
+    build_runtime_info,
+    runtime_doctor,
+)
 from app.runtime_lock import load_runtime_lock
 from app.runtime_paths import resolve_runtime_paths
 
@@ -52,6 +57,12 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
         "schema_hash": "sha256:f8ded2d23197685dc0046e3949e573097fa4ae13e12cfbba240ff0544ca2c9d9",
     }
     assert data["engine"] == {"supported": False, "running": False}
+    assert data["storage"] == {
+        "sqlite_version": runtime_info_module.sqlite3.sqlite_version,
+        "parallel_job_execution_supported": _sqlite_parallel_jobs_supported(
+            runtime_info_module.sqlite3.sqlite_version
+        ),
+    }
     assert data["packs"] == [
         {
             "pack_id": PACK_ID,
@@ -127,6 +138,67 @@ def test_runtime_doctor_explains_missing_document_pack(
     pack = next(check for check in checks if check.code == "pack.document-basic")
     assert pack.status == "warn"
     assert pack.action == "Install or repair the compatible document-basic Pack"
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    (
+        ("3.44.5", False),
+        ("3.44.6", True),
+        ("3.49.9", False),
+        ("3.50.4", False),
+        ("3.50.7", True),
+        ("3.51.2", False),
+        ("3.51.3", True),
+        ("3.51.4", True),
+        ("3.52.0", False),
+        ("3.53.3", False),
+        ("4.0.0", False),
+        ("invalid", False),
+    ),
+)
+def test_sqlite_parallel_job_gate_uses_only_project_validated_release_lines(
+    version: str,
+    expected: bool,
+) -> None:
+    assert _sqlite_parallel_jobs_supported(version) is expected
+
+
+def test_runtime_doctor_warns_when_sqlite_is_unsafe_for_parallel_wal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_info_module.sqlite3, "sqlite_version", "3.50.4")
+
+    check = next(
+        item
+        for item in runtime_doctor(dynamic=False)
+        if item.code == "storage.sqlite.parallel-jobs"
+    )
+
+    assert check.status == "warn"
+    assert check.action == (
+        "Use an AllToNote Runtime validated with SQLite 3.44.6+, 3.50.7+, "
+        "or 3.51.3+ on the same release line before enabling parallel Job execution"
+    )
+
+
+def test_runtime_doctor_passes_for_patched_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_info_module.sqlite3, "sqlite_version", "3.51.3")
+
+    check = next(
+        item
+        for item in runtime_doctor(dynamic=False)
+        if item.code == "storage.sqlite.parallel-jobs"
+    )
+
+    assert check == RuntimeCheck(
+        "storage.sqlite.parallel-jobs",
+        "pass",
+        None,
+        False,
+    )
 
 
 def test_runtime_info_cold_path_does_not_import_heavy_recipe_modules() -> None:

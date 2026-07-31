@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable
@@ -49,6 +50,8 @@ class RuntimeInfo:
     runtime_lock: RuntimeLock
     operating_system: str
     architecture: str
+    sqlite_version: str
+    sqlite_parallel_jobs_supported: bool
     engine_supported: bool
     engine_running: bool
     capabilities: tuple[RuntimeCapability, ...]
@@ -72,6 +75,12 @@ class RuntimeInfo:
             "platform": {
                 "os": self.operating_system,
                 "arch": self.architecture,
+            },
+            "storage": {
+                "sqlite_version": self.sqlite_version,
+                "parallel_job_execution_supported": (
+                    self.sqlite_parallel_jobs_supported
+                ),
             },
             "engine": {
                 "supported": self.engine_supported,
@@ -114,6 +123,21 @@ def _normalized_platform() -> tuple[str, str]:
     return operating_system, architecture
 
 
+def _sqlite_parallel_jobs_supported(version: str) -> bool:
+    try:
+        parts = tuple(int(part) for part in version.split("."))
+    except (AttributeError, ValueError):
+        return False
+    if len(parts) != 3 or parts[0] != 3:
+        return False
+    _major, minor, patch = parts
+    return (
+        (minor == 44 and patch >= 6)
+        or (minor == 50 and patch >= 7)
+        or (minor == 51 and patch >= 3)
+    )
+
+
 def build_runtime_info(
     *,
     registry: CapabilityRegistry | None = None,
@@ -133,6 +157,10 @@ def build_runtime_info(
         runtime_lock=runtime_lock,
         operating_system=operating_system,
         architecture=architecture,
+        sqlite_version=sqlite3.sqlite_version,
+        sqlite_parallel_jobs_supported=_sqlite_parallel_jobs_supported(
+            sqlite3.sqlite_version
+        ),
         engine_supported=False,
         engine_running=False,
         capabilities=(registry or CapabilityRegistry()).snapshot(),
@@ -191,6 +219,24 @@ def runtime_doctor(
                 None
                 if pack_installed
                 else "Install or repair the compatible document-basic Pack"
+            ),
+            False,
+        )
+    )
+
+    sqlite_safe = _sqlite_parallel_jobs_supported(sqlite3.sqlite_version)
+    checks.append(
+        RuntimeCheck(
+            "storage.sqlite.parallel-jobs",
+            "pass" if sqlite_safe else "warn",
+            (
+                None
+                if sqlite_safe
+                else (
+                    "Use an AllToNote Runtime validated with SQLite 3.44.6+, "
+                    "3.50.7+, or 3.51.3+ on the same release line before "
+                    "enabling parallel Job execution"
+                )
             ),
             False,
         )

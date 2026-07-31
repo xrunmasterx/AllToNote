@@ -36,6 +36,7 @@ class _FakeClient:
                 int | float | None,
                 dict[str, object] | None,
                 str | None,
+                Callable[[], None] | None,
             ]
         ] = []
 
@@ -48,6 +49,7 @@ class _FakeClient:
         timeout_seconds: int | float | None = None,
         output_schema: dict[str, object] | None = None,
         reasoning_effort: str | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> object:
         self.calls.append(
             (
@@ -57,6 +59,7 @@ class _FakeClient:
                 timeout_seconds,
                 output_schema,
                 reasoning_effort,
+                check_cancelled,
             )
         )
         return self._responder(prompt, model)
@@ -77,13 +80,28 @@ def test_complete_once_maps_one_call_to_one_frozen_codex_turn() -> None:
     response = bridge.complete_once("compile this transcript")
 
     assert client.calls == [
-        ("compile this transcript", "gpt-5.5-codex", None, None, None, None)
+        ("compile this transcript", "gpt-5.5-codex", None, None, None, None, None)
     ]
     assert response.markdown == "# Note\n\nBody"
     assert response.actual_model == "gpt-5.5-codex"
     assert response.provider_request_id is None
     assert response.input_tokens is None
     assert response.output_tokens is None
+
+
+def test_complete_once_forwards_cancellation_check() -> None:
+    client = _FakeClient(lambda _prompt, _model: "# Note")
+    bridge = CodexAppServerCompletionBridge(
+        model_identity="gpt-5.5-codex",
+        client=client,
+    )
+
+    def check_cancelled() -> None:
+        return None
+
+    bridge.complete_once("compile", check_cancelled=check_cancelled)
+
+    assert client.calls[0][-1] is check_cancelled
 
 
 def test_complete_request_maps_frozen_timeout_and_json_schema() -> None:
@@ -106,7 +124,17 @@ def test_complete_request_maps_frozen_timeout_and_json_schema() -> None:
         response_schema_json='{"type":"object"}',
     )
 
-    response = bridge.complete_request("frozen prompt", request)
+    checks = 0
+
+    def check_cancelled() -> None:
+        nonlocal checks
+        checks += 1
+
+    response = bridge.complete_request(
+        "frozen prompt",
+        request,
+        check_cancelled=check_cancelled,
+    )
 
     assert client.calls == [
         (
@@ -116,8 +144,11 @@ def test_complete_request_maps_frozen_timeout_and_json_schema() -> None:
             37,
             {"type": "object"},
             "medium",
+            check_cancelled,
         )
     ]
+    client.calls[0][-1]()
+    assert checks == 1
     assert response.warnings == ("provider_output_token_limit_unenforced",)
 
 
@@ -157,7 +188,7 @@ def test_complete_request_uses_stage_specific_reasoning_effort(
 
     bridge.complete_request("frozen prompt", request)
 
-    assert client.calls[0][-1] == expected_effort
+    assert client.calls[0][-2] == expected_effort
 
 
 def test_execution_policy_identity_freezes_stage_effort_mapping() -> None:

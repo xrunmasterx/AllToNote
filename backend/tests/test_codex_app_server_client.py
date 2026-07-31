@@ -222,6 +222,23 @@ def test_consume_next_message_rejects_server_request():
         client._consume_next_message(stdout_queue, CodexTurnState(), time.monotonic() + 1)
 
 
+def test_turn_entry_clears_previous_thread_stderr_before_early_cancellation():
+    client = CodexAppServerClient(codex_bin="codex")
+    client._turn_local.stderr_logs = ("previous turn",)
+
+    def cancel() -> None:
+        raise RuntimeError("cancel before process")
+
+    with pytest.raises(RuntimeError, match="cancel before process"):
+        client.run_markdown_turn(
+            "prompt",
+            "gpt-5",
+            check_cancelled=cancel,
+        )
+
+    assert client.stderr_logs == []
+
+
 class _RecordingStdin:
     def __init__(self):
         self.messages = []
@@ -301,18 +318,21 @@ class _ConcurrentFakeProcess(_FakeProcess):
 
 
 class _BlockingStdout:
-    def __init__(self, messages, terminated):
+    def __init__(self, messages, terminated, blocked=None):
         self._messages = messages
         self._terminated = terminated
+        self._blocked = blocked
 
     def __iter__(self):
         for message in self._messages:
             yield json.dumps(message) + "\n"
+        if self._blocked is not None:
+            self._blocked.set()
         self._terminated.wait(timeout=5)
 
 
 class _TimeoutFakeProcess(_FakeProcess):
-    def __init__(self, request_barrier):
+    def __init__(self, request_barrier, blocked=None):
         messages = (
             {"jsonrpc": "2.0", "id": 1, "result": {}},
             {
@@ -325,7 +345,7 @@ class _TimeoutFakeProcess(_FakeProcess):
         super().__init__(())
         self._terminated_event = threading.Event()
         self.stdin = _BarrierStdin(request_barrier)
-        self.stdout = _BlockingStdout(messages, self._terminated_event)
+        self.stdout = _BlockingStdout(messages, self._terminated_event, blocked)
 
     def terminate(self):
         super().terminate()
@@ -523,24 +543,28 @@ def test_shared_client_isolates_concurrent_turn_state(monkeypatch, worker_count)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         results = tuple(
             executor.map(
-                lambda index: client.run_markdown_turn(
-                    f"prompt-{index}",
-                    "gpt-5",
+                lambda index: (
+                    client.run_markdown_turn(
+                        f"prompt-{index}",
+                        "gpt-5",
+                    ),
+                    tuple(client.stderr_logs),
                 ),
                 range(worker_count),
             )
         )
 
-    assert set(results) == {f"# turn-{index}" for index in range(worker_count)}
+    assert set(results) == {
+        (f"# turn-{index}", (f"stderr-turn-{index}",))
+        for index in range(worker_count)
+    }
     assert len(fake_processes) == worker_count
     assert all(
         [message["id"] for message in process.stdin.messages if "id" in message]
         == [1, 2, 3]
         for process in fake_processes
     )
-    assert client.stderr_logs in (
-        [f"stderr-turn-{index}"] for index in range(worker_count)
-    )
+    assert client.stderr_logs == []
 
 
 def test_shared_client_timeout_only_terminates_target_turn(monkeypatch):
@@ -587,4 +611,59 @@ def test_shared_client_timeout_only_terminates_target_turn(monkeypatch):
         assert fast_future.result() == "# fast"
 
     assert timeout_process._terminated is True
+    assert fast_process._terminated is True
+
+
+def test_shared_client_cancellation_only_terminates_target_turn(monkeypatch):
+    request_barrier = threading.Barrier(2)
+    target_process_created = threading.Event()
+    target_is_waiting = threading.Event()
+    cancel_target = threading.Event()
+    fast_process = _ConcurrentFakeProcess(
+        "fast",
+        request_barrier,
+        threading.Barrier(1),
+    )
+    target_process = _TimeoutFakeProcess(request_barrier, target_is_waiting)
+    processes = iter((target_process, fast_process))
+
+    def fake_popen(*args, **kwargs):
+        del args, kwargs
+        process = next(processes)
+        if process is target_process:
+            target_process_created.set()
+        return process
+
+    def check_cancelled() -> None:
+        if cancel_target.is_set():
+            raise RuntimeError("target job cancelled")
+
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.CodexAppServerStatusService.assert_ready",
+        lambda: None,
+    )
+    monkeypatch.setattr(CodexAppServerClient, "_is_windows", staticmethod(lambda: False))
+    monkeypatch.setattr(
+        "app.gpt.codex_app_server_client.subprocess.Popen",
+        fake_popen,
+    )
+    client = CodexAppServerClient(codex_bin="codex", timeout_seconds=2)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        target_future = executor.submit(
+            client.run_markdown_turn,
+            "cancel target",
+            "gpt-5",
+            check_cancelled=check_cancelled,
+        )
+        assert target_process_created.wait(timeout=1)
+        fast_future = executor.submit(client.run_markdown_turn, "fast", "gpt-5")
+        assert target_is_waiting.wait(timeout=1)
+        cancel_target.set()
+
+        with pytest.raises(RuntimeError, match="target job cancelled"):
+            target_future.result(timeout=1)
+        assert fast_future.result(timeout=1) == "# fast"
+
+    assert target_process._terminated is True
     assert fast_process._terminated is True

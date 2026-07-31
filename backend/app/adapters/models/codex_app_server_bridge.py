@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from typing import Protocol
 
@@ -35,6 +36,7 @@ class CodexAppServerTurnClient(Protocol):
         timeout_seconds: int | float | None = None,
         output_schema: dict[str, object] | None = None,
         reasoning_effort: str | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> str: ...
 
 
@@ -63,7 +65,12 @@ class CodexAppServerCompletionBridge:
         self._model_identity = model_identity
         self._client = resolved_client
 
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
+    def complete_once(
+        self,
+        prompt: str,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> LegacyModelResponse:
         """Compatibility entry point for the v1 Markdown generator."""
 
         # CodexAppServerError intentionally crosses this boundary unchanged. The
@@ -72,6 +79,7 @@ class CodexAppServerCompletionBridge:
             prompt,
             self._model_identity,
             cwd=None,
+            check_cancelled=check_cancelled,
         )
         return self._normalized_response(returned_text)
 
@@ -79,6 +87,8 @@ class CodexAppServerCompletionBridge:
         self,
         prompt: str,
         request: ModelExecutionRequest,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> LegacyModelResponse:
         if not isinstance(request, ModelExecutionRequest):
             raise DomainError(
@@ -104,6 +114,7 @@ class CodexAppServerCompletionBridge:
             timeout_seconds=request.timeout_seconds,
             output_schema=output_schema,
             reasoning_effort=self._reasoning_effort(request.stage_id),
+            check_cancelled=check_cancelled,
         )
         return self._normalized_response(
             returned_text,

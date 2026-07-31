@@ -450,9 +450,35 @@ class _Bridge(LegacyCompletionBridge):
         self._responder = responder
         self.prompts: list[str] = []
 
-    def complete_once(self, prompt: str) -> LegacyModelResponse:
+    def complete_once(
+        self,
+        prompt: str,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> LegacyModelResponse:
+        if check_cancelled is not None:
+            check_cancelled()
         self.prompts.append(prompt)
         return self._responder(prompt)
+
+
+class _CancelInsideBridge:
+    def __init__(self) -> None:
+        self.entered = False
+        self.calls = 0
+
+    def complete_once(
+        self,
+        prompt: str,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> LegacyModelResponse:
+        del prompt
+        self.calls += 1
+        self.entered = True
+        assert check_cancelled is not None
+        check_cancelled()
+        raise AssertionError("cancel callback should terminate the turn")
 
 
 class _RecordingGuard:
@@ -631,6 +657,11 @@ def test_each_chunk_is_one_guarded_single_request_and_results_join_by_ordinal(
     draft = adapter.generate(request, _Token())
 
     assert len(bridge.prompts) == 3
+    assert draft.cited_segment_ids == (
+        "seg_000001",
+        "seg_000002",
+        "seg_000003",
+    )
     assert [name for name, _ in guard.events] == [
         "prepare",
         "start",
@@ -761,11 +792,31 @@ def test_cancel_after_first_chunk_resumes_without_reissuing_it(tmp_path: Path) -
     draft = adapter.generate(request, _Token())
 
     assert len(bridge.prompts) == 3
-    assert draft.cited_segment_ids == (
-        "seg_000001",
-        "seg_000002",
-        "seg_000003",
+
+
+def test_cancel_inside_active_v1_turn_preserves_unknown_outcome_without_replay(
+    tmp_path: Path,
+) -> None:
+    bridge = _CancelInsideBridge()
+    guard = _RecordingGuard()
+    adapter = LegacyKnowledgeModelAdapter(
+        model=_model_binding(bridge),
+        execution=_execution_binding(tmp_path, guard),
+        max_prompt_bytes=64 * 1024,
     )
+
+    with pytest.raises(DomainError, match="job_cancelled") as exc_info:
+        adapter.generate(
+            _request(_transcript(1)),
+            _Token(cancel_when=lambda: bridge.entered),
+        )
+
+    assert exc_info.value.category is ErrorCategory.CANCELLED
+    assert [event for event, _value in guard.events][-1] == "unknown"
+
+    with pytest.raises(DomainError, match="external_outcome_unknown"):
+        adapter.generate(_request(_transcript(1)), _Token())
+    assert bridge.calls == 1
 
 
 def test_unknown_outcome_is_persisted_and_never_reissued(tmp_path: Path) -> None:
