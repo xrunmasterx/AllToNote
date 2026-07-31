@@ -46,16 +46,35 @@ def _resolved(tmp_path: Path) -> ResolvedOfficialVideoPack:
     )
 
 
-def _adapter(tmp_path: Path, result: dict[str, object], captured: dict) -> object:
+def _adapter(
+    tmp_path: Path,
+    result: dict[str, object],
+    captured: dict,
+    *,
+    probe_result: dict[str, object] | None = None,
+) -> object:
     def runner(command, request, **kwargs):
         captured.update(command=command, request=request, **kwargs)
         return result
+
+    def probe_runner(command, request, **kwargs):
+        captured["probe"] = {
+            "command": command,
+            "request": request,
+            **kwargs,
+        }
+        return (
+            {"format": {"duration": "12.000000"}}
+            if probe_result is None
+            else probe_result
+        )
 
     return PackedBilibiliVideoSourceAdapter(
         LegacyVideoSourceAdapter(local_machine_id="machine-a"),
         _resolved(tmp_path),
         cookie_resolver=lambda: "SESSDATA=secret",
         runner=runner,
+        probe_runner=probe_runner,
         backend_root=Path(__file__).resolve().parents[2],
     )
 
@@ -181,10 +200,11 @@ def test_adapter_rejects_non_bilibili_remote_source(tmp_path: Path) -> None:
 def test_local_source_still_uses_existing_hardened_path(tmp_path: Path) -> None:
     local = tmp_path / "local.mp4"
     local.write_bytes(b"video")
+    captured: dict[str, object] = {}
     adapter = _adapter(
         tmp_path,
         _result(),
-        {},
+        captured,
     )
     source = adapter.resolve(str(local))
 
@@ -198,3 +218,52 @@ def test_local_source_still_uses_existing_hardened_path(tmp_path: Path) -> None:
 
     assert acquired.source.connector_id == "local"
     assert acquired.title == "local"
+    assert acquired.duration_ms == 12_000
+    assert captured["probe"]["command"] == (
+        str(_resolved(tmp_path).entrypoints["ffprobe"]),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(local),
+    )
+    assert captured["probe"]["request"] == {}
+
+
+@pytest.mark.parametrize(
+    "probe_result",
+    [
+        {},
+        {"format": {}},
+        {"format": {"duration": 12}},
+        {"format": {"duration": "0"}},
+        {"format": {"duration": "NaN"}},
+    ],
+)
+def test_local_source_rejects_invalid_probe_result(
+    tmp_path: Path,
+    probe_result: dict[str, object],
+) -> None:
+    local = tmp_path / "local.mp4"
+    local.write_bytes(b"video")
+    adapter = _adapter(
+        tmp_path,
+        _result(),
+        {},
+        probe_result=probe_result,
+    )
+
+    with pytest.raises(DomainError) as caught:
+        adapter.acquire(
+            adapter.resolve(str(local)),
+            need_media=False,
+            need_subtitles=False,
+            output_dir=tmp_path / "attempt",
+            token=_Token(),
+        )
+
+    assert caught.value.code == "source_result_invalid"
+    assert str(local) not in str(caught.value)

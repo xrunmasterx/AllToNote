@@ -13,6 +13,11 @@ from app.adapters.documents.document_basic_pack import (
     PACK_VERSION,
     document_basic_pack_installed,
 )
+from app.adapters.video_packs.official_video_pack import (
+    MEDIA_BASIC,
+    TRANSCRIBE_CPU,
+    official_video_pack_installed,
+)
 from app.cli.contracts import CLI_PROTOCOL_VERSION
 from app.core.errors import DomainError
 from app.runtime_capabilities import CapabilityRegistry, RuntimeCapability
@@ -149,6 +154,17 @@ def build_runtime_info(
     operating_system, architecture = _normalized_platform()
     active_paths = paths or resolve_runtime_paths()
     active_environ = os.environ if environ is None else environ
+    media_basic_installed = official_video_pack_installed(
+        active_paths.data_dir, MEDIA_BASIC
+    )
+    transcribe_cpu_installed = official_video_pack_installed(
+        active_paths.data_dir, TRANSCRIBE_CPU
+    )
+    capabilities = _capabilities_with_video_packs(
+        (registry or CapabilityRegistry()).snapshot(),
+        media_basic_installed=media_basic_installed,
+        transcribe_cpu_installed=transcribe_cpu_installed,
+    )
     return RuntimeInfo(
         runtime_version=RUNTIME_VERSION,
         core_api_version=CORE_API_VERSION,
@@ -163,14 +179,49 @@ def build_runtime_info(
         ),
         engine_supported=False,
         engine_running=False,
-        capabilities=(registry or CapabilityRegistry()).snapshot(),
+        capabilities=capabilities,
         packs=(
             RuntimePack(
                 PACK_ID,
                 PACK_VERSION,
                 document_basic_pack_installed(active_paths, active_environ),
             ),
+            RuntimePack(
+                MEDIA_BASIC.pack_id,
+                MEDIA_BASIC.pack_version,
+                media_basic_installed,
+            ),
+            RuntimePack(
+                TRANSCRIBE_CPU.pack_id,
+                TRANSCRIBE_CPU.pack_version,
+                transcribe_cpu_installed,
+            ),
         ),
+    )
+
+
+def _capabilities_with_video_packs(
+    capabilities: tuple[RuntimeCapability, ...],
+    *,
+    media_basic_installed: bool,
+    transcribe_cpu_installed: bool,
+) -> tuple[RuntimeCapability, ...]:
+    pack_capabilities = {
+        "recipe.video.acquire.bilibili": media_basic_installed,
+        "recipe.video.acquire.local": media_basic_installed,
+        "recipe.video.transcribe.local.cpu": transcribe_cpu_installed,
+    }
+    return tuple(
+        RuntimeCapability(
+            key=capability.key,
+            installed=(
+                capability.installed
+                or pack_capabilities.get(capability.key, False)
+            ),
+            version=capability.version,
+            probe=capability.probe,
+        )
+        for capability in capabilities
     )
 
 
@@ -183,6 +234,12 @@ def runtime_doctor(
     checks: list[RuntimeCheck] = []
     active_paths = paths or resolve_runtime_paths()
     active_environ = os.environ if environ is None else environ
+    media_basic_installed = official_video_pack_installed(
+        active_paths.data_dir, MEDIA_BASIC
+    )
+    transcribe_cpu_installed = official_video_pack_installed(
+        active_paths.data_dir, TRANSCRIBE_CPU
+    )
     try:
         load_runtime_lock()
         checks.append(RuntimeCheck("runtime.contract", "pass", None, False))
@@ -196,7 +253,12 @@ def runtime_doctor(
             )
         )
 
-    for capability in CapabilityRegistry().snapshot():
+    capabilities = _capabilities_with_video_packs(
+        CapabilityRegistry().snapshot(),
+        media_basic_installed=media_basic_installed,
+        transcribe_cpu_installed=transcribe_cpu_installed,
+    )
+    for capability in capabilities:
         checks.append(
             RuntimeCheck(
                 f"capability.{capability.key}",
@@ -223,6 +285,23 @@ def runtime_doctor(
             False,
         )
     )
+
+    for contract, installed in (
+        (MEDIA_BASIC, media_basic_installed),
+        (TRANSCRIBE_CPU, transcribe_cpu_installed),
+    ):
+        checks.append(
+            RuntimeCheck(
+                f"pack.{contract.pack_id}",
+                "pass" if installed else "warn",
+                (
+                    None
+                    if installed
+                    else f"Install or repair the compatible {contract.pack_id} Pack"
+                ),
+                False,
+            )
+        )
 
     sqlite_safe = _sqlite_parallel_jobs_supported(sqlite3.sqlite_version)
     checks.append(

@@ -460,6 +460,14 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         source_revision_id: str,
         execution: VideoStepExecutionContext,
     ) -> VideoAcquisition:
+        if source.platform == "local":
+            return self._acquire_local(
+                request,
+                source,
+                source_id=source_id,
+                source_revision_id=source_revision_id,
+                execution=execution,
+            )
         token = CancellationToken(self._repository, execution.job_id)
         provided = request.provided_transcript
         acquired = self._source.acquire(
@@ -604,6 +612,138 @@ class _PlatformVideoOperations(VideoRecipeOperations):
             stored_media=stored_media,
         )
 
+    def _acquire_local(
+        self,
+        request: VideoProduceRequest,
+        source: ResolvedVideoSource,
+        *,
+        source_id: str,
+        source_revision_id: str,
+        execution: VideoStepExecutionContext,
+    ) -> VideoAcquisition:
+        token = CancellationToken(self._repository, execution.job_id)
+        live_source = source
+        if live_source.local_binding is None:
+            live_source = self._source.resolve(request.input_value)
+            if (
+                live_source.connector_id != source.connector_id
+                or live_source.connector_version != source.connector_version
+                or live_source.canonical_identity != source.canonical_identity
+                or live_source.logical_reference != source.logical_reference
+                or live_source.content_sha256 != source.content_sha256
+            ):
+                raise DomainError(
+                    "source_local_changed",
+                    ErrorCategory.INVALID_REQUEST,
+                    "The local source changed after it was resolved",
+                )
+        binding = live_source.local_binding
+        digest = live_source.content_sha256
+        storage = self._storage
+        fixture = self._source_metadata.get("local")
+        if (
+            binding is None
+            or digest is None
+            or storage is None
+            or (fixture is not None and frozenset(fixture) != _SOURCE_METADATA_FIELDS)
+        ):
+            raise DomainError(
+                "source_metadata_unavailable",
+                ErrorCategory.RECIPE_FAILED,
+                "Complete source metadata is required for local composition",
+            )
+        provided = request.provided_transcript
+        acquired = self._source.acquire(
+            live_source,
+            need_media=False,
+            need_subtitles=False,
+            output_dir=self._acquisition_root / execution.job_id,
+            token=token,
+        )
+        stored = storage.snapshot_asset(
+            binding.path,
+            job_id=execution.job_id,
+            attempt_id=execution.attempt_id,
+            role=StoredAssetRole.SOURCE_MEDIA,
+            expected_sha256=digest,
+            authority=execution.authority,
+            token=token,
+        )
+        if fixture is None:
+            metadata_values: Mapping[str, object] = {
+                "title": acquired.title or binding.path.stem,
+                "author": "unknown",
+                "channel": "local",
+                "duration_ms": (
+                    acquired.duration_ms
+                    if acquired.duration_ms is not None
+                    else (
+                        provided.segments[-1].end_ms
+                        if provided is not None and provided.segments
+                        else None
+                    )
+                ),
+                "published_at": None,
+                "observed_at": datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                ).replace("+00:00", "Z"),
+                "language": provided.language if provided is not None else "und",
+            }
+        else:
+            metadata_values = fixture
+        try:
+            metadata = VideoSourceMetadata(
+                source_id=source_id,
+                source_revision_id=source_revision_id,
+                connector_id=live_source.connector_id,
+                connector_version=live_source.connector_version,
+                platform="local",
+                canonical_identity_scheme=live_source.canonical_identity_scheme,
+                stable_video_identity=live_source.stable_video_identity,
+                canonical_uri=None,
+                title=metadata_values["title"],
+                author=metadata_values["author"],
+                channel=metadata_values["channel"],
+                duration_ms=metadata_values["duration_ms"],
+                published_at=metadata_values["published_at"],
+                observed_at=metadata_values["observed_at"],
+                language=metadata_values["language"],
+                subtitle_acquisition=(
+                    TranscriptProvenance.PROVIDED.value
+                    if provided is not None
+                    else TranscriptProvenance.GENERATED.value
+                ),
+                source_link=None,
+                materialization_reason="external_local_content",
+                license="unknown",
+                privacy="personal",
+                freshness="point_in_time",
+                logical_reference=live_source.logical_reference,
+                materialization_kind=MaterializationPolicy.EXTERNAL_LOCAL.value,
+            )
+        except (DomainError, TypeError, ValueError):
+            raise DomainError(
+                "source_metadata_invalid",
+                ErrorCategory.RECIPE_FAILED,
+                "Complete source metadata is invalid",
+            ) from None
+        return VideoAcquisition(
+            metadata=metadata,
+            subtitle_availability=(
+                SubtitleAvailability.AVAILABLE
+                if provided is not None
+                else SubtitleAvailability.NOT_SUPPORTED
+            ),
+            transcript=provided,
+            transcript_identity=(
+                transcript_identity(provided) if provided is not None else None
+            ),
+            transcript_provenance=(
+                TranscriptProvenance.PROVIDED if provided is not None else None
+            ),
+            stored_media=stored,
+        )
+
     def transcribe(
         self,
         request: VideoProduceRequest,
@@ -716,104 +856,12 @@ class _LocalVideoOperations(_PlatformVideoOperations):
         source_revision_id: str,
         execution: VideoStepExecutionContext,
     ) -> VideoAcquisition:
-        token = CancellationToken(self._repository, execution.job_id)
-        live_source = source
-        if live_source.local_binding is None:
-            live_source = self._source.resolve(request.input_value)
-            if (
-                live_source.connector_id != source.connector_id
-                or live_source.connector_version != source.connector_version
-                or live_source.canonical_identity != source.canonical_identity
-                or live_source.logical_reference != source.logical_reference
-                or live_source.content_sha256 != source.content_sha256
-            ):
-                raise DomainError(
-                    "source_local_changed",
-                    ErrorCategory.INVALID_REQUEST,
-                    "The local source changed after it was resolved",
-                )
-        binding = live_source.local_binding
-        digest = live_source.content_sha256
-        fixture = self._source_metadata.get("local")
-        if (
-            binding is None
-            or digest is None
-            or fixture is None
-            or frozenset(fixture) != _SOURCE_METADATA_FIELDS
-        ):
-            raise DomainError(
-                "source_metadata_unavailable",
-                ErrorCategory.RECIPE_FAILED,
-                "Complete source metadata is required for local composition",
-            )
-        provided = request.provided_transcript
-        self._source.acquire(
-            live_source,
-            need_media=False,
-            need_subtitles=False,
-            output_dir=self._acquisition_root / execution.job_id,
-            token=token,
-        )
-        stored = self._storage.snapshot_asset(
-            binding.path,
-            job_id=execution.job_id,
-            attempt_id=execution.attempt_id,
-            role=StoredAssetRole.SOURCE_MEDIA,
-            expected_sha256=digest,
-            authority=execution.authority,
-            token=token,
-        )
-        try:
-            metadata = VideoSourceMetadata(
-                source_id=source_id,
-                source_revision_id=source_revision_id,
-                connector_id=live_source.connector_id,
-                connector_version=live_source.connector_version,
-                platform="local",
-                canonical_identity_scheme=live_source.canonical_identity_scheme,
-                stable_video_identity=live_source.stable_video_identity,
-                canonical_uri=None,
-                title=fixture["title"],
-                author=fixture["author"],
-                channel=fixture["channel"],
-                duration_ms=fixture["duration_ms"],
-                published_at=fixture["published_at"],
-                observed_at=fixture["observed_at"],
-                language=fixture["language"],
-                subtitle_acquisition=(
-                    TranscriptProvenance.PROVIDED.value
-                    if provided is not None
-                    else TranscriptProvenance.GENERATED.value
-                ),
-                source_link=None,
-                materialization_reason="external_local_content",
-                license="unknown",
-                privacy="personal",
-                freshness="point_in_time",
-                logical_reference=live_source.logical_reference,
-                materialization_kind=MaterializationPolicy.EXTERNAL_LOCAL.value,
-            )
-        except (DomainError, TypeError, ValueError):
-            raise DomainError(
-                "source_metadata_invalid",
-                ErrorCategory.RECIPE_FAILED,
-                "Complete source metadata is invalid",
-            ) from None
-        return VideoAcquisition(
-            metadata=metadata,
-            subtitle_availability=(
-                SubtitleAvailability.AVAILABLE
-                if provided is not None
-                else SubtitleAvailability.NOT_SUPPORTED
-            ),
-            transcript=provided,
-            transcript_identity=(
-                transcript_identity(provided) if provided is not None else None
-            ),
-            transcript_provenance=(
-                TranscriptProvenance.PROVIDED if provided is not None else None
-            ),
-            stored_media=stored,
+        return self._acquire_local(
+            request,
+            source,
+            source_id=source_id,
+            source_revision_id=source_revision_id,
+            execution=execution,
         )
 
     def transcribe(

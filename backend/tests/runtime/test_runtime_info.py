@@ -12,6 +12,11 @@ import pytest
 import app.runtime_info as runtime_info_module
 import app.runtime_lock as runtime_lock_module
 from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.adapters.video_packs.official_video_pack import (
+    MEDIA_BASIC,
+    TRANSCRIBE_CPU,
+    OfficialVideoPackContract,
+)
 from app.cli.main import main
 from app.core.errors import DomainError
 from app.runtime_capabilities import CapabilityRegistry, CapabilitySpec
@@ -26,6 +31,62 @@ from app.runtime_paths import resolve_runtime_paths
 
 
 HELPER = Path(__file__).parents[1] / "helpers" / "report_cli_imports.py"
+
+
+def _static_video_pack(
+    paths: object,
+    contract: OfficialVideoPackContract,
+    digest_character: str,
+) -> Path:
+    manifest_sha256 = "sha256:" + digest_character * 64
+    generation = (
+        paths.data_dir
+        / "packs"
+        / contract.pack_id
+        / contract.pack_version
+        / "installs"
+        / manifest_sha256.removeprefix("sha256:")
+    )
+    generation.mkdir(parents=True)
+    (generation / "manifest.json").write_bytes(b"{}")
+    for relative_path in {
+        *contract.required_payload_files,
+        *contract.entrypoints(
+            "windows-x86_64" if os.name == "nt" else "posix-x86_64"
+        ).values(),
+    }:
+        target = generation.joinpath(*relative_path.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"fixture")
+    receipt = generation / "receipt.json"
+    receipt.write_bytes(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pack_id": contract.pack_id,
+                "pack_version": contract.pack_version,
+                "manifest_sha256": manifest_sha256,
+                "verified": True,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    active = generation.parents[1] / "active.json"
+    active.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pack_id": contract.pack_id,
+                "pack_version": contract.pack_version,
+                "manifest_sha256": manifest_sha256,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    return receipt
 
 
 def test_runtime_info_reports_pinned_versions_without_private_paths(
@@ -69,7 +130,19 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
             "version": PACK_VERSION,
             "installed": False,
             "probe": "static",
-        }
+        },
+        {
+            "pack_id": MEDIA_BASIC.pack_id,
+            "version": MEDIA_BASIC.pack_version,
+            "installed": False,
+            "probe": "static",
+        },
+        {
+            "pack_id": TRANSCRIBE_CPU.pack_id,
+            "version": TRANSCRIBE_CPU.pack_version,
+            "installed": False,
+            "probe": "static",
+        },
     ]
     assert data["platform"]["os"] in {"windows", "macos", "linux"}
     assert data["platform"]["arch"] in {"x86_64", "arm64"}
@@ -126,6 +199,71 @@ def test_runtime_info_and_doctor_report_installed_document_pack(
     assert next(check for check in checks if check.code == "pack.document-basic") == (
         RuntimeCheck("pack.document-basic", "pass", None, False)
     )
+
+
+def test_runtime_info_and_doctor_report_installed_video_packs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    _static_video_pack(paths, MEDIA_BASIC, "a")
+    transcribe_receipt = _static_video_pack(paths, TRANSCRIBE_CPU, "b")
+    registry = CapabilityRegistry(
+        (
+            CapabilitySpec(
+                "recipe.video.acquire.bilibili", ("missing_bilibili_module",)
+            ),
+            CapabilitySpec(
+                "recipe.video.acquire.youtube", ("missing_youtube_module",)
+            ),
+            CapabilitySpec(
+                "recipe.video.acquire.local", ("missing_local_module",)
+            ),
+            CapabilitySpec(
+                "recipe.video.transcribe.local.cpu", ("missing_whisper_module",)
+            ),
+        )
+    )
+    monkeypatch.setattr(runtime_info_module, "CapabilityRegistry", lambda: registry)
+
+    info = build_runtime_info(paths=paths, environ={}, registry=registry)
+    checks = runtime_doctor(dynamic=False, paths=paths, environ={})
+
+    assert {pack.pack_id: pack.installed for pack in info.packs} == {
+        PACK_ID: False,
+        MEDIA_BASIC.pack_id: True,
+        TRANSCRIBE_CPU.pack_id: True,
+    }
+    capabilities = {item.key: item.installed for item in info.capabilities}
+    assert capabilities["recipe.video.acquire.bilibili"] is True
+    assert capabilities["recipe.video.acquire.local"] is True
+    assert capabilities["recipe.video.transcribe.local.cpu"] is True
+    assert capabilities["recipe.video.acquire.youtube"] is False
+    assert next(check for check in checks if check.code == "pack.media-basic") == (
+        RuntimeCheck("pack.media-basic", "pass", None, False)
+    )
+    assert next(check for check in checks if check.code == "pack.transcribe-cpu") == (
+        RuntimeCheck("pack.transcribe-cpu", "pass", None, False)
+    )
+    for key in (
+        "recipe.video.acquire.bilibili",
+        "recipe.video.acquire.local",
+        "recipe.video.transcribe.local.cpu",
+    ):
+        assert next(
+            check for check in checks if check.code == f"capability.{key}"
+        ) == RuntimeCheck(f"capability.{key}", "pass", None, False)
+    assert next(
+        check
+        for check in checks
+        if check.code == "capability.recipe.video.acquire.youtube"
+    ).status == "warn"
+
+    transcribe_receipt.write_bytes(b"{}")
+    corrupted = build_runtime_info(paths=paths, environ={}, registry=registry)
+    assert next(
+        pack for pack in corrupted.packs if pack.pack_id == TRANSCRIBE_CPU.pack_id
+    ).installed is False
 
 
 def test_runtime_doctor_explains_missing_document_pack(
@@ -215,10 +353,12 @@ def test_runtime_info_cold_path_does_not_import_heavy_recipe_modules() -> None:
     assert report["exit_code"] == 0
     assert envelope["command"] == "runtime info"
     assert not {
+        "cryptography",
         "fastapi",
         "torch",
         "faster_whisper",
         "app.runtime",
+        "app.adapters.video_packs.official_video_pack_verifier",
         "app.services.note",
         "app.transcriber.whisper",
         "app.downloaders.youtube_downloader",

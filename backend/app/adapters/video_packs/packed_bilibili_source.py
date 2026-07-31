@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import stat
 from collections.abc import Callable, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +47,7 @@ _RESULT_KEYS = frozenset(
 _SUBTITLE_KEYS = frozenset({"language", "segments"})
 _SEGMENT_KEYS = frozenset({"start", "end", "text"})
 _MAXIMUM_OUTPUT_BYTES = 32 * 1024 * 1024
+_MAXIMUM_PROBE_OUTPUT_BYTES = 64 * 1024
 
 WorkerRunner = Callable[..., dict[str, object]]
 CookieResolver = Callable[[], str | None]
@@ -96,6 +98,7 @@ class PackedBilibiliVideoSourceAdapter:
         cookie_resolver: CookieResolver,
         timeout_seconds: int = 1800,
         runner: WorkerRunner = run_json_worker,
+        probe_runner: WorkerRunner = run_json_worker,
         backend_root: Path | None = None,
     ) -> None:
         if (
@@ -106,6 +109,7 @@ class PackedBilibiliVideoSourceAdapter:
             or frozenset(pack.entrypoints)
             != frozenset({"python", "ffmpeg", "ffprobe"})
             or not callable(cookie_resolver)
+            or not callable(probe_runner)
             or type(timeout_seconds) is not int
             or timeout_seconds < 1
         ):
@@ -122,6 +126,7 @@ class PackedBilibiliVideoSourceAdapter:
         self._cookie_resolver = cookie_resolver
         self._timeout_seconds = timeout_seconds
         self._runner = runner
+        self._probe_runner = probe_runner
         self._backend_root = root
 
     def resolve(self, input_value: str) -> ResolvedVideoSource:
@@ -144,12 +149,35 @@ class PackedBilibiliVideoSourceAdapter:
         token: CancellationTokenPort,
     ) -> AcquiredVideoSource:
         if source.connector_id == "local":
-            return self._legacy.acquire(
+            acquired = self._legacy.acquire(
                 source,
                 need_media=need_media,
                 need_subtitles=need_subtitles,
                 output_dir=output_dir,
                 token=token,
+            )
+            if acquired.duration_ms is not None:
+                return acquired
+            binding = source.local_binding
+            if binding is None:
+                raise DomainError(
+                    "source_contract_invalid",
+                    ErrorCategory.INVALID_REQUEST,
+                    "The resolved source contract is invalid",
+                )
+            duration_ms = self._probe_local_duration(
+                acquired.media_path or binding.path,
+                token,
+            )
+            return AcquiredVideoSource(
+                source=acquired.source,
+                title=acquired.title,
+                duration_ms=duration_ms,
+                cover_uri=acquired.cover_uri,
+                media_path=acquired.media_path,
+                video_path=acquired.video_path,
+                subtitle_availability=acquired.subtitle_availability,
+                opaque_subtitle=acquired.opaque_subtitle,
             )
         if source.connector_id != "bilibili" or source.canonical_uri is None:
             raise DomainError(
@@ -239,6 +267,56 @@ class PackedBilibiliVideoSourceAdapter:
             need_media=need_media,
             need_subtitles=need_subtitles,
         )
+
+    def _probe_local_duration(
+        self,
+        media_path: Path,
+        token: CancellationTokenPort,
+    ) -> int:
+        token.raise_if_cancelled()
+        result = self._probe_runner(
+            (
+                str(self._pack.entrypoints["ffprobe"]),
+                "-hide_banner",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(media_path),
+            ),
+            {},
+            cwd=media_path.parent,
+            environment=minimal_worker_environment(
+                overrides={
+                    "PATH": str(self._pack.entrypoints["ffprobe"].parent),
+                }
+            ),
+            timeout_seconds=self._timeout_seconds,
+            maximum_output_bytes=_MAXIMUM_PROBE_OUTPUT_BYTES,
+            check_cancelled=token.raise_if_cancelled,
+        )
+        token.raise_if_cancelled()
+        if type(result) is not dict or frozenset(result) != {"format"}:
+            raise _result_invalid()
+        format_result = result.get("format")
+        if (
+            type(format_result) is not dict
+            or frozenset(format_result) != {"duration"}
+            or type(format_result.get("duration")) is not str
+        ):
+            raise _result_invalid()
+        try:
+            duration = Decimal(format_result["duration"])
+        except (InvalidOperation, ValueError):
+            raise _result_invalid() from None
+        if not duration.is_finite():
+            raise _result_invalid()
+        duration_ms = int(duration * 1000)
+        if duration_ms < 1:
+            raise _result_invalid()
+        return duration_ms
 
     @staticmethod
     def _decode_result(

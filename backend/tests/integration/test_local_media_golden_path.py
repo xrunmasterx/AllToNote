@@ -568,6 +568,48 @@ def test_local_video_copies_and_transcribes_once_then_commits_private_safe_bundl
     }
 
 
+def test_platform_runtime_routes_local_source_without_platform_uri(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    calls = Calls()
+    runtime = runtime_module.create_platform_video_runtime(
+        tmp_path / "platform-machine",
+        source=LegacyVideoSourceAdapter(local_machine_id="fixture-machine"),
+        source_metadata={"local": LOCAL_METADATA},
+        transcriber=_TranscriptFake(calls),
+        generated_transcriber_identity="transcribe-cpu/fixture",
+        model=LegacyModelBinding(
+            provider_kind="fixture/provider-v1",
+            model_identity="fixture/model-v1",
+            bridge=_Completion(calls),
+            capabilities=LegacyModelCapabilities(),
+        ),
+    )
+
+    submitted = runtime.submit_video(
+        _request(local_video, workspace_root, "platform-local-success")
+    )
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert calls.transcriber == 1
+    assert calls.model == 1
+    bundle = workspace_root / completed.result.workspace_relative_bundle_path
+    metadata = json.loads((bundle / "sources" / "video-metadata.json").read_bytes())
+    assert metadata["canonical_uri"] is None
+    assert metadata["logical_reference"].startswith(
+        "urn:alltonote:local-content:sha256:"
+    )
+    assert metadata["title"] == LOCAL_METADATA["title"]
+    manifest = json.loads((bundle / "bundle.json").read_bytes())
+    assert manifest["source_revisions"][0]["materialization"]["kind"] == (
+        "external_local"
+    )
+
+
 def test_valid_local_screenshot_uses_snapshot_once_and_checkpoints_verified_webp(
     tmp_path: Path,
     workspace_root: Path,
