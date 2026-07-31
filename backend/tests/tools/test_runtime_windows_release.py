@@ -71,7 +71,7 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, object], Path, Path]:
 def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     lock = _load_lock(LOCK)
 
-    assert lock["runtime_source_commit"] == "ac1fca6b0d9149bbcaa5431c8b007ee1a7b0f368"
+    assert lock["runtime_source_commit"] == "8d59ac5b38460649426d5472789b8a1d5b4aeedc"
     assert lock["python"]["version"] == "3.14.6"
     assert lock["sqlite"] == {
         "version": "3.53.4",
@@ -130,7 +130,7 @@ def test_pip_install_uses_only_absolute_locked_wheels(tmp_path: Path) -> None:
     wheelhouse = tmp_path / "wheelhouse"
     wheels = (
         {"filename": "alltonote_runtime-0.1.0-py3-none-any.whl"},
-        {"filename": "llm_iwiki-0.1.2-py3-none-any.whl"},
+        {"filename": "llm_iwiki-0.1.3-py3-none-any.whl"},
     )
 
     arguments = _locked_wheel_install_arguments(

@@ -20,7 +20,7 @@ from tools.runtime_wheelhouse_release import (
 
 _SOURCE_COMMIT = "a" * 40
 _RUNTIME_VERSION = "0.1.0"
-_IWIKI_VERSION = "0.1.2"
+_IWIKI_VERSION = "0.1.3"
 
 
 def _write_wheel(path: Path, entries: dict[str, bytes]) -> None:
@@ -210,7 +210,7 @@ def test_wheelhouse_verifier_binds_runtime_iwiki_schema_and_clean_source(
     )
 
     assert verify_runtime_wheel(runtime_wheel, backend_root=backend).version == "0.1.0"
-    assert verify_iwiki_wheel(iwiki_wheel, backend_root=backend).version == "0.1.2"
+    assert verify_iwiki_wheel(iwiki_wheel, backend_root=backend).version == "0.1.3"
     assert payload["schema_version"] == 1
     assert payload["runtime_source_commit"] == _SOURCE_COMMIT
     assert payload["iwiki_source_commit"] == _SOURCE_COMMIT
@@ -273,7 +273,7 @@ def test_runtime_wheel_rejects_dependency_constraint_drift(tmp_path: Path) -> No
     entries = zipfile_entries(runtime_wheel)
     metadata = f"alltonote_runtime-{_RUNTIME_VERSION}.dist-info/METADATA"
     entries[metadata] = entries[metadata].replace(
-        b"llm-iwiki==0.1.2",
+        b"llm-iwiki==0.1.3",
         b"llm-iwiki>=0",
     )
     _write_wheel(runtime_wheel, entries)

@@ -113,7 +113,7 @@ def test_runtime_info_reports_pinned_versions_without_private_paths(
     assert data["portable_api_version"] == 1
     assert data["iwiki_contract"] == {
         "package": "llm-iwiki",
-        "package_version": "0.1.2",
+        "package_version": "0.1.3",
         "contract_version": 1,
         "contract_id": "iwiki-portable-contract-v1",
         "schema_id": "2026-07-portable-v1",

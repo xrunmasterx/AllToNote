@@ -51,12 +51,12 @@ def test_recipe_discovery_does_not_import_runtime_or_heavy_modules(
 HELPER = Path(__file__).resolve().parents[1] / "helpers" / "report_cli_imports.py"
 
 EXPECTED_LOCK = {
-    "iwiki_package": "llm-iwiki==0.1.2",
+    "iwiki_package": "llm-iwiki==0.1.3",
     "portable_api_version": 1,
     "portable_contract_id": "iwiki-portable-contract-v1",
     "schema_set_id": "2026-07-portable-v1",
     "schema_sha256": "sha256:f8ded2d23197685dc0046e3949e573097fa4ae13e12cfbba240ff0544ca2c9d9",
-    "source_commit": "8701ace4f65ffd7ee46fbcf3edcc2ce2bcfc47e1",
+    "source_commit": "1fff39fe54ba0cff16df0a4d31111dbc966dd88b",
 }
 
 def test_cli_version_does_not_import_web_or_video_modules():
