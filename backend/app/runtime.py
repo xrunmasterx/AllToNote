@@ -1998,29 +1998,45 @@ def create_codex_app_server_runtime_for_workspace(
         trusted_keys=official_video_pack_trust_keys(),
     )
     media_pack = pack_resolver.resolve_active(MEDIA_BASIC)
-    transcribe_pack = pack_resolver.resolve_active(TRANSCRIBE_CPU)
+    try:
+        transcribe_pack = pack_resolver.resolve_active(TRANSCRIBE_CPU)
+    except DomainError as error:
+        if error.code != "pack_unavailable":
+            raise
+        transcribe_pack = None
     source = PackedBilibiliVideoSourceAdapter(
         LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
         media_pack,
         cookie_resolver=_bilibili_cookie,
     )
-    transcriber = PackedCpuTranscriber(transcribe_pack)
+    transcriber = (
+        PackedCpuTranscriber(transcribe_pack)
+        if transcribe_pack is not None
+        else None
+    )
+    pack_identities = (_pack_identity(media_pack),)
+    if transcribe_pack is not None:
+        pack_identities += (_pack_identity(transcribe_pack),)
     pack_environment = JobPackEnvironmentSnapshot(
         schema_version=1,
-        packs=(
-            _pack_identity(media_pack),
-            _pack_identity(transcribe_pack),
-        ),
+        packs=pack_identities,
     )
 
     def resolve_pack_ports(
         snapshot: JobPackEnvironmentSnapshot,
     ) -> tuple[VideoSourcePort, TranscriptPort | None, str]:
         media_identity = snapshot.pack(MEDIA_BASIC.pack_id)
-        transcribe_identity = snapshot.pack(TRANSCRIBE_CPU.pack_id)
-        if (
-            media_identity.pack_version != MEDIA_BASIC.pack_version
-            or transcribe_identity.pack_version != TRANSCRIBE_CPU.pack_version
+        transcribe_identity = next(
+            (
+                pack
+                for pack in snapshot.packs
+                if pack.pack_id == TRANSCRIBE_CPU.pack_id
+            ),
+            None,
+        )
+        if media_identity.pack_version != MEDIA_BASIC.pack_version or (
+            transcribe_identity is not None
+            and transcribe_identity.pack_version != TRANSCRIBE_CPU.pack_version
         ):
             raise DomainError(
                 "pack_generation_unavailable",
@@ -2031,13 +2047,20 @@ def create_codex_app_server_runtime_for_workspace(
             MEDIA_BASIC,
             media_identity.manifest_sha256,
         )
-        resolved_transcribe = pack_resolver.resolve_exact(
-            TRANSCRIBE_CPU,
-            transcribe_identity.manifest_sha256,
+        resolved_transcribe = (
+            pack_resolver.resolve_exact(
+                TRANSCRIBE_CPU,
+                transcribe_identity.manifest_sha256,
+            )
+            if transcribe_identity is not None
+            else None
         )
-        if (
-            _pack_identity(resolved_media) != media_identity
-            or _pack_identity(resolved_transcribe) != transcribe_identity
+        if _pack_identity(resolved_media) != media_identity or (
+            transcribe_identity is not None
+            and (
+                resolved_transcribe is None
+                or _pack_identity(resolved_transcribe) != transcribe_identity
+            )
         ):
             raise DomainError(
                 "pack_generation_unavailable",
@@ -2049,11 +2072,19 @@ def create_codex_app_server_runtime_for_workspace(
             resolved_media,
             cookie_resolver=_bilibili_cookie,
         )
-        resolved_transcriber = PackedCpuTranscriber(resolved_transcribe)
+        resolved_transcriber = (
+            PackedCpuTranscriber(resolved_transcribe)
+            if resolved_transcribe is not None
+            else None
+        )
         return (
             resolved_source,
             resolved_transcriber,
-            resolved_transcriber.identity,
+            (
+                resolved_transcriber.identity
+                if resolved_transcriber is not None
+                else "transcribe-cpu/unavailable"
+            ),
         )
 
     process_instance_id, resource_lease_store, resource_owner = (
@@ -2064,7 +2095,11 @@ def create_codex_app_server_runtime_for_workspace(
         source=source,
         source_metadata={},
         transcriber=transcriber,
-        generated_transcriber_identity=transcriber.identity,
+        generated_transcriber_identity=(
+            transcriber.identity
+            if transcriber is not None
+            else "transcribe-cpu/unavailable"
+        ),
         model=model,
         model_execution_binding=binding,
         model_execution_profile="default",

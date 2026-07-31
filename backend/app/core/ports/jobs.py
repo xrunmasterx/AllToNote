@@ -270,6 +270,12 @@ class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
 VideoExecutionRepositoryPort = JobExecutionRepositoryPort
 
 
+class AttemptQueryRepositoryPort(Protocol):
+    """Read-only Attempt history used for persisted execution provenance."""
+
+    def list_attempts(self, job_id: str) -> tuple[Attempt, ...]: ...
+
+
 class AttemptMetadataRepositoryPort(Protocol):
     """Durable metadata boundary for checkpoints and Job events."""
 

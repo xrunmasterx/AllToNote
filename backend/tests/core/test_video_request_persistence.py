@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError
+from app.core.jobs.model import Attempt, AttemptState
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest
 from app.core.recipes.registry import RecipeRegistry
 from app.core.recipes.video.adapter import (
@@ -110,6 +112,74 @@ def test_v1_job_request_json_and_hash_remain_frozen(tmp_path: Path) -> None:
     assert VideoService._request_hash(request) == (
         "sha256:efb74f2a44a2706401bc60325655ba61ec3db31429eefac3e6efc1ca50297c85"
     )
+
+
+def test_bilibili_tracking_parameters_are_not_persisted_or_hashed(
+    tmp_path: Path,
+) -> None:
+    service, repository = _service(tmp_path)
+    canonical = VideoProduceRequest(
+        request_schema_version=1,
+        workspace_root=Path("C:/vault"),
+        input_value="https://www.bilibili.com/video/BV1Np3j6QEQc/",
+        client_request_id="tracking-canonical",
+    )
+    shared = VideoProduceRequest(
+        request_schema_version=1,
+        workspace_root=canonical.workspace_root,
+        input_value=(
+            "https://www.bilibili.com/video/BV1Np3j6QEQc/"
+            "?share_source=copy_web"
+            "&vd_source=d236311b8b4bd7fe82b37035f8282097"
+        ),
+        client_request_id=canonical.client_request_id,
+    )
+
+    submitted = service.submit_video(shared)
+    stored = json.loads(repository.get_job_request(submitted.job_id) or "null")
+
+    assert stored["input_value"] == canonical.input_value
+    assert "share_source" not in repository.get_job_request(submitted.job_id)
+    assert "vd_source" not in repository.get_job_request(submitted.job_id)
+    assert VideoService._request_hash(shared) == VideoService._request_hash(canonical)
+
+
+def test_receipt_attempts_exclude_the_in_flight_assembly_attempt() -> None:
+    completed = Attempt(
+        attempt_id="att_completed",
+        job_id="job_test",
+        step_id="optional_screenshots",
+        state=AttemptState.SUCCEEDED,
+        fencing_token=1,
+        created_at="2026-07-31T04:00:00.000Z",
+        updated_at="2026-07-31T04:00:01.000Z",
+    )
+    in_flight = Attempt(
+        attempt_id="att_in_flight",
+        job_id="job_test",
+        step_id="assemble_candidate_bundle",
+        state=AttemptState.RUNNING,
+        fencing_token=2,
+        created_at="2026-07-31T04:00:02.000Z",
+        updated_at="2026-07-31T04:00:02.000Z",
+    )
+    service = object.__new__(VideoService)
+    service._repository = SimpleNamespace(
+        list_attempts=lambda _job_id: (completed, in_flight)
+    )
+
+    attempt_id, started_at, completed_at, steps = service._receipt_attempts(
+        "job_test",
+        resumed_attempt=in_flight,
+    )
+
+    assert attempt_id == completed.attempt_id
+    assert started_at == completed.created_at
+    assert completed_at == completed.updated_at
+    assert [step.step_id for step in steps] == ["optional_screenshots"]
+
+    with pytest.raises(DomainError, match="attempt_provenance_invalid"):
+        service._receipt_attempts("job_test", resumed_attempt=None)
 
 
 def test_sdk_submit_video_is_direct_queued_durable_boundary(tmp_path: Path) -> None:

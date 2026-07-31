@@ -655,6 +655,19 @@ class SqliteJobRepository:
                 )
             return self._create_attempt(connection, job_id, step_id)
 
+    def list_attempts(self, job_id: str) -> tuple[Attempt, ...]:
+        with self._transaction(immediate=False) as connection:
+            self._get_job(connection, job_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM attempts
+                WHERE job_id = ?
+                ORDER BY created_at, attempt_id
+                """,
+                (job_id,),
+            ).fetchall()
+            return tuple(self._attempt_from_row(row) for row in rows)
+
     def acquire_scheduler_lease(
         self, owner_id: str, *, ttl_seconds: int
     ) -> ExecutionAuthority:

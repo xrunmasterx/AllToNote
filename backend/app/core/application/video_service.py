@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeVar
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 from app.core.application.checkpoint_runner import (
@@ -96,6 +97,7 @@ from app.core.recipes.video.compilation.quality import (
 )
 from app.core.ports.jobs import (
     AttemptMetadataRepositoryPort,
+    AttemptQueryRepositoryPort,
     AttemptStoragePort,
     PortableCommitReceipt,
     SourceIdentityBinding,
@@ -370,6 +372,7 @@ class VideoFaithfulCompilerPort(Protocol):
 class _VideoServiceRepositoryPort(
     VideoExecutionRepositoryPort,
     AttemptMetadataRepositoryPort,
+    AttemptQueryRepositoryPort,
     Protocol,
 ):
     pass
@@ -421,7 +424,6 @@ class VideoService:
             if not isinstance(pack_environment, JobPackEnvironmentSnapshot):
                 raise ValueError("pack_environment_invalid")
             pack_environment.pack("media-basic")
-            pack_environment.pack("transcribe-cpu")
         self._submission_pack_environment = pack_environment
         self._execution_pack_environment = pack_environment
         self._pack_environment_activator = pack_environment_activator
@@ -871,8 +873,13 @@ class VideoService:
             draft_bundle_id=ids["bundle"],
             draft_artifact_id=ids["draft"],
         )
-        started, completed, created = self._timestamps(
-            job_id, source.observed_at
+        attempt_id, started, completed, steps = self._receipt_attempts(
+            job_id,
+            resumed_attempt=resumed_attempt,
+        )
+        created = max(
+            self._timestamps(job_id, source.observed_at)[2],
+            completed,
         )
         return VideoBundleInput(
             bundle_id=ids["bundle"],
@@ -896,7 +903,7 @@ class VideoService:
             receipt=ReceiptProvenance(
                 run_id=ids["run"],
                 job_id=job_id,
-                attempt_id=self._derived_id(job_id, "att", "receipt"),
+                attempt_id=attempt_id,
                 started_at=started,
                 completed_at=completed,
                 recipe_id=request.recipe_id,
@@ -926,16 +933,7 @@ class VideoService:
                     "prompts": "hash_only",
                     "provider_payloads": "omitted",
                 },
-                steps=tuple(
-                    StepAttemptSummary(
-                        step_id=step,
-                        attempt=1,
-                        state="succeeded",
-                        started_at=started,
-                        completed_at=completed,
-                    )
-                    for step in CHECKPOINT_STEPS
-                ),
+                steps=steps,
             ),
             display_assets=screenshots,
         )
@@ -1170,15 +1168,14 @@ class VideoService:
                 "Video outputs used inconsistent model bindings",
             )
         primary = portable_drafts[0]
-        started, completed, created = self._timestamps(
-            job_id, source.observed_at
+        attempt_id, started, completed, steps = self._receipt_attempts(
+            job_id,
+            resumed_attempt=resumed_attempt,
         )
-        receipt_steps = list(CHECKPOINT_STEPS)
-        assembly_index = receipt_steps.index("assemble_candidate_bundle")
-        receipt_steps[assembly_index:assembly_index] = [
-            f"generate_{output.document_kind.value.replace('-', '_')}_draft"
-            for output in outputs[1:]
-        ]
+        created = max(
+            self._timestamps(job_id, source.observed_at)[2],
+            completed,
+        )
         usage = {
             key: sum(
                 int(draft.usage.get(key, 0))
@@ -1209,7 +1206,7 @@ class VideoService:
             receipt=ReceiptProvenance(
                 run_id=ids["run"],
                 job_id=job_id,
-                attempt_id=self._derived_id(job_id, "att", "receipt"),
+                attempt_id=attempt_id,
                 started_at=started,
                 completed_at=completed,
                 recipe_id=request.recipe_id,
@@ -1234,16 +1231,7 @@ class VideoService:
                     "prompts": "hash_only",
                     "provider_payloads": "omitted",
                 },
-                steps=tuple(
-                    StepAttemptSummary(
-                        step_id=step,
-                        attempt=1,
-                        state="succeeded",
-                        started_at=started,
-                        completed_at=completed,
-                    )
-                    for step in receipt_steps
-                ),
+                steps=steps,
             ),
             display_assets=screenshots,
             drafts=tuple(portable_drafts),
@@ -1918,6 +1906,60 @@ class VideoService:
             for pack in self._execution_pack_environment.packs
         )
 
+    def _receipt_attempts(
+        self,
+        job_id: str,
+        *,
+        resumed_attempt: Attempt | None,
+    ) -> tuple[str, str, str, tuple[StepAttemptSummary, ...]]:
+        recorded = self._repository.list_attempts(job_id)
+        active = tuple(
+            attempt
+            for attempt in recorded
+            if attempt.state in {AttemptState.PENDING, AttemptState.RUNNING}
+        )
+        if active and (
+            resumed_attempt is None
+            or len(active) != 1
+            or active[0].attempt_id != resumed_attempt.attempt_id
+        ):
+            raise DomainError(
+                "attempt_provenance_invalid",
+                ErrorCategory.INTERNAL,
+                "Completed step Attempt provenance is unavailable",
+            )
+        attempts = tuple(
+            attempt
+            for attempt in recorded
+            if attempt.state not in {AttemptState.PENDING, AttemptState.RUNNING}
+        )
+        if not attempts:
+            raise DomainError(
+                "attempt_provenance_invalid",
+                ErrorCategory.INTERNAL,
+                "Completed step Attempt provenance is unavailable",
+            )
+        ordinals: dict[str, int] = {}
+        steps: list[StepAttemptSummary] = []
+        for attempt in attempts:
+            ordinal = ordinals.get(attempt.step_id, 0) + 1
+            ordinals[attempt.step_id] = ordinal
+            steps.append(
+                StepAttemptSummary(
+                    step_id=attempt.step_id,
+                    attempt=ordinal,
+                    state=attempt.state.value,
+                    started_at=attempt.created_at,
+                    completed_at=attempt.updated_at,
+                )
+            )
+        return (
+            attempts[-1].attempt_id,
+            min(attempt.created_at for attempt in attempts),
+            max(attempt.updated_at for attempt in attempts),
+            tuple(steps),
+        )
+
     def _preflight(self, request: VideoProduceRequest) -> str:
         capabilities = self._operations.preflight_capabilities(request)
         if not isinstance(capabilities, VideoPreflightCapabilities):
@@ -2332,7 +2374,7 @@ class VideoService:
         payload: dict[str, object] = {
             "request_schema_version": request.request_schema_version,
             "workspace_root": request.workspace_root,
-            "input_value": request.input_value,
+            "input_value": cls._persisted_input_value(request.input_value),
             "recipe_id": request.recipe_id,
             "recipe_version": request.recipe_version,
             "provider_profile": request.provider_profile,
@@ -2361,7 +2403,7 @@ class VideoService:
         payload: dict[str, object] = {
             "schema": request.request_schema_version,
             "workspace": str(request.workspace_root),
-            "input": request.input_value,
+            "input": cls._persisted_input_value(request.input_value),
             "recipe": request.recipe_id,
             "recipe_version": request.recipe_version,
             "language": request.output_language,
@@ -2408,6 +2450,25 @@ class VideoService:
                 separators=(",", ":"),
             )
         )
+
+    @staticmethod
+    def _persisted_input_value(input_value: str) -> str:
+        try:
+            parsed = urlsplit(input_value)
+        except ValueError:
+            return input_value
+        host = (parsed.hostname or "").casefold()
+        if host != "bilibili.com" and not host.endswith(".bilibili.com"):
+            return input_value
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        persisted = tuple(
+            (key, value)
+            for key, value in query
+            if key.casefold() not in {"share_source", "vd_source"}
+        )
+        if len(persisted) == len(query):
+            return input_value
+        return urlunsplit(parsed._replace(query=urlencode(persisted)))
 
     @classmethod
     def _preflight_policy_hash(cls, request: VideoProduceRequest) -> str:

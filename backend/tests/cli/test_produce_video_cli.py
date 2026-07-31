@@ -1348,10 +1348,12 @@ def test_default_runtime_uses_real_codex_factory_and_never_fake(
     assert calls.commit == 1
 
 
+@pytest.mark.parametrize("transcribe_available", [True, False])
 def test_codex_runtime_factory_uses_workspace_instance_machine_root(
     tmp_path: Path,
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
+    transcribe_available: bool,
 ) -> None:
     runtime_module = importlib.import_module("app.runtime")
     local_app_data = tmp_path / "local-app-data"
@@ -1398,6 +1400,12 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
             pass
 
         def resolve_active(self, contract):
+            if contract.pack_id == "transcribe-cpu" and not transcribe_available:
+                raise DomainError(
+                    "pack_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "The transcribe-cpu Pack is not installed",
+                )
             return resolved[contract.pack_id]
 
         def resolve_exact(self, contract, manifest_sha256: str):
@@ -1448,16 +1456,27 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
     )
     assert captured["source_metadata"] == {}
     assert captured["pack_environment"].packs[0].pack_id == "media-basic"
-    assert captured["pack_environment"].packs[1].pack_id == "transcribe-cpu"
+    assert [pack.pack_id for pack in captured["pack_environment"].packs] == (
+        ["media-basic", "transcribe-cpu"]
+        if transcribe_available
+        else ["media-basic"]
+    )
     pack_port_resolver = captured["pack_port_resolver"]
     _source, transcriber, transcriber_identity = pack_port_resolver(
         captured["pack_environment"]
     )
-    assert transcriber_identity == transcriber.identity
-    assert exact_resolutions == [
-        ("media-basic", "sha256:" + "a" * 64),
-        ("transcribe-cpu", "sha256:" + "b" * 64),
-    ]
+    if transcribe_available:
+        assert transcriber_identity == transcriber.identity
+        assert exact_resolutions == [
+            ("media-basic", "sha256:" + "a" * 64),
+            ("transcribe-cpu", "sha256:" + "b" * 64),
+        ]
+    else:
+        assert transcriber is None
+        assert transcriber_identity == "transcribe-cpu/unavailable"
+        assert exact_resolutions == [
+            ("media-basic", "sha256:" + "a" * 64),
+        ]
     assert captured["model_execution_profile"] == "default"
     assert model.provider_kind == "codex-app-server"
     assert model.model_identity == "codex-test-model"

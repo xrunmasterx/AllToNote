@@ -1157,6 +1157,63 @@ def test_platform_subtitle_path_commits_without_media(
     assert transcriber["identity"] == f"{platform}/platform-subtitle-v1"
 
 
+def test_platform_subtitle_path_does_not_require_transcribe_pack(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    calls = Calls()
+    media_only = JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=(_pack_environment().pack("media-basic"),),
+    )
+    runtime = _create_runtime(
+        tmp_path / "machine-media-only",
+        "bilibili",
+        calls,
+        pack_environment=media_only,
+    )
+
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.SUCCEEDED
+    assert calls.subtitle == 1
+    assert calls.media_download == 0
+    assert calls.transcriber == 0
+    bundle = workspace_root / result.result.workspace_relative_bundle_path
+    receipt = json.loads((bundle / "receipt.json").read_text("utf-8"))
+    feature_packs = [
+        executor
+        for executor in receipt["executors"]
+        if executor["kind"] == "feature-pack"
+    ]
+    assert [pack["pack_id"] for pack in feature_packs] == ["media-basic"]
+    summary = receipt["parameters"]["summary"]
+    receipt_steps = summary["steps"]
+    persisted_attempts = {
+        attempt.attempt_id: attempt
+        for attempt in runtime.job_repository.list_attempts(submitted.job_id)
+    }
+    receipt_attempt = persisted_attempts[summary["attempt_id"]]
+    assert receipt_attempt.step_id == receipt_steps[-1]["step_id"]
+    assert receipt["started_at"] == min(
+        step["started_at"] for step in receipt_steps
+    )
+    assert receipt["completed_at"] == max(
+        step["completed_at"] for step in receipt_steps
+    )
+    for step in receipt_steps:
+        matching = [
+            attempt
+            for attempt in persisted_attempts.values()
+            if attempt.step_id == step["step_id"]
+            and attempt.created_at == step["started_at"]
+            and attempt.updated_at == step["completed_at"]
+            and attempt.state.value == step["state"]
+        ]
+        assert len(matching) == 1
+
+
 def test_platform_without_subtitles_downloads_media_and_transcribes(
     tmp_path: Path,
     workspace_root: Path,
