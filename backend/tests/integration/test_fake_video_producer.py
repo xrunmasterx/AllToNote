@@ -1938,6 +1938,7 @@ def test_blocking_action_renews_machine_admission_beyond_ttl(
     store._heartbeat = observe_heartbeat  # type: ignore[method-assign]
 
     def block_model(_heartbeat: Callable[[], None]) -> None:
+        heartbeat_observed.clear()
         machine_now_ms[0] = 200_000
         assert heartbeat_observed.wait(timeout=2)
         machine_now_ms[0] = 400_000
