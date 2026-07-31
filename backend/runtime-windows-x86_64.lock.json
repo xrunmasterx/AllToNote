@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "runtime_source_commit": "ac1fca6b0d9149bbcaa5431c8b007ee1a7b0f368",
+  "runtime_version": "0.1.0",
+  "platform": "windows-x86_64",
+  "python": {
+    "version": "3.14.6",
+    "archive": "python-3.14.6-embed-amd64.zip",
+    "url": "https://www.python.org/ftp/python/3.14.6/python-3.14.6-embed-amd64.zip",
+    "sha256": "df901e84a896ff1ee720ad03377e0c8d8c2244fda79808aeeaff6316df1cb75c",
+    "spdx": "python-3.14.6-embed-amd64.zip.spdx.json",
+    "spdx_sha256": "dcf31bf28606b89b911f8031e5d83557d335a9256289831582673b164931e19c"
+  },
+  "sqlite": {
+    "version": "3.53.4",
+    "archive": "sqlite-dll-win-x64-3530400.zip",
+    "url": "https://www.sqlite.org/2026/sqlite-dll-win-x64-3530400.zip",
+    "sha3_256": "deddee963c810d1eeac3ce5e15c7c41da21a1c54d7a39cf54fbf577d2f50de3a",
+    "source_id": "2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc"
+  },
+  "wheels": [
+    {"filename": "alltonote_runtime-0.1.0-py3-none-any.whl", "byte_length": 530294, "sha256": "19e3d2a8bc04362806838240975a06c164858809d76141b063792a2788e26822"},
+    {"filename": "cffi-2.1.0-cp314-cp314-win_amd64.whl", "byte_length": 187937, "sha256": "1b96bfe2c4bd825681b7d311ad6d9b7280a091f43e8f63da5729638083cd3bfb"},
+    {"filename": "cryptography-46.0.7-cp311-abi3-win_amd64.whl", "byte_length": 3488363, "sha256": "397655da831414d165029da9bc483bed2fe0e75dde6a1523ec2fe63f3c46046b"},
+    {"filename": "filelock-3.32.2-py3-none-any.whl", "byte_length": 98830, "sha256": "87dd94cf281e586d135fa51132b8e3d9a598b316e90377a288663c9321036c82"},
+    {"filename": "jaraco.classes-3.4.0-py3-none-any.whl", "byte_length": 6777, "sha256": "f662826b6bed8cace05e7ff873ce0f9283b5c924470fe664fff1c2f00f581790"},
+    {"filename": "jaraco_context-6.1.2-py3-none-any.whl", "byte_length": 7871, "sha256": "bf8150b79a2d5d91ae48629d8b427a8f7ba0e1097dd6202a9059f29a36379535"},
+    {"filename": "jaraco_functools-4.6.0-py3-none-any.whl", "byte_length": 11677, "sha256": "99e3dc0060c5cbe8fcd1cdb36258e2a65ca40f1566b2033b12abb1bb44dd3c30"},
+    {"filename": "keyring-25.7.0-py3-none-any.whl", "byte_length": 39160, "sha256": "be4a0b195f149690c166e850609a477c532ddbfbaed96a404d4e43f8d5e2689f"},
+    {"filename": "llm_iwiki-0.1.2-py3-none-any.whl", "byte_length": 112531, "sha256": "f2207cfe306416f99f4d378067d8e16d87723879c205cbf36fcdfb388a5ada59"},
+    {"filename": "more_itertools-11.1.0-py3-none-any.whl", "byte_length": 72226, "sha256": "4b65538ae22f6fed0ce4874efd317463a7489796a0939fa66824dd542125a192"},
+    {"filename": "platformdirs-4.11.0-py3-none-any.whl", "byte_length": 23247, "sha256": "360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74"},
+    {"filename": "pycparser-3.0-py3-none-any.whl", "byte_length": 48172, "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"},
+    {"filename": "pywin32_ctypes-0.2.3-py3-none-any.whl", "byte_length": 30756, "sha256": "8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8"},
+    {"filename": "pyyaml-6.0.3-cp314-cp314-win_amd64.whl", "byte_length": 156429, "sha256": "4a2e8cebe2ff6ab7d1050ecd59c25d4c8bd7e6f400f5f82b96557ac0abafd0ac"},
+    {"filename": "tomli_w-1.2.0-py3-none-any.whl", "byte_length": 6675, "sha256": "188306098d013b691fcadc011abd66727d3c414c571bb01b1a174ba8c983cf90"}
+  ]
+}
