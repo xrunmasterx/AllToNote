@@ -1867,6 +1867,32 @@ def test_cancel_cancels_pending_attempt_and_persists_request(
         repo.start_attempt(pending.attempt_id, _authority(repo))
 
 
+def test_cancel_waiting_job_cancels_pending_challenge(
+    repo: SqliteJobRepository,
+) -> None:
+    job, attempt = _create_needs_input_attempt(repo)
+    challenge = repo.create_challenge(job.job_id, attempt.attempt_id, "{}")
+
+    cancelled = repo.cancel_job(job.job_id)
+    with sqlite3.connect(repo.database_path) as connection:
+        persisted = connection.execute(
+            "SELECT state FROM challenges WHERE challenge_id = ?",
+            (challenge.challenge_id,),
+        ).fetchone()
+
+    assert cancelled.state is JobState.CANCELLED
+    assert persisted[0] == "cancelled"
+    assert repo.get_job_details(job.job_id)[2] is None
+
+    with sqlite3.connect(repo.database_path) as connection:
+        connection.execute(
+            "UPDATE challenges SET state = 'pending' WHERE challenge_id = ?",
+            (challenge.challenge_id,),
+        )
+    assert repo.cancel_job(job.job_id).state is JobState.CANCELLED
+    assert repo.get_job_details(job.job_id)[2] is None
+
+
 def test_running_job_cancellation_is_durable_across_real_repository_reopen(
     tmp_path: Path,
 ) -> None:

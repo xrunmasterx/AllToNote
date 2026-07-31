@@ -252,6 +252,16 @@ def test_document_compiler_returns_semantic_note_with_separate_evidence(
     ]
     assert "untrusted source data" in executor.requests[0].system_instruction
     assert "[^blk_" not in json.dumps(result.to_dict())
+    assert "uniqueItems" not in executor.requests[0].response_schema_json
+    schema = json.loads(executor.requests[0].response_schema_json)
+    evidence_items = schema["properties"]["title"]["properties"][
+        "source_block_ids"
+    ]["items"]
+    assert evidence_items["enum"] == [
+        "blk_title",
+        "blk_problem",
+        "blk_method",
+    ]
 
 
 def test_document_compiler_accepts_success_from_production_legacy_executor(
@@ -360,6 +370,13 @@ def test_document_compiler_rejects_unknown_finish_reason_without_legacy_signal(
                     "key_points": [],
                 }
             ],
+        },
+        {
+            **_response(),
+            "title": {
+                "text": "Repeated evidence.",
+                "source_block_ids": ["blk_title", "blk_title"],
+            },
         },
         '{"title":"First","title":"Second","overview":[],"sections":[]}',
     ),

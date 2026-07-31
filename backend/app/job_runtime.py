@@ -137,7 +137,11 @@ class JobRuntime:
         return self.get_job(job_id)
 
     def cancel_job(self, job_id: str) -> JobView:
-        self.get_job(job_id)
+        try:
+            self.get_job(job_id)
+        except DomainError as error:
+            if error.code != "job_projection_invalid":
+                raise
         self._jobs.cancel(job_id)
         return self.get_job(job_id)
 

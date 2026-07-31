@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -603,6 +604,49 @@ def test_job_respond_rejects_external_unknown_without_consuming_challenge(
     assert envelope["error"]["code"] == "external_outcome_unknown"
     assert runtime.get_job(job.job_id).state is JobState.WAITING_FOR_INPUT
     assert runtime.get_job(job.job_id).challenge_id == challenge.challenge_id
+
+
+def test_job_cancel_repairs_legacy_cancelled_pending_challenge(
+    runtime: object,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = runtime.job_repository
+    job = repo.create_job(
+        request_hash="sha256:" + "3" * 64,
+        principal="local-user",
+        client_request_id="legacy-cancelled-challenge",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = repo.acquire_scheduler_lease("legacy-cancel-owner", ttl_seconds=300)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        authority,
+    )
+    repo.transition_attempt(
+        attempt.attempt_id,
+        AttemptState.NEEDS_INPUT,
+        authority=authority,
+    )
+    challenge = repo.create_challenge(
+        job.job_id,
+        attempt.attempt_id,
+        '{"code":"external_outcome_unknown"}',
+    )
+    repo.release_scheduler_lease(authority)
+    repo.cancel_job(job.job_id)
+    with sqlite3.connect(repo.database_path) as connection:
+        connection.execute(
+            "UPDATE challenges SET state = 'pending' WHERE challenge_id = ?",
+            (challenge.challenge_id,),
+        )
+
+    code = _job_json(runtime, workspace_root, "cancel", job.job_id)
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert envelope["data"]["job"]["state"] == "cancelled"
+    assert envelope["data"]["job"]["challenge_id"] is None
 
 
 def test_job_permission_mismatch_is_indistinguishable_from_not_found(

@@ -16,7 +16,16 @@ from app.services.codex_app_server import CodexAppServerStatusService
 
 
 class CodexAppServerError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        outcome_known: bool = False,
+    ) -> None:
+        self.code = code
+        self.outcome_known = outcome_known
+        super().__init__(message)
 
 
 _CANCELLATION_POLL_SECONDS = 0.05
@@ -27,6 +36,8 @@ class CodexTurnState:
     text: str = ""
     done: bool = False
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    error_outcome_known: bool = False
 
 
 class CodexAppServerClient:
@@ -85,7 +96,10 @@ class CodexAppServerClient:
             if status == "completed":
                 state.error = None
             elif status == "failed":
-                state.error = CodexAppServerClient._extract_error_message(turn.get("error") or turn)
+                error = turn.get("error") or turn
+                state.error = CodexAppServerClient._extract_error_message(error)
+                state.error_code = CodexAppServerClient._extract_error_code(error)
+                state.error_outcome_known = True
             elif status == "interrupted":
                 state.error = "Codex app-server turn interrupted"
             else:
@@ -97,7 +111,10 @@ class CodexAppServerClient:
             if params.get("willRetry") is True:
                 return
             state.done = True
-            state.error = CodexAppServerClient._extract_error_message(params.get("error") or params)
+            error = params.get("error") or params
+            state.error = CodexAppServerClient._extract_error_message(error)
+            state.error_code = CodexAppServerClient._extract_error_code(error)
+            state.error_outcome_known = True
 
     def run_markdown_turn(
         self,
@@ -241,7 +258,11 @@ class CodexAppServerClient:
                 )
 
             if state.error:
-                raise CodexAppServerError(state.error)
+                raise CodexAppServerError(
+                    state.error,
+                    code=state.error_code,
+                    outcome_known=state.error_outcome_known,
+                )
             return self.clean_markdown(state.text)
         finally:
             self._terminate_process(process)
@@ -294,7 +315,12 @@ class CodexAppServerClient:
             if message.get("id") != request_id:
                 continue
             if "error" in message:
-                raise CodexAppServerError(self._extract_error_message(message["error"]))
+                error = message["error"]
+                raise CodexAppServerError(
+                    self._extract_error_message(error),
+                    code=self._extract_error_code(error),
+                    outcome_known=True,
+                )
             return message
 
     def _consume_next_message(
@@ -381,6 +407,27 @@ class CodexAppServerClient:
         if isinstance(value, str) and value:
             return value
         return "Codex app-server turn failed"
+
+    @staticmethod
+    def _extract_error_code(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            code = value.get("code")
+            if isinstance(code, str) and code:
+                return code
+            for key in ("error", "message"):
+                nested = CodexAppServerClient._extract_error_code(value.get(key))
+                if nested:
+                    return nested
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    return None
+                return CodexAppServerClient._extract_error_code(parsed)
+        return None
 
     @staticmethod
     def _extract_thread_id(response: dict[str, Any]) -> Optional[str]:

@@ -29,6 +29,7 @@ class AttemptState(StrEnum):
 class ChallengeState(StrEnum):
     PENDING = "pending"
     CONSUMED = "consumed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)

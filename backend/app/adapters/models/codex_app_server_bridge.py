@@ -5,13 +5,14 @@ import json
 from typing import Protocol
 
 from app.adapters.models.legacy_gpt import (
+    LegacyKnownRetryableModelFailure,
     LegacyModelResponse,
     LegacyReturnedInvalidResponse,
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.identity import is_executor_identity
 from app.core.ports.model_executor import ModelExecutionRequest, ModelOutputMode
-from app.gpt.codex_app_server_client import CodexAppServerClient
+from app.gpt.codex_app_server_client import CodexAppServerClient, CodexAppServerError
 
 
 _SUPPORTED_OUTER_FENCES = frozenset({"```json", "```markdown"})
@@ -107,15 +108,28 @@ class CodexAppServerCompletionBridge:
             if request.output_mode is ModelOutputMode.JSON_SCHEMA
             else None
         )
-        returned_text = self._client.run_markdown_turn(
-            prompt,
-            self._model_identity,
-            cwd=None,
-            timeout_seconds=request.timeout_seconds,
-            output_schema=output_schema,
-            reasoning_effort=self._reasoning_effort(request.stage_id),
-            check_cancelled=check_cancelled,
-        )
+        try:
+            returned_text = self._client.run_markdown_turn(
+                prompt,
+                self._model_identity,
+                cwd=None,
+                timeout_seconds=request.timeout_seconds,
+                output_schema=output_schema,
+                reasoning_effort=self._reasoning_effort(request.stage_id),
+                check_cancelled=check_cancelled,
+            )
+        except CodexAppServerError as error:
+            if error.outcome_known and error.code == "invalid_json_schema":
+                raise DomainError(
+                    "model_response_schema_unsupported",
+                    ErrorCategory.RECIPE_FAILED,
+                    "The model provider rejected the response schema",
+                ) from None
+            if error.outcome_known:
+                raise LegacyKnownRetryableModelFailure(
+                    "The model provider returned a known failure"
+                ) from None
+            raise
         return self._normalized_response(
             returned_text,
             warnings=("provider_output_token_limit_unenforced",),

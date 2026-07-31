@@ -859,6 +859,20 @@ class SqliteJobRepository:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
             if job.state in TERMINAL_JOB_STATES:
+                if job.state is JobState.CANCELLED:
+                    now = utc_now_millis()
+                    connection.execute(
+                        """
+                        UPDATE challenges SET state = ?, updated_at = ?
+                        WHERE job_id = ? AND state = ?
+                        """,
+                        (
+                            ChallengeState.CANCELLED.value,
+                            now,
+                            job_id,
+                            ChallengeState.PENDING.value,
+                        ),
+                    )
                 return job
             now = utc_now_millis()
             connection.execute(
@@ -878,6 +892,18 @@ class SqliteJobRepository:
                     now,
                     job_id,
                     AttemptState.PENDING.value,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE challenges SET state = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    ChallengeState.CANCELLED.value,
+                    now,
+                    job_id,
+                    ChallengeState.PENDING.value,
                 ),
             )
             self._settle_cancelled_job_if_idle(connection, job_id, now)

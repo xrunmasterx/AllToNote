@@ -203,7 +203,7 @@ class DocumentCompilationContext:
             )
 
 
-def _response_schema() -> str:
+def _response_schema(allowed_ids: tuple[str, ...]) -> str:
     def claim(maximum_text: int) -> dict[str, object]:
         return {
             "type": "object",
@@ -219,8 +219,10 @@ def _response_schema() -> str:
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 64,
-                    "uniqueItems": True,
-                    "items": {"type": "string"},
+                    "items": {
+                        "type": "string",
+                        "enum": list(allowed_ids),
+                    },
                 },
             },
         }
@@ -406,6 +408,7 @@ class DocumentKnowledgeCompiler:
         blocks = tuple(
             block for page in request.parsed.pages for block in page.blocks
         )
+        allowed_ids = tuple(block.block_id for block in blocks)
         source_payload = {
             "output_language": request.output_language,
             "source_name": request.parsed.source_name,
@@ -434,7 +437,7 @@ class DocumentKnowledgeCompiler:
             "footnotes, evidence markers, or facts absent from the source. Preserve "
             "important qualifications and uncertainty. Write in the requested language."
         )
-        response_schema = _response_schema()
+        response_schema = _response_schema(allowed_ids)
         max_output_tokens = min(
             request.max_output_tokens,
             binding.max_output_tokens,
@@ -483,7 +486,7 @@ class DocumentKnowledgeCompiler:
             raise _invalid_response()
         return _parse_response(
             result.text,
-            allowed_ids=tuple(block.block_id for block in blocks),
+            allowed_ids=allowed_ids,
             maximum_bytes=request.max_response_bytes,
             model_identity=result.actual_model_identity,
             input_tokens=result.input_tokens,

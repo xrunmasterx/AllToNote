@@ -82,13 +82,18 @@ def test_handle_turn_completed_failed_records_error_message():
     CodexAppServerClient.handle_notification(
         {
             "method": "turn/completed",
-            "params": {"status": "failed", "error": {"message": "model failed"}},
+            "params": {
+                "status": "failed",
+                "error": {"code": "invalid_json_schema", "message": "model failed"},
+            },
         },
         state,
     )
 
     assert state.done is True
     assert state.error == "model failed"
+    assert state.error_code == "invalid_json_schema"
+    assert state.error_outcome_known is True
 
 
 def test_handle_turn_completed_interrupted_records_error_and_done():
@@ -167,6 +172,20 @@ def test_handle_nested_error_notification_records_error_and_done():
 
     assert state.done is True
     assert state.error == "bad request"
+
+
+def test_error_code_is_extracted_from_json_encoded_provider_error() -> None:
+    value = json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_json_schema",
+            },
+        }
+    )
+
+    assert CodexAppServerClient._extract_error_code(value) == "invalid_json_schema"
 
 
 def test_clean_markdown_rejects_empty_output():
