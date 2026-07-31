@@ -405,6 +405,8 @@ def test_document_workspace_factory_reuses_process_identity_and_frozen_model(
         local_app_data=local_app_data,
         requested_model_identity="fixture/frozen-model",
         requested_provider_profile="fixture/frozen-profile",
+        requested_verifier_model_identity="fixture/verifier-model",
+        requested_verifier_provider_profile="fixture/verifier-profile",
     )
 
     registry = json.loads(
@@ -425,6 +427,15 @@ def test_document_workspace_factory_reuses_process_identity_and_frozen_model(
         == "fixture/frozen-model"
     )
     assert captured["model_execution_profile"] == "fixture/frozen-profile"
+    assert captured["verifier_model"].model_identity == (
+        "fixture/verifier-model"
+    )
+    assert captured["verifier_model_execution_binding"].model_identity == (
+        "fixture/verifier-model"
+    )
+    assert captured["verifier_model_execution_profile"] == (
+        "fixture/verifier-profile"
+    )
     assert resource_owner.workspace_identity == instance["workspace_identity"]
     assert resource_owner.process_id == os.getpid()
     assert resource_lease_store.database_path == (

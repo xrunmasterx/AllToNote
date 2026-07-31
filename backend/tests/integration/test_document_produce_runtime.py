@@ -12,7 +12,13 @@ from pathlib import Path
 
 import pytest
 
+import app.runtime as runtime_module
 from app.adapters.documents.document_basic_pack import PACK_VERSION
+from app.adapters.models.legacy_gpt import (
+    LegacyModelBinding,
+    LegacyModelCapabilities,
+    LegacyModelResponse,
+)
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
@@ -55,6 +61,7 @@ from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import JobState
 from app.core.jobs.resource_lease import ResourceOwner
 from app.core.ports.jobs import SourceIdentityBinding
+from app.core.ports.model_executor import ModelExecutionBinding
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
 from app.core.recipes.document.adapter import DocumentRecipeAdapter
 from app.core.recipes.document.descriptor import DOCUMENT_NOTE_V1
@@ -109,9 +116,76 @@ class _Parser:
         )
 
 
+class _RuntimeParser(_Parser):
+    def doctor(self) -> None:
+        return None
+
+
+class _StageBridge:
+    def __init__(self, model_identity: str, stage_id: str, response: object) -> None:
+        self.model_identity = model_identity
+        self.stage_id = stage_id
+        self.response = response
+        self.calls: list[str] = []
+
+    def complete_request(
+        self,
+        prompt: str,
+        request,
+        *,
+        check_cancelled=None,
+    ) -> LegacyModelResponse:
+        del prompt
+        if check_cancelled is not None:
+            check_cancelled()
+        assert request.stage_id == self.stage_id
+        self.calls.append(request.stage_id)
+        return LegacyModelResponse(
+            markdown=json.dumps(self.response),
+            provider_request_id=f"{self.stage_id}-request",
+            input_tokens=10,
+            output_tokens=10,
+            actual_model=self.model_identity,
+        )
+
+
+class _RoutingStageBridge:
+    def __init__(self, model_identity: str, responses: dict[str, object]) -> None:
+        self.model_identity = model_identity
+        self.responses = responses
+        self.calls: list[str] = []
+
+    def complete_request(
+        self,
+        prompt: str,
+        request,
+        *,
+        check_cancelled=None,
+    ) -> LegacyModelResponse:
+        del prompt
+        if check_cancelled is not None:
+            check_cancelled()
+        response = self.responses[request.stage_id]
+        self.calls.append(request.stage_id)
+        return LegacyModelResponse(
+            markdown=json.dumps(response),
+            provider_request_id=f"{request.stage_id}-request",
+            input_tokens=10,
+            output_tokens=10,
+            actual_model=self.model_identity,
+        )
+
+
 class _KnowledgeCompiler:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        verifier_provider_profile: str = "default",
+        verifier_model_identity: str = "fixture/model-v1",
+    ) -> None:
         self.calls = 0
+        self.verifier_provider_profile = verifier_provider_profile
+        self.verifier_model_identity = verifier_model_identity
 
     def compilation_identity(self) -> str:
         return "sha256:" + "c" * 64
@@ -170,6 +244,11 @@ class _KnowledgeCompiler:
         execution,
     ) -> DocumentKnowledgeVerificationV1:
         execution.heartbeat()
+        assert (
+            request.verifier_provider_profile
+            == self.verifier_provider_profile
+        )
+        assert request.verifier_model_override == self.verifier_model_identity
         return DocumentKnowledgeVerificationV1(
             compiled_sha256=compiled_document_knowledge_sha256(request.compiled),
             evidence_input_sha256=document_knowledge_evidence_sha256(
@@ -179,7 +258,7 @@ class _KnowledgeCompiler:
                 DocumentKnowledgeClaimVerificationV1(claim_id, "supported")
                 for claim_id, _claim in document_knowledge_claims(request.compiled)
             ),
-            model_identity="fixture/model-v1",
+            model_identity=self.verifier_model_identity,
             input_tokens=5,
             output_tokens=5,
             token_counts_complete=True,
@@ -675,6 +754,216 @@ def test_document_v2_same_model_review_remains_not_publishable(
         "source_metadata",
     }
     assert compiler.calls == 1
+
+
+def test_document_v3_independent_verifier_is_frozen_and_publishable(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    compiler = _KnowledgeCompiler(
+        verifier_provider_profile="reviewer",
+        verifier_model_identity="fixture/reviewer-v1",
+    )
+    service, repository = _service(
+        tmp_path / "machine",
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+        knowledge_compiler=compiler,
+    )
+    submission = ProduceService(
+        RecipeRegistry(((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(service)),))
+    ).submit(
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(workspace),
+            ("knowledge-note",),
+            {
+                "provider_profile": "default",
+                "model_override": "fixture/model-v1",
+                "output_language": "en",
+                "verifier_provider_profile": "reviewer",
+                "verifier_model_override": "fixture/reviewer-v1",
+            },
+        )
+    )
+    stored_request = json.loads(
+        repository.get_job_request(submission.job_id) or ""
+    )
+
+    completed = service.wait_job(submission.job_id)
+
+    assert stored_request["request_schema_version"] == 3
+    assert stored_request["provider_profile"] == "default"
+    assert stored_request["model_override"] == "fixture/model-v1"
+    assert stored_request["verifier_provider_profile"] == "reviewer"
+    assert stored_request["verifier_model_override"] == "fixture/reviewer-v1"
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert completed.result.quality_overall == "pass"
+    assert completed.result.publish_eligible is True
+
+
+def test_document_runtime_routes_v2_self_review_and_v3_independent_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    composer_identity = "fixture/composer-v1"
+    verifier_identity = "fixture/reviewer-v1"
+    compiled_response = {
+        "title": {
+            "text": "Compiled paper note",
+            "source_block_ids": ["blk_title"],
+        },
+        "overview": [
+            {
+                "text": "The paper studies glossy reflections.",
+                "source_block_ids": ["blk_title"],
+            }
+        ],
+        "sections": [
+            {
+                "heading": {
+                    "text": "Main idea",
+                    "source_block_ids": ["blk_title"],
+                },
+                "paragraphs": [
+                    {
+                        "text": "The source establishes the topic.",
+                        "source_block_ids": ["blk_title"],
+                    }
+                ],
+                "key_points": [],
+            }
+        ],
+    }
+    verification_response = {
+        "claims": [
+            {"claim_id": claim_id, "status": "supported"}
+            for claim_id in (
+                "title-0001",
+                "overview-0001",
+                "section-0001-heading-0001",
+                "section-0001-paragraph-0001",
+            )
+        ]
+    }
+    composer_bridge = _RoutingStageBridge(
+        composer_identity,
+        {
+            "document-knowledge-compose": compiled_response,
+            "document-knowledge-verify": verification_response,
+        },
+    )
+    verifier_bridge = _StageBridge(
+        verifier_identity,
+        "document-knowledge-verify",
+        verification_response,
+    )
+
+    def legacy_binding(identity: str, bridge: object) -> LegacyModelBinding:
+        return LegacyModelBinding(
+            provider_kind="fixture",
+            model_identity=identity,
+            bridge=bridge,
+            capabilities=LegacyModelCapabilities(),
+        )
+
+    def core_binding(identity: str) -> ModelExecutionBinding:
+        return ModelExecutionBinding(
+            schema_version=1,
+            provider_type="fixture",
+            model_identity=identity,
+            credential_profile_ref="fixture/credential",
+            context_window_tokens=128_000,
+            max_output_tokens=4_096,
+            max_concurrency=1,
+            supports_structured_output=True,
+            supports_temperature=True,
+            timeout_seconds=60,
+        )
+
+    monkeypatch.setattr(
+        runtime_module,
+        "DoclingWorkerParser",
+        lambda _config: _RuntimeParser(),
+    )
+    runtime = runtime_module.create_document_runtime(
+        tmp_path / "machine-runtime",
+        worker_config=object(),  # type: ignore[arg-type]
+        model=legacy_binding(composer_identity, composer_bridge),
+        model_execution_binding=core_binding(composer_identity),
+        model_execution_profile="composer",
+        verifier_model=legacy_binding(verifier_identity, verifier_bridge),
+        verifier_model_execution_binding=core_binding(verifier_identity),
+        verifier_model_execution_profile="reviewer",
+    )
+    legacy_submission = runtime.submit(
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(workspace),
+            ("knowledge-note",),
+            {
+                "provider_profile": "composer",
+                "model_override": composer_identity,
+                "output_language": "en",
+            },
+        )
+    )
+    legacy_request = json.loads(
+        runtime.job_repository.get_job_request(legacy_submission.job_id) or ""
+    )
+    legacy_completed = runtime.wait_job(legacy_submission.job_id)
+
+    assert legacy_request["request_schema_version"] == 2
+    assert legacy_completed.state is JobState.SUCCEEDED
+    assert legacy_completed.result is not None
+    assert legacy_completed.result.quality_overall == "fail"
+    assert legacy_completed.result.publish_eligible is False
+    assert composer_bridge.calls == [
+        "document-knowledge-compose",
+        "document-knowledge-verify",
+    ]
+    assert verifier_bridge.calls == []
+
+    independent_submission = runtime.submit(
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(workspace),
+            ("knowledge-note",),
+            {
+                "provider_profile": "composer",
+                "model_override": composer_identity,
+                "output_language": "en",
+                "verifier_provider_profile": "reviewer",
+                "verifier_model_override": verifier_identity,
+            },
+        )
+    )
+
+    completed = runtime.wait_job(independent_submission.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert completed.result.quality_overall == "pass"
+    assert completed.result.publish_eligible is True
+    assert composer_bridge.calls == [
+        "document-knowledge-compose",
+        "document-knowledge-verify",
+        "document-knowledge-compose",
+    ]
+    assert verifier_bridge.calls == ["document-knowledge-verify"]
 
 
 def test_document_v2_fails_before_parsing_when_compiler_is_unavailable(

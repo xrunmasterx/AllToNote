@@ -261,6 +261,8 @@ def create_job_runtime_for_workspace(
 
             requested_model_identity = None
             requested_provider_profile = None
+            requested_verifier_model_identity = None
+            requested_verifier_provider_profile = None
             request_json = repository.get_job_request(job_id)
             if request_json is not None:
                 try:
@@ -270,7 +272,7 @@ def create_job_runtime_for_workspace(
                 if (
                     type(request) is dict
                     and type(request.get("request_schema_version")) is int
-                    and request.get("request_schema_version") == 2
+                    and request.get("request_schema_version") in (2, 3)
                     and type(request.get("model_override")) is str
                     and request["model_override"].strip()
                     and type(request.get("provider_profile")) is str
@@ -278,12 +280,36 @@ def create_job_runtime_for_workspace(
                 ):
                     requested_model_identity = request["model_override"]
                     requested_provider_profile = request["provider_profile"]
+                    if request["request_schema_version"] == 3:
+                        if not (
+                            type(request.get("verifier_model_override")) is str
+                            and request["verifier_model_override"].strip()
+                            and type(request.get("verifier_provider_profile")) is str
+                            and request["verifier_provider_profile"].strip()
+                        ):
+                            raise DomainError(
+                                "job_request_invalid",
+                                ErrorCategory.INTERNAL,
+                                "Stored Document request is invalid",
+                            )
+                        requested_verifier_model_identity = request[
+                            "verifier_model_override"
+                        ]
+                        requested_verifier_provider_profile = request[
+                            "verifier_provider_profile"
+                        ]
             runtime = create_document_runtime_for_workspace(
                 workspace_root,
                 local_app_data=trusted_root,
                 current_config_snapshot=current_config_snapshot,
                 requested_model_identity=requested_model_identity,
                 requested_provider_profile=requested_provider_profile,
+                requested_verifier_model_identity=(
+                    requested_verifier_model_identity
+                ),
+                requested_verifier_provider_profile=(
+                    requested_verifier_provider_profile
+                ),
             )
         else:
             from app.runtime import create_codex_app_server_runtime_for_workspace

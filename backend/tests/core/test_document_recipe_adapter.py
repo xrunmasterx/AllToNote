@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import app.core.recipes.document.adapter as adapter_module
 from app.core.domain.document import MAX_BORN_DIGITAL_PDF_BYTES
+from app.core.domain.video import JobState
 from app.core.errors import DomainError, ErrorCategory
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
 from app.core.recipes.document.adapter import DocumentRecipeAdapter
@@ -177,3 +179,95 @@ def test_pdf_directory_is_rejected_before_job_submission(tmp_path: Path) -> None
     assert caught.value.code == "document_input_unsupported"
     assert caught.value.category is ErrorCategory.INVALID_REQUEST
     assert service.submissions == 0
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    (
+        {
+            "provider_profile": "composer",
+            "model_override": "fixture/model-v1",
+            "output_language": "en",
+            "verifier_provider_profile": "reviewer",
+        },
+        {
+            "provider_profile": "composer",
+            "model_override": "fixture/model-v1",
+            "output_language": "en",
+            "verifier_provider_profile": "different-profile",
+            "verifier_model_override": "fixture/model-v1",
+        },
+    ),
+)
+def test_invalid_verifier_selection_fails_before_pdf_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parameters: dict[str, object],
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    service = _Service()
+    inspected = False
+
+    def inspect(_path: Path) -> tuple[str, object]:
+        nonlocal inspected
+        inspected = True
+        raise AssertionError("invalid model selection must fail before source hashing")
+
+    monkeypatch.setattr(adapter_module, "_inspect_pdf_source", inspect)
+    request = ProduceRequest(
+        1,
+        RecipeKey("alltonote.document-note", 1),
+        InputDescriptor("file", str(source)),
+        str(tmp_path / "workspace"),
+        ("knowledge-note",),
+        parameters,
+    )
+
+    with pytest.raises(DomainError) as caught:
+        DocumentRecipeAdapter(service).submit(request)  # type: ignore[arg-type]
+
+    assert caught.value.code == "document_recipe_parameters_invalid"
+    assert inspected is False
+    assert service.submissions == 0
+
+
+def test_independent_verifier_selection_creates_frozen_v3_request(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+
+    class Service:
+        def __init__(self) -> None:
+            self.request = None
+
+        def knowledge_model_identity(self) -> str:
+            return "fixture/composer-v1"
+
+        def submit_document(self, request: object) -> object:
+            self.request = request
+            return SimpleNamespace(job_id="job_fixture", state=JobState.QUEUED)
+
+    service = Service()
+    DocumentRecipeAdapter(service).submit(  # type: ignore[arg-type]
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(tmp_path / "workspace"),
+            ("knowledge-note",),
+            {
+                "provider_profile": "composer",
+                "model_override": None,
+                "output_language": "en",
+                "verifier_provider_profile": "reviewer",
+                "verifier_model_override": "fixture/reviewer-v1",
+            },
+        )
+    )
+
+    assert service.request.request_schema_version == 3
+    assert service.request.model_override == "fixture/composer-v1"
+    assert service.request.verifier_provider_profile == "reviewer"
+    assert service.request.verifier_model_override == "fixture/reviewer-v1"

@@ -262,9 +262,19 @@ def test_document_pack_missing_or_partial_installation_fails_closed(
     assert raised.value.code == "document_pack_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("request_schema_version", "verifier_profile", "verifier_model"),
+    (
+        (2, None, None),
+        (3, "fixture/reviewer-profile", "fixture/reviewer-model"),
+    ),
+)
 def test_job_wait_selects_document_runtime_from_persisted_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request_schema_version: int,
+    verifier_profile: str | None,
+    verifier_model: str | None,
 ) -> None:
     workspace = tmp_path / "workspace"
     shutil.copytree(FIXTURE_ROOT, workspace)
@@ -278,20 +288,28 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     )
     instance = registry.resolve(workspace)
     repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    request_values = {
+        "expected_source_mtime_ns": 1,
+        "expected_source_sha256": "sha256:" + "b" * 64,
+        "expected_source_size": 1,
+        "input_path": str((workspace / "paper.pdf").resolve()),
+        "model_override": "fixture/frozen-model",
+        "output_language": "en",
+        "provider_profile": "fixture/frozen-profile",
+        "recipe_id": "alltonote.document-note",
+        "recipe_version": 1,
+        "request_schema_version": request_schema_version,
+        "workspace_root": str(workspace.resolve()),
+    }
+    if request_schema_version == 3:
+        request_values.update(
+            {
+                "verifier_model_override": verifier_model,
+                "verifier_provider_profile": verifier_profile,
+            }
+        )
     request_json = json.dumps(
-        {
-            "expected_source_mtime_ns": 1,
-            "expected_source_sha256": "sha256:" + "b" * 64,
-            "expected_source_size": 1,
-            "input_path": str((workspace / "paper.pdf").resolve()),
-            "model_override": "fixture/frozen-model",
-            "output_language": "en",
-            "provider_profile": "fixture/frozen-profile",
-            "recipe_id": "alltonote.document-note",
-            "recipe_version": 1,
-            "request_schema_version": 2,
-            "workspace_root": str(workspace.resolve()),
-        },
+        request_values,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -310,7 +328,16 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             pack_version=PACK_VERSION,
         ),
     )
-    selected: list[tuple[Path, Path | None, str | None, str | None]] = []
+    selected: list[
+        tuple[
+            Path,
+            Path | None,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+        ]
+    ] = []
 
     class Runtime:
         def wait_job(self, job_id: str) -> JobSnapshot:
@@ -332,6 +359,8 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         current_config_snapshot=None,
         requested_model_identity: str | None = None,
         requested_provider_profile: str | None = None,
+        requested_verifier_model_identity: str | None = None,
+        requested_verifier_provider_profile: str | None = None,
     ) -> Runtime:
         assert current_config_snapshot is None
         selected.append(
@@ -340,6 +369,8 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
                 local_app_data,
                 requested_model_identity,
                 requested_provider_profile,
+                requested_verifier_model_identity,
+                requested_verifier_provider_profile,
             )
         )
         return Runtime()
@@ -361,6 +392,8 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             local_data,
             "fixture/frozen-model",
             "fixture/frozen-profile",
+            verifier_model,
+            verifier_profile,
         )
     ]
 

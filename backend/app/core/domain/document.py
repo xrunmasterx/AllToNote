@@ -202,6 +202,8 @@ class DocumentKnowledgeProduceRequest:
     provider_profile: str
     model_override: str | None
     output_language: str
+    verifier_provider_profile: str | None = None
+    verifier_model_override: str | None = None
     recipe_id: str = "alltonote.document-note"
     recipe_version: int = 1
     principal: str = "local-user"
@@ -210,7 +212,7 @@ class DocumentKnowledgeProduceRequest:
     def __post_init__(self) -> None:
         if (
             type(self.request_schema_version) is not int
-            or self.request_schema_version != 2
+            or self.request_schema_version not in (2, 3)
             or type(self.recipe_id) is not str
             or not self.recipe_id
             or type(self.recipe_version) is not int
@@ -224,15 +226,27 @@ class DocumentKnowledgeProduceRequest:
             or self.expected_source_mtime_ns < 0
             or type(self.provider_profile) is not str
             or not self.provider_profile.strip()
-            or (
-                self.model_override is not None
-                and (
-                    type(self.model_override) is not str
-                    or not self.model_override.strip()
-                )
-            )
+            or type(self.model_override) is not str
+            or not self.model_override.strip()
             or type(self.output_language) is not str
             or not self.output_language.strip()
+            or (
+                self.request_schema_version == 2
+                and (
+                    self.verifier_provider_profile is not None
+                    or self.verifier_model_override is not None
+                )
+            )
+            or (
+                self.request_schema_version == 3
+                and (
+                    type(self.verifier_provider_profile) is not str
+                    or not self.verifier_provider_profile.strip()
+                    or type(self.verifier_model_override) is not str
+                    or not self.verifier_model_override.strip()
+                    or self.verifier_model_override == self.model_override
+                )
+            )
             or (
                 self.client_request_id is not None
                 and (type(self.client_request_id) is not str or not self.client_request_id)

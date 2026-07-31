@@ -104,6 +104,7 @@ def _build_parser(
         choices=(
             "default_workspace",
             "default_provider_profile",
+            "default_verifier_provider_profile",
             "default_transcriber_profile",
             "ffmpeg_path",
             "recipe_defaults.output_language",
@@ -729,6 +730,16 @@ def _produce_generic(
             active_runtime = runtime or _default_runtime(
                 workspace_root,
                 recipe_key=request.recipe_key,
+                document_provider_profile=request.parameters.get(
+                    "provider_profile"
+                ),
+                document_model_identity=request.parameters.get("model_override"),
+                document_verifier_provider_profile=request.parameters.get(
+                    "verifier_provider_profile"
+                ),
+                document_verifier_model_identity=request.parameters.get(
+                    "verifier_model_override"
+                ),
             )
         else:
             effective_args = argparse.Namespace(
@@ -795,25 +806,74 @@ def _produce_generic(
             provider_profile = config.default_provider_profile
             provider = config.providers.get(provider_profile)
             config_snapshot = effective.job_snapshot()
+            model_override = (
+                provider.default_model if provider is not None else None
+            )
+            verifier_provider_profile = (
+                config.default_verifier_provider_profile
+            )
+            verifier_model_override = None
+            if verifier_provider_profile is not None:
+                verifier_provider = config.providers.get(
+                    verifier_provider_profile
+                )
+                verifier_model_override = (
+                    verifier_provider.default_model
+                    if verifier_provider is not None
+                    else None
+                )
+                if (
+                    verifier_provider is not None
+                    and verifier_provider.provider_type != "codex-app-server"
+                ):
+                    raise DomainError(
+                        "model_provider_unsupported",
+                        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                        "The configured Document verifier provider is not supported",
+                    )
+                if verifier_model_override is None:
+                    raise DomainError(
+                        "document_verifier_profile_invalid",
+                        ErrorCategory.INVALID_REQUEST,
+                        "The configured Document verifier profile has no frozen model",
+                    )
+                if (
+                    verifier_model_override == model_override
+                ):
+                    raise DomainError(
+                        "document_verifier_profile_invalid",
+                        ErrorCategory.INVALID_REQUEST,
+                        "The configured Document verifier must be independent",
+                    )
+            parameters = {
+                "provider_profile": provider_profile,
+                "model_override": model_override,
+                "output_language": config.recipe_defaults.output_language,
+            }
+            if verifier_provider_profile is not None:
+                parameters.update(
+                    {
+                        "verifier_provider_profile": verifier_provider_profile,
+                        "verifier_model_override": verifier_model_override,
+                    }
+                )
             request = ProduceRequest(
                 1,
                 key,
                 InputDescriptor("file", args.input_value),
                 str(workspace_root),
                 requested_outputs,
-                {
-                    "provider_profile": provider_profile,
-                    "model_override": (
-                        provider.default_model if provider is not None else None
-                    ),
-                    "output_language": config.recipe_defaults.output_language,
-                },
+                parameters,
                 client_request_id=correlation_id,
             )
             active_runtime = runtime or _default_runtime(
                 workspace_root,
                 current_config_snapshot=config_snapshot,
                 recipe_key=key,
+                document_provider_profile=provider_profile,
+                document_model_identity=model_override,
+                document_verifier_provider_profile=verifier_provider_profile,
+                document_verifier_model_identity=verifier_model_override,
             )
         else:
             effective_args = argparse.Namespace(
@@ -1579,6 +1639,10 @@ def _default_runtime(
     *,
     current_config_snapshot: JobConfigSnapshot | None = None,
     recipe_key: RecipeKey | None = None,
+    document_provider_profile: object = None,
+    document_model_identity: object = None,
+    document_verifier_provider_profile: object = None,
+    document_verifier_model_identity: object = None,
 ) -> _VideoRuntime:
     if recipe_key == _DOCUMENT_NOTE_V1:
         from app.runtime import create_document_runtime_for_workspace
@@ -1586,6 +1650,26 @@ def _default_runtime(
         return create_document_runtime_for_workspace(
             workspace_root,
             current_config_snapshot=current_config_snapshot,
+            requested_model_identity=(
+                document_model_identity
+                if type(document_model_identity) is str
+                else None
+            ),
+            requested_provider_profile=(
+                document_provider_profile
+                if type(document_provider_profile) is str
+                else None
+            ),
+            requested_verifier_model_identity=(
+                document_verifier_model_identity
+                if type(document_verifier_model_identity) is str
+                else None
+            ),
+            requested_verifier_provider_profile=(
+                document_verifier_provider_profile
+                if type(document_verifier_provider_profile) is str
+                else None
+            ),
         )
     from app.runtime import create_codex_app_server_runtime_for_workspace
 

@@ -144,6 +144,34 @@ def test_arbitrary_environment_and_ephemeral_secret_are_not_config_layers(
     assert effective.config.default_provider_profile == "user-provider"
 
 
+def test_verifier_provider_profile_round_trips_and_is_semantic(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    base = _user_config(tmp_path)
+    configured = replace(
+        base,
+        default_verifier_provider_profile="document-reviewer",
+        providers={
+            **base.providers,
+            "document-reviewer": ProviderProfileConfig(
+                provider_type="codex-app-server",
+                default_model="fixture/verifier-v1",
+                credential_ref="codex/local-login",
+            ),
+        },
+    )
+    write_runtime_config(configured, paths.config_file)
+
+    loaded = RuntimeConfigService(paths=paths).effective()
+
+    assert loaded.config.default_verifier_provider_profile == "document-reviewer"
+    assert loaded.values["default_verifier_provider_profile"] == (
+        "document-reviewer"
+    )
+    assert loaded.semantic_digest != effective_runtime_config(base).semantic_digest
+
+
 def test_effective_config_digest_distinguishes_semantic_drift() -> None:
     base_config = RuntimeConfig()
     base = effective_runtime_config(base_config)
@@ -167,7 +195,21 @@ def test_config_cli_get_validate_profiles_and_set_are_one_safe_envelope(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths = _paths(tmp_path)
-    write_runtime_config(_user_config(tmp_path), paths.config_file)
+    user_config = _user_config(tmp_path)
+    write_runtime_config(
+        replace(
+            user_config,
+            providers={
+                **user_config.providers,
+                "document-reviewer": ProviderProfileConfig(
+                    provider_type="codex-app-server",
+                    default_model="reviewer-model",
+                    credential_ref="codex/local-login",
+                ),
+            },
+        ),
+        paths.config_file,
+    )
     profile_dir = paths.config_dir / "profiles"
     profile_dir.mkdir(parents=True)
     (profile_dir / "agent.toml").write_text(
@@ -213,6 +255,24 @@ def test_config_cli_get_validate_profiles_and_set_are_one_safe_envelope(
     assert set_envelope["data"]["updated"] == "recipe_defaults.style"
     assert load_runtime_config(paths.config_file, {}).recipe_defaults.style == "concise"
     assert not tuple(paths.config_dir.glob("*.tmp"))
+
+    assert (
+        main(
+            [
+                "config",
+                "set",
+                "default_verifier_provider_profile",
+                "document-reviewer",
+                "--json",
+            ],
+            config_service=service,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert load_runtime_config(
+        paths.config_file, {}
+    ).default_verifier_provider_profile == "document-reviewer"
 
 
 def test_config_set_invalid_value_fails_without_rewriting_file(

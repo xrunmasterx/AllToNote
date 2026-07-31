@@ -1034,7 +1034,9 @@ class _RuntimeCompilationProfile:
 @dataclass(frozen=True)
 class _RuntimeDocumentKnowledgeCompiler:
     profile: _RuntimeCompilationProfile
+    verifier_profile: _RuntimeCompilationProfile
     compiler: DocumentKnowledgeCompiler
+    self_verifier: DocumentKnowledgeVerifier
     verifier: DocumentKnowledgeVerifier
 
     def model_identity(self) -> str:
@@ -1042,14 +1044,16 @@ class _RuntimeDocumentKnowledgeCompiler:
 
     def compilation_identity(self) -> str:
         binding = self.profile.binding
+        verifier_binding = self.verifier_profile.binding
         return sha256_digest(
             json.dumps(
                 {
                     "behavior": self.compiler.behavior_identity(),
                     "verification_behavior": self.verifier.behavior_identity(),
-                    "binding": {
+                    "composer_binding": {
                         "context_window_tokens": binding.context_window_tokens,
                         "credential_profile_ref": binding.credential_profile_ref,
+                        "max_concurrency": binding.max_concurrency,
                         "max_output_tokens": binding.max_output_tokens,
                         "model_identity": binding.model_identity,
                         "provider_type": binding.provider_type,
@@ -1060,11 +1064,37 @@ class _RuntimeDocumentKnowledgeCompiler:
                         "supports_temperature": binding.supports_temperature,
                         "timeout_seconds": binding.timeout_seconds,
                     },
-                    "provider_execution_policy": (
+                    "composer_provider_execution_policy": (
                         self.profile.provider_execution_policy
                     ),
-                    "provider_profile": self.profile.provider_profile,
-                    "schema_version": 1,
+                    "composer_provider_profile": self.profile.provider_profile,
+                    "verifier_binding": {
+                        "context_window_tokens": (
+                            verifier_binding.context_window_tokens
+                        ),
+                        "credential_profile_ref": (
+                            verifier_binding.credential_profile_ref
+                        ),
+                        "max_concurrency": verifier_binding.max_concurrency,
+                        "max_output_tokens": verifier_binding.max_output_tokens,
+                        "model_identity": verifier_binding.model_identity,
+                        "provider_type": verifier_binding.provider_type,
+                        "schema_version": verifier_binding.schema_version,
+                        "supports_structured_output": (
+                            verifier_binding.supports_structured_output
+                        ),
+                        "supports_temperature": (
+                            verifier_binding.supports_temperature
+                        ),
+                        "timeout_seconds": verifier_binding.timeout_seconds,
+                    },
+                    "verifier_provider_execution_policy": (
+                        self.verifier_profile.provider_execution_policy
+                    ),
+                    "verifier_provider_profile": (
+                        self.verifier_profile.provider_profile
+                    ),
+                    "schema_version": 2,
                 },
                 ensure_ascii=False,
                 allow_nan=False,
@@ -1123,9 +1153,26 @@ class _RuntimeDocumentKnowledgeCompiler:
         *,
         execution: object,
     ) -> DocumentKnowledgeVerificationV1:
-        self.profile.validate_selection(
-            provider_profile=request.provider_profile,
-            model_override=request.model_override,
+        self_review = (
+            request.verifier_provider_profile == self.profile.provider_profile
+            and request.verifier_model_override
+            == self.profile.binding.model_identity
+        )
+        selected_profile = self.profile if self_review else self.verifier_profile
+        selected_verifier = self.self_verifier if self_review else self.verifier
+        if (
+            not self_review
+            and selected_profile.binding.model_identity
+            == self.profile.binding.model_identity
+        ):
+            raise DomainError(
+                "document_knowledge_verifier_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The frozen independent Document verifier is unavailable",
+            )
+        selected_profile.validate_selection(
+            provider_profile=request.verifier_provider_profile,
+            model_override=request.verifier_model_override,
         )
         try:
             job_id = execution.job_id
@@ -1139,12 +1186,12 @@ class _RuntimeDocumentKnowledgeCompiler:
                 ErrorCategory.INTERNAL,
                 "Document execution context is invalid",
             ) from None
-        return self.verifier.verify(
+        return selected_verifier.verify(
             DocumentKnowledgeVerificationRequestV1(
                 schema_version=1,
                 parsed=request.parsed,
                 compiled=request.compiled,
-                model_binding=self.profile.binding,
+                model_binding=selected_profile.binding,
             ),
             DocumentCompilationContext(
                 execution=ModelCallExecution(
@@ -1812,12 +1859,38 @@ def create_document_runtime(
     model: LegacyModelBinding | None = None,
     model_execution_binding: ModelExecutionBinding | None = None,
     model_execution_profile: str | None = None,
+    verifier_model: LegacyModelBinding | None = None,
+    verifier_model_execution_binding: ModelExecutionBinding | None = None,
+    verifier_model_execution_profile: str | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
 ) -> AllToNoteRuntime:
+    verifier_options = (
+        verifier_model,
+        verifier_model_execution_binding,
+        verifier_model_execution_profile,
+    )
+    if model is None and (
+        model_execution_binding is not None
+        or model_execution_profile is not None
+        or any(value is not None for value in verifier_options)
+    ):
+        raise DomainError(
+            "model_execution_binding_mismatch",
+            ErrorCategory.INVALID_REQUEST,
+            "Document model bindings require a provider model",
+        )
+    if model is not None and any(value is not None for value in verifier_options) and not all(
+        value is not None for value in verifier_options
+    ):
+        raise DomainError(
+            "model_execution_binding_mismatch",
+            ErrorCategory.INVALID_REQUEST,
+            "Document verifier requires one complete frozen model profile",
+        )
     parser = DoclingWorkerParser(worker_config)
     parser.doctor()
     resolved_machine_root = Path(machine_root).resolve()
@@ -1836,12 +1909,7 @@ def create_document_runtime(
     portable = IWikiPortableGateway()
     knowledge_compiler = None
     if model is None:
-        if model_execution_binding is not None or model_execution_profile is not None:
-            raise DomainError(
-                "model_execution_binding_mismatch",
-                ErrorCategory.INVALID_REQUEST,
-                "Document model binding requires a provider model",
-            )
+        pass
     else:
         if model_execution_binding is None or model_execution_profile is None:
             raise DomainError(
@@ -1856,10 +1924,23 @@ def create_document_runtime(
             provider_profile=model_execution_profile,
             result_root=storage.root,
         )
+        if any(value is not None for value in verifier_options):
+            verifier_coordinator, verifier_profile = _create_runtime_model_services(
+                repository=repository,
+                model=verifier_model,
+                binding=verifier_model_execution_binding,
+                provider_profile=verifier_model_execution_profile,
+                result_root=storage.root,
+            )
+        else:
+            verifier_coordinator = coordinator
+            verifier_profile = profile
         knowledge_compiler = _RuntimeDocumentKnowledgeCompiler(
             profile=profile,
+            verifier_profile=verifier_profile,
             compiler=DocumentKnowledgeCompiler(coordinator),
-            verifier=DocumentKnowledgeVerifier(coordinator),
+            self_verifier=DocumentKnowledgeVerifier(coordinator),
+            verifier=DocumentKnowledgeVerifier(verifier_coordinator),
         )
 
     def resolve_source_identity(
@@ -1939,6 +2020,8 @@ def create_document_runtime_for_workspace(
     current_config_snapshot: JobConfigSnapshot | None = None,
     requested_model_identity: str | None = None,
     requested_provider_profile: str | None = None,
+    requested_verifier_model_identity: str | None = None,
+    requested_verifier_provider_profile: str | None = None,
 ) -> AllToNoteRuntime:
     trusted_root = local_app_data or _default_local_app_data()
     paths = resolve_runtime_paths(local_data_parent=trusted_root)
@@ -1956,9 +2039,90 @@ def create_document_runtime_for_workspace(
         _workspace_resource_admission(paths, instance)
     )
     status = CodexAppServerStatusService.get_status()
+    snapshot_values = (
+        current_config_snapshot.values
+        if current_config_snapshot is not None
+        else {}
+    )
+    configured_providers = snapshot_values.get("providers", {})
+    if not isinstance(configured_providers, Mapping):
+        configured_providers = {}
+    provider_profile = requested_provider_profile or "default"
+    if requested_provider_profile is None:
+        configured_profile = snapshot_values.get(
+            "default_provider_profile",
+            "default",
+        )
+        if type(configured_profile) is str and configured_profile.strip():
+            provider_profile = configured_profile
+    provider_values = configured_providers.get(provider_profile, {})
+    if not isinstance(provider_values, Mapping):
+        provider_values = {}
+    configured_model = provider_values.get("default_model")
+    selected_model = requested_model_identity or (
+        configured_model
+        if type(configured_model) is str and configured_model.strip()
+        else status.default_model
+    )
+    verifier_provider_profile = requested_verifier_provider_profile
+    if (
+        verifier_provider_profile is None
+        and requested_model_identity is None
+        and requested_provider_profile is None
+    ):
+        configured_verifier_profile = snapshot_values.get(
+            "default_verifier_provider_profile"
+        )
+        if (
+            type(configured_verifier_profile) is str
+            and configured_verifier_profile.strip()
+        ):
+            verifier_provider_profile = configured_verifier_profile
+    if (
+        (requested_verifier_model_identity is None)
+        != (requested_verifier_provider_profile is None)
+    ):
+        raise DomainError(
+            "model_execution_binding_mismatch",
+            ErrorCategory.INVALID_REQUEST,
+            "Document verifier selection must include profile and model",
+        )
+    selected_verifier_model = requested_verifier_model_identity
+    if verifier_provider_profile is not None and selected_verifier_model is None:
+        verifier_values = configured_providers.get(
+            verifier_provider_profile,
+            {},
+        )
+        if not isinstance(verifier_values, Mapping):
+            verifier_values = {}
+        verifier_provider_type = verifier_values.get("type")
+        if verifier_provider_type != "codex-app-server":
+            raise DomainError(
+                "model_provider_unsupported",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The configured Document verifier provider is not supported",
+            )
+        configured_verifier_model = verifier_values.get("default_model")
+        if (
+            type(configured_verifier_model) is not str
+            or not configured_verifier_model.strip()
+        ):
+            raise DomainError(
+                "document_verifier_model_required",
+                ErrorCategory.INVALID_REQUEST,
+                "The configured Document verifier profile has no frozen model",
+            )
+        selected_verifier_model = configured_verifier_model
+    if selected_verifier_model is not None and selected_verifier_model == selected_model:
+        raise DomainError(
+            "document_verifier_not_independent",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Document verifier must use a different model",
+        )
     model = None
     binding = None
-    selected_model = requested_model_identity or status.default_model
+    verifier_model = None
+    verifier_binding = None
     if status.ready and selected_model:
         bridge = CodexAppServerCompletionBridge(
             model_identity=selected_model
@@ -1981,20 +2145,45 @@ def create_document_runtime_for_workspace(
             supports_temperature=False,
             timeout_seconds=600,
         )
-    provider_profile = requested_provider_profile or "default"
-    if requested_provider_profile is None and current_config_snapshot is not None:
-        configured_profile = current_config_snapshot.values.get(
-            "default_provider_profile",
-            "default",
+        if selected_verifier_model is not None:
+            verifier_bridge = CodexAppServerCompletionBridge(
+                model_identity=selected_verifier_model
+            )
+            verifier_model = LegacyModelBinding(
+                provider_kind="codex-app-server",
+                model_identity=selected_verifier_model,
+                bridge=verifier_bridge,
+                capabilities=LegacyModelCapabilities(),
+            )
+            verifier_binding = ModelExecutionBinding(
+                schema_version=1,
+                provider_type="codex-app-server",
+                model_identity=selected_verifier_model,
+                credential_profile_ref="codex/local-login",
+                context_window_tokens=128_000,
+                max_output_tokens=16_000,
+                max_concurrency=1,
+                supports_structured_output=True,
+                supports_temperature=False,
+                timeout_seconds=600,
+            )
+    elif selected_verifier_model is not None:
+        raise DomainError(
+            "codex_app_server_unavailable",
+            ErrorCategory.POLICY_DENIED,
+            "The configured Document verifier model is unavailable",
         )
-        if type(configured_profile) is str and configured_profile.strip():
-            provider_profile = configured_profile
     return create_document_runtime(
         instance.machine_root,
         worker_config=worker_config,
         model=model,
         model_execution_binding=binding,
         model_execution_profile=provider_profile if model is not None else None,
+        verifier_model=verifier_model,
+        verifier_model_execution_binding=verifier_binding,
+        verifier_model_execution_profile=(
+            verifier_provider_profile if verifier_model is not None else None
+        ),
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         resource_lease_store=resource_lease_store,

@@ -28,6 +28,7 @@ _SETTABLE_KEYS = frozenset(
     {
         "default_workspace",
         "default_provider_profile",
+        "default_verifier_provider_profile",
         "default_transcriber_profile",
         "ffmpeg_path",
         "recipe_defaults.output_language",
@@ -161,6 +162,24 @@ class RuntimeConfigService:
                 "Runtime configuration key cannot be set by this command",
             )
         current = load_runtime_config(self._paths.config_file, {})
+        if key == "default_verifier_provider_profile":
+            verifier = current.providers.get(value)
+            composer = current.providers.get(current.default_provider_profile)
+            if verifier is None or verifier.default_model is None:
+                raise DomainError(
+                    "document_verifier_model_required",
+                    ErrorCategory.INVALID_REQUEST,
+                    "The configured Document verifier profile has no frozen model",
+                )
+            if (
+                composer is not None
+                and composer.default_model == verifier.default_model
+            ):
+                raise DomainError(
+                    "document_verifier_not_independent",
+                    ErrorCategory.INVALID_REQUEST,
+                    "The configured Document verifier must use a different model",
+                )
         if key.startswith("recipe_defaults."):
             recipe_key = key.removeprefix("recipe_defaults.")
             updated = replace(

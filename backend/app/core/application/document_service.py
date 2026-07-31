@@ -84,12 +84,19 @@ _REQUEST_FIELDS = frozenset(
         "workspace_root",
     }
 )
-_KNOWLEDGE_REQUEST_FIELDS = frozenset(
+_KNOWLEDGE_REQUEST_FIELDS_V2 = frozenset(
     {
         *_REQUEST_FIELDS,
         "model_override",
         "output_language",
         "provider_profile",
+    }
+)
+_KNOWLEDGE_REQUEST_FIELDS_V3 = frozenset(
+    {
+        *_KNOWLEDGE_REQUEST_FIELDS_V2,
+        "verifier_model_override",
+        "verifier_provider_profile",
     }
 )
 DocumentRequest = DocumentProduceRequest | DocumentKnowledgeProduceRequest
@@ -107,8 +114,8 @@ class DocumentKnowledgeCompilationInput:
 class DocumentKnowledgeVerificationInput:
     parsed: ParsedDocument
     compiled: CompiledDocumentKnowledgeNoteV1
-    provider_profile: str
-    model_override: str | None
+    verifier_provider_profile: str
+    verifier_model_override: str
 
 
 class DocumentKnowledgeCompilerPort(Protocol):
@@ -414,8 +421,15 @@ class DocumentService:
                 DocumentKnowledgeVerificationInput(
                     parsed=parsed,
                     compiled=compiled,
-                    provider_profile=request.provider_profile,
-                    model_override=request.model_override,
+                    verifier_provider_profile=(
+                        request.verifier_provider_profile
+                        or request.provider_profile
+                    ),
+                    verifier_model_override=(
+                        request.verifier_model_override
+                        or request.model_override
+                        or compiler.model_identity()
+                    ),
                 ),
                 execution=execution,
             )
@@ -679,12 +693,23 @@ class DocumentService:
             }
             if fields == _REQUEST_FIELDS:
                 return DocumentProduceRequest(**common)
-            if fields == _KNOWLEDGE_REQUEST_FIELDS:
+            if fields == _KNOWLEDGE_REQUEST_FIELDS_V2:
                 return DocumentKnowledgeProduceRequest(
                     **common,
                     provider_profile=value["provider_profile"],
                     model_override=value["model_override"],
                     output_language=value["output_language"],
+                )
+            if fields == _KNOWLEDGE_REQUEST_FIELDS_V3:
+                return DocumentKnowledgeProduceRequest(
+                    **common,
+                    provider_profile=value["provider_profile"],
+                    model_override=value["model_override"],
+                    output_language=value["output_language"],
+                    verifier_provider_profile=value[
+                        "verifier_provider_profile"
+                    ],
+                    verifier_model_override=value["verifier_model_override"],
                 )
             raise TypeError
         except (DomainError, KeyError, TypeError, ValueError, json.JSONDecodeError):

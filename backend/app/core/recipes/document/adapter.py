@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat as stat_module
+from collections.abc import Mapping
 from pathlib import Path
 
 from app.core.application.document_service import DocumentService
@@ -16,13 +17,83 @@ from app.core.recipes.contracts import ProduceRequest, ProduceSubmission, Recipe
 
 
 _KEY = RecipeKey("alltonote.document-note", 1)
-_KNOWLEDGE_PARAMETERS = frozenset(
+_KNOWLEDGE_PARAMETERS_V2 = frozenset(
     {"model_override", "output_language", "provider_profile"}
+)
+_KNOWLEDGE_PARAMETERS_V3 = frozenset(
+    {
+        *_KNOWLEDGE_PARAMETERS_V2,
+        "verifier_model_override",
+        "verifier_provider_profile",
+    }
 )
 
 
 def _invalid(code: str, message: str) -> DomainError:
     return DomainError(code, ErrorCategory.INVALID_REQUEST, message)
+
+
+def _knowledge_selection(
+    parameters: Mapping[str, object],
+    service: DocumentService,
+) -> tuple[int, str, str, str, str | None, str | None] | None:
+    if not parameters:
+        return None
+    fields = frozenset(parameters)
+    if fields not in {
+        _KNOWLEDGE_PARAMETERS_V2,
+        _KNOWLEDGE_PARAMETERS_V3,
+    }:
+        raise _invalid(
+            "document_recipe_parameters_invalid",
+            "Document knowledge parameters are invalid",
+        )
+    provider_profile = parameters["provider_profile"]
+    model_override = parameters["model_override"]
+    output_language = parameters["output_language"]
+    verifier_provider_profile = parameters.get("verifier_provider_profile")
+    verifier_model_override = parameters.get("verifier_model_override")
+    if (
+        type(provider_profile) is not str
+        or not provider_profile.strip()
+        or (
+            model_override is not None
+            and (type(model_override) is not str or not model_override.strip())
+        )
+        or type(output_language) is not str
+        or not output_language.strip()
+        or (
+            fields == _KNOWLEDGE_PARAMETERS_V3
+            and (
+                type(verifier_provider_profile) is not str
+                or not verifier_provider_profile.strip()
+                or type(verifier_model_override) is not str
+                or not verifier_model_override.strip()
+            )
+        )
+    ):
+        raise _invalid(
+            "document_recipe_parameters_invalid",
+            "Document knowledge parameters are invalid",
+        )
+    if model_override is None:
+        model_override = service.knowledge_model_identity()
+    if (
+        fields == _KNOWLEDGE_PARAMETERS_V3
+        and verifier_model_override == model_override
+    ):
+        raise _invalid(
+            "document_recipe_parameters_invalid",
+            "Document verifier must use an independent frozen model binding",
+        )
+    return (
+        3 if fields == _KNOWLEDGE_PARAMETERS_V3 else 2,
+        provider_profile,
+        model_override,
+        output_language,
+        verifier_provider_profile,
+        verifier_model_override,
+    )
 
 
 def _inspect_pdf_source(path: Path) -> tuple[str, os.stat_result]:
@@ -108,11 +179,7 @@ class DocumentRecipeAdapter:
                 "document_recipe_parameters_invalid",
                 "Document Recipe supports only the knowledge-note output",
             )
-        if request.parameters and frozenset(request.parameters) != _KNOWLEDGE_PARAMETERS:
-            raise _invalid(
-                "document_recipe_parameters_invalid",
-                "Document knowledge parameters are invalid",
-            )
+        selection = _knowledge_selection(request.parameters, self._service)
         try:
             source = Path(request.input.value).resolve(strict=True)
             source_sha256, stat = _inspect_pdf_source(source)
@@ -129,34 +196,22 @@ class DocumentRecipeAdapter:
             "principal": request.principal,
             "client_request_id": request.client_request_id,
         }
-        if request.parameters:
-            provider_profile = request.parameters["provider_profile"]
-            model_override = request.parameters["model_override"]
-            output_language = request.parameters["output_language"]
-            if (
-                type(provider_profile) is not str
-                or not provider_profile.strip()
-                or (
-                    model_override is not None
-                    and (
-                        type(model_override) is not str
-                        or not model_override.strip()
-                    )
-                )
-                or type(output_language) is not str
-                or not output_language.strip()
-            ):
-                raise _invalid(
-                    "document_recipe_parameters_invalid",
-                    "Document knowledge parameters are invalid",
-                )
-            if model_override is None:
-                model_override = self._service.knowledge_model_identity()
+        if selection is not None:
+            (
+                request_schema_version,
+                provider_profile,
+                model_override,
+                output_language,
+                verifier_provider_profile,
+                verifier_model_override,
+            ) = selection
             document_request = DocumentKnowledgeProduceRequest(
-                request_schema_version=2,
+                request_schema_version=request_schema_version,
                 provider_profile=provider_profile,
                 model_override=model_override,
                 output_language=output_language,
+                verifier_provider_profile=verifier_provider_profile,
+                verifier_model_override=verifier_model_override,
                 **common,
             )
         else:

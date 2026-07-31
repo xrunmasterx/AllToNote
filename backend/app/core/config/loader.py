@@ -27,6 +27,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "config_version",
         "default_workspace",
         "default_provider_profile",
+        "default_verifier_provider_profile",
         "default_transcriber_profile",
         "providers",
         "transcribers",
@@ -57,6 +58,9 @@ _SECRET_FIELD_NAMES = frozenset(
 _ENVIRONMENT_FIELDS = {
     "ALLTONOTE_DEFAULT_WORKSPACE": "default_workspace",
     "ALLTONOTE_DEFAULT_PROVIDER_PROFILE": "default_provider_profile",
+    "ALLTONOTE_DEFAULT_VERIFIER_PROVIDER_PROFILE": (
+        "default_verifier_provider_profile"
+    ),
     "ALLTONOTE_DEFAULT_TRANSCRIBER_PROFILE": "default_transcriber_profile",
     "ALLTONOTE_FFMPEG_PATH": "ffmpeg_path",
     "ALLTONOTE_LOG_LEVEL": "log_level",
@@ -170,6 +174,7 @@ def _validate_partial_config(
     string_fields = (
         "default_workspace",
         "default_provider_profile",
+        "default_verifier_provider_profile",
         "default_transcriber_profile",
         "ffmpeg_path",
         "log_level",
@@ -331,6 +336,9 @@ def _runtime_config_from_mapping(data: Mapping[str, object]) -> RuntimeConfig:
         if "default_workspace" in data
         else None,
         default_provider_profile=data["default_provider_profile"],
+        default_verifier_provider_profile=data.get(
+            "default_verifier_provider_profile"
+        ),
         default_transcriber_profile=data["default_transcriber_profile"],
         providers=providers,
         transcribers=transcribers,
@@ -431,6 +439,10 @@ def _runtime_config_to_mapping(config: RuntimeConfig) -> dict[str, object]:
     }
     if config.default_workspace is not None:
         values["default_workspace"] = str(config.default_workspace)
+    if config.default_verifier_provider_profile is not None:
+        values["default_verifier_provider_profile"] = (
+            config.default_verifier_provider_profile
+        )
     if config.ffmpeg_path is not None:
         values["ffmpeg_path"] = str(config.ffmpeg_path)
     if config.work_directory is not None:

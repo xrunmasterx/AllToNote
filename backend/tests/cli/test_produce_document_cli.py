@@ -192,8 +192,16 @@ def test_generic_document_produce_selects_document_runtime_by_recipe(
         workspace_root: Path,
         *,
         current_config_snapshot=None,
+        requested_model_identity=None,
+        requested_provider_profile=None,
+        requested_verifier_model_identity=None,
+        requested_verifier_provider_profile=None,
     ) -> _DocumentRuntime:
         assert current_config_snapshot is not None
+        assert requested_model_identity is None
+        assert requested_provider_profile == "default"
+        assert requested_verifier_model_identity is None
+        assert requested_verifier_provider_profile is None
         selected.append(workspace_root)
         return runtime
 
@@ -218,6 +226,62 @@ def test_generic_document_produce_selects_document_runtime_by_recipe(
     capsys.readouterr()
 
     assert selected == [workspace.resolve()]
+
+
+def test_generic_document_produce_freezes_independent_verifier_profile(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.core.config.model import ProviderProfileConfig, RuntimeConfig
+    from app.runtime_config import effective_runtime_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+
+    class ConfigService:
+        def effective(self, *, profile: object, cli_overrides: object) -> object:
+            del profile, cli_overrides
+            return effective_runtime_config(
+                RuntimeConfig(
+                    default_workspace=workspace,
+                    default_provider_profile="composer",
+                    default_verifier_provider_profile="verifier",
+                    providers={
+                        "composer": ProviderProfileConfig(
+                            "codex-app-server",
+                            default_model="fixture/composer-v1",
+                        ),
+                        "verifier": ProviderProfileConfig(
+                            "codex-app-server",
+                            default_model="fixture/verifier-v1",
+                        ),
+                    },
+                )
+            )
+
+    runtime = _DocumentRuntime()
+    assert main(
+        [
+            "produce",
+            str(source),
+            "--recipe",
+            "alltonote.document-note@1",
+            "--json",
+        ],
+        runtime=runtime,
+        config_service=ConfigService(),  # type: ignore[arg-type]
+    ) == 0
+    capsys.readouterr()
+
+    assert runtime.requests[0].parameters == {
+        "model_override": "fixture/composer-v1",
+        "output_language": "zh-CN",
+        "provider_profile": "composer",
+        "verifier_model_override": "fixture/verifier-v1",
+        "verifier_provider_profile": "verifier",
+    }
 
 
 def test_generic_document_request_file_preserves_document_contract(
@@ -256,6 +320,71 @@ def test_generic_document_request_file_preserves_document_contract(
     assert len(runtime.requests) == 1
     assert runtime.requests[0].input.kind == "file"
     assert runtime.requests[0].parameters == {}
+
+
+def test_document_request_file_builds_runtime_from_frozen_v3_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.document-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "file", "value": str(source)},
+                "workspace_ref": str(workspace),
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {
+                    "provider_profile": "composer",
+                    "model_override": "fixture/composer-v1",
+                    "output_language": "en",
+                    "verifier_provider_profile": "reviewer",
+                    "verifier_model_override": "fixture/reviewer-v1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = _DocumentRuntime()
+    selected: list[tuple[object, ...]] = []
+
+    def create(workspace_root: Path, **options: object) -> _DocumentRuntime:
+        selected.append((workspace_root, options))
+        return runtime
+
+    monkeypatch.setattr(
+        "app.runtime.create_document_runtime_for_workspace",
+        create,
+        raising=False,
+    )
+
+    assert main(["produce", "--request", str(request_path), "--json"]) == 0
+    capsys.readouterr()
+
+    assert selected == [
+        (
+            workspace.resolve(),
+            {
+                "current_config_snapshot": None,
+                "requested_model_identity": "fixture/composer-v1",
+                "requested_provider_profile": "composer",
+                "requested_verifier_model_identity": "fixture/reviewer-v1",
+                "requested_verifier_provider_profile": "reviewer",
+            },
+        )
+    ]
+    assert runtime.requests[0].parameters["verifier_model_override"] == (
+        "fixture/reviewer-v1"
+    )
 
 
 def test_generic_job_result_refs_support_document_result() -> None:

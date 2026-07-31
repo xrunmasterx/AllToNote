@@ -14,6 +14,7 @@ SEMANTIC_CONFIG_KEYS = frozenset(
     {
         "config_version",
         "default_provider_profile",
+        "default_verifier_provider_profile",
         "default_transcriber_profile",
         "providers",
         "transcribers",
@@ -104,6 +105,7 @@ class RuntimeConfig:
     config_version: int = 1
     default_workspace: Path | None = None
     default_provider_profile: str = "default"
+    default_verifier_provider_profile: str | None = None
     default_transcriber_profile: str = "default"
     providers: Mapping[str, ProviderProfileConfig] = field(default_factory=dict)
     transcribers: Mapping[str, TranscriberProfileConfig] = field(default_factory=dict)
