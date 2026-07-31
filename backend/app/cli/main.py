@@ -185,7 +185,7 @@ def _build_parser(
     generic_parser.add_argument("--recipe")
     generic_parser.add_argument("--request", type=Path)
     generic_parser.add_argument("--workspace", type=Path)
-    generic_parser.add_argument("--wait", action="store_true")
+    generic_parser.add_argument("--wait", action="store_true", default=True)
     generic_parser.add_argument("--json", action="store_true")
     video_parser = produce_subparsers.add_parser("video")
     video_parser.add_argument(
@@ -199,7 +199,7 @@ def _build_parser(
         help="video URL or local video path",
     )
     video_parser.add_argument("--workspace", type=Path)
-    video_parser.add_argument("--wait", action="store_true")
+    video_parser.add_argument("--wait", action="store_true", default=True)
     video_parser.add_argument("--json", action="store_true")
     video_parser.add_argument("--recipe-version", choices=(1, 2), type=int)
     video_parser.add_argument("--config-profile")
@@ -1057,7 +1057,10 @@ def _video_snapshot_result(
                 "workspace_relative_bundle_path": (
                     produced.workspace_relative_bundle_path
                 ),
+                "source_id": produced.source_id,
+                "source_revision_id": produced.source_revision_id,
                 "primary_draft_artifact_id": primary_draft,
+                "evidence_set_artifact_id": produced.artifacts.get("evidence_set"),
                 "quality": {
                     "overall": produced.quality_overall,
                     "publish_eligible": produced.publish_eligible,
@@ -1072,6 +1075,7 @@ def _video_snapshot_result(
         human_lines.append(f"Bundle: {produced.bundle_id}")
         if primary_draft is not None:
             human_lines.append(f"Draft: {primary_draft}")
+            human_lines.append(f"Read: alltonote draft show {primary_draft}")
     elif produced is not None:
         data.update(
             {

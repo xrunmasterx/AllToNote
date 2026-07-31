@@ -89,6 +89,7 @@ class _GoldenRuntime:
     def __init__(self) -> None:
         self.submitted = _submitted_snapshot()
         self.completed = _completed_snapshot()
+        self.wait_calls: list[str] = []
 
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
         del request
@@ -99,7 +100,18 @@ class _GoldenRuntime:
     ) -> JobSnapshot:
         del event_sink
         assert job_id == JOB_ID
+        self.wait_calls.append(job_id)
         return self.completed
+
+
+class _QueuedGoldenRuntime(_GoldenRuntime):
+    def wait_job(
+        self, job_id: str, event_sink: object | None = None
+    ) -> JobSnapshot:
+        del event_sink
+        assert job_id == JOB_ID
+        self.wait_calls.append(job_id)
+        return self.submitted
 
 
 class _CapabilityFailureRuntime:
@@ -147,7 +159,7 @@ def test_version_json_matches_published_golden(
     assert captured.out.count("\n") == 1
 
 
-def test_submitted_job_projection_matches_published_golden(
+def test_queued_wait_result_projection_matches_published_golden(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -156,10 +168,12 @@ def test_submitted_job_projection_matches_published_golden(
     workspace_root.mkdir()
     monkeypatch.setattr("app.cli.main.new_typed_id", lambda prefix: CORRELATION_ID)
 
-    exit_code = _run_produce(workspace_root, _GoldenRuntime(), wait=False)
+    runtime = _QueuedGoldenRuntime()
+    exit_code = _run_produce(workspace_root, runtime, wait=False)
     captured = capsys.readouterr()
 
     assert exit_code == 0
+    assert runtime.wait_calls == [JOB_ID]
     assert json.loads(captured.out) == _golden("job-submitted.v1.json")
     assert captured.err == ""
     assert captured.out.count("\n") == 1

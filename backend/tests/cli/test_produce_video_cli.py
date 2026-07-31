@@ -312,6 +312,7 @@ def test_generic_produce_calls_runtime_submit_once(
     assert code == 0
     assert envelope["command"] == "produce"
     assert runtime.video_calls == 0
+    assert runtime.wait_calls == ["job_generic"]
     assert len(runtime.requests) == 1
     assert runtime.requests[0].recipe_key.recipe_id == "alltonote.video-producer"
     assert runtime.requests[0].recipe_key.recipe_version == 2
@@ -325,6 +326,14 @@ def test_generic_explicit_v2_matches_legacy_v2_job_identity(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     runtime, _ = runtime_factory()
+    wait_calls: list[str] = []
+
+    def defer(job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del event_sink
+        wait_calls.append(job_id)
+        return runtime.get_job(job_id)
+
+    monkeypatch.setattr(runtime, "wait_job", defer)
     monkeypatch.setattr(
         "app.cli.main.new_typed_id",
         lambda prefix: "corr_018f0000-0000-7000-8000-000000000002",
@@ -362,6 +371,7 @@ def test_generic_explicit_v2_matches_legacy_v2_job_identity(
     assert legacy["artifacts"] == generic["artifacts"]
     assert legacy["command"] == "produce video"
     assert generic["command"] == "produce"
+    assert wait_calls == [legacy["data"]["job_id"], generic["data"]["job_id"]]
 
 
 def test_generic_literal_video_input_uses_generic_route(
@@ -552,6 +562,7 @@ def test_generic_request_file_uses_existing_contract(
 def test_request_file_binds_current_config_snapshot_and_reopens(
     tmp_path: Path,
     workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from app.core.config.model import RuntimeConfig
@@ -586,6 +597,14 @@ def test_request_file_binds_current_config_snapshot_and_reopens(
     )
     machine_root = tmp_path / "machine"
     runtime = create_fake_runtime(machine_root)
+    wait_calls: list[str] = []
+
+    def defer(job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del event_sink
+        wait_calls.append(job_id)
+        return runtime.get_job(job_id)
+
+    monkeypatch.setattr(runtime, "wait_job", defer)
 
     assert main(
         ["produce", f"--request={request_path}", "--json"],
@@ -596,6 +615,7 @@ def test_request_file_binds_current_config_snapshot_and_reopens(
     job_id = envelope["data"]["job_id"]
     events = runtime.job_repository.list_events(job_id)
 
+    assert wait_calls == [job_id]
     assert [event.event_type for event in events] == ["configuration.snapshot.v1"]
     assert json.loads(events[0].payload_json)["digest"] == effective.digest
 
@@ -654,10 +674,8 @@ def test_generic_wait_reuses_job_control_and_interrupt_cancels(
 class _RequestCaptureRuntime:
     def __init__(self) -> None:
         self.request: VideoProduceRequest | None = None
-
-    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
-        self.request = request
-        return JobSnapshot(
+        self.wait_calls: list[str] = []
+        self.snapshot = JobSnapshot(
             job_id="job_captured",
             state=JobState.QUEUED,
             cancellation_requested=False,
@@ -667,6 +685,16 @@ class _RequestCaptureRuntime:
             result=None,
             error=None,
         )
+
+    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
+        self.request = request
+        return self.snapshot
+
+    def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:
+        del event_sink
+        assert job_id == self.snapshot.job_id
+        self.wait_calls.append(job_id)
+        return self.snapshot
 
 
 def test_canonical_input_and_positional_alias_keep_request_hash_compatible(
@@ -712,6 +740,8 @@ def test_canonical_input_and_positional_alias_keep_request_hash_compatible(
     assert alias_envelope["warnings"] == [
         "Positional video input is deprecated; use --input"
     ]
+    assert canonical.wait_calls == ["job_captured"]
+    assert alias.wait_calls == ["job_captured"]
     assert canonical.request == alias.request
     assert canonical.request is not None
     assert alias.request is not None
@@ -743,6 +773,7 @@ def test_human_positional_video_warning_preserves_success_output_contract(
     assert code == 0
     assert captured.out == "Job: job_captured\nState: queued\n"
     assert captured.err == "Warning: Positional video input is deprecated; use --input\n"
+    assert runtime.wait_calls == ["job_captured"]
     assert runtime.request is not None
 
 

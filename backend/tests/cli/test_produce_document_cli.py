@@ -45,6 +45,7 @@ class _DocumentRuntime:
     def __init__(self) -> None:
         self.job_id = new_typed_id("job")
         self.requests: list[ProduceRequest] = []
+        self.wait_calls: list[str] = []
         self.completed = JobSnapshot(
             job_id=self.job_id,
             state=JobState.SUCCEEDED,
@@ -77,6 +78,7 @@ class _DocumentRuntime:
     def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:
         del event_sink
         assert job_id == self.job_id
+        self.wait_calls.append(job_id)
         return self.completed
 
     def cancel_job(self, job_id: str) -> JobSnapshot:
@@ -102,7 +104,6 @@ def test_generic_document_produce_uses_file_contract_and_projects_result(
             "alltonote.document-note@1",
             "--workspace",
             str(workspace),
-            "--wait",
             "--json",
         ],
         runtime=runtime,
@@ -110,6 +111,7 @@ def test_generic_document_produce_uses_file_contract_and_projects_result(
     envelope = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
+    assert runtime.wait_calls == [runtime.job_id]
     assert len(runtime.requests) == 1
     request = runtime.requests[0]
     assert request.input.kind == "file"
@@ -128,9 +130,46 @@ def test_generic_document_produce_uses_file_contract_and_projects_result(
     assert envelope["data"]["primary_draft_artifact_id"] == (
         runtime.completed.result.artifacts["primary_draft"]
     )
+    assert envelope["data"]["evidence_set_artifact_id"] == (
+        runtime.completed.result.artifacts["evidence_set"]
+    )
+    assert envelope["data"]["source_id"] == runtime.completed.result.source_id
+    assert envelope["data"]["source_revision_id"] == (
+        runtime.completed.result.source_revision_id
+    )
     assert {item["role"] for item in envelope["artifacts"]} == set(
         runtime.completed.result.artifacts
     )
+
+
+def test_generic_document_produce_hands_off_to_clean_draft(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    runtime = _DocumentRuntime()
+
+    assert main(
+        [
+            "produce",
+            str(source),
+            "--recipe",
+            "alltonote.document-note@1",
+            "--workspace",
+            str(workspace),
+        ],
+        runtime=runtime,
+    ) == 0
+    captured = capsys.readouterr()
+
+    draft_id = runtime.completed.result.artifacts["primary_draft"]
+    assert f"Read: alltonote draft show {draft_id}\n" in captured.out
+    assert "Document page" not in captured.out
+    assert "[^ev_" not in captured.out
+    assert captured.err == ""
 
 
 def test_generic_document_produce_selects_document_runtime_by_recipe(
