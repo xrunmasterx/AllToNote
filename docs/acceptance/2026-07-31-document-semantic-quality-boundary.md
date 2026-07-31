@@ -56,6 +56,10 @@ schema v2 请求，保持同模型 advisory；配置有效且不同的 verifier 
 Automation Protocol 仍为 v1，没有新增 Document 专用命令或 envelope。
 
 当前集成回归已证明同一双 binding Runtime 会把 schema v2 review 路由回 composer，
-而 schema v3 只调用独立 verifier。真正进程退出、SQLite reopen 和 Attempt
-takeover 后两个成功模型调用均不重放的组合回归仍是后续 P2 证明项，因此本记录
-不把结构化重连覆盖扩大解释为完整的 crash/reopen 验收。
+而 schema v3 只调用独立 verifier。另一个 Windows `spawn` 回归会在 compose 与
+verify 两条 external operation 及 result file 均成功持久化、candidate checkpoint
+尚未写入时令子进程直接退出；父进程在 scheduler lease 过期后重新打开 SQLite，
+以新 fencing token 接管 Attempt，并使用禁止调用的 executor 完成恢复。恢复前后
+两条 operation、两份 model-result 文件及 parse checkpoint 的 bytes/mtime 均不变，
+最终只产生一个 Portable commit。该证明覆盖本地持久化与零重放语义，不把 fixture
+模型扩大解释为外部供应商可用性验收。

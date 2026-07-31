@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
+import sqlite3
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import app.runtime as runtime_module
+import app.core.application.document_service as document_service_module
 from app.adapters.documents.document_basic_pack import PACK_VERSION
 from app.adapters.models.legacy_gpt import (
     LegacyModelBinding,
@@ -58,7 +61,7 @@ from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import VideoProduceRequest
 from app.core.errors import DomainError
 from app.core.jobs.external_operation import ExternalOperationGuard
-from app.core.jobs.model import JobState
+from app.core.jobs.model import AttemptState, JobState
 from app.core.jobs.resource_lease import ResourceOwner
 from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -174,6 +177,183 @@ class _RoutingStageBridge:
             output_tokens=10,
             actual_model=self.model_identity,
         )
+
+
+class _ForbiddenStageBridge:
+    def __init__(self, model_identity: str) -> None:
+        self.model_identity = model_identity
+        self.calls = 0
+
+    def complete_request(
+        self,
+        prompt: str,
+        request,
+        *,
+        check_cancelled=None,
+    ) -> LegacyModelResponse:
+        del prompt, request, check_cancelled
+        self.calls += 1
+        raise AssertionError("successful model operations must not be replayed")
+
+
+class _TerminateAfterVerificationAssembler:
+    def assemble(self, *args, **kwargs) -> None:
+        del args, kwargs
+        os._exit(23)
+
+
+def _compiled_stage_response() -> dict[str, object]:
+    return {
+        "title": {
+            "text": "Compiled paper note",
+            "source_block_ids": ["blk_title"],
+        },
+        "overview": [
+            {
+                "text": "The paper studies glossy reflections.",
+                "source_block_ids": ["blk_title"],
+            }
+        ],
+        "sections": [
+            {
+                "heading": {
+                    "text": "Main idea",
+                    "source_block_ids": ["blk_title"],
+                },
+                "paragraphs": [
+                    {
+                        "text": "The source establishes the topic.",
+                        "source_block_ids": ["blk_title"],
+                    }
+                ],
+                "key_points": [],
+            }
+        ],
+    }
+
+
+def _verification_stage_response() -> dict[str, object]:
+    return {
+        "claims": [
+            {"claim_id": claim_id, "status": "supported"}
+            for claim_id in (
+                "title-0001",
+                "overview-0001",
+                "section-0001-heading-0001",
+                "section-0001-paragraph-0001",
+            )
+        ]
+    }
+
+
+def _legacy_model_binding(identity: str, bridge: object) -> LegacyModelBinding:
+    return LegacyModelBinding(
+        provider_kind="fixture",
+        model_identity=identity,
+        bridge=bridge,
+        capabilities=LegacyModelCapabilities(),
+    )
+
+
+def _core_model_binding(identity: str) -> ModelExecutionBinding:
+    return ModelExecutionBinding(
+        schema_version=1,
+        provider_type="fixture",
+        model_identity=identity,
+        credential_profile_ref="fixture/credential",
+        context_window_tokens=128_000,
+        max_output_tokens=4_096,
+        max_concurrency=1,
+        supports_structured_output=True,
+        supports_temperature=True,
+        timeout_seconds=60,
+    )
+
+
+def _dual_model_runtime(
+    machine_root: Path,
+    *,
+    owner_id: str,
+    clock: Callable[[], int],
+    composer_bridge: object,
+    verifier_bridge: object,
+) -> runtime_module.AllToNoteRuntime:
+    composer_identity = "fixture/composer-v1"
+    verifier_identity = "fixture/reviewer-v1"
+    return runtime_module.create_document_runtime(
+        machine_root,
+        worker_config=object(),  # type: ignore[arg-type]
+        model=_legacy_model_binding(composer_identity, composer_bridge),
+        model_execution_binding=_core_model_binding(composer_identity),
+        model_execution_profile="composer",
+        verifier_model=_legacy_model_binding(verifier_identity, verifier_bridge),
+        verifier_model_execution_binding=_core_model_binding(verifier_identity),
+        verifier_model_execution_profile="reviewer",
+        owner_id=owner_id,
+        local_instance_id="document-test",
+        clock=clock,
+    )
+
+
+def _terminate_after_document_model_success(
+    machine_root: str,
+    job_id: str,
+) -> None:
+    runtime_module.DoclingWorkerParser = lambda _config: _RuntimeParser()
+    document_service_module.DocumentBundleAssembler = (
+        _TerminateAfterVerificationAssembler
+    )
+    runtime = _dual_model_runtime(
+        Path(machine_root),
+        owner_id="lost-document-process",
+        clock=lambda: 1_000,
+        composer_bridge=_RoutingStageBridge(
+            "fixture/composer-v1",
+            {"document-knowledge-compose": _compiled_stage_response()},
+        ),
+        verifier_bridge=_RoutingStageBridge(
+            "fixture/reviewer-v1",
+            {"document-knowledge-verify": _verification_stage_response()},
+        ),
+    )
+    runtime.wait_job(job_id)
+    os._exit(24)
+
+
+def _document_operation_rows(
+    machine_root: Path,
+    job_id: str,
+) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(machine_root / "job-store" / "jobs.sqlite") as connection:
+        rows = connection.execute(
+            """
+            SELECT operation_id, job_id, step_id, attempt_id, provider,
+                   request_hash, operation_idempotency_key, provider_request_id,
+                   outcome, summary_json, created_at, updated_at
+            FROM external_operations
+            WHERE job_id = ?
+            ORDER BY rowid
+            """,
+            (job_id,),
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _document_checkpoint_count(
+    machine_root: Path,
+    job_id: str,
+    step_id: str,
+) -> int:
+    with sqlite3.connect(machine_root / "job-store" / "jobs.sqlite") as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) FROM checkpoints
+            WHERE job_id = ? AND step_id = ?
+            """,
+            (job_id, step_id),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 class _KnowledgeCompiler:
@@ -964,6 +1144,206 @@ def test_document_runtime_routes_v2_self_review_and_v3_independent_verifier(
         "document-knowledge-compose",
     ]
     assert verifier_bridge.calls == ["document-knowledge-verify"]
+
+
+def test_document_process_restart_recovers_both_model_calls_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    machine_root = tmp_path / "machine-restart"
+    submit_service, submit_repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="submit-process",
+        knowledge_compiler=_KnowledgeCompiler(
+            verifier_provider_profile="reviewer",
+            verifier_model_identity="fixture/reviewer-v1",
+        ),
+    )
+    submission = ProduceService(
+        RecipeRegistry(
+            ((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(submit_service)),)
+        )
+    ).submit(
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(workspace),
+            ("knowledge-note",),
+            {
+                "provider_profile": "composer",
+                "model_override": "fixture/composer-v1",
+                "output_language": "en",
+                "verifier_provider_profile": "reviewer",
+                "verifier_model_override": "fixture/reviewer-v1",
+            },
+        )
+    )
+    stored_request = json.loads(
+        submit_repository.get_job_request(submission.job_id) or ""
+    )
+    assert stored_request["request_schema_version"] == 3
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_terminate_after_document_model_success,
+        args=(str(machine_root), submission.job_id),
+    )
+    process.start()
+    process.join(timeout=30)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+        pytest.fail("Document crash fixture did not terminate")
+    assert process.exitcode == 23
+
+    crashed_repository = SqliteJobRepository.open(
+        machine_root / "job-store",
+        clock=lambda: 301_001,
+    )
+    crashed_job, crashed_attempt, crashed_result = (
+        crashed_repository.get_job_details(submission.job_id)
+    )
+    assert crashed_job.state is JobState.RUNNING
+    assert crashed_attempt is not None
+    assert crashed_attempt.step_id == "assemble_candidate_bundle"
+    assert crashed_attempt.state is AttemptState.RUNNING
+    assert crashed_attempt.fencing_token == 1
+    assert crashed_result is None
+
+    parse_checkpoint = crashed_repository.latest_checkpoint(
+        submission.job_id,
+        "parse_document",
+    )
+    assert parse_checkpoint is not None
+    assert (
+        crashed_repository.latest_checkpoint(
+            submission.job_id,
+            "assemble_candidate_bundle",
+        )
+        is None
+    )
+    parse_path = machine_root / "attempts" / parse_checkpoint.relative_path
+    parse_before = (
+        parse_checkpoint,
+        parse_path.read_bytes(),
+        parse_path.stat().st_mtime_ns,
+    )
+
+    operations_before = _document_operation_rows(
+        machine_root,
+        submission.job_id,
+    )
+    assert len(operations_before) == 2
+    assert {row[8] for row in operations_before} == {
+        "external_outcome_succeeded"
+    }
+    assert len({row[5] for row in operations_before}) == 2
+    summaries = tuple(json.loads(str(row[9])) for row in operations_before)
+    assert {summary["shard_key"] for summary in summaries} == {
+        "document-note",
+        "document-note-verification",
+    }
+    result_root = machine_root / "attempts" / "model-operations"
+    model_results_before = {
+        summary["result"]["path"]: (
+            (result_root / summary["result"]["path"]).read_bytes(),
+            (result_root / summary["result"]["path"]).stat().st_mtime_ns,
+        )
+        for summary in summaries
+    }
+    assert len(model_results_before) == 2
+    assert (
+        _document_checkpoint_count(
+            machine_root,
+            submission.job_id,
+            "parse_document",
+        )
+        == 1
+    )
+    assert not tuple(workspace.rglob("commit.json"))
+
+    recovered_parser = _RuntimeParser()
+    composer_bridge = _ForbiddenStageBridge("fixture/composer-v1")
+    verifier_bridge = _ForbiddenStageBridge("fixture/reviewer-v1")
+    monkeypatch.setattr(
+        runtime_module,
+        "DoclingWorkerParser",
+        lambda _config: recovered_parser,
+    )
+    recovered_runtime = _dual_model_runtime(
+        machine_root,
+        owner_id="recovered-document-process",
+        clock=lambda: 301_001,
+        composer_bridge=composer_bridge,
+        verifier_bridge=verifier_bridge,
+    )
+
+    completed = recovered_runtime.wait_job(submission.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert completed.result.quality_overall == "pass"
+    assert completed.result.publish_eligible is True
+    assert recovered_parser.calls == 0
+    assert composer_bridge.calls == 0
+    assert verifier_bridge.calls == 0
+    assert _document_operation_rows(machine_root, submission.job_id) == (
+        operations_before
+    )
+    assert {
+        name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for name in model_results_before
+        for path in (result_root / name,)
+    } == model_results_before
+
+    parse_after = recovered_runtime.job_repository.latest_checkpoint(
+        submission.job_id,
+        "parse_document",
+    )
+    assert parse_after == parse_before[0]
+    assert parse_path.read_bytes() == parse_before[1]
+    assert parse_path.stat().st_mtime_ns == parse_before[2]
+    assert (
+        _document_checkpoint_count(
+            machine_root,
+            submission.job_id,
+            "parse_document",
+        )
+        == 1
+    )
+    assert len(
+        tuple(
+            (machine_root / "attempts" / "model-operations").glob("*.json")
+        )
+    ) == 2
+    candidate_checkpoint = recovered_runtime.job_repository.latest_checkpoint(
+        submission.job_id,
+        "assemble_candidate_bundle",
+    )
+    assert candidate_checkpoint is not None
+    assemble_attempts = sorted(
+        (
+            attempt
+            for attempt in recovered_runtime.job_repository.list_attempts(
+                submission.job_id
+            )
+            if attempt.step_id == "assemble_candidate_bundle"
+        ),
+        key=lambda attempt: attempt.fencing_token,
+    )
+    assert len(assemble_attempts) == 2
+    assert assemble_attempts[0].attempt_id == crashed_attempt.attempt_id
+    assert assemble_attempts[0].state is AttemptState.INTERRUPTED
+    assert assemble_attempts[0].fencing_token == 1
+    assert assemble_attempts[1].state is AttemptState.SUCCEEDED
+    assert assemble_attempts[1].fencing_token == 2
+    assert candidate_checkpoint.attempt_id == assemble_attempts[1].attempt_id
+    assert len(tuple(workspace.rglob("commit.json"))) == 1
 
 
 def test_document_v2_fails_before_parsing_when_compiler_is_unavailable(
