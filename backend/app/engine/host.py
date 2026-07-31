@@ -34,6 +34,7 @@ from app.engine.transport import (
     AUTHENTICATION_TIMEOUT_SECONDS,
     EngineListener,
     authenticate_server,
+    connect_engine,
     create_engine_listener,
     receive_bytes,
 )
@@ -187,13 +188,27 @@ def run_engine_host(
                 stop_event.set()
     finally:
         stop_event.set()
+        if server is not None and server.is_alive():
+            wake_connection = None
+            try:
+                wake_connection = connect_engine(
+                    paths.endpoint_name,
+                    authkey=authkey,
+                    expected_pid=os.getpid(),
+                    timeout_seconds=AUTHENTICATION_TIMEOUT_SECONDS,
+                )
+            except (AuthenticationError, EOFError, OSError, TimeoutError):
+                pass
+            finally:
+                if wake_connection is not None:
+                    wake_connection.close()
+        if server is not None:
+            server.join(timeout=AUTHENTICATION_TIMEOUT_SECONDS + 0.5)
         if listener is not None:
             try:
                 listener.close()
             except OSError:
                 pass
-        if server is not None:
-            server.join(timeout=AUTHENTICATION_TIMEOUT_SECONDS + 0.5)
         with active_lock:
             remaining_clients = tuple(client_threads)
         for worker in remaining_clients:
