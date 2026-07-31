@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "runtime_source_commit": "9b77912e9186c4b8007fe4e6c0118c25980b8846",
+  "runtime_source_commit": "edc3a6d91af1c77f1357bbc1019189c188474bf4",
   "runtime_version": "0.1.0",
   "platform": "windows-x86_64",
   "python": {
@@ -19,7 +19,7 @@
     "source_id": "2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc"
   },
   "wheels": [
-    {"filename": "alltonote_runtime-0.1.0-py3-none-any.whl", "byte_length": 533604, "sha256": "eaf2a4bd31942a372a75201b075305424771b7780d165bf9cea1f42c8408038d"},
+    {"filename": "alltonote_runtime-0.1.0-py3-none-any.whl", "byte_length": 533760, "sha256": "e7282cd7744b363d149a900d4f19d484ad705dee56eda49b678b45d952c8acd7"},
     {"filename": "cffi-2.1.0-cp314-cp314-win_amd64.whl", "byte_length": 187937, "sha256": "1b96bfe2c4bd825681b7d311ad6d9b7280a091f43e8f63da5729638083cd3bfb"},
     {"filename": "cryptography-46.0.7-cp311-abi3-win_amd64.whl", "byte_length": 3488363, "sha256": "397655da831414d165029da9bc483bed2fe0e75dde6a1523ec2fe63f3c46046b"},
     {"filename": "filelock-3.32.2-py3-none-any.whl", "byte_length": 98830, "sha256": "87dd94cf281e586d135fa51132b8e3d9a598b316e90377a288663c9321036c82"},
