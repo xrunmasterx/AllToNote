@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -45,6 +46,8 @@ from app.core.ports.portable import PortableWorkspacePort
 CHECKPOINT_SCHEMA = "document-step.v1"
 _LEASE_TTL_SECONDS = 300
 _HEARTBEAT_SECONDS = 30.0
+_LOCAL_DOCUMENT_PATH_CONNECTOR = "local-document-path-v1"
+_LEGACY_DOCUMENT_CONTENT_CONNECTOR = "local-document-sha256"
 _BINDING = JobExecutionBinding(
     recipe_id="alltonote.document-note",
     recipe_version=1,
@@ -79,6 +82,10 @@ class DocumentService:
         checkpoint_reader: Callable[[CheckpointMetadata], bytes],
         owner_id: str,
         local_instance_id: str,
+        source_identity_resolver: Callable[
+            [Path, str, str],
+            SourceIdentityBinding | None,
+        ],
         resource_lease_store: ResourceLeaseStorePort | None = None,
         resource_owner: ResourceOwner | None = None,
     ) -> None:
@@ -97,6 +104,7 @@ class DocumentService:
         self._checkpoint_reader = checkpoint_reader
         self._owner_id = owner_id
         self._local_instance_id = local_instance_id
+        self._source_identity_resolver = source_identity_resolver
         self._resource_lease_store = resource_lease_store
         self._resource_owner = resource_owner
         self._active_resource_lease: ResourceLease | None = None
@@ -285,12 +293,18 @@ class DocumentService:
             local_instance_id=self._local_instance_id,
             nonce=sha256_digest(f"document-candidate-v1:{job_id}")[7:39],
         )
+        connector_id, canonical_identity = self._source_identity(request)
         candidate = DocumentBundleAssembler().assemble(
             parsed,
             job_id=job_id,
             created_at=created_at,
             location=location,
-            source_id=self._existing_source_id(request),
+            source_id=self._existing_source_id(
+                request.workspace_root,
+                connector_id,
+                canonical_identity,
+            ),
+            source_canonical_identity=canonical_identity,
         )
         block_count = sum(len(page.blocks) for page in parsed.pages)
         return DocumentCandidateCheckpoint(
@@ -311,17 +325,43 @@ class DocumentService:
             publish_eligible=candidate.publish_eligible,
             usage={"pages": len(parsed.pages), "blocks": block_count},
             warnings=parsed.warnings,
+            source_identity_connector_id=connector_id,
+            source_canonical_identity=canonical_identity,
         )
 
     def _existing_source_id(
         self,
-        request: DocumentProduceRequest,
+        workspace_root: Path,
+        connector_id: str,
+        canonical_identity: str,
     ) -> str | None:
-        binding = self._repository.read_source_identity_candidate(
-            "local-document-sha256",
-            request.expected_source_sha256,
+        binding = self._source_identity_resolver(
+            workspace_root,
+            connector_id,
+            canonical_identity,
         )
+        if binding is not None and (
+            binding.connector_id != connector_id
+            or binding.canonical_identity != canonical_identity
+        ):
+            raise DomainError(
+                "source_identity_resolution_invalid",
+                ErrorCategory.INTERNAL,
+                "Resolved Document source identity does not match the request",
+            )
         return binding.source_id if binding is not None else None
+
+    def _source_identity(
+        self,
+        request: DocumentProduceRequest,
+    ) -> tuple[str, str]:
+        normalized_path = os.path.normcase(
+            os.path.normpath(str(request.input_path))
+        )
+        return (
+            _LOCAL_DOCUMENT_PATH_CONNECTOR,
+            sha256_digest(f"{self._local_instance_id}\0{normalized_path}"),
+        )
 
     def _validate(
         self,
@@ -373,6 +413,10 @@ class DocumentService:
 
         try:
             self._heartbeat_resource_lease()
+            connector_id, canonical_identity = self._checkpoint_source_identity(
+                request,
+                checkpoint,
+            )
             self._repository.commit_recipe_result_atomic(
                 attempt.job_id,
                 attempt.attempt_id,
@@ -392,8 +436,8 @@ class DocumentService:
                     warnings=checkpoint.warnings,
                 ),
                 source_identity=SourceIdentityBinding(
-                    connector_id="local-document-sha256",
-                    canonical_identity=request.expected_source_sha256,
+                    connector_id=connector_id,
+                    canonical_identity=canonical_identity,
                     source_id=checkpoint.source_id,
                     owning_bundle_id=checkpoint.bundle_id,
                     manifest_sha256=checkpoint.manifest_sha256,
@@ -405,6 +449,28 @@ class DocumentService:
                 self._portable.discard_prepared(prepared)
             raise
         return self.get_job(attempt.job_id)
+
+    def _checkpoint_source_identity(
+        self,
+        request: DocumentProduceRequest,
+        checkpoint: DocumentCandidateCheckpoint,
+    ) -> tuple[str, str]:
+        if checkpoint.source_identity_connector_id is None:
+            return (
+                _LEGACY_DOCUMENT_CONTENT_CONNECTOR,
+                request.expected_source_sha256,
+            )
+        expected = self._source_identity(request)
+        if expected != (
+            checkpoint.source_identity_connector_id,
+            checkpoint.source_canonical_identity,
+        ):
+            raise DomainError(
+                "candidate_checkpoint_invalid",
+                ErrorCategory.INTERNAL,
+                "Document candidate checkpoint source identity is invalid",
+            )
+        return expected
 
     def _reconcile_commit(
         self,

@@ -137,16 +137,38 @@ class DocumentCandidateCheckpoint:
     publish_eligible: bool
     usage: Mapping[str, int]
     warnings: tuple[str, ...]
+    source_identity_connector_id: str | None = None
+    source_canonical_identity: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "artifacts", MappingProxyType(dict(self.artifacts)))
         object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        if (self.source_identity_connector_id is None) != (
+            self.source_canonical_identity is None
+        ) or (
+            self.source_identity_connector_id is not None
+            and (
+                type(self.source_identity_connector_id) is not str
+                or not self.source_identity_connector_id
+                or type(self.source_canonical_identity) is not str
+                or not self.source_canonical_identity
+            )
+        ):
+            raise _invalid()
 
     def encode(self) -> bytes:
+        identity = (
+            {}
+            if self.source_identity_connector_id is None
+            else {
+                "source_identity_connector_id": self.source_identity_connector_id,
+                "source_canonical_identity": self.source_canonical_identity,
+            }
+        )
         return json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 1 if not identity else 2,
                 "staging_relative_path": self.staging_relative_path,
                 "bundle_id": self.bundle_id,
                 "manifest_sha256": self.manifest_sha256,
@@ -158,6 +180,7 @@ class DocumentCandidateCheckpoint:
                 "publish_eligible": self.publish_eligible,
                 "usage": dict(self.usage),
                 "warnings": list(self.warnings),
+                **identity,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -169,7 +192,7 @@ class DocumentCandidateCheckpoint:
     def decode(cls, payload: bytes) -> "DocumentCandidateCheckpoint":
         try:
             value = json.loads(payload)
-            expected_fields = frozenset(
+            version_one_fields = frozenset(
                 {
                     "schema_version",
                     "staging_relative_path",
@@ -185,10 +208,24 @@ class DocumentCandidateCheckpoint:
                     "warnings",
                 }
             )
+            version_two_fields = version_one_fields | {
+                "source_identity_connector_id",
+                "source_canonical_identity",
+            }
+            schema_version = (
+                value.get("schema_version") if type(value) is dict else None
+            )
             if (
                 type(value) is not dict
-                or frozenset(value) != expected_fields
-                or value.get("schema_version") != 1
+                or (
+                    schema_version == 1
+                    and frozenset(value) != version_one_fields
+                )
+                or (
+                    schema_version == 2
+                    and frozenset(value) != version_two_fields
+                )
+                or schema_version not in {1, 2}
             ):
                 raise TypeError
             return cls(
@@ -203,6 +240,10 @@ class DocumentCandidateCheckpoint:
                 publish_eligible=value["publish_eligible"],
                 usage=value["usage"],
                 warnings=tuple(value["warnings"]),
+                source_identity_connector_id=value.get(
+                    "source_identity_connector_id"
+                ),
+                source_canonical_identity=value.get("source_canonical_identity"),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             raise _invalid() from None

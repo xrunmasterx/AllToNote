@@ -165,6 +165,7 @@ class DocumentBundleAssembler:
         job_id: str,
         created_at: str,
         location: CandidateLocationCapabilityPort,
+        source_canonical_identity: str,
         source_id: str | None = None,
     ) -> DocumentCandidate:
         ids = {
@@ -428,11 +429,15 @@ class DocumentBundleAssembler:
             }
             for payload in payloads
         ]
+        external_ref_id = f"ext_{ids['source'].removeprefix('src_')}"
         source_document = {
             "source_schema_version": 1,
             "source_id": ids["source"],
             "source_kind": "document",
-            "canonical_identity": {"scheme": "sha256", "value": parsed.source_sha256[7:]},
+            "canonical_identity": {
+                "scheme": "local-document-path-v1",
+                "value": source_canonical_identity,
+            },
             "display": {"title": title},
             "extensions": {},
         }
@@ -443,7 +448,10 @@ class DocumentBundleAssembler:
             "captured_at": created_at,
             "observed_revision": {"sha256": parsed.source_sha256},
             "content_digest": parsed.source_sha256,
-            "materialization": {"kind": "reference_only", "reason_code": "user-local-file"},
+            "materialization": {
+                "kind": "external_local",
+                "external_ref_id": external_ref_id,
+            },
             "license": {"status": "unknown", "archive_permission": "unknown"},
             "privacy": "personal",
             "freshness": {"kind": "snapshot", "observed_at": created_at},

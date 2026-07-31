@@ -141,6 +141,7 @@ def test_document_candidate_is_semantically_valid_portable_bundle(
         parsed,
         job_id=new_typed_id("job"),
         created_at="2026-07-30T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=gateway.candidate_location(
             workspace,
             local_instance_id="document-x0b",
@@ -213,6 +214,7 @@ def test_document_candidate_renders_untrusted_pdf_text_without_markdown_authorit
         parsed,
         job_id=new_typed_id("job"),
         created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=gateway.candidate_location(
             workspace,
             local_instance_id="document-markdown-safety",
@@ -313,6 +315,7 @@ def test_document_candidate_fails_closed_when_final_markdown_validation_fails(
         parsed,
         job_id=new_typed_id("job"),
         created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=gateway.candidate_location(
             workspace,
             local_instance_id="document-markdown-fail-closed",
@@ -377,6 +380,7 @@ def test_document_candidate_is_not_publishable_when_extraction_is_empty(
         parsed,
         job_id=new_typed_id("job"),
         created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=IWikiPortableGateway().candidate_location(
             workspace,
             local_instance_id="document-empty-quality",
@@ -413,6 +417,7 @@ def test_document_candidate_is_not_publishable_for_partial_extraction(
         parsed,
         job_id=new_typed_id("job"),
         created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=IWikiPortableGateway().candidate_location(
             workspace,
             local_instance_id="document-partial-quality",
@@ -450,6 +455,7 @@ def test_document_literal_projection_blocks_gfm_autolinks_and_setext_headings(
         _document_with_blocks(("paragraph", body)),
         job_id=new_typed_id("job"),
         created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=IWikiPortableGateway().candidate_location(
             workspace,
             local_instance_id="document-gfm-literal-safety",
@@ -523,6 +529,7 @@ def test_document_candidate_preserves_safe_docling_table_structure(
         parsed,
         job_id=new_typed_id("job"),
         created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
         location=IWikiPortableGateway().candidate_location(
             workspace,
             local_instance_id="document-table-safety",

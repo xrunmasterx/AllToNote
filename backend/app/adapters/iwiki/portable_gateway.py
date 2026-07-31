@@ -271,8 +271,9 @@ def _read_verified_source_bindings(
     bindings: list[SourceIdentityBinding] = []
     seen: set[tuple[str, str, str]] = set()
     for source in manifest["sources"]:
-        if type(source) is not dict or source.get("source_kind") != "video":
+        if type(source) is not dict:
             continue
+        source_kind = source.get("source_kind")
         source_id = source.get("source_id")
         canonical = source.get("canonical_identity")
         extensions = source.get("extensions")
@@ -285,19 +286,30 @@ def _read_verified_source_bindings(
             continue
         scheme = canonical.get("scheme")
         value = canonical.get("value")
-        video_extension = extensions.get("alltonote.video:source")
         if (
             type(scheme) is not str
             or not scheme
             or type(value) is not str
             or not value
-            or type(video_extension) is not dict
         ):
             continue
-        connector_id = video_extension.get("connector_id")
-        if type(connector_id) is not str or not connector_id:
+        if source_kind == "video":
+            video_extension = extensions.get("alltonote.video:source")
+            if type(video_extension) is not dict:
+                continue
+            connector_id = video_extension.get("connector_id")
+            if type(connector_id) is not str or not connector_id:
+                continue
+            identity = f"{scheme}:{value}"
+        elif (
+            source_kind == "document"
+            and scheme == "local-document-path-v1"
+            and _MANIFEST_DIGEST.fullmatch(value) is not None
+        ):
+            connector_id = scheme
+            identity = value
+        else:
             continue
-        identity = f"{scheme}:{value}"
         key = (connector_id, identity, source_id)
         if key in seen:
             continue

@@ -121,6 +121,7 @@ from app.core.packs.events import (
     JobPackEnvironmentSnapshot,
 )
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
+from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.model import KnowledgeModelRequest
 from app.core.ports.model_executor import ModelExecutionBinding
 from app.core.ports.screenshot import ScreenshotPort
@@ -1603,16 +1604,30 @@ def create_document_runtime(
             DOCUMENT_CHECKPOINT_SCHEMA: _document_checkpoint_payload_is_valid,
         },
     )
+    portable = IWikiPortableGateway()
+
+    def resolve_source_identity(
+        workspace_root: Path,
+        connector_id: str,
+        canonical_identity: str,
+    ) -> SourceIdentityBinding | None:
+        return VerifiedSourceIdentityRegistry(
+            workspace_root,
+            cache=repository,
+            truth=portable,
+        ).resolve_verified(connector_id, canonical_identity)
+
     service = DocumentService(
         repository,
         storage,
         parser,
-        IWikiPortableGateway(),
+        portable,
         work_root=storage.root,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
         owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
+        source_identity_resolver=resolve_source_identity,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )

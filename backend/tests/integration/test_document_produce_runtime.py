@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,8 @@ from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+from app.adapters.sources.legacy_video import VerifiedSourceIdentityRegistry
+from app.core.application.document_checkpoints import DocumentCandidateCheckpoint
 from app.core.application.document_service import CHECKPOINT_SCHEMA, DocumentService
 from app.core.application.job_execution_router import JobExecutionRouter
 from app.core.application.produce_service import ProduceService
@@ -22,13 +26,16 @@ from app.core.domain.document import (
     DocumentBlock,
     DocumentBoundingBox,
     DocumentPage,
+    DocumentProduceRequest,
     ParsedDocument,
 )
+from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import VideoProduceRequest
 from app.core.errors import DomainError
 from app.core.jobs.model import JobState
 from app.core.jobs.resource_lease import ResourceOwner
+from app.core.ports.jobs import SourceIdentityBinding
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
 from app.core.recipes.document.adapter import DocumentRecipeAdapter
 from app.core.recipes.document.descriptor import DOCUMENT_NOTE_V1
@@ -130,6 +137,18 @@ def _service(
             CHECKPOINT_SCHEMA: lambda payload: isinstance(json.loads(payload), dict)
         },
     )
+
+    def resolve_source_identity(
+        workspace_root: Path,
+        connector_id: str,
+        canonical_identity: str,
+    ) -> SourceIdentityBinding | None:
+        return VerifiedSourceIdentityRegistry(
+            workspace_root,
+            cache=repository,
+            truth=gateway,
+        ).resolve_verified(connector_id, canonical_identity)
+
     service = DocumentService(
         repository,
         storage,
@@ -141,6 +160,7 @@ def _service(
         ).read_bytes(),
         owner_id=owner_id,
         local_instance_id="document-test",
+        source_identity_resolver=resolve_source_identity,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
@@ -230,8 +250,202 @@ def test_document_recipe_uses_generic_submit_and_survives_reopen(tmp_path: Path)
     assert second.state is JobState.SUCCEEDED
     assert isinstance(second.result, RecipeProduceResult)
     assert second.result.source_id == completed.result.source_id
+    assert second.result.source_revision_id != completed.result.source_revision_id
     assert second.result.bundle_id != completed.result.bundle_id
     assert parser.calls == 2
+
+
+def test_document_source_identity_tracks_path_while_revision_tracks_bytes(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    first_source = tmp_path / "first paper.pdf"
+    second_source = tmp_path / "second paper.pdf"
+    original = b"%PDF-1.7\nidentical fixture\n"
+    first_source.write_bytes(original)
+    second_source.write_bytes(original)
+    parser = _Parser()
+    service, repository = _service(
+        tmp_path / "machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    legacy_source_id = new_typed_id("src")
+    repository.cache_source_identity_candidate(
+        SourceIdentityBinding(
+            connector_id="local-document-sha256",
+            canonical_identity="sha256:" + hashlib.sha256(original).hexdigest(),
+            source_id=legacy_source_id,
+            owning_bundle_id=new_typed_id("bnd"),
+            manifest_sha256="sha256:" + "a" * 64,
+        )
+    )
+    current_identity = sha256_digest(
+        "document-test\0"
+        + os.path.normcase(os.path.normpath(str(first_source.resolve())))
+    )
+    stale_source_id = new_typed_id("src")
+    stale_binding = SourceIdentityBinding(
+        connector_id="local-document-path-v1",
+        canonical_identity=current_identity,
+        source_id=stale_source_id,
+        owning_bundle_id=new_typed_id("bnd"),
+        manifest_sha256="sha256:" + "b" * 64,
+    )
+    repository.cache_source_identity_candidate(stale_binding)
+
+    first_job_id, first_router = _submit(
+        service,
+        repository,
+        workspace,
+        first_source,
+    )
+    first = first_router.wait_job(first_job_id)
+    second_job_id, second_router = _submit(
+        service,
+        repository,
+        workspace,
+        second_source,
+    )
+    second = second_router.wait_job(second_job_id)
+
+    assert first.state is JobState.SUCCEEDED
+    assert second.state is JobState.SUCCEEDED
+    assert isinstance(first.result, RecipeProduceResult)
+    assert isinstance(second.result, RecipeProduceResult)
+    assert first.result.source_id != legacy_source_id
+    assert first.result.source_id != stale_source_id
+    assert first.result.source_id != second.result.source_id
+    assert first.result.source_revision_id != second.result.source_revision_id
+
+    verified_binding = repository.read_source_identity_candidate(
+        "local-document-path-v1",
+        current_identity,
+    )
+    assert verified_binding is not None
+    repository.discard_source_identity_candidate(verified_binding)
+    rebuilt_job_id, rebuilt_router = _submit(
+        service,
+        repository,
+        workspace,
+        first_source,
+    )
+    rebuilt = rebuilt_router.wait_job(rebuilt_job_id)
+    assert rebuilt.state is JobState.SUCCEEDED
+    assert isinstance(rebuilt.result, RecipeProduceResult)
+    assert rebuilt.result.source_id == first.result.source_id
+    assert rebuilt.result.source_revision_id != first.result.source_revision_id
+
+    previous_mtime_ns = first_source.stat().st_mtime_ns
+    changed = b"%PDF-1.7\nchanged fixture content\n"
+    first_source.write_bytes(changed)
+    os.utime(
+        first_source,
+        ns=(previous_mtime_ns + 1_000_000_000, previous_mtime_ns + 1_000_000_000),
+    )
+    changed_job_id, changed_router = _submit(
+        service,
+        repository,
+        workspace,
+        first_source,
+    )
+    changed_result = changed_router.wait_job(changed_job_id)
+
+    assert changed_result.state is JobState.SUCCEEDED
+    assert isinstance(changed_result.result, RecipeProduceResult)
+    assert changed_result.result.source_id == first.result.source_id
+    assert changed_result.result.source_revision_id != first.result.source_revision_id
+
+    first_manifest = json.loads(
+        (
+            workspace
+            / first.result.workspace_relative_bundle_path
+            / "bundle.json"
+        ).read_text(encoding="utf-8")
+    )
+    second_manifest = json.loads(
+        (
+            workspace
+            / second.result.workspace_relative_bundle_path
+            / "bundle.json"
+        ).read_text(encoding="utf-8")
+    )
+    changed_manifest_path = (
+        workspace
+        / changed_result.result.workspace_relative_bundle_path
+        / "bundle.json"
+    )
+    changed_manifest_text = changed_manifest_path.read_text(encoding="utf-8")
+    changed_manifest = json.loads(changed_manifest_text)
+    first_identity = first_manifest["sources"][0]["canonical_identity"]
+    second_identity = second_manifest["sources"][0]["canonical_identity"]
+    changed_identity = changed_manifest["sources"][0]["canonical_identity"]
+
+    assert first_identity["scheme"] == "local-document-path-v1"
+    assert first_identity != second_identity
+    assert changed_identity == first_identity
+    assert changed_manifest["source_revisions"][0]["content_digest"] == (
+        "sha256:" + hashlib.sha256(changed).hexdigest()
+    )
+    assert changed_manifest["source_revisions"][0]["materialization"] == {
+        "kind": "external_local",
+        "external_ref_id": f"ext_{first.result.source_id.removeprefix('src_')}",
+    }
+    assert str(first_source) not in changed_manifest_text
+    assert str(first_source.parent) not in changed_manifest_text
+
+
+def test_document_candidate_checkpoint_identity_modes_fail_closed(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    raw = b"%PDF-1.7\nfixture\n"
+    source.write_bytes(raw)
+    service, _ = _service(
+        tmp_path / "machine",
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    stat = source.stat()
+    request = DocumentProduceRequest(
+        1,
+        workspace,
+        source.resolve(),
+        "sha256:" + hashlib.sha256(raw).hexdigest(),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+    legacy = DocumentCandidateCheckpoint(
+        staging_relative_path="raw/personal/.staging/candidate",
+        bundle_id=new_typed_id("bnd"),
+        manifest_sha256="sha256:" + "a" * 64,
+        run_id=new_typed_id("run"),
+        source_id=new_typed_id("src"),
+        source_revision_id=new_typed_id("rev"),
+        artifacts={"primary_draft": new_typed_id("art")},
+        quality_overall="pass",
+        publish_eligible=False,
+        usage={"pages": 1, "blocks": 1},
+        warnings=(),
+    )
+
+    assert service._checkpoint_source_identity(request, legacy) == (
+        "local-document-sha256",
+        request.expected_source_sha256,
+    )
+    current_connector, current_identity = service._source_identity(request)
+    mismatched = replace(
+        legacy,
+        source_identity_connector_id=current_connector,
+        source_canonical_identity="sha256:" + "b" * 64,
+    )
+    with pytest.raises(DomainError) as caught:
+        service._checkpoint_source_identity(request, mismatched)
+    assert caught.value.code == "candidate_checkpoint_invalid"
+    assert current_identity != mismatched.source_canonical_identity
 
 
 def test_document_commit_crash_reuses_bundle_without_duplicate_effect(tmp_path: Path) -> None:
