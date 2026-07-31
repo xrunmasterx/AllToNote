@@ -57,7 +57,7 @@ Stop condition：
 - [x] 记录 portable commit writer-lock 持有时间；
 - [x] busy/locked 被映射为稳定、可诊断的运行时错误或重试策略；
 - [ ] 不因预期未来压力迁移到 PostgreSQL/Redis；
-- [ ] legacy JobStore 可无损打开。
+- [x] legacy JobStore 可无损打开。
 
 Stop condition：
 
@@ -75,7 +75,8 @@ Stop condition：
 - Gate 对未进入项目白名单的 SQLite 在创建临时状态和 spawn 前 fail closed。2026-07-31 使用 SHA-256 为 `df901e84a896ff1ee720ad03377e0c8d8c2244fda79808aeeaff6316df1cb75c` 的官方 CPython 3.14.6 embeddable x64 与 SHA3-256 为 `deddee963c810d1eeac3ce5e15c7c41da21a1c54d7a39cf54fbf577d2f50de3a` 的官方 SQLite 3.53.4 x64 DLL 完成 ABI 探针；实际加载 source id 为 `2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc`；
 - 同一 SQLite 3.53.4 二进制随后通过完整 1/4/8/16 connection WAL Gate：短写、混合读写、在线 PASSIVE checkpoint、forced busy 后调用方显式重试、portable commit writer-lock、未提交/已确认崩溃恢复、最终 TRUNCATE、integrity、foreign-key 与 schema 版本检查均通过；Gate 仍明确报告 `parallel_job_execution_enabled=false`，尚未打开服务并行；
 - 已新增离线 Windows directory Runtime assembler 与固定输入 lock；由工具组装的 `runtime-portable-sqlite-v5` 候选从自身通过 version/info/doctor、中文空格路径 Workspace 初始化和完整 WAL Gate，并把实际加载的 `python314.dll`、`_sqlite3.pyd`、`sqlite3.dll` 约束在 artifact root 内；694 个 payload 文件由相对路径、byte length、SHA-256 清单覆盖，且无 worktree/input/builder 绝对路径、`direct_url.json` 或生成式 pip launcher；
-- Task 2 仍待：clean non-admin VM/Defender/中文用户 Gate、稳定 launcher/installer、签名/SBOM/license、legacy JobStore 安装包回归，以及从同一正式 artifact 完成 Video/Document E2E；在这些结束前不打开并行 Job。
+- Task 2 仍待：clean non-admin VM/Defender/中文用户 Gate、稳定 launcher/installer、签名/SBOM/license，以及从同一正式 artifact 完成 Video/Document E2E；在这些结束前不打开并行 Job。
+- 2026-08-01 的 `runtime-portable-sqlite-v9` 已把最新的 JobStore/MachineLease WAL+FULL fail-closed、`machine_lease_store_busy` 可重试分类和 `parallel_job_execution_enabled=false` 明确报告带入同一 Windows 候选；候选自身及发布后复跑均通过 1/4/8/16 connection WAL Gate，且 v1 JobStore 在候选解释器中迁移、重开、结果与子记录保持一致。公开发行和真正多 Job 执行仍未因此解锁。
 
 ## Task 3: [ ] 实现按需 Engine 单实例生命周期
 
