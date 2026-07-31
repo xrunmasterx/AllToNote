@@ -88,6 +88,7 @@ class DoclingWorkerParser:
             output = Path(directory) / "doctor.json"
             command = [
                 str(python_executable),
+                "-B",
                 "-m",
                 "app.adapters.documents.docling_worker_doctor",
                 "--artifacts-path",
@@ -150,6 +151,7 @@ class DoclingWorkerParser:
             output = Path(directory) / "parsed.json"
             command = [
                 str(python_executable),
+                "-B",
                 "-m",
                 "app.adapters.documents.docling_worker",
                 "--input",
@@ -232,6 +234,7 @@ class DoclingWorkerParser:
         environment["HF_HUB_OFFLINE"] = "1"
         environment["TRANSFORMERS_OFFLINE"] = "1"
         environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONPATH"] = str(backend_root)
         return environment
 

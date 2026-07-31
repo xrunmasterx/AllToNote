@@ -7,6 +7,7 @@ import pytest
 
 from app.cli.main import main
 from app.core.errors import DomainError, ErrorCategory
+from tests.document_pack_support import write_pack_source
 
 
 class FakePackService:
@@ -126,7 +127,7 @@ def test_pack_install_projects_no_source_or_destination_path(
     assert service.install_calls == [(source, True)]
 
 
-def test_default_pack_install_is_gated_without_release_trust(
+def test_default_pack_install_rejects_non_official_signature(
     tmp_path: Path,
     capsys,
     monkeypatch: pytest.MonkeyPatch,
@@ -134,6 +135,8 @@ def test_default_pack_install_is_gated_without_release_trust(
     monkeypatch.delenv("ALLTONOTE_DOCUMENT_BASIC_PYTHON", raising=False)
     monkeypatch.delenv("ALLTONOTE_DOCUMENT_BASIC_ARTIFACTS", raising=False)
     source = tmp_path / "private signed source"
+    source.mkdir()
+    write_pack_source(source)
 
     exit_code = main(
         [
@@ -150,7 +153,7 @@ def test_default_pack_install_is_gated_without_release_trust(
 
     assert exit_code == 40
     assert captured.err == ""
-    assert envelope["error"]["code"] == "pack_trust_unconfigured"
+    assert envelope["error"]["code"] == "pack_signature_invalid"
     assert str(source) not in captured.out
 
 

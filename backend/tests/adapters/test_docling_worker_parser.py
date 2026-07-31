@@ -126,11 +126,13 @@ def test_adapter_uses_argument_list_offline_worker_and_validates_source(
     assert captured["env"]["TRANSFORMERS_OFFLINE"] == "1"
     assert captured["env"]["PYTHONPATH"] == str(tmp_path / "backend")
     assert captured["env"]["PYTHONNOUSERSITE"] == "1"
+    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert "ALLTONOTE_TEST_SECRET" not in captured["env"]
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.DEVNULL
     assert "capture_output" not in captured
-    assert captured["command"][1:3] == [
+    assert captured["command"][1:4] == [
+        "-B",
         "-m",
         "app.adapters.documents.docling_worker",
     ]
@@ -158,12 +160,14 @@ def test_doctor_checks_locked_pack_in_offline_worker(tmp_path: Path) -> None:
 
     _parser(tmp_path, runner).doctor()
 
-    assert captured["command"][1:3] == [
+    assert captured["command"][1:4] == [
+        "-B",
         "-m",
         "app.adapters.documents.docling_worker_doctor",
     ]
     assert captured["env"]["HF_HUB_OFFLINE"] == "1"
     assert captured["env"]["TRANSFORMERS_OFFLINE"] == "1"
+    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.DEVNULL
 
