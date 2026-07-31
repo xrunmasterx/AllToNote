@@ -66,10 +66,16 @@ from app.core.jobs.resource_lease import (
     ResourceLeaseStorePort,
     ResourceOwner,
 )
+from app.core.packs.events import (
+    JOB_PACK_ENVIRONMENT_EVENT,
+    ExecutionPackIdentity,
+    JobPackEnvironmentSnapshot,
+)
 from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.bundle_assembler import (
     BundleAssembler,
     DisplayAssetInput,
+    FeaturePackProvenance,
     ReceiptProvenance,
     StepAttemptSummary,
     VideoArtifactIds,
@@ -294,6 +300,12 @@ class VideoRecipeOperations(Protocol):
     def after_portable_commit(self, result: PortableCommitResultPort) -> None: ...
 
 
+PackEnvironmentActivator = Callable[
+    [JobPackEnvironmentSnapshot],
+    tuple[VideoRecipeOperations, str],
+]
+
+
 @dataclass(frozen=True)
 class VideoKnowledgeCompilationInput:
     output: ResolvedVideoOutput
@@ -375,6 +387,8 @@ class VideoService:
         faithful_compiler: VideoFaithfulCompilerPort | None = None,
         current_config_snapshot: JobConfigSnapshot | None = None,
         generated_transcriber_identity: str = "fake/transcriber-v1",
+        pack_environment: JobPackEnvironmentSnapshot | None = None,
+        pack_environment_activator: PackEnvironmentActivator | None = None,
         resource_lease_store: ResourceLeaseStorePort | None = None,
         resource_owner: ResourceOwner | None = None,
     ) -> None:
@@ -398,6 +412,14 @@ class VideoService:
         self._faithful_compiler = faithful_compiler
         self._current_config_snapshot = current_config_snapshot
         self._generated_transcriber_identity = generated_transcriber_identity
+        if pack_environment is not None:
+            if not isinstance(pack_environment, JobPackEnvironmentSnapshot):
+                raise ValueError("pack_environment_invalid")
+            pack_environment.pack("media-basic")
+            pack_environment.pack("transcribe-cpu")
+        self._submission_pack_environment = pack_environment
+        self._execution_pack_environment = pack_environment
+        self._pack_environment_activator = pack_environment_activator
         self._resource_lease_store = resource_lease_store
         self._resource_owner = resource_owner
         self._active_resource_lease: ResourceLease | None = None
@@ -413,6 +435,33 @@ class VideoService:
             additional_heartbeat=self._heartbeat_resource_lease,
         )
 
+    def execution_binding(
+        self,
+        recipe_id: str,
+        recipe_version: int,
+    ) -> JobExecutionBinding:
+        media_pack = (
+            self._submission_pack_environment.pack("media-basic")
+            if self._submission_pack_environment is not None
+            else None
+        )
+        return JobExecutionBinding(
+            recipe_id=recipe_id,
+            recipe_version=recipe_version,
+            executor_id="alltonote.video",
+            executor_version=1,
+            pack_id=(
+                media_pack.pack_id
+                if media_pack is not None
+                else "media-basic"
+            ),
+            pack_version=(
+                media_pack.pack_version
+                if media_pack is not None
+                else "builtin-v1"
+            ),
+        )
+
     def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
         if not isinstance(request, VideoProduceRequest):
             raise DomainError(
@@ -421,10 +470,24 @@ class VideoService:
                 "Video production requires a versioned request",
             )
         config_snapshot = request.config_snapshot or self._current_config_snapshot
-        initial_events = (
-            ((JOB_CONFIG_SNAPSHOT_EVENT, config_snapshot),)
-            if config_snapshot is not None
-            else ()
+        initial_events = tuple(
+            event
+            for event in (
+                (
+                    (JOB_CONFIG_SNAPSHOT_EVENT, config_snapshot)
+                    if config_snapshot is not None
+                    else None
+                ),
+                (
+                    (
+                        JOB_PACK_ENVIRONMENT_EVENT,
+                        self._submission_pack_environment,
+                    )
+                    if self._submission_pack_environment is not None
+                    else None
+                ),
+            )
+            if event is not None
         )
         recipe_key = (request.recipe_id, request.recipe_version)
         bound_recipe_id, bound_recipe_version = (
@@ -435,13 +498,9 @@ class VideoService:
         snapshot = self._job_service.submit(
             self._job_request_payload(request),
             initial_events=initial_events,
-            execution_binding=JobExecutionBinding(
-                recipe_id=bound_recipe_id,
-                recipe_version=bound_recipe_version,
-                executor_id="alltonote.video",
-                executor_version=1,
-                pack_id="media-basic",
-                pack_version="builtin-v1",
+            execution_binding=self.execution_binding(
+                bound_recipe_id,
+                bound_recipe_version,
             ),
         )
         if config_snapshot is not None:
@@ -467,6 +526,7 @@ class VideoService:
             JobState.WAITING_FOR_INPUT,
         }:
             return snapshot
+        self._assert_pack_environment_compatible(job_id)
         self._assert_config_compatible(job_id)
         request = self._load_request(job_id)
         self._acquire_resource_lease()
@@ -829,6 +889,7 @@ class VideoService:
                 },
                 model_identity=draft.model_identity,
                 transcriber_identity=self._transcriber_identity(source),
+                feature_packs=self._receipt_feature_packs(),
                 usage={
                     key: value
                     for key, value in draft.usage.items()
@@ -1141,6 +1202,7 @@ class VideoService:
                 },
                 model_identity=next(iter(model_identities)),
                 transcriber_identity=self._transcriber_identity(source),
+                feature_packs=self._receipt_feature_packs(),
                 usage=usage,
                 warnings=(),
                 retry_of_job_id=retry_of_job_id,
@@ -1820,6 +1882,19 @@ class VideoService:
             return f"{source.connector_id}/platform-subtitle-v1"
         return self._generated_transcriber_identity
 
+    def _receipt_feature_packs(self) -> tuple[FeaturePackProvenance, ...]:
+        if self._execution_pack_environment is None:
+            return ()
+        return tuple(
+            FeaturePackProvenance(
+                pack_id=pack.pack_id,
+                pack_version=pack.pack_version,
+                platform=pack.platform,
+                manifest_sha256=pack.manifest_sha256,
+            )
+            for pack in self._execution_pack_environment.packs
+        )
+
     def _preflight(self, request: VideoProduceRequest) -> str:
         capabilities = self._operations.preflight_capabilities(request)
         if not isinstance(capabilities, VideoPreflightCapabilities):
@@ -2118,6 +2193,102 @@ class VideoService:
                     "current_semantic_digest": current.semantic_digest,
                 },
             )
+
+    def _assert_pack_environment_compatible(self, job_id: str) -> None:
+        events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == JOB_PACK_ENVIRONMENT_EVENT
+        )
+        if not events:
+            if self._submission_pack_environment is not None:
+                raise DomainError(
+                    "execution_pack_snapshot_missing",
+                    ErrorCategory.CONFLICT,
+                    "The Job does not contain a frozen execution Pack environment",
+                )
+            return
+        if len(events) != 1 or self._execution_pack_environment is None:
+            raise DomainError(
+                "execution_pack_snapshot_invalid",
+                ErrorCategory.CONFLICT,
+                "The Job execution Pack environment is unavailable or invalid",
+            )
+        try:
+            payload = json.loads(events[0].payload_json)
+            raw_packs = payload["packs"]
+            if (
+                type(payload) is not dict
+                or frozenset(payload)
+                != frozenset({"schema_version", "packs"})
+                or type(raw_packs) is not list
+                or not raw_packs
+                or any(
+                    type(value) is not dict
+                    or frozenset(value)
+                    != frozenset(
+                        {
+                            "pack_id",
+                            "pack_version",
+                            "platform",
+                            "manifest_sha256",
+                        }
+                    )
+                    for value in raw_packs
+                )
+            ):
+                raise ValueError
+            stored = JobPackEnvironmentSnapshot(
+                schema_version=payload["schema_version"],
+                packs=tuple(
+                    ExecutionPackIdentity(
+                        pack_id=value["pack_id"],
+                        pack_version=value["pack_version"],
+                        platform=value["platform"],
+                        manifest_sha256=value["manifest_sha256"],
+                    )
+                    for value in raw_packs
+                ),
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            raise DomainError(
+                "execution_pack_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job execution Pack environment is invalid",
+            ) from error
+        if stored == self._execution_pack_environment:
+            return
+        if self._pack_environment_activator is None:
+            raise DomainError(
+                "execution_pack_drift",
+                ErrorCategory.CONFLICT,
+                "The exact execution Pack environment is unavailable; reinstall it or create a new Job",
+                {
+                    "submitted_packs": tuple(
+                        f"{pack.pack_id}@{pack.pack_version}:{pack.manifest_sha256}"
+                        for pack in stored.packs
+                    ),
+                    "current_packs": tuple(
+                        f"{pack.pack_id}@{pack.pack_version}:{pack.manifest_sha256}"
+                        for pack in self._execution_pack_environment.packs
+                    ),
+                },
+            )
+        operations, transcriber_identity = self._pack_environment_activator(stored)
+        if type(transcriber_identity) is not str or not transcriber_identity:
+            raise DomainError(
+                "execution_pack_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "The resolved execution Pack environment is invalid",
+            )
+        self._operations = operations
+        self._generated_transcriber_identity = transcriber_identity
+        self._execution_pack_environment = stored
 
     @staticmethod
     def _resolved_output_bindings(
@@ -2509,6 +2680,7 @@ __all__ = [
     "CHECKPOINT_STEPS",
     "PREFLIGHT_CHECKS",
     "RUNTIME_VERSION",
+    "PackEnvironmentActivator",
     "VideoKnowledgeCompilationInput",
     "VideoKnowledgeCompilerPort",
     "VideoRecipeOperations",

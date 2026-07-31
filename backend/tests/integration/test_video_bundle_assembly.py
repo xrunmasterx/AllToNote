@@ -30,6 +30,7 @@ from app.core.portable.bundle_assembler import (
     BundleAssembler,
     CandidateBundle,
     DisplayAssetInput,
+    FeaturePackProvenance,
     ReceiptProvenance,
     StepAttemptSummary,
     VideoArtifactIds,
@@ -484,6 +485,53 @@ def _relative_files(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def test_receipt_records_exact_feature_pack_generations(
+    workspace_root: Path,
+) -> None:
+    bundle_input = _bundle_input(workspace_root)
+    receipt = replace(
+        bundle_input.receipt,
+        feature_packs=(
+            FeaturePackProvenance(
+                pack_id="media-basic",
+                pack_version="yt-dlp-2026.7.4-ffmpeg-8.1.2-r1",
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + "a" * 64,
+            ),
+            FeaturePackProvenance(
+                pack_id="transcribe-cpu",
+                pack_version="faster-whisper-1.1.1-small-536b0662-r1",
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + "b" * 64,
+            ),
+        ),
+    )
+
+    candidate = BundleAssembler().assemble(
+        replace(bundle_input, receipt=receipt)
+    )
+    executors = _read_json(candidate.absolute_path / "receipt.json")[
+        "executors"
+    ]
+
+    assert executors[-2:] == [
+        {
+            "kind": "feature-pack",
+            "manifest_sha256": "sha256:" + "a" * 64,
+            "pack_id": "media-basic",
+            "platform": "windows-x86_64",
+            "version": "yt-dlp-2026.7.4-ffmpeg-8.1.2-r1",
+        },
+        {
+            "kind": "feature-pack",
+            "manifest_sha256": "sha256:" + "b" * 64,
+            "pack_id": "transcribe-cpu",
+            "platform": "windows-x86_64",
+            "version": "faster-whisper-1.1.1-small-536b0662-r1",
+        },
+    ]
 
 
 def test_candidate_has_exact_canonical_manifest_receipt_and_payload_inventory(

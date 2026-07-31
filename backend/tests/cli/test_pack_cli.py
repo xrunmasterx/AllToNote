@@ -7,7 +7,9 @@ import pytest
 
 from app.cli.main import main
 from app.core.errors import DomainError, ErrorCategory
+from app.adapters.video_packs.official_video_pack import MEDIA_BASIC
 from tests.document_pack_support import write_pack_source
+from tests.video_pack_support import write_pack_source as write_video_pack_source
 
 
 class FakePackService:
@@ -179,6 +181,55 @@ def test_pack_human_output_is_concise(capsys, tmp_path: Path) -> None:
         "document-basic docling-2.117.0-tableformer-v2.3.0: installed\n"
     )
     assert captured.err == ""
+
+
+@pytest.mark.parametrize("pack_id", ("media-basic", "transcribe-cpu"))
+def test_video_pack_ids_are_supported_by_doctor_cli(
+    pack_id: str,
+    capsys,
+) -> None:
+    service = FakePackService()
+    service.doctor_result["pack_id"] = pack_id
+    service.doctor_result["pack_version"] = "fixture-v1"
+
+    assert main(
+        ["pack", "doctor", pack_id, "--json"],
+        pack_service=service,
+    ) == 0
+
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["data"]["pack_id"] == pack_id
+
+
+def test_default_media_pack_install_rejects_non_official_signature(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ALLTONOTE_MEDIA_BASIC_ROOT", raising=False)
+    source = tmp_path / "test-signed-media-pack"
+    source.mkdir()
+    write_video_pack_source(
+        source,
+        MEDIA_BASIC,
+        platform_tag="windows-x86_64",
+    )
+
+    exit_code = main(
+        [
+            "pack",
+            "install",
+            "media-basic",
+            "--source",
+            str(source),
+            "--json",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 40
+    assert envelope["error"]["code"] == "pack_signature_untrusted"
+    assert str(source) not in json.dumps(envelope)
 
 
 @pytest.mark.parametrize(

@@ -1366,6 +1366,47 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
             lambda: SimpleNamespace(ready=True, default_model="codex-test-model")
         ),
     )
+    pack_root = tmp_path / "packs"
+
+    def resolved_pack(contract, digest: str):
+        generation = pack_root / contract.pack_id
+        entrypoints = {}
+        for name, relative in contract.entrypoints("windows-x86_64").items():
+            path = generation.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture")
+            entrypoints[name] = path.resolve()
+        if contract.pack_id == "transcribe-cpu":
+            (generation / "models" / "small").mkdir(parents=True)
+        return runtime_module.ResolvedOfficialVideoPack(
+            pack_id=contract.pack_id,
+            pack_version=contract.pack_version,
+            platform="windows-x86_64",
+            manifest_sha256="sha256:" + digest * 64,
+            generation=generation.resolve(),
+            entrypoints=entrypoints,
+        )
+
+    resolved = {
+        "media-basic": resolved_pack(runtime_module.MEDIA_BASIC, "a"),
+        "transcribe-cpu": resolved_pack(runtime_module.TRANSCRIBE_CPU, "b"),
+    }
+    exact_resolutions: list[tuple[str, str]] = []
+
+    class _Resolver:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def resolve_active(self, contract):
+            return resolved[contract.pack_id]
+
+        def resolve_exact(self, contract, manifest_sha256: str):
+            exact_resolutions.append((contract.pack_id, manifest_sha256))
+            selected = resolved[contract.pack_id]
+            assert selected.manifest_sha256 == manifest_sha256
+            return selected
+
+    monkeypatch.setattr(runtime_module, "OfficialVideoPackResolver", _Resolver)
 
     def capture_runtime(machine_root: Path, **options: object):
         captured["machine_root"] = machine_root
@@ -1406,6 +1447,17 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
         local_app_data / "AllToNote" / "machine" / "leases.sqlite"
     )
     assert captured["source_metadata"] == {}
+    assert captured["pack_environment"].packs[0].pack_id == "media-basic"
+    assert captured["pack_environment"].packs[1].pack_id == "transcribe-cpu"
+    pack_port_resolver = captured["pack_port_resolver"]
+    _source, transcriber, transcriber_identity = pack_port_resolver(
+        captured["pack_environment"]
+    )
+    assert transcriber_identity == transcriber.identity
+    assert exact_resolutions == [
+        ("media-basic", "sha256:" + "a" * 64),
+        ("transcribe-cpu", "sha256:" + "b" * 64),
+    ]
     assert captured["model_execution_profile"] == "default"
     assert model.provider_kind == "codex-app-server"
     assert model.model_identity == "codex-test-model"

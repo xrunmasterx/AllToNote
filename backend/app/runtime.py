@@ -44,6 +44,23 @@ from app.adapters.transcription.legacy_transcriber import (
     LegacyTranscriberAdapter,
     normalize_platform_subtitle,
 )
+from app.adapters.video_packs.official_video_pack import (
+    MEDIA_BASIC,
+    TRANSCRIBE_CPU,
+)
+from app.adapters.video_packs.official_video_pack_resolver import (
+    OfficialVideoPackResolver,
+    ResolvedOfficialVideoPack,
+)
+from app.adapters.video_packs.official_video_pack_trust import (
+    official_video_pack_trust_keys,
+)
+from app.adapters.video_packs.packed_bilibili_source import (
+    PackedBilibiliVideoSourceAdapter,
+)
+from app.adapters.video_packs.packed_cpu_transcriber import (
+    PackedCpuTranscriber,
+)
 from app.core.application.produce_service import ProduceService
 from app.core.application.document_service import (
     CHECKPOINT_SCHEMA as DOCUMENT_CHECKPOINT_SCHEMA,
@@ -98,6 +115,10 @@ from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import CheckpointMetadata, JobExecutionBinding
 from app.core.jobs.resource_lease import ResourceLeaseStorePort, ResourceOwner
+from app.core.packs.events import (
+    ExecutionPackIdentity,
+    JobPackEnvironmentSnapshot,
+)
 from app.core.portable.bundle_assembler import DisplayAssetInput, VideoSourceMetadata
 from app.core.ports.model import KnowledgeModelRequest
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -1307,13 +1328,9 @@ def _create_video_runtime(
         repository,
         (*(
             (
-                JobExecutionBinding(
-                    recipe_id=descriptor.key.recipe_id,
-                    recipe_version=descriptor.key.recipe_version,
-                    executor_id="alltonote.video",
-                    executor_version=1,
-                    pack_id="media-basic",
-                    pack_version="builtin-v1",
+                service.execution_binding(
+                    descriptor.key.recipe_id,
+                    descriptor.key.recipe_version,
                 ),
                 service,
             )
@@ -1406,6 +1423,12 @@ def _resolve_execution_owner_id(
     return f"runtime-{uuid4().hex}"
 
 
+_PackPortResolver = Callable[
+    [JobPackEnvironmentSnapshot],
+    tuple[VideoSourcePort, TranscriptPort | None, str],
+]
+
+
 def _create_platform_video_runtime_components(
     machine_root: Path,
     *,
@@ -1417,6 +1440,8 @@ def _create_platform_video_runtime_components(
     model_execution_binding: ModelExecutionBinding | None = None,
     model_execution_profile: str | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    pack_environment: JobPackEnvironmentSnapshot | None = None,
+    pack_port_resolver: _PackPortResolver | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
@@ -1443,6 +1468,28 @@ def _create_platform_video_runtime_components(
         storage=storage,
         transcriber=transcriber,
     )
+    pack_environment_activator = None
+    if pack_port_resolver is not None:
+        def activate_pack_environment(
+            snapshot: JobPackEnvironmentSnapshot,
+        ) -> tuple[VideoRecipeOperations, str]:
+            resolved_source, resolved_transcriber, identity = (
+                pack_port_resolver(snapshot)
+            )
+            return (
+                _PlatformVideoOperations(
+                    repository,
+                    resolved_source,
+                    source_metadata,
+                    model,
+                    result_root,
+                    storage=storage,
+                    transcriber=resolved_transcriber,
+                ),
+                identity,
+            )
+
+        pack_environment_activator = activate_pack_environment
     knowledge_compiler, faithful_compiler = _create_runtime_compilers(
         repository=repository,
         model=model,
@@ -1466,6 +1513,8 @@ def _create_platform_video_runtime_components(
         generated_transcriber_identity=(
             generated_transcriber_identity or "fake/transcriber-v1"
         ),
+        pack_environment=pack_environment,
+        pack_environment_activator=pack_environment_activator,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
@@ -1483,6 +1532,8 @@ def create_platform_video_runtime(
     model_execution_binding: ModelExecutionBinding | None = None,
     model_execution_profile: str | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    pack_environment: JobPackEnvironmentSnapshot | None = None,
+    pack_port_resolver: _PackPortResolver | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
@@ -1499,6 +1550,8 @@ def create_platform_video_runtime(
         model_execution_binding=model_execution_binding,
         model_execution_profile=model_execution_profile,
         current_config_snapshot=current_config_snapshot,
+        pack_environment=pack_environment,
+        pack_port_resolver=pack_port_resolver,
         owner_id=owner_id,
         local_instance_id=local_instance_id,
         clock=clock,
@@ -1859,14 +1912,22 @@ def create_fake_runtime_for_workspace(
     )
 
 
-def _create_cpu_whisper_transcriber(model_size: str) -> object:
-    from app.transcriber.whisper import WhisperTranscriber
-
-    return WhisperTranscriber(
-        model_size=model_size,
-        device="cpu",
-        compute_type="int8",
+def _pack_identity(
+    pack: ResolvedOfficialVideoPack,
+) -> ExecutionPackIdentity:
+    return ExecutionPackIdentity(
+        pack_id=pack.pack_id,
+        pack_version=pack.pack_version,
+        platform=pack.platform,
+        manifest_sha256=pack.manifest_sha256,
     )
+
+
+def _bilibili_cookie() -> str | None:
+    from app.services.cookie_manager import CookieConfigManager
+
+    value = CookieConfigManager().get("bilibili")
+    return value if isinstance(value, str) and value else None
 
 
 def create_codex_app_server_runtime_for_workspace(
@@ -1915,16 +1976,69 @@ def create_codex_app_server_runtime_for_workspace(
         supports_temperature=False,
         timeout_seconds=600,
     )
-    source = LegacyVideoSourceAdapter(local_machine_id=instance.instance_id)
-    whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "base")
-    transcriber = LegacyTranscriberAdapter(
-        "fast-whisper",
-        factories={
-            "fast-whisper": lambda: _create_cpu_whisper_transcriber(
-                whisper_model_size
-            )
-        },
+    pack_resolver = OfficialVideoPackResolver(
+        paths,
+        trusted_keys=official_video_pack_trust_keys(),
     )
+    media_pack = pack_resolver.resolve_active(MEDIA_BASIC)
+    transcribe_pack = pack_resolver.resolve_active(TRANSCRIBE_CPU)
+    source = PackedBilibiliVideoSourceAdapter(
+        LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
+        media_pack,
+        cookie_resolver=_bilibili_cookie,
+    )
+    transcriber = PackedCpuTranscriber(transcribe_pack)
+    pack_environment = JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=(
+            _pack_identity(media_pack),
+            _pack_identity(transcribe_pack),
+        ),
+    )
+
+    def resolve_pack_ports(
+        snapshot: JobPackEnvironmentSnapshot,
+    ) -> tuple[VideoSourcePort, TranscriptPort | None, str]:
+        media_identity = snapshot.pack(MEDIA_BASIC.pack_id)
+        transcribe_identity = snapshot.pack(TRANSCRIBE_CPU.pack_id)
+        if (
+            media_identity.pack_version != MEDIA_BASIC.pack_version
+            or transcribe_identity.pack_version != TRANSCRIBE_CPU.pack_version
+        ):
+            raise DomainError(
+                "pack_generation_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The exact Video Pack generation is unavailable",
+            )
+        resolved_media = pack_resolver.resolve_exact(
+            MEDIA_BASIC,
+            media_identity.manifest_sha256,
+        )
+        resolved_transcribe = pack_resolver.resolve_exact(
+            TRANSCRIBE_CPU,
+            transcribe_identity.manifest_sha256,
+        )
+        if (
+            _pack_identity(resolved_media) != media_identity
+            or _pack_identity(resolved_transcribe) != transcribe_identity
+        ):
+            raise DomainError(
+                "pack_generation_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The exact Video Pack generation is unavailable",
+            )
+        resolved_source = PackedBilibiliVideoSourceAdapter(
+            LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
+            resolved_media,
+            cookie_resolver=_bilibili_cookie,
+        )
+        resolved_transcriber = PackedCpuTranscriber(resolved_transcribe)
+        return (
+            resolved_source,
+            resolved_transcriber,
+            resolved_transcriber.identity,
+        )
+
     process_instance_id, resource_lease_store, resource_owner = (
         _workspace_resource_admission(paths, instance)
     )
@@ -1933,15 +2047,15 @@ def create_codex_app_server_runtime_for_workspace(
         source=source,
         source_metadata={},
         transcriber=transcriber,
-        generated_transcriber_identity=(
-            f"faster-whisper/{whisper_model_size}-cpu-int8"
-        ),
+        generated_transcriber_identity=transcriber.identity,
         model=model,
         model_execution_binding=binding,
         model_execution_profile="default",
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         current_config_snapshot=current_config_snapshot,
+        pack_environment=pack_environment,
+        pack_port_resolver=resolve_pack_ports,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
@@ -16,7 +18,21 @@ class PackService(Protocol):
 
 
 class _DefaultPackService:
+    def __init__(self, pack_id: str) -> None:
+        if pack_id not in {
+            "document-basic",
+            "media-basic",
+            "transcribe-cpu",
+        }:
+            raise ValueError("Unknown Pack")
+        self._pack_id = pack_id
+
     def doctor(self, *, dynamic: bool) -> Mapping[str, object]:
+        if self._pack_id != "document-basic":
+            return self._video_doctor(dynamic=dynamic)
+        return self._document_doctor(dynamic=dynamic)
+
+    def _document_doctor(self, *, dynamic: bool) -> Mapping[str, object]:
         from app.adapters.documents.document_basic_pack import (
             PACK_ID,
             PACK_VERSION,
@@ -108,6 +124,16 @@ class _DefaultPackService:
         }
 
     def install(self, source: Path, *, repair: bool) -> Mapping[str, object]:
+        if self._pack_id != "document-basic":
+            return self._install_video(source, repair=repair)
+        return self._install_document(source, repair=repair)
+
+    def _install_document(
+        self,
+        source: Path,
+        *,
+        repair: bool,
+    ) -> Mapping[str, object]:
         from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
         from app.adapters.documents.document_basic_pack_installer import (
             install_document_basic_pack,
@@ -155,6 +181,195 @@ class _DefaultPackService:
             )
         ).doctor()
 
+    def _video_doctor(self, *, dynamic: bool) -> Mapping[str, object]:
+        from app.adapters.video_packs.official_video_pack import (
+            official_video_pack,
+        )
+        from app.adapters.video_packs.official_video_pack_resolver import (
+            OfficialVideoPackResolver,
+        )
+        from app.adapters.video_packs.official_video_pack_trust import (
+            official_video_pack_trust_keys,
+        )
+        from app.runtime_paths import resolve_runtime_paths
+
+        contract = official_video_pack(self._pack_id)
+        try:
+            resolved = OfficialVideoPackResolver(
+                resolve_runtime_paths(),
+                trusted_keys=official_video_pack_trust_keys(),
+            ).resolve_active(contract)
+        except DomainError:
+            installed = False
+            manifest_sha256 = None
+            static_status = "fail"
+            static_action = (
+                f"Install the {contract.pack_id} Pack from an official signed source"
+            )
+            resolved = None
+        else:
+            installed = True
+            manifest_sha256 = resolved.manifest_sha256
+            static_status = "pass"
+            static_action = "No action required"
+        checks: list[dict[str, object]] = [
+            {
+                "code": f"pack.{contract.pack_id}.static",
+                "status": static_status,
+                "action": static_action,
+                "dynamic": False,
+            }
+        ]
+        if dynamic and resolved is not None:
+            try:
+                self._probe_video_entrypoints(
+                    contract.pack_id,
+                    resolved.entrypoints,
+                )
+            except DomainError:
+                checks.append(
+                    {
+                        "code": f"pack.{contract.pack_id}.dynamic",
+                        "status": "fail",
+                        "action": f"Repair or reinstall the {contract.pack_id} Pack",
+                        "dynamic": True,
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "code": f"pack.{contract.pack_id}.dynamic",
+                        "status": "pass",
+                        "action": "No action required",
+                        "dynamic": True,
+                    }
+                )
+        return {
+            "pack_id": contract.pack_id,
+            "pack_version": contract.pack_version,
+            "installed": installed,
+            "healthy": all(check["status"] != "fail" for check in checks),
+            "dynamic": dynamic,
+            "manifest_sha256": manifest_sha256,
+            "checks": tuple(checks),
+        }
+
+    def _install_video(
+        self,
+        source: Path,
+        *,
+        repair: bool,
+    ) -> Mapping[str, object]:
+        from app.adapters.video_packs.official_video_pack import (
+            official_video_pack,
+        )
+        from app.adapters.video_packs.official_video_pack_installer import (
+            install_official_video_pack,
+        )
+        from app.adapters.video_packs.official_video_pack_trust import (
+            official_video_pack_trust_keys,
+        )
+        from app.runtime_paths import resolve_runtime_paths
+
+        contract = official_video_pack(self._pack_id)
+        installed = install_official_video_pack(
+            source,
+            contract=contract,
+            paths=resolve_runtime_paths(),
+            trusted_keys=official_video_pack_trust_keys(),
+            probe=lambda verified, root: self._probe_video_entrypoints(
+                contract.pack_id,
+                {
+                    name: root.joinpath(*relative.split("/"))
+                    for name, relative in verified.entrypoints.items()
+                },
+            ),
+            repair=repair,
+            environ=os.environ,
+        )
+        return {
+            "pack_id": installed.pack_id,
+            "pack_version": installed.pack_version,
+            "manifest_sha256": installed.manifest_sha256,
+            "result": installed.result,
+        }
+
+    @staticmethod
+    def _probe_video_entrypoints(
+        pack_id: str,
+        entrypoints: Mapping[str, Path],
+    ) -> None:
+        from app.adapters.video_packs.official_pack_process import (
+            minimal_worker_environment,
+        )
+
+        expected = (
+            {"requests": "2.32.3", "yt-dlp": "2026.7.4"}
+            if pack_id == "media-basic"
+            else {
+                "av": "14.2.0",
+                "ctranslate2": "4.6.0",
+                "faster-whisper": "1.1.1",
+                "tokenizers": "0.21.1",
+            }
+        )
+        script = (
+            "import importlib.metadata as m,json;"
+            f"names={tuple(expected)!r};"
+            "versions={n:m.version(n) for n in names};"
+            + (
+                "import yt_dlp,requests;"
+                if pack_id == "media-basic"
+                else "import faster_whisper,ctranslate2,av,tokenizers;"
+            )
+            + "print(json.dumps(versions,sort_keys=True))"
+        )
+        environment = minimal_worker_environment()
+        try:
+            completed = subprocess.run(
+                (str(entrypoints["python"]), "-I", "-B", "-c", script),
+                check=True,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=60,
+                env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            actual = json.loads(completed.stdout.decode("utf-8"))
+            if actual != expected:
+                raise ValueError("dependency identity mismatch")
+            if pack_id == "media-basic":
+                for name in ("ffmpeg", "ffprobe"):
+                    tool = subprocess.run(
+                        (str(entrypoints[name]), "-version"),
+                        check=True,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        timeout=30,
+                        env=environment,
+                        creationflags=getattr(
+                            subprocess, "CREATE_NO_WINDOW", 0
+                        ),
+                    )
+                    first_line = tool.stdout.decode(
+                        "utf-8", errors="replace"
+                    ).splitlines()[0]
+                    if not first_line.startswith(f"{name} version 8.1.2"):
+                        raise ValueError("FFmpeg identity mismatch")
+        except (
+            KeyError,
+            OSError,
+            ValueError,
+            UnicodeError,
+            json.JSONDecodeError,
+            subprocess.SubprocessError,
+        ) as error:
+            raise DomainError(
+                "pack_probe_failed",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                f"The {pack_id} Pack failed its isolated dynamic probe",
+            ) from error
+
 
 def pack_command_result(
     args: object,
@@ -163,7 +378,8 @@ def pack_command_result(
     service: PackService | None = None,
     versions: Mapping[str, object] | None = None,
 ) -> ApplicationResult:
-    active_service = service or _DefaultPackService()
+    pack_id = str(getattr(args, "pack_id"))
+    active_service = service or _DefaultPackService(pack_id)
     command_name = str(getattr(args, "pack_command"))
     command = f"pack {command_name}"
     if command_name == "doctor":
@@ -187,7 +403,7 @@ def pack_command_result(
             data=data,
             versions=versions or {},
             human_lines=(
-                f"document-basic healthy: {'yes' if data['healthy'] is True else 'no'}",
+                f"{data['pack_id']} healthy: {'yes' if data['healthy'] is True else 'no'}",
             ),
         )
 
@@ -212,7 +428,7 @@ def pack_command_result(
         data=data,
         versions=versions or {},
         human_lines=(
-            f"document-basic {data['pack_version']}: {labels.get(result, result)}",
+            f"{data['pack_id']} {data['pack_version']}: {labels.get(result, result)}",
         ),
     )
 

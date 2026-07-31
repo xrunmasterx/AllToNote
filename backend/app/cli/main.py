@@ -142,11 +142,17 @@ def _build_parser(
     pack_parser = subparsers.add_parser("pack")
     pack_subparsers = pack_parser.add_subparsers(dest="pack_command", required=True)
     pack_doctor_parser = pack_subparsers.add_parser("doctor")
-    pack_doctor_parser.add_argument("pack_id", choices=("document-basic",))
+    pack_doctor_parser.add_argument(
+        "pack_id",
+        choices=("document-basic", "media-basic", "transcribe-cpu"),
+    )
     pack_doctor_parser.add_argument("--dynamic", action="store_true")
     pack_doctor_parser.add_argument("--json", action="store_true")
     pack_install_parser = pack_subparsers.add_parser("install")
-    pack_install_parser.add_argument("pack_id", choices=("document-basic",))
+    pack_install_parser.add_argument(
+        "pack_id",
+        choices=("document-basic", "media-basic", "transcribe-cpu"),
+    )
     pack_install_parser.add_argument("--source", type=Path, required=True)
     pack_install_parser.add_argument("--repair", action="store_true")
     pack_install_parser.add_argument("--json", action="store_true")

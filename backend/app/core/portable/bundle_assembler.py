@@ -658,6 +658,20 @@ class StepAttemptSummary:
 
 
 @dataclass(frozen=True)
+class FeaturePackProvenance:
+    pack_id: str
+    pack_version: str
+    platform: str
+    manifest_sha256: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("pack_id", "pack_version", "platform"):
+            value = _require_text(getattr(self, field_name), field_name)
+            _validate_safe_value(value, field_name)
+        _require_digest(self.manifest_sha256, "manifest_sha256")
+
+
+@dataclass(frozen=True)
 class ReceiptProvenance:
     run_id: str
     job_id: str
@@ -679,6 +693,7 @@ class ReceiptProvenance:
     steps: tuple[StepAttemptSummary, ...]
     retry_of_job_id: str | None = None
     parent_run_id: str | None = None
+    feature_packs: tuple[FeaturePackProvenance, ...] = ()
 
     def __post_init__(self) -> None:
         _require_id(self.run_id, "run", "run_id")
@@ -712,6 +727,11 @@ class ReceiptProvenance:
         object.__setattr__(self, "redactions", _snapshot_mapping(self.redactions, "redactions"))
         object.__setattr__(self, "warnings", _snapshot_tuple(self.warnings, "warnings"))
         object.__setattr__(self, "steps", _snapshot_tuple(self.steps, "steps"))
+        object.__setattr__(
+            self,
+            "feature_packs",
+            _snapshot_tuple(self.feature_packs, "feature_packs"),
+        )
         if not self.steps or len(self.steps) > 32:
             raise _error(
                 "video_bundle_input_invalid",
@@ -719,6 +739,19 @@ class ReceiptProvenance:
             )
         if any(not isinstance(step, StepAttemptSummary) for step in self.steps):
             raise _error("video_bundle_input_invalid", "Receipt step summary is invalid")
+        if (
+            len(self.feature_packs) > 8
+            or any(
+                not isinstance(pack, FeaturePackProvenance)
+                for pack in self.feature_packs
+            )
+            or len({pack.pack_id for pack in self.feature_packs})
+            != len(self.feature_packs)
+        ):
+            raise _error(
+                "video_bundle_input_invalid",
+                "Receipt feature Pack provenance is invalid",
+            )
         if any(type(warning) is not str or not warning for warning in self.warnings):
             raise _error("video_bundle_input_invalid", "Receipt warnings are invalid")
         _require_executor_identity(self.model_identity, "model_identity")
@@ -1568,6 +1601,16 @@ class BundleAssembler:
                     "kind": "transcriber",
                     "identity": provenance.transcriber_identity,
                 },
+                *(
+                    {
+                        "kind": "feature-pack",
+                        "pack_id": pack.pack_id,
+                        "version": pack.pack_version,
+                        "platform": pack.platform,
+                        "manifest_sha256": pack.manifest_sha256,
+                    }
+                    for pack in provenance.feature_packs
+                ),
             ],
             "usage": dict(provenance.usage),
             "quality": {

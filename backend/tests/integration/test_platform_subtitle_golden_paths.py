@@ -40,6 +40,11 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError
 from app.core.jobs.model import AttemptState
+from app.core.packs.events import (
+    JOB_PACK_ENVIRONMENT_EVENT,
+    ExecutionPackIdentity,
+    JobPackEnvironmentSnapshot,
+)
 from app.core.ports.model_executor import (
     ModelExecutionBinding,
     ModelExecutionRequest,
@@ -319,6 +324,8 @@ def _create_runtime(
     owner_id: str | None = None,
     now_ms: int | None = None,
     media_fallback: bool = False,
+    pack_environment: JobPackEnvironmentSnapshot | None = None,
+    resolved_pack_environments: list[JobPackEnvironmentSnapshot] | None = None,
 ) -> object:
     downloader = _FixtureDownloader(
         platform,
@@ -335,19 +342,58 @@ def _create_runtime(
         bridge=_Completion(calls, failure),
         capabilities=LegacyModelCapabilities(),
     )
+    transcriber = _Transcript(calls) if media_fallback else None
+
+    def resolve_pack_ports(
+        snapshot: JobPackEnvironmentSnapshot,
+    ) -> tuple[object, object | None, str]:
+        assert resolved_pack_environments is not None
+        resolved_pack_environments.append(snapshot)
+        return source, transcriber, "fixture/transcriber-v1"
+
     runtime, service = runtime_module._create_platform_video_runtime_components(
         machine_root,
         source=source,
         source_metadata={platform: _fixture(platform, "metadata.json")},
-        transcriber=_Transcript(calls) if media_fallback else None,
+        transcriber=transcriber,
         generated_transcriber_identity=(
             "fixture/transcriber-v1" if media_fallback else None
+        ),
+        pack_environment=pack_environment,
+        pack_port_resolver=(
+            resolve_pack_ports
+            if resolved_pack_environments is not None
+            else None
         ),
         model=model,
         owner_id=owner_id,
         clock=(None if now_ms is None else lambda: now_ms),
     )
     return _RuntimeHarness(runtime, service)
+
+
+def _pack_environment(
+    *,
+    media_digest: str = "a",
+    transcribe_digest: str = "b",
+) -> JobPackEnvironmentSnapshot:
+    return JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=(
+            ExecutionPackIdentity(
+                pack_id="media-basic",
+                pack_version="yt-dlp-2026.7.4-ffmpeg-8.1.2-r1",
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + media_digest * 64,
+            ),
+            ExecutionPackIdentity(
+                pack_id="transcribe-cpu",
+                pack_version="faster-whisper-1.1.1-small-536b0662-r1",
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + transcribe_digest * 64,
+            ),
+        ),
+    )
 
 
 def _create_v2_runtime(
@@ -872,6 +918,115 @@ def request(
         client_request_id=client_request_id or f"subtitle-{platform}",
         provided_transcript=provided_transcript,
     )
+
+
+def test_job_freezes_both_official_video_pack_generations(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    environment = _pack_environment()
+    runtime = _create_runtime(
+        tmp_path / "machine",
+        "bilibili",
+        Calls(),
+        pack_environment=environment,
+    )
+
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+
+    binding = runtime.job_repository.get_job_execution_binding(
+        submitted.job_id
+    )
+    assert binding.pack_id == "media-basic"
+    assert binding.pack_version == environment.pack("media-basic").pack_version
+    events = [
+        event
+        for event in runtime.job_repository.list_events(submitted.job_id)
+        if event.event_type == JOB_PACK_ENVIRONMENT_EVENT
+    ]
+    assert len(events) == 1
+    payload = json.loads(events[0].payload_json)
+    assert payload == {
+        "packs": [
+            {
+                "manifest_sha256": "sha256:" + "a" * 64,
+                "pack_id": "media-basic",
+                "pack_version": "yt-dlp-2026.7.4-ffmpeg-8.1.2-r1",
+                "platform": "windows-x86_64",
+            },
+            {
+                "manifest_sha256": "sha256:" + "b" * 64,
+                "pack_id": "transcribe-cpu",
+                "pack_version": "faster-whisper-1.1.1-small-536b0662-r1",
+                "platform": "windows-x86_64",
+            },
+        ],
+        "schema_version": 1,
+    }
+
+
+def test_recovery_refuses_same_version_with_different_pack_digest(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    machine = tmp_path / "machine"
+    first = _create_runtime(
+        machine,
+        "bilibili",
+        Calls(),
+        pack_environment=_pack_environment(),
+    )
+    submitted = first.submit_video(request("bilibili", workspace_root))
+    restarted = _create_runtime(
+        machine,
+        "bilibili",
+        Calls(),
+        pack_environment=_pack_environment(media_digest="c"),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        restarted.wait_job(submitted.job_id)
+
+    assert caught.value.code == "execution_pack_drift"
+
+
+def test_recovery_rebinds_to_exact_recorded_pack_generations(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    machine = tmp_path / "machine"
+    submitted_environment = _pack_environment()
+    first = _create_runtime(
+        machine,
+        "bilibili",
+        Calls(),
+        pack_environment=submitted_environment,
+    )
+    submitted = first.submit_video(request("bilibili", workspace_root))
+    resolved: list[JobPackEnvironmentSnapshot] = []
+    restarted = _create_runtime(
+        machine,
+        "bilibili",
+        Calls(),
+        pack_environment=_pack_environment(media_digest="c"),
+        resolved_pack_environments=resolved,
+    )
+
+    completed = restarted.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert resolved == [submitted_environment]
+    bundle = workspace_root / completed.result.workspace_relative_bundle_path
+    receipt = json.loads((bundle / "receipt.json").read_text("utf-8"))
+    feature_packs = [
+        executor
+        for executor in receipt["executors"]
+        if executor["kind"] == "feature-pack"
+    ]
+    assert [pack["manifest_sha256"] for pack in feature_packs] == [
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+    ]
 
 
 def _decode_acquisition_checkpoint(runtime: object, job_id: str) -> object:
