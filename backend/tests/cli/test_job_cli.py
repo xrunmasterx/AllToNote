@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from app.cli.errors import map_error
 from app.cli.main import main
 from app.core.domain.video import JobState, VideoProduceRequest
+from app.core.errors import ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState
 
@@ -154,6 +156,20 @@ def test_job_get_failed_is_a_successful_query_with_actionable_failure(
     assert job["failure"]["retryable"] is False
     assert job["failure"]["next_actions"]
     assert job["retry"]["allowed"] is True
+
+
+def test_attempt_storage_capacity_failure_has_machine_state_recovery_action() -> None:
+    mapped = map_error(
+        code="attempt_storage_capacity_insufficient",
+        category=ErrorCategory.RETRYABLE_RUNTIME,
+        message="Attempt storage has insufficient free disk space",
+        details={"required_bytes": 11, "available_bytes": 10},
+    )
+
+    assert mapped.error.retryable is True
+    assert mapped.error.next_actions == (
+        "Free space in the AllToNote machine-state location and retry",
+    )
 
 
 def test_job_list_is_bounded_cursor_paginated_and_state_filtered(

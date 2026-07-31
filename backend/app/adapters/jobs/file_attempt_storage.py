@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -77,6 +78,20 @@ def _storage_io_failed() -> DomainError:
         "attempt_storage_io_failed",
         ErrorCategory.RETRYABLE_RUNTIME,
         "Attempt storage could not publish the asset",
+    )
+
+
+def _storage_capacity_insufficient(
+    *, required_bytes: int, available_bytes: int
+) -> DomainError:
+    return DomainError(
+        "attempt_storage_capacity_insufficient",
+        ErrorCategory.RETRYABLE_RUNTIME,
+        "Attempt storage has insufficient free disk space",
+        {
+            "required_bytes": required_bytes,
+            "available_bytes": available_bytes,
+        },
     )
 
 
@@ -238,11 +253,24 @@ class FileAttemptStorage:
                     or self._path_chain_has_reparse_point(source)
                 ):
                     raise _stored_asset_invalid()
+                source_length = source_stat.st_size
+                available_bytes = shutil.disk_usage(self.root).free
+                if available_bytes < source_length:
+                    raise _storage_capacity_insufficient(
+                        required_bytes=source_length,
+                        available_bytes=available_bytes,
+                    )
+                copied_length = 0
                 with temporary.open("xb") as target_stream:
                     while chunk := source_stream.read(1024 * 1024):
                         token.raise_if_cancelled()
+                        copied_length += len(chunk)
+                        if copied_length > source_length:
+                            raise _stored_asset_invalid()
                         if target_stream.write(chunk) != len(chunk):
                             raise OSError("short attempt asset write")
+                    if copied_length != source_length:
+                        raise _stored_asset_invalid()
                     target_stream.flush()
                     os.fsync(target_stream.fileno())
             verified_digest, verified_length = self._verified_file_digest(temporary)

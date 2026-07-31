@@ -339,7 +339,8 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 - 本地路径收据固定 `media-basic`、`transcribe-cpu` 与 `faster-whisper/1.1.1/small/cpu-int8`，源 MP4 SHA-256 前后不变；
 - Bundle semantic validate 为 `valid=true, issues=[]`；新进程 `job wait` 前后事件序列、Bundle 哈希与源哈希不变；
 - VREL-04 核心安全决策已冻结：provided 优先、有效字幕不下载媒体、确认无字幕才允许回退、UNKNOWN 不回退、损坏字幕直接失败；质量/多语言/全平台矩阵仍待完成；
-- 最终完整 backend 回归为 `2234 passed, 2 skipped, 3 warnings`，独立 Gate Review 为 0 P0 / 0 P1；
+- 媒体快照现在按已打开源文件长度预检机器状态卷容量并限制复制增长；该检查不是空间预留，预检后的真实磁盘耗尽仍保留在发布故障矩阵；
+- 最终完整 backend 回归为 `2240 passed, 2 skipped, 3 warnings, 3 subtests passed`，当前健壮性切片的独立 Gate Review 为 0 P0 / 0 P1；
 - 权威摘要：[`Official Video Packs 与真实视频验收`](../acceptance/2026-07-31-official-video-packs.md)。
 
 剩余 Gate：独立非管理员 Windows 用户/VM、受控较长本地视频、VREL-03 故障矩阵、VREL-04 质量/多语言/全平台矩阵，以及 VREL-05 至 VREL-11 尚未关闭的发布项。新 Workspace 缺 `wiki/common/index.md` 的 strict validate 问题属于 Workspace-init 后续合同，不在 Video Produce 中隐式修补。

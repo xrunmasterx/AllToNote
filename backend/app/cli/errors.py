@@ -105,6 +105,10 @@ def map_error(
         next_actions = (
             "Inspect the unknown external operation before confirming a new retry",
         )
+    elif code == "attempt_storage_capacity_insufficient":
+        next_actions = (
+            "Free space in the AllToNote machine-state location and retry",
+        )
     elif code == "pack_trust_unconfigured":
         next_actions = ("Install a Runtime release with official Pack trust roots",)
     elif code == "pack_install_busy":

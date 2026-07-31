@@ -4,6 +4,7 @@ import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -865,6 +866,82 @@ def test_snapshot_asset_rejects_non_regular_directory_source(tmp_path: Path) -> 
             authority=authority,
             token=_Token(),
         )
+
+
+def test_snapshot_asset_checks_machine_state_capacity_before_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "repository")
+    storage = _storage(tmp_path / "machine-state" / "attempts", repository)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"local-media")
+    job, attempt, authority = _running_attempt(repository)
+    _, role_type = _asset_api()
+    monkeypatch.setattr(
+        storage_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=100, used=90, free=10),
+    )
+
+    with pytest.raises(DomainError) as caught:
+        storage.snapshot_asset(
+            source,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+            role=role_type.SOURCE_MEDIA,
+            expected_sha256=sha256_digest(source.read_bytes()),
+            authority=authority,
+            token=_Token(),
+        )
+
+    assert caught.value.code == "attempt_storage_capacity_insufficient"
+    assert caught.value.category.value == "retryable_runtime"
+    assert caught.value.details == {"required_bytes": 11, "available_bytes": 10}
+    serialized = f"{caught.value.message}{dict(caught.value.details)}"
+    assert str(source) not in serialized
+    assert str(storage.root) not in serialized
+    assert not tuple(storage.root.rglob("source_media.*"))
+    assert not tuple(storage.root.rglob("*.partial"))
+
+
+def test_snapshot_asset_rejects_source_growth_beyond_opened_length(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SqliteJobRepository.open(tmp_path / "repository")
+    storage = _storage(tmp_path / "attempts", repository)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"local-media")
+    job, attempt, authority = _running_attempt(repository)
+    _, role_type = _asset_api()
+    original_fstat = os.fstat
+
+    def shorter_source_stat(file_descriptor: int) -> object:
+        result = original_fstat(file_descriptor)
+        return SimpleNamespace(
+            st_mode=result.st_mode,
+            st_dev=result.st_dev,
+            st_ino=result.st_ino,
+            st_size=result.st_size - 1,
+        )
+
+    monkeypatch.setattr(storage_module.os, "fstat", shorter_source_stat)
+
+    with pytest.raises(DomainError) as caught:
+        storage.snapshot_asset(
+            source,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+            role=role_type.SOURCE_MEDIA,
+            expected_sha256=sha256_digest(source.read_bytes()),
+            authority=authority,
+            token=_Token(),
+        )
+
+    assert caught.value.code == "attempt_stored_asset_invalid"
+    assert not tuple(storage.root.rglob("source_media.*"))
+    assert not tuple(storage.root.rglob("*.partial"))
 
 
 def test_windows_junction_is_detected_as_reparse_point(tmp_path: Path) -> None:
