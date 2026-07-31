@@ -157,6 +157,15 @@ def test_prompt_allows_reusing_evidence_without_redundant_adjacent_citations() -
     assert "避免无意义相邻重复引用" in prompt
 
 
+def test_prompt_requires_evidence_in_every_substantive_h2_section() -> None:
+    transcript = _transcript(count=2)
+
+    prompt = build_video_prompt(_request(transcript), transcript.segments)
+
+    assert "每个包含实质内容的二级标题（##）章节" in prompt
+    assert "方法论、流程和总结也不能例外" in prompt
+
+
 def test_parser_preserves_repeated_citation_uses_but_projects_unique_ids() -> None:
     output = (
         "# Note\n\n"
@@ -361,11 +370,13 @@ def test_chunker_keeps_segment_boundaries_and_accounts_linearly() -> None:
         chunk.encoded_bytes for chunk in one_segment_plan.chunks
     ]
     assert len(encoded_sizes) == 1
-    per_document_bytes = encoded_sizes[0]
+    four_segment_bytes = len(
+        build_video_prompt(request, transcript.segments[:4]).encode("utf-8")
+    )
 
     plan = plan_transcript_chunks(
         request,
-        max_prompt_bytes=max(1, per_document_bytes // 2),
+        max_prompt_bytes=four_segment_bytes,
     )
 
     assert plan.segment_visits == 8

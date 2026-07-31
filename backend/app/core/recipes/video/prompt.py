@@ -41,6 +41,9 @@ def _prompt_parts(request: KnowledgeModelRequest) -> tuple[str, str, str]:
         " 引用事实，仅引用本批次分段。\n"
         "同一分段可支持不同陈述或章节；"
         "避免无意义相邻重复引用。\n"
+        "每个包含实质内容的二级标题（##）章节都必须在该章节正文中"
+        "至少使用一个允许的引用；方法论、流程和总结也不能例外；"
+        "不得把引用放在标题中。\n"
         f"{screenshot_rule}\n\n"
         "<BEGIN_UNTRUSTED_TRANSCRIPT_JSONL>\n"
     )
