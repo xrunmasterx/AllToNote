@@ -27,7 +27,15 @@ from app.core.application.document_knowledge_compiler import (
 from app.core.application.document_service import (
     CHECKPOINT_SCHEMA,
     DocumentKnowledgeCompilationInput,
+    DocumentKnowledgeVerificationInput,
     DocumentService,
+)
+from app.core.application.document_knowledge_verifier import (
+    DocumentKnowledgeClaimVerificationV1,
+    DocumentKnowledgeVerificationV1,
+    compiled_document_knowledge_sha256,
+    document_knowledge_evidence_sha256,
+    document_knowledge_claims,
 )
 from app.core.application.job_execution_router import JobExecutionRouter
 from app.core.application.produce_service import ProduceService
@@ -152,6 +160,28 @@ class _KnowledgeCompiler:
             model_identity="fixture/model-v1",
             input_tokens=10,
             output_tokens=20,
+            token_counts_complete=True,
+        )
+
+    def verify(
+        self,
+        request: DocumentKnowledgeVerificationInput,
+        *,
+        execution,
+    ) -> DocumentKnowledgeVerificationV1:
+        execution.heartbeat()
+        return DocumentKnowledgeVerificationV1(
+            compiled_sha256=compiled_document_knowledge_sha256(request.compiled),
+            evidence_input_sha256=document_knowledge_evidence_sha256(
+                request.parsed, request.compiled
+            ),
+            claims=tuple(
+                DocumentKnowledgeClaimVerificationV1(claim_id, "supported")
+                for claim_id, _claim in document_knowledge_claims(request.compiled)
+            ),
+            model_identity="fixture/model-v1",
+            input_tokens=5,
+            output_tokens=5,
             token_counts_complete=True,
         )
 
@@ -590,7 +620,7 @@ def _knowledge_request(
     )
 
 
-def test_document_v2_compiles_note_but_requires_semantic_quality_verification(
+def test_document_v2_same_model_review_remains_not_publishable(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)

@@ -72,7 +72,7 @@ file hash + page + bbox + block hash；range reader/preview overlay；测试重�
 
 Knowledge Note + deterministic Quality；来源语言/中文；section-aware inputs；表格/figure引用；没有可用文本时先要求 OCR，不让模型猜。
 
-当前增量（2026-07-31）：Compiler 已生成结构化 Knowledge Note 与独立 Knowledge Map，并对引用存在性和 source/page coverage 做确定性检查；但这些检查不证明生成主张被来源语义支持。在独立 claim-level 语义验证实现前，编译结果保持 Job `succeeded`，同时固定为 `knowledge-note-quality=skipped / semantic-not-evaluated`、`quality.overall=fail`、`publish_eligible=false`。验证边界见 [`Document Knowledge Note 语义质量边界`](../../acceptance/2026-07-31-document-semantic-quality-boundary.md)。
+当前增量（2026-07-31）：Compiler 已生成结构化 Knowledge Note 与独立 Knowledge Map；第二个可恢复的结构化 stage 会逐 claim、仅基于其引用 block 给出 model review，并绑定 compiled/source/parser、block 声明 hash 与实际文本 hash。正式 Runtime 目前生成与复核仍使用同一 frozen model binding，因此该结果只作 advisory，固定为 `same-model-review-not-independent`、`quality.overall=fail`、`publish_eligible=false`；未来必须显式提供独立 verifier binding 才可恢复自动发布资格。验证边界见 [`Document Knowledge Note 语义质量边界`](../../acceptance/2026-07-31-document-semantic-quality-boundary.md)。
 
 ## 9. Task DOC-07：局部 OCR Pack
 

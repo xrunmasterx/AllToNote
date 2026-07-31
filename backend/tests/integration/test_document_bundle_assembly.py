@@ -15,6 +15,13 @@ from app.core.application.document_knowledge_compiler import (
     DocumentKnowledgeClaimV1,
     DocumentKnowledgeSectionV1,
 )
+from app.core.application.document_knowledge_verifier import (
+    DocumentKnowledgeClaimVerificationV1,
+    DocumentKnowledgeVerificationV1,
+    compiled_document_knowledge_sha256,
+    document_knowledge_evidence_sha256,
+    document_knowledge_claims,
+)
 from app.core.domain.document import (
     DocumentBlock,
     DocumentBoundingBox,
@@ -607,6 +614,26 @@ def _compiled_note(
     )
 
 
+def _verification(
+    compiled: CompiledDocumentKnowledgeNoteV1,
+    *,
+    parsed: ParsedDocument,
+    status: str = "supported",
+) -> DocumentKnowledgeVerificationV1:
+    return DocumentKnowledgeVerificationV1(
+        compiled_sha256=compiled_document_knowledge_sha256(compiled),
+        evidence_input_sha256=document_knowledge_evidence_sha256(parsed, compiled),
+        claims=tuple(
+            DocumentKnowledgeClaimVerificationV1(claim_id, status)
+            for claim_id, _claim in document_knowledge_claims(compiled)
+        ),
+        model_identity="fixture/verifier-v1",
+        input_tokens=40,
+        output_tokens=20,
+        token_counts_complete=True,
+    )
+
+
 def test_compiled_document_is_not_publishable_without_semantic_verification(
     tmp_path: Path,
 ) -> None:
@@ -732,3 +759,61 @@ def test_compiled_document_low_source_coverage_is_not_publishable(
         "reason": "semantic-not-evaluated",
     }
     assert checks["source-coverage"]["status"] == "fail"
+
+
+def test_semantically_verified_document_is_publishable_and_auditable(
+    tmp_path: Path,
+) -> None:
+    workspace = _candidate_workspace(tmp_path)
+    parsed = _document_with_blocks(
+        ("section_header", "Source title"),
+        ("paragraph", "The source states the problem and method."),
+    )
+    compiled = _compiled_note()
+    gateway = IWikiPortableGateway()
+
+    candidate = DocumentBundleAssembler().assemble(
+        parsed,
+        compiled=compiled,
+        verification=_verification(compiled, parsed=parsed),
+        job_id=new_typed_id("job"),
+        created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
+        location=gateway.candidate_location(
+            workspace,
+            local_instance_id="document-semantic-quality",
+            nonce="fixture",
+        ),
+    )
+    quality = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "quality"
+            / f"{candidate.quality_report_artifact_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+    knowledge_map = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "evidence"
+            / "knowledge-map.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert gateway.validate_candidate(
+        workspace,
+        candidate.candidate.staging_relative_path,
+    ).valid
+    assert candidate.quality_overall == "pass"
+    assert candidate.publish_eligible is True
+    checks = {value["id"]: value["status"] for value in quality["checks"]}
+    assert checks["knowledge-note-quality"] == "pass"
+    assert checks["source-coverage"] == "pass"
+    assert quality["method"] == {"kind": "model"}
+    assert knowledge_map["semantic_verification"]["model_identity"] == (
+        "fixture/verifier-v1"
+    )
+    assert all(
+        claim["status"] == "supported"
+        for claim in knowledge_map["semantic_verification"]["claims"]
+    )

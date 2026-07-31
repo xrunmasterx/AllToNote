@@ -66,6 +66,7 @@ from app.core.application.produce_service import ProduceService
 from app.core.application.document_service import (
     CHECKPOINT_SCHEMA as DOCUMENT_CHECKPOINT_SCHEMA,
     DocumentKnowledgeCompilationInput,
+    DocumentKnowledgeVerificationInput,
     DocumentService,
 )
 from app.core.application.document_knowledge_compiler import (
@@ -73,6 +74,11 @@ from app.core.application.document_knowledge_compiler import (
     DocumentCompilationContext,
     DocumentKnowledgeCompilationRequestV1,
     DocumentKnowledgeCompiler,
+)
+from app.core.application.document_knowledge_verifier import (
+    DocumentKnowledgeVerificationRequestV1,
+    DocumentKnowledgeVerificationV1,
+    DocumentKnowledgeVerifier,
 )
 from app.core.application.job_execution_router import JobExecutionRouter
 from app.core.application.video_acquisition import (
@@ -1029,6 +1035,7 @@ class _RuntimeCompilationProfile:
 class _RuntimeDocumentKnowledgeCompiler:
     profile: _RuntimeCompilationProfile
     compiler: DocumentKnowledgeCompiler
+    verifier: DocumentKnowledgeVerifier
 
     def model_identity(self) -> str:
         return self.profile.binding.model_identity
@@ -1039,6 +1046,7 @@ class _RuntimeDocumentKnowledgeCompiler:
             json.dumps(
                 {
                     "behavior": self.compiler.behavior_identity(),
+                    "verification_behavior": self.verifier.behavior_identity(),
                     "binding": {
                         "context_window_tokens": binding.context_window_tokens,
                         "credential_profile_ref": binding.credential_profile_ref,
@@ -1092,6 +1100,50 @@ class _RuntimeDocumentKnowledgeCompiler:
                 schema_version=1,
                 parsed=request.parsed,
                 output_language=request.output_language,
+                model_binding=self.profile.binding,
+            ),
+            DocumentCompilationContext(
+                execution=ModelCallExecution(
+                    job_id=job_id,
+                    step_id=step_id,
+                    attempt_id=attempt_id,
+                    authority=authority,
+                    heartbeat=heartbeat,
+                ),
+                cancellation_token=CancellationToken(
+                    self.profile.repository,
+                    job_id,
+                ),
+            ),
+        )
+
+    def verify(
+        self,
+        request: DocumentKnowledgeVerificationInput,
+        *,
+        execution: object,
+    ) -> DocumentKnowledgeVerificationV1:
+        self.profile.validate_selection(
+            provider_profile=request.provider_profile,
+            model_override=request.model_override,
+        )
+        try:
+            job_id = execution.job_id
+            step_id = execution.step_id
+            attempt_id = execution.attempt_id
+            authority = execution.authority
+            heartbeat = execution.heartbeat
+        except AttributeError:
+            raise DomainError(
+                "document_knowledge_verification_contract_invalid",
+                ErrorCategory.INTERNAL,
+                "Document execution context is invalid",
+            ) from None
+        return self.verifier.verify(
+            DocumentKnowledgeVerificationRequestV1(
+                schema_version=1,
+                parsed=request.parsed,
+                compiled=request.compiled,
                 model_binding=self.profile.binding,
             ),
             DocumentCompilationContext(
@@ -1807,6 +1859,7 @@ def create_document_runtime(
         knowledge_compiler = _RuntimeDocumentKnowledgeCompiler(
             profile=profile,
             compiler=DocumentKnowledgeCompiler(coordinator),
+            verifier=DocumentKnowledgeVerifier(coordinator),
         )
 
     def resolve_source_identity(

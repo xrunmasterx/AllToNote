@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,9 +12,16 @@ from app.adapters.models.legacy_gpt import LegacyModelResponse
 from app.adapters.models.legacy_model_executor import LegacyModelExecutor
 from app.adapters.models.model_result_store import ModelOperationResultStore
 from app.core.application.document_knowledge_compiler import (
+    CompiledDocumentKnowledgeNoteV1,
     DocumentCompilationContext,
     DocumentKnowledgeCompilationRequestV1,
     DocumentKnowledgeCompiler,
+)
+from app.core.application.document_knowledge_verifier import (
+    DocumentKnowledgeVerificationRequestV1,
+    DocumentKnowledgeVerifier,
+    compiled_document_knowledge_sha256,
+    document_knowledge_evidence_sha256,
 )
 from app.core.application.model_call_coordinator import (
     ModelCallCoordinator,
@@ -108,6 +116,16 @@ class _Executor:
         )
 
 
+class _SequentialExecutor(_Executor):
+    def __init__(self, responses: tuple[str, ...]) -> None:
+        super().__init__(responses[0])
+        self._responses = list(responses)
+
+    def complete(self, request: ModelExecutionRequest, token) -> ModelExecutionResult:
+        self.response = self._responses.pop(0)
+        return super().complete(request, token)
+
+
 class _LegacyBridge:
     def __init__(self, response: str) -> None:
         self.response = response
@@ -130,10 +148,10 @@ class _LegacyBridge:
         )
 
 
-def _compilation_harness(
+def _model_harness(
     tmp_path: Path,
     executor,
-) -> tuple[DocumentKnowledgeCompiler, DocumentCompilationContext]:
+) -> tuple[ModelCallCoordinator, DocumentCompilationContext]:
     repository = SqliteJobRepository.open(tmp_path / "machine", clock=lambda: 1_000)
     job = repository.create_job(
         request_hash="sha256:" + "b" * 64,
@@ -152,7 +170,7 @@ def _compilation_harness(
         executor=executor,
     )
     return (
-        DocumentKnowledgeCompiler(coordinator),
+        coordinator,
         DocumentCompilationContext(
             execution=ModelCallExecution(
                 job_id=job.job_id,
@@ -166,6 +184,14 @@ def _compilation_harness(
             cancellation_token=CancellationToken(repository, job.job_id),
         ),
     )
+
+
+def _compilation_harness(
+    tmp_path: Path,
+    executor,
+) -> tuple[DocumentKnowledgeCompiler, DocumentCompilationContext]:
+    coordinator, context = _model_harness(tmp_path, executor)
+    return DocumentKnowledgeCompiler(coordinator), context
 
 
 def _compiler(
@@ -215,6 +241,41 @@ def _response() -> dict[str, object]:
             }
         ],
     }
+
+
+def _compiled_note(tmp_path: Path) -> CompiledDocumentKnowledgeNoteV1:
+    compiler, context, _executor = _compiler(tmp_path, _response())
+    return compiler.compile(
+        DocumentKnowledgeCompilationRequestV1(
+            schema_version=1,
+            parsed=_document(),
+            output_language="en",
+            model_binding=_binding(),
+        ),
+        context,
+    )
+
+
+def test_document_verification_evidence_digest_binds_actual_block_text(
+    tmp_path: Path,
+) -> None:
+    parsed = _document()
+    compiled = _compiled_note(tmp_path)
+    changed_block = replace(parsed.pages[0].blocks[1], text="changed evidence")
+    changed_page = replace(
+        parsed.pages[0],
+        blocks=(
+            parsed.pages[0].blocks[0],
+            changed_block,
+            parsed.pages[0].blocks[2],
+        ),
+    )
+    changed = replace(parsed, pages=(changed_page,))
+
+    assert changed_block.content_sha256 == parsed.pages[0].blocks[1].content_sha256
+    assert document_knowledge_evidence_sha256(
+        parsed, compiled
+    ) != document_knowledge_evidence_sha256(changed, compiled)
 
 
 def test_document_compiler_returns_semantic_note_with_separate_evidence(
@@ -420,3 +481,161 @@ def test_document_compiler_fails_before_model_call_when_source_is_too_large(
 
     assert caught.value.code == "document_long_compilation_required"
     assert executor.requests == []
+
+
+def _verification_response(status: str = "supported") -> dict[str, object]:
+    return {
+        "claims": [
+            {"claim_id": claim_id, "status": status}
+            for claim_id in (
+                "title-0001",
+                "overview-0001",
+                "section-0001-heading-0001",
+                "section-0001-paragraph-0001",
+                "section-0001-key-point-0001",
+            )
+        ]
+    }
+
+
+def _verifier(
+    tmp_path: Path,
+    response: object,
+) -> tuple[DocumentKnowledgeVerifier, DocumentCompilationContext, _Executor]:
+    text = response if isinstance(response, str) else json.dumps(response)
+    executor = _Executor(text)
+    coordinator, context = _model_harness(tmp_path, executor)
+    return DocumentKnowledgeVerifier(coordinator), context, executor
+
+
+def test_document_verifier_checks_every_claim_against_only_its_cited_blocks(
+    tmp_path: Path,
+) -> None:
+    compiled = _compiled_note(tmp_path / "compile")
+    verifier, context, executor = _verifier(
+        tmp_path / "verify",
+        _verification_response(),
+    )
+
+    result = verifier.verify(
+        DocumentKnowledgeVerificationRequestV1(
+            schema_version=1,
+            parsed=_document(),
+            compiled=compiled,
+            model_binding=_binding(),
+        ),
+        context,
+    )
+
+    assert result.passed is True
+    assert result.compiled_sha256 == compiled_document_knowledge_sha256(compiled)
+    assert len(result.claims) == 5
+    assert len(executor.requests) == 1
+    assert executor.requests[0].stage_id == "document-knowledge-verify"
+    payload = json.loads(executor.requests[0].user_content)
+    overview = next(
+        claim for claim in payload["claims"] if claim["claim_id"] == "overview-0001"
+    )
+    assert overview["cited_sources"] == [
+        {"block_id": "blk_problem", "text": "P" * 32}
+    ]
+    assert "only against its cited source" in executor.requests[0].system_instruction
+
+
+def test_document_verifier_fails_closed_when_any_claim_is_not_supported(
+    tmp_path: Path,
+) -> None:
+    compiled = _compiled_note(tmp_path / "compile")
+    response = _verification_response()
+    response["claims"][3]["status"] = "insufficient-evidence"  # type: ignore[index]
+    verifier, context, _executor = _verifier(tmp_path / "verify", response)
+
+    result = verifier.verify(
+        DocumentKnowledgeVerificationRequestV1(
+            schema_version=1,
+            parsed=_document(),
+            compiled=compiled,
+            model_binding=_binding(),
+        ),
+        context,
+    )
+
+    assert result.passed is False
+    assert result.claims[3].status == "insufficient-evidence"
+
+
+@pytest.mark.parametrize(
+    "claims",
+    (
+        _verification_response()["claims"][:-1],
+        [
+            *_verification_response()["claims"][:-1],
+            {"claim_id": "title-0001", "status": "supported"},
+        ],
+        [
+            *_verification_response()["claims"][:-1],
+            {"claim_id": "unknown", "status": "supported"},
+        ],
+    ),
+)
+def test_document_verifier_rejects_missing_duplicate_or_unknown_claims(
+    tmp_path: Path,
+    claims: object,
+) -> None:
+    compiled = _compiled_note(tmp_path / "compile")
+    verifier, context, _executor = _verifier(
+        tmp_path / "verify",
+        {"claims": claims},
+    )
+
+    with pytest.raises(DomainError) as caught:
+        verifier.verify(
+            DocumentKnowledgeVerificationRequestV1(
+                schema_version=1,
+                parsed=_document(),
+                compiled=compiled,
+                model_binding=_binding(),
+            ),
+            context,
+        )
+
+    assert caught.value.code == "document_knowledge_verification_response_invalid"
+
+
+def test_document_compose_and_verify_recover_without_repeating_paid_calls(
+    tmp_path: Path,
+) -> None:
+    executor = _SequentialExecutor(
+        (
+            json.dumps(_response()),
+            json.dumps(_verification_response()),
+        )
+    )
+    coordinator, context = _model_harness(tmp_path, executor)
+    compiler = DocumentKnowledgeCompiler(coordinator)
+    verifier = DocumentKnowledgeVerifier(coordinator)
+    compilation_request = DocumentKnowledgeCompilationRequestV1(
+        schema_version=1,
+        parsed=_document(),
+        output_language="en",
+        model_binding=_binding(),
+    )
+
+    compiled = compiler.compile(compilation_request, context)
+    verification_request = DocumentKnowledgeVerificationRequestV1(
+        schema_version=1,
+        parsed=_document(),
+        compiled=compiled,
+        model_binding=_binding(),
+    )
+    verified = verifier.verify(verification_request, context)
+    recovered_compiled = compiler.compile(compilation_request, context)
+    recovered_verified = verifier.verify(verification_request, context)
+
+    assert verified.passed is True
+    assert recovered_compiled == compiled
+    assert recovered_verified == verified
+    assert [request.stage_id for request in executor.requests] == [
+        "document-knowledge-compose",
+        "document-knowledge-verify",
+    ]

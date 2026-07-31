@@ -8,9 +8,14 @@ from uuid import UUID
 from app.core.application.document_knowledge_compiler import (
     CompiledDocumentKnowledgeNoteV1,
 )
+from app.core.application.document_knowledge_verifier import (
+    DocumentKnowledgeVerificationV1,
+    compiled_document_knowledge_sha256,
+    document_knowledge_evidence_sha256,
+)
 from app.core.domain.document import ParsedDocument
 from app.core.domain.ids import new_typed_id, sha256_digest
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.bundle_assembler import CandidateBundle
 from app.core.portable.jsonio import encode_json, encode_ndjson
 from app.core.portable.markdown_safety import validate_markdown_safety
@@ -217,6 +222,7 @@ class DocumentBundleAssembler:
         parsed: ParsedDocument,
         *,
         compiled: CompiledDocumentKnowledgeNoteV1 | None = None,
+        verification: DocumentKnowledgeVerificationV1 | None = None,
         job_id: str,
         created_at: str,
         location: CandidateLocationCapabilityPort,
@@ -326,6 +332,12 @@ class DocumentBundleAssembler:
         title = title_block.text if title_block is not None else parsed.source_name
         knowledge_map: bytes | None = None
         if compiled is None:
+            if verification is not None:
+                raise DomainError(
+                    "document_knowledge_verification_invalid",
+                    ErrorCategory.RECIPE_FAILED,
+                    "Document semantic verification does not match the knowledge note",
+                )
             draft_lines = [_render_inline_text(title, prefix="# "), ""]
             for block in blocks:
                 if block is title_block:
@@ -334,12 +346,41 @@ class DocumentBundleAssembler:
             draft_text = "\n".join(draft_lines) + "\n"
         else:
             draft_text, knowledge_items = _compiled_projection(compiled)
+            if verification is not None and (
+                verification.compiled_sha256
+                != compiled_document_knowledge_sha256(compiled)
+                or verification.evidence_input_sha256
+                != document_knowledge_evidence_sha256(parsed, compiled)
+                or tuple(claim.claim_id for claim in verification.claims)
+                != tuple(item["note_item_id"] for item in knowledge_items)
+            ):
+                raise DomainError(
+                    "document_knowledge_verification_invalid",
+                    ErrorCategory.RECIPE_FAILED,
+                    "Document semantic verification does not match the knowledge note",
+                )
             knowledge_map = encode_json(
                 {
                     "knowledge_map_schema_version": 1,
                     "model_identity": compiled.model_identity,
                     "referenced_block_ids": list(compiled.referenced_block_ids),
                     "items": list(knowledge_items),
+                    **(
+                        {
+                            "semantic_verification": {
+                                "model_identity": verification.model_identity,
+                                "claims": [
+                                    {
+                                        "claim_id": claim.claim_id,
+                                        "status": claim.status,
+                                    }
+                                    for claim in verification.claims
+                                ],
+                            }
+                        }
+                        if verification is not None
+                        else {}
+                    ),
                 }
             )
         try:
@@ -406,12 +447,24 @@ class DocumentBundleAssembler:
             and source_coverage_ratio >= 0.35
             and page_reference_coverage_ratio >= 0.60
         )
-        quality_overall = (
-            "fail"
-            if compiled is not None
-            else ("pass" if extraction_passed else "fail")
+        semantic_quality_passed = (
+            verification is not None
+            and verification.passed
+            and verification.model_identity != compiled.model_identity
         )
-        publish_eligible = False
+        quality_overall = (
+            "pass"
+            if compiled is not None
+            and extraction_passed
+            and source_coverage_passed
+            and semantic_quality_passed
+            else (
+                "fail"
+                if compiled is not None
+                else ("pass" if extraction_passed else "fail")
+            )
+        )
+        publish_eligible = compiled is not None and quality_overall == "pass"
         quality_messages = list(parsed.warnings)
         if not markdown_safe:
             quality_messages.append("markdown-safety")
@@ -423,10 +476,14 @@ class DocumentBundleAssembler:
             quality_messages.append("partial-extraction")
         if compiled is None:
             quality_messages.append("knowledge-note-quality-not-evaluated")
-        else:
+        elif verification is None:
             quality_messages.append("knowledge-note-semantic-quality-not-evaluated")
-            if not source_coverage_passed:
-                quality_messages.append("knowledge-note-source-coverage")
+        elif verification.model_identity == compiled.model_identity:
+            quality_messages.append("knowledge-note-same-model-review-not-independent")
+        elif not semantic_quality_passed:
+            quality_messages.append("knowledge-note-semantic-quality")
+        if compiled is not None and not source_coverage_passed:
+            quality_messages.append("knowledge-note-source-coverage")
         checks: list[dict[str, object]] = [
             {
                 "id": "native-text",
@@ -458,13 +515,29 @@ class DocumentBundleAssembler:
             quality_profile = "alltonote.document-native-extraction"
             metrics: dict[str, object] = {"quality_repair_attempts": 0}
         else:
-            checks.extend(
-                (
+            knowledge_quality_check: dict[str, object]
+            if verification is None:
+                knowledge_quality_check = {
+                    "id": "knowledge-note-quality",
+                    "status": "skipped",
+                    "reason": "semantic-not-evaluated",
+                }
+            else:
+                knowledge_quality_check = (
                     {
                         "id": "knowledge-note-quality",
                         "status": "skipped",
-                        "reason": "semantic-not-evaluated",
-                    },
+                        "reason": "same-model-review-not-independent",
+                    }
+                    if verification.model_identity == compiled.model_identity
+                    else {
+                        "id": "knowledge-note-quality",
+                        "status": "pass" if verification.passed else "fail",
+                    }
+                )
+            checks.extend(
+                (
+                    knowledge_quality_check,
                     {
                         "id": "source-coverage",
                         "status": "pass" if source_coverage_passed else "fail",
@@ -482,6 +555,17 @@ class DocumentBundleAssembler:
                 "output_tokens": compiled.output_tokens,
                 "token_counts_complete": compiled.token_counts_complete,
             }
+            if verification is not None:
+                metrics.update(
+                    {
+                        "semantic_verification_input_tokens": verification.input_tokens,
+                        "semantic_verification_output_tokens": verification.output_tokens,
+                        "semantic_verification_token_counts_complete": (
+                            verification.token_counts_complete
+                        ),
+                        "semantic_verifier_model_identity": verification.model_identity,
+                    }
+                )
         quality = encode_json(
             {
                 "quality_report_schema_version": 1,
@@ -496,7 +580,9 @@ class DocumentBundleAssembler:
                 },
                 "overall": quality_overall,
                 "checks": checks,
-                "method": {"kind": "deterministic"},
+                "method": {
+                    "kind": "model" if verification is not None else "deterministic"
+                },
                 "metrics": metrics,
                 "messages": quality_messages,
                 "evidence_ids": [

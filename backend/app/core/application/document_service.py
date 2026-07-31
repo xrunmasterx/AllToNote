@@ -15,6 +15,9 @@ from app.core.application.checkpoint_runner import (
 from app.core.application.document_knowledge_compiler import (
     CompiledDocumentKnowledgeNoteV1,
 )
+from app.core.application.document_knowledge_verifier import (
+    DocumentKnowledgeVerificationV1,
+)
 from app.core.application.document_checkpoints import (
     DocumentCandidateCheckpoint,
     decode_parsed_document,
@@ -100,6 +103,14 @@ class DocumentKnowledgeCompilationInput:
     output_language: str
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentKnowledgeVerificationInput:
+    parsed: ParsedDocument
+    compiled: CompiledDocumentKnowledgeNoteV1
+    provider_profile: str
+    model_override: str | None
+
+
 class DocumentKnowledgeCompilerPort(Protocol):
     def model_identity(self) -> str: ...
 
@@ -111,6 +122,13 @@ class DocumentKnowledgeCompilerPort(Protocol):
         *,
         execution: CheckpointedStepExecutionContext,
     ) -> CompiledDocumentKnowledgeNoteV1: ...
+
+    def verify(
+        self,
+        request: DocumentKnowledgeVerificationInput,
+        *,
+        execution: CheckpointedStepExecutionContext,
+    ) -> DocumentKnowledgeVerificationV1: ...
 
 
 class DocumentService:
@@ -380,6 +398,7 @@ class DocumentService:
         )
         connector_id, canonical_identity = self._source_identity(request)
         compiled: CompiledDocumentKnowledgeNoteV1 | None = None
+        verification: DocumentKnowledgeVerificationV1 | None = None
         if isinstance(request, DocumentKnowledgeProduceRequest):
             compiler = self._require_knowledge_compiler()
             compiled = compiler.compile(
@@ -391,9 +410,19 @@ class DocumentService:
                 ),
                 execution=execution,
             )
+            verification = compiler.verify(
+                DocumentKnowledgeVerificationInput(
+                    parsed=parsed,
+                    compiled=compiled,
+                    provider_profile=request.provider_profile,
+                    model_override=request.model_override,
+                ),
+                execution=execution,
+            )
         candidate = DocumentBundleAssembler().assemble(
             parsed,
             compiled=compiled,
+            verification=verification,
             job_id=job_id,
             created_at=created_at,
             location=location,
@@ -715,5 +744,6 @@ class DocumentService:
 __all__ = [
     "DocumentKnowledgeCompilationInput",
     "DocumentKnowledgeCompilerPort",
+    "DocumentKnowledgeVerificationInput",
     "DocumentService",
 ]
