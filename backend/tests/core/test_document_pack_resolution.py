@@ -8,6 +8,7 @@ import shutil
 import pytest
 
 from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError
 from app.core.jobs.model import JobExecutionBinding, JobSnapshot, JobState
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
@@ -269,8 +270,27 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     )
     instance = registry.resolve(workspace)
     repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    request_json = json.dumps(
+        {
+            "expected_source_mtime_ns": 1,
+            "expected_source_sha256": "sha256:" + "b" * 64,
+            "expected_source_size": 1,
+            "input_path": str((workspace / "paper.pdf").resolve()),
+            "model_override": "fixture/frozen-model",
+            "output_language": "en",
+            "provider_profile": "fixture/frozen-profile",
+            "recipe_id": "alltonote.document-note",
+            "recipe_version": 1,
+            "request_schema_version": 2,
+            "workspace_root": str(workspace.resolve()),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     job = repository.create_job(
-        request_hash="sha256:" + "a" * 64,
+        request_hash=sha256_digest(request_json),
+        request_json=request_json,
         principal="local-user",
         client_request_id="document-reconnect",
         execution_binding=JobExecutionBinding(
@@ -282,7 +302,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             pack_version=PACK_VERSION,
         ),
     )
-    selected: list[tuple[Path, Path | None]] = []
+    selected: list[tuple[Path, Path | None, str | None, str | None]] = []
 
     class Runtime:
         def wait_job(self, job_id: str) -> JobSnapshot:
@@ -301,8 +321,19 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         workspace_root: Path,
         *,
         local_app_data: Path | None = None,
+        current_config_snapshot=None,
+        requested_model_identity: str | None = None,
+        requested_provider_profile: str | None = None,
     ) -> Runtime:
-        selected.append((workspace_root, local_app_data))
+        assert current_config_snapshot is None
+        selected.append(
+            (
+                workspace_root,
+                local_app_data,
+                requested_model_identity,
+                requested_provider_profile,
+            )
+        )
         return Runtime()
 
     monkeypatch.setattr(
@@ -316,4 +347,11 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     )
 
     assert runtime.wait_for_job(job.job_id).snapshot.state is JobState.QUEUED
-    assert selected == [(workspace, local_data)]
+    assert selected == [
+        (
+            workspace,
+            local_data,
+            "fixture/frozen-model",
+            "fixture/frozen-profile",
+        )
+    ]

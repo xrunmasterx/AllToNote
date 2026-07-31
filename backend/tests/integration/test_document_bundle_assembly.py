@@ -10,6 +10,11 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
+from app.core.application.document_knowledge_compiler import (
+    CompiledDocumentKnowledgeNoteV1,
+    DocumentKnowledgeClaimV1,
+    DocumentKnowledgeSectionV1,
+)
 from app.core.domain.document import (
     DocumentBlock,
     DocumentBoundingBox,
@@ -555,3 +560,166 @@ def test_document_candidate_preserves_safe_docling_table_structure(
     assert "<table>" in rendered
     assert "A | B" in rendered
     assert candidate.publish_eligible is False
+
+
+def _compiled_note(
+    *,
+    overview_sources: tuple[str, ...] = ("blk_1",),
+    section_sources: tuple[str, ...] = ("blk_1", "blk_2"),
+) -> CompiledDocumentKnowledgeNoteV1:
+    referenced = tuple(dict.fromkeys((*overview_sources, *section_sources)))
+    return CompiledDocumentKnowledgeNoteV1(
+        title=DocumentKnowledgeClaimV1(
+            "A human-readable knowledge note",
+            overview_sources,
+        ),
+        overview=(
+            DocumentKnowledgeClaimV1(
+                "This note explains the central problem.",
+                overview_sources,
+            ),
+        ),
+        sections=(
+            DocumentKnowledgeSectionV1(
+                DocumentKnowledgeClaimV1(
+                    "How the method works",
+                    section_sources,
+                ),
+                (
+                    DocumentKnowledgeClaimV1(
+                        "The method follows a clear sequence.",
+                        section_sources,
+                    ),
+                ),
+                (
+                    DocumentKnowledgeClaimV1(
+                        "The source supports the main result.",
+                        section_sources,
+                    ),
+                ),
+            ),
+        ),
+        referenced_block_ids=referenced,
+        model_identity="fixture/model-v1",
+        input_tokens=120,
+        output_tokens=80,
+        token_counts_complete=True,
+    )
+
+
+def test_compiled_document_renders_clean_note_and_separate_knowledge_map(
+    tmp_path: Path,
+) -> None:
+    workspace = _candidate_workspace(tmp_path)
+    parsed = _document_with_blocks(
+        ("section_header", "Source title"),
+        ("paragraph", "The source states the problem."),
+        ("paragraph", "The source explains the method."),
+    )
+    gateway = IWikiPortableGateway()
+
+    candidate = DocumentBundleAssembler().assemble(
+        parsed,
+        compiled=_compiled_note(),
+        job_id=new_typed_id("job"),
+        created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
+        location=gateway.candidate_location(
+            workspace,
+            local_instance_id="document-knowledge-note",
+            nonce="fixture",
+        ),
+    )
+
+    draft = (
+        candidate.candidate.absolute_path
+        / "drafts"
+        / f"{candidate.primary_draft_artifact_id}.md"
+    ).read_text(encoding="utf-8")
+    knowledge_map = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "evidence"
+            / "knowledge-map.json"
+        ).read_text(encoding="utf-8")
+    )
+    quality = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "quality"
+            / f"{candidate.quality_report_artifact_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert draft == (
+        "# A human-readable knowledge note\n\n"
+        "This note explains the central problem.\n\n"
+        "## How the method works\n\n"
+        "The method follows a clear sequence.\n\n"
+        "- The source supports the main result.\n"
+    )
+    assert "blk_" not in draft
+    assert "Document page" not in draft
+    assert knowledge_map["referenced_block_ids"] == ["blk_1", "blk_2"]
+    assert knowledge_map["items"][0] == {
+        "note_item_id": "title-0001",
+        "source_block_ids": ["blk_1"],
+    }
+    assert knowledge_map["items"][2] == {
+        "note_item_id": "section-0001-heading-0001",
+        "source_block_ids": ["blk_1", "blk_2"],
+    }
+    assert candidate.knowledge_map_artifact_id is not None
+    assert candidate.quality_overall == "pass"
+    assert candidate.publish_eligible is True
+    assert quality["profile"] == {
+        "id": "alltonote.document-knowledge-note",
+        "version": 1,
+    }
+    checks = {value["id"]: value["status"] for value in quality["checks"]}
+    assert checks["knowledge-note-quality"] == "pass"
+    assert checks["source-coverage"] == "pass"
+    assert quality["metrics"]["referenced_block_count"] == 2
+
+
+def test_compiled_document_low_source_coverage_is_not_publishable(
+    tmp_path: Path,
+) -> None:
+    workspace = _candidate_workspace(tmp_path)
+    parsed = _document_with_blocks(
+        ("section_header", "Source title"),
+        ("paragraph", "A" * 100),
+        ("paragraph", "B" * 100),
+        ("paragraph", "C" * 100),
+        ("paragraph", "D" * 100),
+    )
+    gateway = IWikiPortableGateway()
+
+    candidate = DocumentBundleAssembler().assemble(
+        parsed,
+        compiled=_compiled_note(
+            overview_sources=("blk_1",),
+            section_sources=("blk_1",),
+        ),
+        job_id=new_typed_id("job"),
+        created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
+        location=gateway.candidate_location(
+            workspace,
+            local_instance_id="document-low-coverage",
+            nonce="fixture",
+        ),
+    )
+    quality = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "quality"
+            / f"{candidate.quality_report_artifact_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert candidate.quality_overall == "fail"
+    assert candidate.publish_eligible is False
+    checks = {value["id"]: value["status"] for value in quality["checks"]}
+    assert checks["knowledge-note-quality"] == "pass"
+    assert checks["source-coverage"] == "fail"

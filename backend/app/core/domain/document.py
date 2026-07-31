@@ -190,10 +190,67 @@ class DocumentProduceRequest:
         object.__setattr__(self, "input_path", Path(self.input_path))
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentKnowledgeProduceRequest:
+    request_schema_version: int
+    workspace_root: Path
+    input_path: Path
+    expected_source_sha256: str
+    expected_source_size: int
+    expected_source_mtime_ns: int
+    provider_profile: str
+    model_override: str | None
+    output_language: str
+    recipe_id: str = "alltonote.document-note"
+    recipe_version: int = 1
+    principal: str = "local-user"
+    client_request_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.request_schema_version) is not int
+            or self.request_schema_version != 2
+            or type(self.recipe_id) is not str
+            or not self.recipe_id
+            or type(self.recipe_version) is not int
+            or self.recipe_version != 1
+            or type(self.principal) is not str
+            or not self.principal
+            or _SHA256.fullmatch(self.expected_source_sha256) is None
+            or type(self.expected_source_size) is not int
+            or self.expected_source_size < 5
+            or type(self.expected_source_mtime_ns) is not int
+            or self.expected_source_mtime_ns < 0
+            or type(self.provider_profile) is not str
+            or not self.provider_profile.strip()
+            or (
+                self.model_override is not None
+                and (
+                    type(self.model_override) is not str
+                    or not self.model_override.strip()
+                )
+            )
+            or type(self.output_language) is not str
+            or not self.output_language.strip()
+            or (
+                self.client_request_id is not None
+                and (type(self.client_request_id) is not str or not self.client_request_id)
+            )
+        ):
+            raise DomainError(
+                "document_produce_request_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Document production request is invalid",
+            )
+        object.__setattr__(self, "workspace_root", Path(self.workspace_root))
+        object.__setattr__(self, "input_path", Path(self.input_path))
+
+
 __all__ = [
     "DocumentBlock",
     "DocumentBoundingBox",
     "DocumentPage",
+    "DocumentKnowledgeProduceRequest",
     "DocumentProduceRequest",
     "ParsedDocument",
 ]

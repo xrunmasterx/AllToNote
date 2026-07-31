@@ -19,13 +19,23 @@ from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.sources.legacy_video import VerifiedSourceIdentityRegistry
 from app.core.application.document_checkpoints import DocumentCandidateCheckpoint
-from app.core.application.document_service import CHECKPOINT_SCHEMA, DocumentService
+from app.core.application.document_knowledge_compiler import (
+    CompiledDocumentKnowledgeNoteV1,
+    DocumentKnowledgeClaimV1,
+    DocumentKnowledgeSectionV1,
+)
+from app.core.application.document_service import (
+    CHECKPOINT_SCHEMA,
+    DocumentKnowledgeCompilationInput,
+    DocumentService,
+)
 from app.core.application.job_execution_router import JobExecutionRouter
 from app.core.application.produce_service import ProduceService
 from app.core.domain.document import (
     DocumentBlock,
     DocumentBoundingBox,
     DocumentPage,
+    DocumentKnowledgeProduceRequest,
     DocumentProduceRequest,
     ParsedDocument,
 )
@@ -33,6 +43,7 @@ from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import VideoProduceRequest
 from app.core.errors import DomainError
+from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import JobState
 from app.core.jobs.resource_lease import ResourceOwner
 from app.core.ports.jobs import SourceIdentityBinding
@@ -90,6 +101,61 @@ class _Parser:
         )
 
 
+class _KnowledgeCompiler:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def compilation_identity(self) -> str:
+        return "sha256:" + "c" * 64
+
+    def model_identity(self) -> str:
+        return "fixture/model-v1"
+
+    def compile(
+        self,
+        request: DocumentKnowledgeCompilationInput,
+        *,
+        execution,
+    ) -> CompiledDocumentKnowledgeNoteV1:
+        execution.heartbeat()
+        self.calls += 1
+        assert request.provider_profile == "default"
+        assert request.model_override == "fixture/model-v1"
+        assert request.output_language == "en"
+        return CompiledDocumentKnowledgeNoteV1(
+            title=DocumentKnowledgeClaimV1(
+                "Compiled paper note",
+                ("blk_title",),
+            ),
+            overview=(
+                DocumentKnowledgeClaimV1(
+                    "The paper studies glossy reflections.",
+                    ("blk_title",),
+                ),
+            ),
+            sections=(
+                DocumentKnowledgeSectionV1(
+                    DocumentKnowledgeClaimV1(
+                        "Main idea",
+                        ("blk_title",),
+                    ),
+                    (
+                        DocumentKnowledgeClaimV1(
+                            "The source establishes the topic.",
+                            ("blk_title",),
+                        ),
+                    ),
+                    (),
+                ),
+            ),
+            referenced_block_ids=("blk_title",),
+            model_identity="fixture/model-v1",
+            input_tokens=10,
+            output_tokens=20,
+            token_counts_complete=True,
+        )
+
+
 class _CrashParser(_Parser):
     def parse(
         self,
@@ -142,6 +208,7 @@ def _service(
     owner_id: str,
     resource_lease_store: MachineResourceLeaseStore | None = None,
     resource_owner: ResourceOwner | None = None,
+    knowledge_compiler: _KnowledgeCompiler | None = None,
 ) -> tuple[DocumentService, SqliteJobRepository]:
     repository = SqliteJobRepository.open(machine_root / "job-store")
     storage = FileAttemptStorage(
@@ -175,6 +242,7 @@ def _service(
         owner_id=owner_id,
         local_instance_id="document-test",
         source_identity_resolver=resolve_source_identity,
+        knowledge_compiler=knowledge_compiler,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
@@ -501,6 +569,155 @@ def test_document_candidate_checkpoint_identity_modes_fail_closed(
         service._checkpoint_source_identity(request, mismatched)
     assert caught.value.code == "candidate_checkpoint_invalid"
     assert current_identity != mismatched.source_canonical_identity
+
+
+def _knowledge_request(
+    workspace: Path,
+    source: Path,
+) -> DocumentKnowledgeProduceRequest:
+    raw = source.read_bytes()
+    stat = source.stat()
+    return DocumentKnowledgeProduceRequest(
+        request_schema_version=2,
+        workspace_root=workspace,
+        input_path=source.resolve(),
+        expected_source_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+        expected_source_size=stat.st_size,
+        expected_source_mtime_ns=stat.st_mtime_ns,
+        provider_profile="default",
+        model_override="fixture/model-v1",
+        output_language="en",
+    )
+
+
+def test_document_v2_compiles_publishable_note_with_separate_knowledge_map(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    compiler = _KnowledgeCompiler()
+    service, repository = _service(
+        tmp_path / "machine",
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+        knowledge_compiler=compiler,
+    )
+    submission = ProduceService(
+        RecipeRegistry(((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(service)),))
+    ).submit(
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(workspace),
+            ("knowledge-note",),
+            {
+                "provider_profile": "default",
+                "model_override": None,
+                "output_language": "en",
+            },
+        )
+    )
+    router = JobExecutionRouter(
+        repository,
+        ((service.execution_binding, service),),
+    )
+    stored_request = json.loads(
+        repository.get_job_request(submission.job_id) or ""
+    )
+
+    completed = router.wait_job(submission.job_id)
+
+    assert stored_request["request_schema_version"] == 2
+    assert stored_request["model_override"] == "fixture/model-v1"
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert completed.result.publish_eligible is True
+    assert completed.result.quality_overall == "pass"
+    assert set(completed.result.artifacts) == {
+        "evidence_set",
+        "knowledge_map",
+        "normalized_content",
+        "primary_draft",
+        "quality_report",
+        "source_metadata",
+    }
+    assert compiler.calls == 1
+
+
+def test_document_v2_fails_before_parsing_when_compiler_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    service, repository = _service(
+        tmp_path / "machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    snapshot = service.submit_document(_knowledge_request(workspace, source))
+    router = JobExecutionRouter(
+        repository,
+        ((service.execution_binding, service),),
+    )
+
+    completed = router.wait_job(snapshot.job_id)
+
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert completed.error.code == "document_knowledge_compiler_unavailable"
+    assert parser.calls == 0
+
+
+def test_document_v2_process_loss_pauses_unknown_model_operation(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    compiler = _KnowledgeCompiler()
+    service, repository = _service(
+        tmp_path / "machine",
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="new-process",
+        knowledge_compiler=compiler,
+    )
+    snapshot = service.submit_document(_knowledge_request(workspace, source))
+    repository.transition_job(snapshot.job_id, JobState.RUNNING)
+    old_authority = repository.acquire_scheduler_lease(
+        "old-process",
+        ttl_seconds=60,
+    )
+    attempt = repository.start_attempt(
+        repository.create_attempt(
+            snapshot.job_id,
+            "assemble_candidate_bundle",
+        ).attempt_id,
+        old_authority,
+    )
+    guard = ExternalOperationGuard(repository, old_authority)
+    operation = guard.prepare(
+        job_id=snapshot.job_id,
+        step_id=attempt.step_id,
+        attempt_id=attempt.attempt_id,
+        provider="fixture",
+        request_hash="sha256:" + "d" * 64,
+        summary_json="{}",
+    )
+    guard.start(operation.operation_id)
+    repository.release_scheduler_lease(old_authority)
+
+    paused = service.wait_job(snapshot.job_id)
+
+    assert paused.state is JobState.WAITING_FOR_INPUT
+    assert paused.challenge_id is not None
+    assert compiler.calls == 0
 
 
 def test_document_commit_crash_reuses_bundle_without_duplicate_effect(tmp_path: Path) -> None:

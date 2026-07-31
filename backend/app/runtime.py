@@ -65,7 +65,14 @@ from app.adapters.video_packs.packed_cpu_transcriber import (
 from app.core.application.produce_service import ProduceService
 from app.core.application.document_service import (
     CHECKPOINT_SCHEMA as DOCUMENT_CHECKPOINT_SCHEMA,
+    DocumentKnowledgeCompilationInput,
     DocumentService,
+)
+from app.core.application.document_knowledge_compiler import (
+    CompiledDocumentKnowledgeNoteV1,
+    DocumentCompilationContext,
+    DocumentKnowledgeCompilationRequestV1,
+    DocumentKnowledgeCompiler,
 )
 from app.core.application.job_execution_router import JobExecutionRouter
 from app.core.application.video_acquisition import (
@@ -960,6 +967,91 @@ class _RuntimeCompilationProfile:
         )
 
 
+@dataclass(frozen=True)
+class _RuntimeDocumentKnowledgeCompiler:
+    profile: _RuntimeCompilationProfile
+    compiler: DocumentKnowledgeCompiler
+
+    def model_identity(self) -> str:
+        return self.profile.binding.model_identity
+
+    def compilation_identity(self) -> str:
+        binding = self.profile.binding
+        return sha256_digest(
+            json.dumps(
+                {
+                    "behavior": self.compiler.behavior_identity(),
+                    "binding": {
+                        "context_window_tokens": binding.context_window_tokens,
+                        "credential_profile_ref": binding.credential_profile_ref,
+                        "max_output_tokens": binding.max_output_tokens,
+                        "model_identity": binding.model_identity,
+                        "provider_type": binding.provider_type,
+                        "schema_version": binding.schema_version,
+                        "supports_structured_output": (
+                            binding.supports_structured_output
+                        ),
+                        "supports_temperature": binding.supports_temperature,
+                        "timeout_seconds": binding.timeout_seconds,
+                    },
+                    "provider_execution_policy": (
+                        self.profile.provider_execution_policy
+                    ),
+                    "provider_profile": self.profile.provider_profile,
+                    "schema_version": 1,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    def compile(
+        self,
+        request: DocumentKnowledgeCompilationInput,
+        *,
+        execution: object,
+    ) -> CompiledDocumentKnowledgeNoteV1:
+        self.profile.validate_selection(
+            provider_profile=request.provider_profile,
+            model_override=request.model_override,
+        )
+        try:
+            job_id = execution.job_id
+            step_id = execution.step_id
+            attempt_id = execution.attempt_id
+            authority = execution.authority
+            heartbeat = execution.heartbeat
+        except AttributeError:
+            raise DomainError(
+                "document_knowledge_compilation_contract_invalid",
+                ErrorCategory.INTERNAL,
+                "Document execution context is invalid",
+            ) from None
+        return self.compiler.compile(
+            DocumentKnowledgeCompilationRequestV1(
+                schema_version=1,
+                parsed=request.parsed,
+                output_language=request.output_language,
+                model_binding=self.profile.binding,
+            ),
+            DocumentCompilationContext(
+                execution=ModelCallExecution(
+                    job_id=job_id,
+                    step_id=step_id,
+                    attempt_id=attempt_id,
+                    authority=authority,
+                    heartbeat=heartbeat,
+                ),
+                cancellation_token=CancellationToken(
+                    self.profile.repository,
+                    job_id,
+                ),
+            ),
+        )
+
+
 class _RuntimeVideoKnowledgeCompiler:
     """Builds the frozen Core request around the shared knowledge compiler."""
 
@@ -1212,25 +1304,14 @@ class _RuntimeFaithfulEditionCompiler:
         )
 
 
-def _create_runtime_compilers(
+def _create_runtime_model_services(
     *,
     repository: SqliteJobRepository,
     model: LegacyModelBinding,
-    binding: ModelExecutionBinding | None,
-    provider_profile: str | None,
+    binding: ModelExecutionBinding,
+    provider_profile: str,
     result_root: Path,
-) -> tuple[
-    _RuntimeVideoKnowledgeCompiler | None,
-    _RuntimeFaithfulEditionCompiler | None,
-]:
-    if binding is None:
-        if provider_profile is not None:
-            raise DomainError(
-                "model_execution_profile_invalid",
-                ErrorCategory.INVALID_REQUEST,
-                "A v2 provider profile requires a frozen Core binding",
-            )
-        return None, None
+) -> tuple[ModelCallCoordinator, _RuntimeCompilationProfile]:
     if type(provider_profile) is not str or not provider_profile.strip():
         raise DomainError(
             "model_execution_profile_required",
@@ -1280,6 +1361,41 @@ def _create_runtime_compilers(
         binding=binding,
         provider_profile=provider_profile,
         provider_execution_policy=provider_execution_policy,
+    )
+    return coordinator, profile
+
+
+def _create_runtime_compilers(
+    *,
+    repository: SqliteJobRepository,
+    model: LegacyModelBinding,
+    binding: ModelExecutionBinding | None,
+    provider_profile: str | None,
+    result_root: Path,
+) -> tuple[
+    _RuntimeVideoKnowledgeCompiler | None,
+    _RuntimeFaithfulEditionCompiler | None,
+]:
+    if binding is None:
+        if provider_profile is not None:
+            raise DomainError(
+                "model_execution_profile_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "A v2 provider profile requires a frozen Core binding",
+            )
+        return None, None
+    if provider_profile is None:
+        raise DomainError(
+            "model_execution_profile_required",
+            ErrorCategory.INVALID_REQUEST,
+            "A v2 provider profile must be explicitly bound",
+        )
+    coordinator, profile = _create_runtime_model_services(
+        repository=repository,
+        model=model,
+        binding=binding,
+        provider_profile=provider_profile,
+        result_root=result_root,
     )
     return (
         _RuntimeVideoKnowledgeCompiler(
@@ -1583,6 +1699,9 @@ def create_document_runtime(
     machine_root: Path,
     *,
     worker_config: DoclingWorkerConfig,
+    model: LegacyModelBinding | None = None,
+    model_execution_binding: ModelExecutionBinding | None = None,
+    model_execution_profile: str | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
@@ -1605,6 +1724,32 @@ def create_document_runtime(
         },
     )
     portable = IWikiPortableGateway()
+    knowledge_compiler = None
+    if model is None:
+        if model_execution_binding is not None or model_execution_profile is not None:
+            raise DomainError(
+                "model_execution_binding_mismatch",
+                ErrorCategory.INVALID_REQUEST,
+                "Document model binding requires a provider model",
+            )
+    else:
+        if model_execution_binding is None or model_execution_profile is None:
+            raise DomainError(
+                "model_execution_profile_required",
+                ErrorCategory.INVALID_REQUEST,
+                "Document knowledge compilation requires a frozen model profile",
+            )
+        coordinator, profile = _create_runtime_model_services(
+            repository=repository,
+            model=model,
+            binding=model_execution_binding,
+            provider_profile=model_execution_profile,
+            result_root=storage.root,
+        )
+        knowledge_compiler = _RuntimeDocumentKnowledgeCompiler(
+            profile=profile,
+            compiler=DocumentKnowledgeCompiler(coordinator),
+        )
 
     def resolve_source_identity(
         workspace_root: Path,
@@ -1628,6 +1773,7 @@ def create_document_runtime(
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         source_identity_resolver=resolve_source_identity,
+        knowledge_compiler=knowledge_compiler,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
@@ -1679,6 +1825,9 @@ def create_document_runtime_for_workspace(
     workspace_root: Path,
     *,
     local_app_data: Path | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
+    requested_model_identity: str | None = None,
+    requested_provider_profile: str | None = None,
 ) -> AllToNoteRuntime:
     trusted_root = local_app_data or _default_local_app_data()
     paths = resolve_runtime_paths(local_data_parent=trusted_root)
@@ -1695,9 +1844,46 @@ def create_document_runtime_for_workspace(
     process_instance_id, resource_lease_store, resource_owner = (
         _workspace_resource_admission(paths, instance)
     )
+    status = CodexAppServerStatusService.get_status()
+    model = None
+    binding = None
+    selected_model = requested_model_identity or status.default_model
+    if status.ready and selected_model:
+        bridge = CodexAppServerCompletionBridge(
+            model_identity=selected_model
+        )
+        model = LegacyModelBinding(
+            provider_kind="codex-app-server",
+            model_identity=selected_model,
+            bridge=bridge,
+            capabilities=LegacyModelCapabilities(),
+        )
+        binding = ModelExecutionBinding(
+            schema_version=1,
+            provider_type="codex-app-server",
+            model_identity=selected_model,
+            credential_profile_ref="codex/local-login",
+            context_window_tokens=128_000,
+            max_output_tokens=16_000,
+            max_concurrency=1,
+            supports_structured_output=True,
+            supports_temperature=False,
+            timeout_seconds=600,
+        )
+    provider_profile = requested_provider_profile or "default"
+    if requested_provider_profile is None and current_config_snapshot is not None:
+        configured_profile = current_config_snapshot.values.get(
+            "default_provider_profile",
+            "default",
+        )
+        if type(configured_profile) is str and configured_profile.strip():
+            provider_profile = configured_profile
     return create_document_runtime(
         instance.machine_root,
         worker_config=worker_config,
+        model=model,
+        model_execution_binding=binding,
+        model_execution_profile=provider_profile if model is not None else None,
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         resource_lease_store=resource_lease_store,

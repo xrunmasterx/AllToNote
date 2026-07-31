@@ -363,10 +363,12 @@ def test_workspace_runtimes_share_one_machine_production_admission(
     assert (paths.data_dir / "machine" / "leases.sqlite").is_file()
 
 
-def test_document_workspace_factory_reuses_process_identity_for_admission(
+def test_document_workspace_factory_reuses_process_identity_and_frozen_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.services.codex_app_server import CodexAppServerStatus
+
     workspace = _workspace(tmp_path, "Vault document admission")
     local_app_data = tmp_path / "document-local-app-data"
     captured: dict[str, object] = {}
@@ -376,6 +378,19 @@ def test_document_workspace_factory_reuses_process_identity_for_admission(
         runtime_module,
         "_resolve_document_worker_config",
         lambda _paths, _environ: object(),
+    )
+    monkeypatch.setattr(
+        runtime_module.CodexAppServerStatusService,
+        "get_status",
+        staticmethod(
+            lambda: CodexAppServerStatus(
+                codex_cli_available=True,
+                codex_version="fixture",
+                auth_available=True,
+                default_model="fixture/current-default",
+                ready=True,
+            )
+        ),
     )
 
     def capture_runtime(machine_root: Path, **options: object) -> object:
@@ -388,6 +403,8 @@ def test_document_workspace_factory_reuses_process_identity_for_admission(
     created = runtime_module.create_document_runtime_for_workspace(
         workspace,
         local_app_data=local_app_data,
+        requested_model_identity="fixture/frozen-model",
+        requested_provider_profile="fixture/frozen-profile",
     )
 
     registry = json.loads(
@@ -402,6 +419,12 @@ def test_document_workspace_factory_reuses_process_identity_for_admission(
     assert created is sentinel
     assert captured["local_instance_id"] == instance["instance_id"]
     assert captured["owner_id"] == resource_owner.process_instance_id
+    assert captured["model"].model_identity == "fixture/frozen-model"
+    assert (
+        captured["model_execution_binding"].model_identity
+        == "fixture/frozen-model"
+    )
+    assert captured["model_execution_profile"] == "fixture/frozen-profile"
     assert resource_owner.workspace_identity == instance["workspace_identity"]
     assert resource_owner.process_id == os.getpid()
     assert resource_lease_store.database_path == (

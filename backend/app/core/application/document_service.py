@@ -4,16 +4,28 @@ import json
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
-from app.core.application.checkpoint_runner import CheckpointedStepRunner
+from app.core.application.checkpoint_runner import (
+    CheckpointedStepExecutionContext,
+    CheckpointedStepRunner,
+)
+from app.core.application.document_knowledge_compiler import (
+    CompiledDocumentKnowledgeNoteV1,
+)
 from app.core.application.document_checkpoints import (
     DocumentCandidateCheckpoint,
     decode_parsed_document,
     encode_parsed_document,
 )
 from app.core.application.job_service import JobService
-from app.core.domain.document import DocumentProduceRequest, ParsedDocument
+from app.core.domain.document import (
+    DocumentKnowledgeProduceRequest,
+    DocumentProduceRequest,
+    ParsedDocument,
+)
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.cancellation import CancellationToken
@@ -69,6 +81,36 @@ _REQUEST_FIELDS = frozenset(
         "workspace_root",
     }
 )
+_KNOWLEDGE_REQUEST_FIELDS = frozenset(
+    {
+        *_REQUEST_FIELDS,
+        "model_override",
+        "output_language",
+        "provider_profile",
+    }
+)
+DocumentRequest = DocumentProduceRequest | DocumentKnowledgeProduceRequest
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentKnowledgeCompilationInput:
+    parsed: ParsedDocument
+    provider_profile: str
+    model_override: str | None
+    output_language: str
+
+
+class DocumentKnowledgeCompilerPort(Protocol):
+    def model_identity(self) -> str: ...
+
+    def compilation_identity(self) -> str: ...
+
+    def compile(
+        self,
+        request: DocumentKnowledgeCompilationInput,
+        *,
+        execution: CheckpointedStepExecutionContext,
+    ) -> CompiledDocumentKnowledgeNoteV1: ...
 
 
 class DocumentService:
@@ -87,6 +129,7 @@ class DocumentService:
             [Path, str, str],
             SourceIdentityBinding | None,
         ],
+        knowledge_compiler: DocumentKnowledgeCompilerPort | None = None,
         resource_lease_store: ResourceLeaseStorePort | None = None,
         resource_owner: ResourceOwner | None = None,
     ) -> None:
@@ -106,6 +149,7 @@ class DocumentService:
         self._owner_id = owner_id
         self._local_instance_id = local_instance_id
         self._source_identity_resolver = source_identity_resolver
+        self._knowledge_compiler = knowledge_compiler
         self._resource_lease_store = resource_lease_store
         self._resource_owner = resource_owner
         self._active_resource_lease: ResourceLease | None = None
@@ -125,8 +169,11 @@ class DocumentService:
     def execution_binding(self) -> JobExecutionBinding:
         return _BINDING
 
-    def submit_document(self, request: DocumentProduceRequest) -> JobSnapshot:
-        if not isinstance(request, DocumentProduceRequest):
+    def submit_document(self, request: DocumentRequest) -> JobSnapshot:
+        if not isinstance(
+            request,
+            (DocumentProduceRequest, DocumentKnowledgeProduceRequest),
+        ):
             raise DomainError(
                 "document_produce_request_invalid",
                 ErrorCategory.INVALID_REQUEST,
@@ -139,6 +186,17 @@ class DocumentService:
 
     def cancel_job(self, job_id: str) -> JobSnapshot:
         return self._job_service.cancel(job_id)
+
+    def knowledge_model_identity(self) -> str:
+        compiler = self._require_knowledge_compiler()
+        identity = compiler.model_identity()
+        if type(identity) is not str or not identity.strip():
+            raise DomainError(
+                "document_knowledge_compiler_invalid",
+                ErrorCategory.INTERNAL,
+                "The Document knowledge compiler model identity is invalid",
+            )
+        return identity
 
     def wait_job(self, job_id: str) -> JobSnapshot:
         with self._execution_lock:
@@ -183,6 +241,19 @@ class DocumentService:
                             active_attempt.attempt_id,
                             authority,
                         )
+                        unknown = (
+                            self._repository.reconcile_external_operations_after_process_loss(
+                                job_id,
+                                authority,
+                            )
+                        )
+                        if unknown:
+                            self._repository.pause_for_external_outcome_atomic(
+                                job_id,
+                                active_attempt.attempt_id,
+                                authority,
+                            )
+                            return self.get_job(job_id)
                     if active_attempt is not None and active_attempt.step_id == "commit":
                         return self._reconcile_commit(request, active_attempt, authority)
                     return self._execute(
@@ -231,12 +302,14 @@ class DocumentService:
     def _execute(
         self,
         job_id: str,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
         authority: ExecutionAuthority,
         *,
         resumed_attempt: Attempt | None,
     ) -> JobSnapshot:
         job = self._repository.get_job_details(job_id)[0]
+        if isinstance(request, DocumentKnowledgeProduceRequest):
+            self._require_knowledge_compiler()
         self._portable.inspect(request.workspace_root)
         self._verify_source_stat(request)
         parsed = self._checkpoint_runner.run(
@@ -252,9 +325,15 @@ class DocumentService:
         checkpoint = self._checkpoint_runner.run(
             job_id,
             "assemble_candidate_bundle",
-            sha256_digest(f"document-candidate-v1:{job.request_hash}"),
+            self._candidate_input_hash(job.request_hash, request),
             authority,
-            lambda _execution: self._assemble(job_id, job.created_at, request, parsed),
+            lambda execution: self._assemble(
+                job_id,
+                job.created_at,
+                request,
+                parsed,
+                execution,
+            ),
             encode=lambda value: value.encode(),
             decode=DocumentCandidateCheckpoint.decode,
             resumed_attempt=resumed_attempt,
@@ -271,7 +350,7 @@ class DocumentService:
         attempt = self._repository.start_attempt(attempt.attempt_id, authority)
         return self._commit(request, checkpoint, attempt, authority)
 
-    def _parse(self, request: DocumentProduceRequest, job_id: str) -> ParsedDocument:
+    def _parse(self, request: DocumentRequest, job_id: str) -> ParsedDocument:
         parsed = self._parser.parse(
             request.input_path,
             work_root=self._work_root,
@@ -290,8 +369,9 @@ class DocumentService:
         self,
         job_id: str,
         created_at: str,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
         parsed: ParsedDocument,
+        execution: CheckpointedStepExecutionContext,
     ) -> DocumentCandidateCheckpoint:
         location = self._portable.candidate_location(
             request.workspace_root,
@@ -299,8 +379,21 @@ class DocumentService:
             nonce=sha256_digest(f"document-candidate-v1:{job_id}")[7:39],
         )
         connector_id, canonical_identity = self._source_identity(request)
+        compiled: CompiledDocumentKnowledgeNoteV1 | None = None
+        if isinstance(request, DocumentKnowledgeProduceRequest):
+            compiler = self._require_knowledge_compiler()
+            compiled = compiler.compile(
+                DocumentKnowledgeCompilationInput(
+                    parsed=parsed,
+                    provider_profile=request.provider_profile,
+                    model_override=request.model_override,
+                    output_language=request.output_language,
+                ),
+                execution=execution,
+            )
         candidate = DocumentBundleAssembler().assemble(
             parsed,
+            compiled=compiled,
             job_id=job_id,
             created_at=created_at,
             location=location,
@@ -325,6 +418,11 @@ class DocumentService:
                 "evidence_set": candidate.evidence_set_artifact_id,
                 "quality_report": candidate.quality_report_artifact_id,
                 "source_metadata": candidate.source_metadata_artifact_id,
+                **(
+                    {"knowledge_map": candidate.knowledge_map_artifact_id}
+                    if candidate.knowledge_map_artifact_id is not None
+                    else {}
+                ),
             },
             quality_overall=candidate.quality_overall,
             publish_eligible=candidate.publish_eligible,
@@ -358,7 +456,7 @@ class DocumentService:
 
     def _source_identity(
         self,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
     ) -> tuple[str, str]:
         normalized_path = os.path.normcase(
             os.path.normpath(str(request.input_path))
@@ -368,9 +466,31 @@ class DocumentService:
             sha256_digest(f"{self._local_instance_id}\0{normalized_path}"),
         )
 
+    def _require_knowledge_compiler(self) -> DocumentKnowledgeCompilerPort:
+        compiler = self._knowledge_compiler
+        if compiler is None:
+            raise DomainError(
+                "document_knowledge_compiler_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The Document knowledge compiler is unavailable",
+            )
+        return compiler
+
+    def _candidate_input_hash(
+        self,
+        request_hash: str,
+        request: DocumentRequest,
+    ) -> str:
+        if isinstance(request, DocumentProduceRequest):
+            return sha256_digest(f"document-candidate-v1:{request_hash}")
+        return sha256_digest(
+            "document-candidate-v2:"
+            f"{request_hash}:{self._require_knowledge_compiler().compilation_identity()}"
+        )
+
     def _validate(
         self,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
         checkpoint: DocumentCandidateCheckpoint,
     ) -> None:
         report = self._portable.validate_candidate(
@@ -390,7 +510,7 @@ class DocumentService:
 
     def _commit(
         self,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
         checkpoint: DocumentCandidateCheckpoint,
         attempt: Attempt,
         authority: ExecutionAuthority,
@@ -457,7 +577,7 @@ class DocumentService:
 
     def _checkpoint_source_identity(
         self,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
         checkpoint: DocumentCandidateCheckpoint,
     ) -> tuple[str, str]:
         if checkpoint.source_identity_connector_id is None:
@@ -479,17 +599,21 @@ class DocumentService:
 
     def _reconcile_commit(
         self,
-        request: DocumentProduceRequest,
+        request: DocumentRequest,
         attempt: Attempt,
         authority: ExecutionAuthority,
     ) -> JobSnapshot:
-        checkpoint = self._load_candidate(attempt.job_id)
+        checkpoint = self._load_candidate(attempt.job_id, request)
         return self._commit(request, checkpoint, attempt, authority)
 
-    def _load_candidate(self, job_id: str) -> DocumentCandidateCheckpoint:
+    def _load_candidate(
+        self,
+        job_id: str,
+        request: DocumentRequest,
+    ) -> DocumentCandidateCheckpoint:
         job = self._repository.get_job_details(job_id)[0]
         metadata = self._repository.latest_checkpoint(job_id, "assemble_candidate_bundle")
-        input_hash = sha256_digest(f"document-candidate-v1:{job.request_hash}")
+        input_hash = self._candidate_input_hash(job.request_hash, request)
         if metadata is None or not self._attempt_storage.validate_checkpoint(
             metadata,
             expected_schema_id=CHECKPOINT_SCHEMA,
@@ -502,27 +626,38 @@ class DocumentService:
             )
         return DocumentCandidateCheckpoint.decode(self._checkpoint_reader(metadata))
 
-    def _load_request(self, job_id: str) -> DocumentProduceRequest:
+    def _load_request(self, job_id: str) -> DocumentRequest:
         job = self._repository.get_job_details(job_id)[0]
         payload = self._repository.get_job_request(job_id)
         try:
             if payload is None or sha256_digest(payload) != job.request_hash:
                 raise TypeError
             value = json.loads(payload)
-            if type(value) is not dict or frozenset(value) != _REQUEST_FIELDS:
+            if type(value) is not dict:
                 raise TypeError
-            return DocumentProduceRequest(
-                request_schema_version=value["request_schema_version"],
-                workspace_root=Path(value["workspace_root"]),
-                input_path=Path(value["input_path"]),
-                expected_source_sha256=value["expected_source_sha256"],
-                expected_source_size=value["expected_source_size"],
-                expected_source_mtime_ns=value["expected_source_mtime_ns"],
-                recipe_id=value["recipe_id"],
-                recipe_version=value["recipe_version"],
-                principal=job.principal,
-                client_request_id=job.client_request_id,
-            )
+            fields = frozenset(value)
+            common = {
+                "request_schema_version": value["request_schema_version"],
+                "workspace_root": Path(value["workspace_root"]),
+                "input_path": Path(value["input_path"]),
+                "expected_source_sha256": value["expected_source_sha256"],
+                "expected_source_size": value["expected_source_size"],
+                "expected_source_mtime_ns": value["expected_source_mtime_ns"],
+                "recipe_id": value["recipe_id"],
+                "recipe_version": value["recipe_version"],
+                "principal": job.principal,
+                "client_request_id": job.client_request_id,
+            }
+            if fields == _REQUEST_FIELDS:
+                return DocumentProduceRequest(**common)
+            if fields == _KNOWLEDGE_REQUEST_FIELDS:
+                return DocumentKnowledgeProduceRequest(
+                    **common,
+                    provider_profile=value["provider_profile"],
+                    model_override=value["model_override"],
+                    output_language=value["output_language"],
+                )
+            raise TypeError
         except (DomainError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             raise DomainError(
                 "job_request_invalid",
@@ -531,7 +666,7 @@ class DocumentService:
             ) from None
 
     @staticmethod
-    def _verify_source_stat(request: DocumentProduceRequest) -> None:
+    def _verify_source_stat(request: DocumentRequest) -> None:
         try:
             stat = request.input_path.stat()
         except OSError as error:
@@ -577,4 +712,8 @@ class DocumentService:
         )
 
 
-__all__ = ["DocumentService"]
+__all__ = [
+    "DocumentKnowledgeCompilationInput",
+    "DocumentKnowledgeCompilerPort",
+    "DocumentService",
+]

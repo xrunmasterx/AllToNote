@@ -768,25 +768,23 @@ def _produce_generic(
         key = parse_recipe_selector(args.recipe)
         requested_outputs = ("knowledge-note",)
         if key == _DOCUMENT_NOTE_V1:
-            if args.workspace is None:
-                effective_args = argparse.Namespace(
-                    workspace=None,
-                    provider_profile=None,
-                    transcriber_profile=None,
-                    output_language=None,
-                    quality=None,
-                    style=None,
-                    screenshot_policy=None,
-                    config_profile=None,
-                )
-                effective = _effective_video_config(
-                    effective_args,
-                    runtime_injected=runtime is not None,
-                    config_service=config_service,
-                )
-                workspace_value = effective.config.default_workspace
-            else:
-                workspace_value = args.workspace
+            effective_args = argparse.Namespace(
+                workspace=args.workspace,
+                provider_profile=None,
+                transcriber_profile=None,
+                output_language=None,
+                quality=None,
+                style=None,
+                screenshot_policy=None,
+                config_profile=None,
+            )
+            effective = _effective_video_config(
+                effective_args,
+                runtime_injected=runtime is not None,
+                config_service=config_service,
+            )
+            config = effective.config
+            workspace_value = args.workspace or config.default_workspace
             if workspace_value is None:
                 raise DomainError(
                     "workspace_required",
@@ -794,16 +792,27 @@ def _produce_generic(
                     "A Workspace must be provided by flag or Runtime configuration",
                 )
             workspace_root = Path(workspace_value).resolve()
+            provider_profile = config.default_provider_profile
+            provider = config.providers.get(provider_profile)
+            config_snapshot = effective.job_snapshot()
             request = ProduceRequest(
                 1,
                 key,
                 InputDescriptor("file", args.input_value),
                 str(workspace_root),
                 requested_outputs,
+                {
+                    "provider_profile": provider_profile,
+                    "model_override": (
+                        provider.default_model if provider is not None else None
+                    ),
+                    "output_language": config.recipe_defaults.output_language,
+                },
                 client_request_id=correlation_id,
             )
             active_runtime = runtime or _default_runtime(
                 workspace_root,
+                current_config_snapshot=config_snapshot,
                 recipe_key=key,
             )
         else:
@@ -1574,7 +1583,10 @@ def _default_runtime(
     if recipe_key == _DOCUMENT_NOTE_V1:
         from app.runtime import create_document_runtime_for_workspace
 
-        return create_document_runtime_for_workspace(workspace_root)
+        return create_document_runtime_for_workspace(
+            workspace_root,
+            current_config_snapshot=current_config_snapshot,
+        )
     from app.runtime import create_codex_app_server_runtime_for_workspace
 
     return create_codex_app_server_runtime_for_workspace(

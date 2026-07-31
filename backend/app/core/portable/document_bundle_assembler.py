@@ -5,6 +5,9 @@ from pathlib import Path
 import re
 from uuid import UUID
 
+from app.core.application.document_knowledge_compiler import (
+    CompiledDocumentKnowledgeNoteV1,
+)
 from app.core.domain.document import ParsedDocument
 from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.errors import DomainError
@@ -24,6 +27,7 @@ class DocumentCandidate:
     primary_draft_artifact_id: str
     normalized_artifact_id: str
     evidence_set_artifact_id: str
+    knowledge_map_artifact_id: str | None
     quality_report_artifact_id: str
     quality_overall: str
     publish_eligible: bool
@@ -150,6 +154,56 @@ def _render_document_block(kind: str, text: str) -> str:
     return preferred if _markdown_is_safe(preferred) else _code_block(text)
 
 
+def _compiled_projection(
+    compiled: CompiledDocumentKnowledgeNoteV1,
+) -> tuple[str, tuple[dict[str, object], ...]]:
+    lines = [_render_inline_text(compiled.title.text, prefix="# "), ""]
+    items: list[dict[str, object]] = [
+        {
+            "note_item_id": "title-0001",
+            "source_block_ids": list(compiled.title.source_block_ids),
+        }
+    ]
+
+    for index, claim in enumerate(compiled.overview, start=1):
+        lines.extend((_markdown_literal(claim.text), ""))
+        items.append(
+            {
+                "note_item_id": f"overview-{index:04d}",
+                "source_block_ids": list(claim.source_block_ids),
+            }
+        )
+    for section_index, section in enumerate(compiled.sections, start=1):
+        lines.extend((_render_inline_text(section.heading.text, prefix="## "), ""))
+        items.append(
+            {
+                "note_item_id": f"section-{section_index:04d}-heading-0001",
+                "source_block_ids": list(section.heading.source_block_ids),
+            }
+        )
+        for paragraph_index, claim in enumerate(section.paragraphs, start=1):
+            lines.extend((_markdown_literal(claim.text), ""))
+            items.append(
+                {
+                    "note_item_id": (
+                        f"section-{section_index:04d}-paragraph-{paragraph_index:04d}"
+                    ),
+                    "source_block_ids": list(claim.source_block_ids),
+                }
+            )
+        for point_index, claim in enumerate(section.key_points, start=1):
+            lines.extend((f"- {_markdown_literal(claim.text)}", ""))
+            items.append(
+                {
+                    "note_item_id": (
+                        f"section-{section_index:04d}-key-point-{point_index:04d}"
+                    ),
+                    "source_block_ids": list(claim.source_block_ids),
+                }
+            )
+    return "\n".join(lines).rstrip() + "\n", tuple(items)
+
+
 class DocumentBundleAssembler:
     @staticmethod
     def _derived_id(job_id: str, prefix: str, role: str) -> str:
@@ -162,6 +216,7 @@ class DocumentBundleAssembler:
         self,
         parsed: ParsedDocument,
         *,
+        compiled: CompiledDocumentKnowledgeNoteV1 | None = None,
         job_id: str,
         created_at: str,
         location: CandidateLocationCapabilityPort,
@@ -184,6 +239,7 @@ class DocumentBundleAssembler:
                 ("evidence", "art"),
                 ("draft", "art"),
                 ("quality", "art"),
+                ("knowledge_map", "art"),
             )
         }
         if source_id is not None:
@@ -268,12 +324,24 @@ class DocumentBundleAssembler:
             None,
         )
         title = title_block.text if title_block is not None else parsed.source_name
-        draft_lines = [_render_inline_text(title, prefix="# "), ""]
-        for block in blocks:
-            if block is title_block:
-                continue
-            draft_lines.extend((_render_document_block(block.kind, block.text), ""))
-        draft_text = "\n".join(draft_lines) + "\n"
+        knowledge_map: bytes | None = None
+        if compiled is None:
+            draft_lines = [_render_inline_text(title, prefix="# "), ""]
+            for block in blocks:
+                if block is title_block:
+                    continue
+                draft_lines.extend((_render_document_block(block.kind, block.text), ""))
+            draft_text = "\n".join(draft_lines) + "\n"
+        else:
+            draft_text, knowledge_items = _compiled_projection(compiled)
+            knowledge_map = encode_json(
+                {
+                    "knowledge_map_schema_version": 1,
+                    "model_identity": compiled.model_identity,
+                    "referenced_block_ids": list(compiled.referenced_block_ids),
+                    "items": list(knowledge_items),
+                }
+            )
         try:
             validate_markdown_safety(
                 draft_text,
@@ -299,8 +367,51 @@ class DocumentBundleAssembler:
             and pages_have_content
             and parser_complete
         )
-        quality_overall = "pass" if extraction_passed else "fail"
-        publish_eligible = False
+        referenced_ids = (
+            frozenset(compiled.referenced_block_ids)
+            if compiled is not None
+            else frozenset()
+        )
+        substantive_blocks = tuple(
+            block
+            for block in blocks
+            if block.kind not in {"title", "section_header"}
+        ) or blocks
+        substantive_bytes = sum(
+            len(block.text.encode("utf-8")) for block in substantive_blocks
+        )
+        referenced_bytes = sum(
+            len(block.text.encode("utf-8"))
+            for block in substantive_blocks
+            if block.block_id in referenced_ids
+        )
+        substantive_pages = {
+            block.page_number for block in substantive_blocks
+        }
+        referenced_pages = {
+            block.page_number
+            for block in substantive_blocks
+            if block.block_id in referenced_ids
+        }
+        source_coverage_ratio = (
+            referenced_bytes / substantive_bytes if substantive_bytes else 0.0
+        )
+        page_reference_coverage_ratio = (
+            len(referenced_pages) / len(substantive_pages)
+            if substantive_pages
+            else 0.0
+        )
+        source_coverage_passed = (
+            compiled is not None
+            and source_coverage_ratio >= 0.35
+            and page_reference_coverage_ratio >= 0.60
+        )
+        quality_overall = (
+            "pass"
+            if extraction_passed and source_coverage_passed
+            else "fail"
+        ) if compiled is not None else ("pass" if extraction_passed else "fail")
+        publish_eligible = compiled is not None and quality_overall == "pass"
         quality_messages = list(parsed.warnings)
         if not markdown_safe:
             quality_messages.append("markdown-safety")
@@ -310,7 +421,61 @@ class DocumentBundleAssembler:
             quality_messages.append("empty-page")
         if not parser_complete:
             quality_messages.append("partial-extraction")
-        quality_messages.append("knowledge-note-quality-not-evaluated")
+        if compiled is None:
+            quality_messages.append("knowledge-note-quality-not-evaluated")
+        elif not source_coverage_passed:
+            quality_messages.append("knowledge-note-source-coverage")
+        checks: list[dict[str, object]] = [
+            {
+                "id": "native-text",
+                "status": "pass" if has_native_text else "fail",
+            },
+            {
+                "id": "page-coverage",
+                "status": "pass" if pages_have_content else "fail",
+            },
+            {
+                "id": "parser-completeness",
+                "status": "pass" if parser_complete else "fail",
+            },
+            {"id": "page-bbox", "status": "pass"},
+            {"id": "source-hash", "status": "pass"},
+            {
+                "id": "markdown-safety",
+                "status": "pass" if markdown_safe else "fail",
+            },
+        ]
+        if compiled is None:
+            checks.append(
+                {
+                    "id": "knowledge-note-quality",
+                    "status": "skipped",
+                    "reason": "not-evaluated",
+                }
+            )
+            quality_profile = "alltonote.document-native-extraction"
+            metrics: dict[str, object] = {"quality_repair_attempts": 0}
+        else:
+            checks.extend(
+                (
+                    {"id": "knowledge-note-quality", "status": "pass"},
+                    {
+                        "id": "source-coverage",
+                        "status": "pass" if source_coverage_passed else "fail",
+                    },
+                )
+            )
+            quality_profile = "alltonote.document-knowledge-note"
+            metrics = {
+                "quality_repair_attempts": 0,
+                "referenced_block_count": len(referenced_ids),
+                "substantive_block_count": len(substantive_blocks),
+                "source_coverage_ratio": source_coverage_ratio,
+                "page_reference_coverage_ratio": page_reference_coverage_ratio,
+                "input_tokens": compiled.input_tokens,
+                "output_tokens": compiled.output_tokens,
+                "token_counts_complete": compiled.token_counts_complete,
+            }
         quality = encode_json(
             {
                 "quality_report_schema_version": 1,
@@ -320,39 +485,19 @@ class DocumentBundleAssembler:
                     "sha256": sha256_digest(draft),
                 },
                 "profile": {
-                    "id": "alltonote.document-native-extraction",
+                    "id": quality_profile,
                     "version": 1,
                 },
                 "overall": quality_overall,
-                "checks": [
-                    {
-                        "id": "native-text",
-                        "status": "pass" if has_native_text else "fail",
-                    },
-                    {
-                        "id": "page-coverage",
-                        "status": "pass" if pages_have_content else "fail",
-                    },
-                    {
-                        "id": "parser-completeness",
-                        "status": "pass" if parser_complete else "fail",
-                    },
-                    {"id": "page-bbox", "status": "pass"},
-                    {"id": "source-hash", "status": "pass"},
-                    {
-                        "id": "markdown-safety",
-                        "status": "pass" if markdown_safe else "fail",
-                    },
-                    {
-                        "id": "knowledge-note-quality",
-                        "status": "skipped",
-                        "reason": "not-evaluated",
-                    },
-                ],
+                "checks": checks,
                 "method": {"kind": "deterministic"},
-                "metrics": {"quality_repair_attempts": 0},
+                "metrics": metrics,
                 "messages": quality_messages,
-                "evidence_ids": list(evidence_ids.values()),
+                "evidence_ids": [
+                    evidence_ids[block.block_id]
+                    for block in blocks
+                    if compiled is None or block.block_id in referenced_ids
+                ],
             }
         )
         metadata = encode_json(
@@ -372,18 +517,24 @@ class DocumentBundleAssembler:
                 "extensions": {},
             }
         )
-        payloads = tuple(
-            sorted(
-                (
-                    _Payload(ids["metadata"], "source.metadata.v1", "sources/document-metadata.json", "application/json", metadata),
-                    _Payload(ids["normalized"], "document.normalized-content.v1", "evidence/document-content.jsonl", "application/x-ndjson", normalized),
-                    _Payload(ids["evidence"], "evidence.reference-set.v1", "evidence/evidence-set.jsonl", "application/x-ndjson", evidence),
-                    _Payload(ids["draft"], "knowledge.draft.markdown.v1", f"drafts/{ids['draft']}.md", "text/markdown", draft),
-                    _Payload(ids["quality"], "quality.report.v1", f"quality/{ids['quality']}.json", "application/json", quality),
-                ),
-                key=lambda item: item.path,
+        payload_values = [
+            _Payload(ids["metadata"], "source.metadata.v1", "sources/document-metadata.json", "application/json", metadata),
+            _Payload(ids["normalized"], "document.normalized-content.v1", "evidence/document-content.jsonl", "application/x-ndjson", normalized),
+            _Payload(ids["evidence"], "evidence.reference-set.v1", "evidence/evidence-set.jsonl", "application/x-ndjson", evidence),
+            _Payload(ids["draft"], "knowledge.draft.markdown.v1", f"drafts/{ids['draft']}.md", "text/markdown", draft),
+            _Payload(ids["quality"], "quality.report.v1", f"quality/{ids['quality']}.json", "application/json", quality),
+        ]
+        if knowledge_map is not None:
+            payload_values.append(
+                _Payload(
+                    ids["knowledge_map"],
+                    "document.knowledge-map.v1",
+                    "evidence/knowledge-map.json",
+                    "application/json",
+                    knowledge_map,
+                )
             )
-        )
+        payloads = tuple(sorted(payload_values, key=lambda item: item.path))
         source_revision_ref = {
             "bundle_id": ids["bundle"],
             "source_revision_id": ids["revision"],
@@ -398,9 +549,29 @@ class DocumentBundleAssembler:
         }
         parents = {
             ids["evidence"]: [refs[ids["normalized"]]],
-            ids["draft"]: [refs[ids["normalized"]], refs[ids["evidence"]]],
-            ids["quality"]: [refs[ids["draft"]]],
+            ids["draft"]: [
+                refs[ids["normalized"]],
+                refs[ids["evidence"]],
+                *(
+                    [refs[ids["knowledge_map"]]]
+                    if knowledge_map is not None
+                    else []
+                ),
+            ],
+            ids["quality"]: [
+                refs[ids["draft"]],
+                *(
+                    [refs[ids["knowledge_map"]]]
+                    if knowledge_map is not None
+                    else []
+                ),
+            ],
         }
+        if knowledge_map is not None:
+            parents[ids["knowledge_map"]] = [
+                refs[ids["normalized"]],
+                refs[ids["evidence"]],
+            ]
         artifact_documents = [
             {
                 "artifact_schema_version": 1,
@@ -465,15 +636,43 @@ class DocumentBundleAssembler:
                 "started_at": created_at,
                 "completed_at": created_at,
                 "recipe": {"id": "alltonote.document-note", "version": 1},
-                "parameters": {"sha256": sha256_digest("document-first-slice-v1"), "summary": {"job_id": job_id}},
+                "parameters": {
+                    "sha256": sha256_digest(
+                        "document-knowledge-note-v1"
+                        if compiled is not None
+                        else "document-first-slice-v1"
+                    ),
+                    "summary": {"job_id": job_id},
+                },
                 "inputs": [source_revision_ref],
                 "outputs": list(refs.values()),
                 "capabilities": ["alltonote.document-source-bundle@1.0.0"],
                 "executors": [
                     {"kind": "alltonote-runtime", "product": "alltonote", "version": "0.1.0", "portable_contract_id": "iwiki-portable-contract-v1"},
                     {"kind": "document-parser", "identity": f"docling/{parsed.parser_version}@{parsed.model_revision}"},
+                    *(
+                        [
+                            {
+                                "kind": "model",
+                                "identity": compiled.model_identity,
+                            }
+                        ]
+                        if compiled is not None
+                        else []
+                    ),
                 ],
-                "usage": {"pages": len(parsed.pages), "blocks": len(blocks)},
+                "usage": {
+                    "pages": len(parsed.pages),
+                    "blocks": len(blocks),
+                    **(
+                        {
+                            "input_tokens": compiled.input_tokens,
+                            "output_tokens": compiled.output_tokens,
+                        }
+                        if compiled is not None
+                        else {}
+                    ),
+                },
                 "quality": {
                     "overall": quality_overall,
                     "publish_eligible": publish_eligible,
@@ -538,6 +737,9 @@ class DocumentBundleAssembler:
             primary_draft_artifact_id=ids["draft"],
             normalized_artifact_id=ids["normalized"],
             evidence_set_artifact_id=ids["evidence"],
+            knowledge_map_artifact_id=(
+                ids["knowledge_map"] if knowledge_map is not None else None
+            ),
             quality_report_artifact_id=ids["quality"],
             quality_overall=quality_overall,
             publish_eligible=publish_eligible,

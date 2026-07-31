@@ -118,7 +118,11 @@ def test_generic_document_produce_uses_file_contract_and_projects_result(
     assert request.input.value == str(source)
     assert request.input.attributes == {}
     assert request.requested_outputs == ("knowledge-note",)
-    assert request.parameters == {}
+    assert request.parameters == {
+        "model_override": None,
+        "output_language": "zh-CN",
+        "provider_profile": "default",
+    }
     assert envelope["ok"] is True
     assert envelope["command"] == "produce"
     assert envelope["data"]["result_kind"] == "document-note"
@@ -184,7 +188,12 @@ def test_generic_document_produce_selects_document_runtime_by_recipe(
     runtime = _DocumentRuntime()
     selected: list[Path] = []
 
-    def create(workspace_root: Path) -> _DocumentRuntime:
+    def create(
+        workspace_root: Path,
+        *,
+        current_config_snapshot=None,
+    ) -> _DocumentRuntime:
+        assert current_config_snapshot is not None
         selected.append(workspace_root)
         return runtime
 

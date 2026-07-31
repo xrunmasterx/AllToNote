@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -248,9 +249,31 @@ def create_job_runtime_for_workspace(
         ):
             from app.runtime import create_document_runtime_for_workspace
 
+            requested_model_identity = None
+            requested_provider_profile = None
+            request_json = repository.get_job_request(job_id)
+            if request_json is not None:
+                try:
+                    request = json.loads(request_json)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    request = None
+                if (
+                    type(request) is dict
+                    and type(request.get("request_schema_version")) is int
+                    and request.get("request_schema_version") == 2
+                    and type(request.get("model_override")) is str
+                    and request["model_override"].strip()
+                    and type(request.get("provider_profile")) is str
+                    and request["provider_profile"].strip()
+                ):
+                    requested_model_identity = request["model_override"]
+                    requested_provider_profile = request["provider_profile"]
             runtime = create_document_runtime_for_workspace(
                 workspace_root,
                 local_app_data=trusted_root,
+                current_config_snapshot=current_config_snapshot,
+                requested_model_identity=requested_model_identity,
+                requested_provider_profile=requested_provider_profile,
             )
         else:
             from app.runtime import create_codex_app_server_runtime_for_workspace
