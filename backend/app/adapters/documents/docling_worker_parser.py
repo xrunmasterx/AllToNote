@@ -24,6 +24,7 @@ from app.adapters.worker_process import (
 from app.core.domain.document import (
     DocumentBlock,
     DocumentBoundingBox,
+    MAX_BORN_DIGITAL_PDF_BYTES,
     DocumentPage,
     ParsedDocument,
 )
@@ -31,7 +32,6 @@ from app.core.errors import DomainError, ErrorCategory
 from app.core.ports.source import CancellationTokenPort
 
 
-_MAX_FIRST_SLICE_BYTES = 64 * 1024 * 1024
 _MAX_DOCTOR_RESULT_BYTES = 64 * 1024
 _MAX_PARSER_RESULT_BYTES = 128 * 1024 * 1024
 _WORKER_ENVIRONMENT_KEYS = (
@@ -165,7 +165,7 @@ class DoclingWorkerParser:
             not source.is_file()
             or source.suffix.lower() != ".pdf"
             or stat.st_size < 5
-            or stat.st_size > _MAX_FIRST_SLICE_BYTES
+            or stat.st_size > MAX_BORN_DIGITAL_PDF_BYTES
             or magic != b"%PDF-"
         ):
             raise _failed(

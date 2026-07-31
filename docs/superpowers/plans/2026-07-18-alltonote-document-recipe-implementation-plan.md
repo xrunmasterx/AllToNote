@@ -42,6 +42,8 @@ X0-A 完成后，首个生产纵切只选择一份真实本地 born-digital PDF 
 
 实现 local root grant、stable copy/handle、file hash、magic/MIME、ZIP ratio/object/page/slide limits、encrypted/damaged/active content。测试编译中修改、symlink/reparse、密码不进argv/log。
 
+当前增量（2026-07-31）：`alltonote.document-note@1` 已在全文件 SHA-256 和 Job 创建前拒绝非常规文件、非 `.pdf`、错误 `%PDF-` magic、少于 5 bytes 或超过 64 MiB 的输入；Recipe Adapter 与 Docling worker 共用同一上限。该增量只关闭明显不支持输入造成的无谓全文件读取，不代表恶意路径竞态、PDF 对象/页面/解压膨胀或解析器资源隔离已完成。验证边界见 [`Document PDF 输入准入边界`](../../acceptance/2026-07-31-document-input-admission.md)。
+
 ## 4. Task DOC-02：Source Copy Policy
 
 `copy|reference|copy-if-under-limit`、hash/metadata、超限交互、source unavailable。原文件前后 hash测试；不复制整个用户目录。

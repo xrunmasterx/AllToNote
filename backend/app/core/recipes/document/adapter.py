@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat as stat_module
 from pathlib import Path
 
 from app.core.application.document_service import DocumentService
 from app.core.domain.document import (
     DocumentKnowledgeProduceRequest,
     DocumentProduceRequest,
+    MAX_BORN_DIGITAL_PDF_BYTES,
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission, RecipeKey
@@ -22,12 +25,70 @@ def _invalid(code: str, message: str) -> DomainError:
     return DomainError(code, ErrorCategory.INVALID_REQUEST, message)
 
 
-def _sha256(path: Path) -> str:
+def _inspect_pdf_source(path: Path) -> tuple[str, os.stat_result]:
+    if path.suffix.lower() != ".pdf":
+        raise _invalid(
+            "document_input_unsupported",
+            "The Document Recipe requires a bounded born-digital PDF",
+        )
+    initial = path.stat()
+    if not stat_module.S_ISREG(initial.st_mode):
+        raise _invalid(
+            "document_input_unsupported",
+            "The Document Recipe requires a bounded born-digital PDF",
+        )
     digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        opened = os.fstat(stream.fileno())
+        if not os.path.samestat(initial, opened):
+            raise _invalid(
+                "document_input_unavailable",
+                "Document input is unavailable",
+            )
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or opened.st_size < 5
+            or opened.st_size > MAX_BORN_DIGITAL_PDF_BYTES
+        ):
+            raise _invalid(
+                "document_input_unsupported",
+                "The Document Recipe requires a bounded born-digital PDF",
+            )
+        magic = stream.read(5)
+        if magic != b"%PDF-":
+            raise _invalid(
+                "document_input_unsupported",
+                "The Document Recipe requires a bounded born-digital PDF",
+            )
+        digest.update(magic)
+        total_bytes = len(magic)
+        while total_bytes <= MAX_BORN_DIGITAL_PDF_BYTES:
+            chunk = stream.read(
+                min(1024 * 1024, MAX_BORN_DIGITAL_PDF_BYTES - total_bytes + 1)
+            )
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_BORN_DIGITAL_PDF_BYTES:
+                raise _invalid(
+                    "document_input_unsupported",
+                    "The Document Recipe requires a bounded born-digital PDF",
+                )
             digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
+        final = os.fstat(stream.fileno())
+    current = path.stat()
+    if (
+        not os.path.samestat(opened, final)
+        or not os.path.samestat(opened, current)
+        or final.st_size != total_bytes
+        or opened.st_size != final.st_size
+        or opened.st_mtime_ns != final.st_mtime_ns
+    ):
+        raise _invalid(
+            "document_input_unavailable",
+            "Document input is unavailable",
+        )
+    return "sha256:" + digest.hexdigest(), final
 
 
 class DocumentRecipeAdapter:
@@ -54,8 +115,9 @@ class DocumentRecipeAdapter:
             )
         try:
             source = Path(request.input.value).resolve(strict=True)
-            stat = source.stat()
-            source_sha256 = _sha256(source)
+            source_sha256, stat = _inspect_pdf_source(source)
+        except DomainError:
+            raise
         except OSError as error:
             raise _invalid("document_input_unavailable", "Document input is unavailable") from error
         common = {

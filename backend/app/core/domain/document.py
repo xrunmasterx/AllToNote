@@ -11,6 +11,7 @@ from app.core.errors import DomainError, ErrorCategory
 
 
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+MAX_BORN_DIGITAL_PDF_BYTES = 64 * 1024 * 1024
 
 
 def _invalid(message: str) -> DomainError:
@@ -252,5 +253,6 @@ __all__ = [
     "DocumentPage",
     "DocumentKnowledgeProduceRequest",
     "DocumentProduceRequest",
+    "MAX_BORN_DIGITAL_PDF_BYTES",
     "ParsedDocument",
 ]
