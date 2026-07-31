@@ -102,6 +102,93 @@ def test_subtitle_first_path_does_not_start_ytdlp(tmp_path: Path) -> None:
     assert "Cookie" not in http.calls[2][1]["headers"]
 
 
+@pytest.mark.parametrize(
+    ("tracks", "expected_language", "expected_path"),
+    [
+        (
+            [
+                {
+                    "lan": "ai-zh",
+                    "ai_type": 1,
+                    "subtitle_url": "//aisubtitle.hdslb.com/ai.json",
+                },
+                {
+                    "lan": "zh-CN",
+                    "ai_type": 0,
+                    "subtitle_url": "//aisubtitle.hdslb.com/manual.json",
+                },
+                {
+                    "lan": "en-US",
+                    "ai_type": 0,
+                    "subtitle_url": "//aisubtitle.hdslb.com/en.json",
+                },
+            ],
+            "zh-CN",
+            "/manual.json",
+        ),
+        (
+            [
+                {
+                    "lan": "en-US",
+                    "ai_type": 0,
+                    "subtitle_url": "//aisubtitle.hdslb.com/en.json",
+                },
+                {
+                    "lan": "ai-zh",
+                    "ai_type": 1,
+                    "subtitle_url": "//aisubtitle.hdslb.com/ai.json",
+                },
+            ],
+            "ai-zh",
+            "/ai.json",
+        ),
+        (
+            [
+                {
+                    "lan": "en-US",
+                    "ai_type": 0,
+                    "subtitle_url": "//aisubtitle.hdslb.com/en.json",
+                },
+                {
+                    "lan": "ja-JP",
+                    "ai_type": 0,
+                    "subtitle_url": "//aisubtitle.hdslb.com/ja.json",
+                },
+            ],
+            "en-US",
+            "/en.json",
+        ),
+    ],
+)
+def test_subtitle_selection_uses_practical_default_priority(
+    tmp_path: Path,
+    tracks: list[dict[str, object]],
+    expected_language: str,
+    expected_path: str,
+) -> None:
+    http = _Http(
+        [
+            _view(),
+            {
+                "code": 0,
+                "data": {"subtitle": {"subtitles": tracks}},
+            },
+            {"body": [{"from": 0.0, "to": 1.0, "content": "selected"}]},
+        ]
+    )
+
+    result = acquire_request(
+        _request(tmp_path),
+        versions=_VERSIONS,
+        http_get=http,
+        youtube_dl_factory=lambda _opts: pytest.fail("yt-dlp was started"),
+    )
+
+    assert result["subtitle_status"] == "available"
+    assert result["subtitle"]["language"] == expected_language
+    assert http.calls[2][0].endswith(expected_path)
+
+
 def test_media_path_uses_private_cookie_file_and_removes_it(
     tmp_path: Path,
 ) -> None:
