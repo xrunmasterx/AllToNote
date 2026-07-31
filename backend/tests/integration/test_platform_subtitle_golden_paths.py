@@ -120,6 +120,8 @@ class _FixtureDownloader:
         self._calls.subtitle += 1
         if self._subtitle_outcome == "unavailable":
             raise LegacyNoSubtitleError
+        if self._subtitle_outcome == "unknown":
+            return None
         if self._subtitle_outcome == "malformed":
             return SimpleNamespace(
                 language=self._subtitle["language"],
@@ -1318,7 +1320,86 @@ def test_platform_without_subtitles_downloads_media_and_transcribes(
     assert transcriber["identity"] == "fixture/transcriber-v1"
 
 
-@pytest.mark.parametrize("subtitle_outcome", ["unavailable", "malformed"])
+def test_unknown_subtitle_status_does_not_start_media_fallback(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    calls = Calls()
+    runtime = _create_runtime(
+        tmp_path / "machine-unknown-subtitle",
+        "bilibili",
+        calls,
+        subtitle_outcome="unknown",
+        media_fallback=True,
+    )
+
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.FAILED
+    assert result.error is not None
+    assert result.error.code == "platform_subtitle_status_unknown"
+    assert result.error.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert calls.subtitle == 1
+    assert calls.media_download == 0
+    assert calls.transcriber == 0
+    assert calls.model == 0
+
+
+def test_confirmed_no_subtitle_without_transcriber_fails_without_media_download(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    calls = Calls()
+    runtime = _create_runtime(
+        tmp_path / "machine-no-transcriber",
+        "bilibili",
+        calls,
+        subtitle_outcome="unavailable",
+        media_fallback=False,
+    )
+
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.FAILED
+    assert result.error is not None
+    assert result.error.code == "platform_subtitle_unavailable"
+    assert calls.subtitle == 1
+    assert calls.media_download == 0
+    assert calls.transcriber == 0
+    assert calls.model == 0
+
+
+def test_malformed_platform_subtitle_fails_without_media_fallback(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    calls = Calls()
+    runtime = _create_runtime(
+        tmp_path / "machine-malformed-subtitle",
+        "bilibili",
+        calls,
+        subtitle_outcome="malformed",
+        media_fallback=True,
+    )
+
+    submitted = runtime.submit_video(request("bilibili", workspace_root))
+    result = runtime.wait_job(submitted.job_id)
+
+    assert result.state is JobState.FAILED
+    assert result.error is not None
+    assert result.error.code == "transcript_segment_invalid"
+    assert calls.subtitle == 1
+    assert calls.media_download == 0
+    assert calls.transcriber == 0
+    assert calls.model == 0
+
+
+@pytest.mark.parametrize(
+    "subtitle_outcome",
+    ["unavailable", "unknown", "malformed"],
+)
 def test_provided_transcript_precedes_lower_priority_platform_subtitle(
     subtitle_outcome: str,
     runtime_factory: Callable[..., tuple[object, Calls]],

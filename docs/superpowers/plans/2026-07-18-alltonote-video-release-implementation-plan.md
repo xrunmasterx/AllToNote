@@ -293,6 +293,7 @@ YouTube 保持外部阻塞时，跳过实时成功 Gate并继续其余任务；�
 - `VREL-02`：三条用户提供的真实 Bilibili 输入已通过签名 `media-basic` / `transcribe-cpu` 组合、Portable commit 和用户结果 Gate，证据见 [`Official Video Packs 与真实视频验收`](../../acceptance/2026-07-31-official-video-packs.md)。
 - `VREL-03`：项目自建 12 秒英文语音 MP4 已在提交 `34cbf9550edae6fabae1fd13c04cc623bd5c401b` 导出的 Runtime wheel 中，通过签名 Pack 的真实 `ffprobe`、`faster-whisper small/cpu-int8`、Codex、semantic validate、commit 与新进程零重放；源文件哈希保持不变。
 - `VREL-03` 尚未关闭完整发布 Gate：仍需独立非管理员 Windows 用户或 VM、受控较长本地文件，以及取消、磁盘不足、模型缺失和 FFmpeg crash 的真实发布环境矩阵。
+- `VREL-04` 的核心安全决策已冻结：用户提供稿件优先；有效平台字幕不下载媒体；只有已确认无字幕或平台明确不支持字幕时才允许在转写能力存在的前提下回退；字幕状态未知返回可重试失败且不启动媒体下载；损坏字幕直接失败且不伪装成“无字幕”。高质量人工/自动/多语言选择、质量标记和各平台真实矩阵仍未完成。
 - `VREL-09` 的当前版本签名 Pack 安装、解析、动态 doctor、Job 精确 digest 冻结与恢复已通过；通用更新、rollback、卸载、Desktop Resolver 和公开分发仍在后续 Runtime/平台发布范围。
-- `VREL-11` 当前完整 backend 为 `2230 passed, 2 skipped, 3 warnings`；这只证明当前代码回归和上述有限真实输入，不等于 VREL-04 至 VREL-10 全矩阵完成。
+- `VREL-11` 当前完整 backend 为 `2234 passed, 2 skipped, 3 warnings`；这只证明当前代码回归和上述有限真实输入，不等于 VREL-04 至 VREL-10 全矩阵完成。
 - 新 Workspace 的 strict validate 仍会报告缺少 `wiki/common/index.md`；本次提交的 Portable Bundle semantic validate 为 `valid=true, issues=[]`。Workspace 严格初始化属于 Workspace-init 后续合同，不在 Video Produce 中隐式修补。

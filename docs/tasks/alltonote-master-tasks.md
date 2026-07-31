@@ -111,7 +111,7 @@ git diff --check
 | 产品与架构基线 | `confirmed` | AllToNote 是上层知识编译/积累平台；Production 是用例，Video/Article/Document/Codebase/Personal 是并列 Recipe；CLI/Desktop/MCP 共享 ProduceService；所有当前路线阶段已有下位设计 |
 | iwiki Portable 消费/提交基础 | `implemented foundation` | AllToNote Bundle 已通过真实 iwiki semantic validation 和 commit |
 | Knowledge Compiler Core | `implemented foundation` | Job、Attempt、Checkpoint、ExternalOperation、ModelExecutor、Quality、Bundle 基础已建立 |
-| Video Producer v1/v2 Core | `mostly completed` | Wave 1A Runtime/CLI、Portable Bundle、Knowledge/Faithful 多 Draft Core 已实现；VREL-02 真实 Bilibili 与 VREL-03 本地短夹具正式链路已有证据，VREL-04..11 与完整发布矩阵仍未闭合 |
+| Video Producer v1/v2 Core | `mostly completed` | Wave 1A Runtime/CLI、Portable Bundle、Knowledge/Faithful 多 Draft Core 已实现；VREL-02 真实 Bilibili、VREL-03 本地短夹具和 VREL-04 核心安全决策已有证据，VREL-04 质量/多语言/全平台矩阵及 VREL-05..11 仍未闭合 |
 | 65 分钟长视频知识编译 | `completed after acquisition` | 7 Map + 1 Compose，Quality/commit/恢复通过 |
 | 实时 YouTube acquisition | `blocked` | 当前 IP 与最新 Cookie 仍被 YouTube anti-bot 拦截 |
 | Bilibili/本地视频正式发布矩阵 | `release-candidate evidence` | 三条真实 Bilibili 与一条项目自建本地 MP4 已通过签名 Pack、semantic validate、commit 和重启零重放；独立非管理员 Windows VM、较长本地文件和故障矩阵仍待完成 |
@@ -338,10 +338,11 @@ URL -> metadata -> subtitles/audio -> Transcript -> v2 compile
 - 三条真实 Bilibili 输入与项目自建本地 MP4 均产生 committed、quality `pass`、publishable Bundle；
 - 本地路径收据固定 `media-basic`、`transcribe-cpu` 与 `faster-whisper/1.1.1/small/cpu-int8`，源 MP4 SHA-256 前后不变；
 - Bundle semantic validate 为 `valid=true, issues=[]`；新进程 `job wait` 前后事件序列、Bundle 哈希与源哈希不变；
-- 最终完整 backend 回归为 `2230 passed, 2 skipped, 3 warnings`，独立 Gate Review 为 0 P0 / 0 P1；
+- VREL-04 核心安全决策已冻结：provided 优先、有效字幕不下载媒体、确认无字幕才允许回退、UNKNOWN 不回退、损坏字幕直接失败；质量/多语言/全平台矩阵仍待完成；
+- 最终完整 backend 回归为 `2234 passed, 2 skipped, 3 warnings`，独立 Gate Review 为 0 P0 / 0 P1；
 - 权威摘要：[`Official Video Packs 与真实视频验收`](../acceptance/2026-07-31-official-video-packs.md)。
 
-剩余 Gate：独立非管理员 Windows 用户/VM、受控较长本地视频、VREL-03 故障矩阵，以及 VREL-04 至 VREL-11 尚未关闭的发布项。新 Workspace 缺 `wiki/common/index.md` 的 strict validate 问题属于 Workspace-init 后续合同，不在 Video Produce 中隐式修补。
+剩余 Gate：独立非管理员 Windows 用户/VM、受控较长本地视频、VREL-03 故障矩阵、VREL-04 质量/多语言/全平台矩阵，以及 VREL-05 至 VREL-11 尚未关闭的发布项。新 Workspace 缺 `wiki/common/index.md` 的 strict validate 问题属于 Workspace-init 后续合同，不在 Video Produce 中隐式修补。
 
 ### RELEASE-CLI-01：补齐 Headless CLI 自动化面
 

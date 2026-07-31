@@ -493,6 +493,16 @@ class _PlatformVideoOperations(VideoRecipeOperations):
             )
             provenance = TranscriptProvenance.PLATFORM
         subtitle_availability = acquired.subtitle_availability
+        if (
+            transcript is None
+            and subtitle_availability is SubtitleAvailability.UNKNOWN
+        ):
+            raise DomainError(
+                "platform_subtitle_status_unknown",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Platform subtitle availability could not be determined; "
+                "media fallback was not started",
+            )
         stored_media = None
         if (
             transcript is None
