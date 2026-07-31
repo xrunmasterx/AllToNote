@@ -582,6 +582,8 @@ class VideoService:
                         resumed_attempt=active_attempt,
                     )
                 except DomainError as error:
+                    if error.code == "job_store_busy":
+                        raise
                     try:
                         self._fail_job(job_id, active_attempt, authority, error)
                     except DomainError as convergence_error:

@@ -70,7 +70,8 @@ Stop condition：
 - `runtime info` 已报告实际 SQLite 版本与 `parallel_job_execution_supported`；
 - `runtime doctor` 对未进入项目验证白名单的版本给出结构化 warn，现有单 Job/单 writer 保护保持不变；
 - 当前白名单仅含已知修复并按本项目版本线确认的 3.44.6+、3.50.7+、3.51.3+；3.52/3.53 即使上游版本包含修复，也要等对应开发、CI、安装包完成多连接 WAL Gate 后才可加入，不能只凭版本大小放行；
-- 1/4/8/16 connection、busy/checkpoint/crash-reopen 与安装包 SQLite 验证仍待完成。
+- JobStore 已按 SQLite primary result code 将 `SQLITE_BUSY`/`SQLITE_LOCKED`（含 extended code）映射为脱敏、可重试的 `job_store_busy`，Video/Document 不再把该临时争用永久写成失败；没有加入事务自动重放，也没有解除现有串行保护；
+- 1/4/8/16 connection、checkpoint/crash-reopen、writer-lock 测量与安装包 SQLite 身份验证仍待完成。
 
 ## Task 3: [ ] 实现按需 Engine 单实例生命周期
 

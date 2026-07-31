@@ -59,7 +59,7 @@ from app.core.domain.document import (
 from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import VideoProduceRequest
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState, JobState
 from app.core.jobs.resource_lease import ResourceOwner
@@ -1516,6 +1516,35 @@ def test_document_job_can_be_cancelled_before_execution(tmp_path: Path) -> None:
 
     assert cancelled.state is JobState.CANCELLED
     assert router.wait_job(job_id) == cancelled
+    assert parser.calls == 0
+
+
+def test_job_store_busy_does_not_fail_document_job(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    service, repository = _service(
+        tmp_path / "document-busy-machine",
+        parser,
+        IWikiPortableGateway(),
+        owner_id="document-busy-process",
+    )
+    job_id, router = _submit(service, repository, workspace, source)
+
+    def busy(*_args: object, **_kwargs: object) -> object:
+        raise DomainError(
+            "job_store_busy",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "The workspace JobStore is busy; retry the operation",
+        )
+
+    service._execute = busy  # type: ignore[method-assign]
+
+    with pytest.raises(DomainError, match="job_store_busy"):
+        router.wait_job(job_id)
+
+    assert router.get_job(job_id).state is JobState.RUNNING
     assert parser.calls == 0
 
 

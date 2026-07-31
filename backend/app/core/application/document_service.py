@@ -288,6 +288,8 @@ class DocumentService:
                         resumed_attempt=active_attempt,
                     )
                 except DomainError as error:
+                    if error.code == "job_store_busy":
+                        raise
                     self._fail_job(job_id, active_attempt, authority, error)
                     return self.get_job(job_id)
             finally:

@@ -462,6 +462,119 @@ def test_open_creates_version_two_database_with_exact_schema_and_pragmas(
     assert foreign_key_violations == []
 
 
+def test_busy_begin_immediate_is_stable_retryable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(repository_module, "_BUSY_TIMEOUT_MS", 25)
+    repo = SqliteJobRepository.open(tmp_path / "busy-store")
+    holder = sqlite3.connect(repo.database_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(DomainError) as raised:
+            repo.create_job(
+                request_hash=HASH_A,
+                principal="local",
+                client_request_id=None,
+            )
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert dict(raised.value.details) == {
+        "sqlite_result": "busy",
+        "busy_timeout_ms": 25,
+    }
+    assert "database" not in raised.value.message.casefold()
+
+
+def test_busy_connect_is_stable_retryable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = sqlite3.OperationalError("private SQLite connect detail")
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    def fail_connect(*_args: object, **_kwargs: object) -> sqlite3.Connection:
+        raise error
+
+    monkeypatch.setattr(repository_module.sqlite3, "connect", fail_connect)
+    repo = SqliteJobRepository(tmp_path / "connect-busy", clock=lambda: 1)
+
+    with pytest.raises(DomainError) as raised:
+        repo._connect()
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert "private" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("primary_result", "result_name"),
+    (
+        (sqlite3.SQLITE_BUSY, "busy"),
+        (sqlite3.SQLITE_LOCKED, "locked"),
+    ),
+)
+def test_extended_lock_result_uses_primary_result_code(
+    primary_result: int,
+    result_name: str,
+) -> None:
+    error = sqlite3.OperationalError("private SQLite detail")
+    error.sqlite_errorcode = primary_result | (7 << 8)
+
+    with pytest.raises(DomainError) as raised:
+        repository_module._raise_if_job_store_busy(error)
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert raised.value.details["sqlite_result"] == result_name
+    assert "private" not in raised.value.message
+
+
+def test_open_contention_is_not_reported_as_schema_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = sqlite3.OperationalError("database is locked at a private path")
+    error.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+    monkeypatch.setattr(
+        SqliteJobRepository,
+        "_connect",
+        lambda _self: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(DomainError) as raised:
+        SqliteJobRepository.open(tmp_path / "open-busy")
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert "private path" not in str(raised.value)
+
+
+def test_authorize_attempt_storage_maps_busy_statement(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = sqlite3.OperationalError("private SQLite statement detail")
+    error.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+
+    def fail_authority(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(repo, "_assert_execution_authority", fail_authority)
+
+    with pytest.raises(DomainError) as raised:
+        repo.authorize_attempt_storage("job", "attempt", _authority(repo))
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert raised.value.details["sqlite_result"] == "locked"
+    assert "private" not in str(raised.value)
+
+
 def test_version_one_database_migrates_execution_binding_and_reopens(
     tmp_path: Path,
 ) -> None:
@@ -946,6 +1059,97 @@ def test_commit_guard_can_succeed_job_after_all_attempts_are_settled(
         pass
 
     assert repo.get_job(job.job_id).state is JobState.SUCCEEDED
+
+
+def test_commit_guard_maps_busy_before_portable_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(repository_module, "_BUSY_TIMEOUT_MS", 25)
+    repo = SqliteJobRepository.open(tmp_path / "guard-busy")
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "commit").attempt_id,
+        authority,
+    )
+    holder = sqlite3.connect(repo.database_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    portable_commit_calls = 0
+    try:
+        with pytest.raises(DomainError) as raised:
+            with repo.commit_guard(job.job_id, attempt.attempt_id, authority):
+                portable_commit_calls += 1
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert portable_commit_calls == 0
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
+
+
+def test_commit_guard_maps_busy_commit_without_replaying_callback(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id=None,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo)
+    attempt = repo.start_attempt(
+        repo.create_attempt(job.job_id, "commit").attempt_id,
+        authority,
+    )
+    original_connect = repo._connect
+    first_connection = True
+
+    class BusyCommitConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, *args: object, **kwargs: object) -> sqlite3.Cursor:
+            return self._connection.execute(*args, **kwargs)
+
+        def commit(self) -> None:
+            error = sqlite3.OperationalError("private SQLite commit detail")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+
+        def rollback(self) -> None:
+            self._connection.rollback()
+
+        def close(self) -> None:
+            self._connection.close()
+
+    def connect_with_busy_first_commit() -> sqlite3.Connection:
+        nonlocal first_connection
+        connection = original_connect()
+        if first_connection:
+            first_connection = False
+            return BusyCommitConnection(connection)  # type: ignore[return-value]
+        return connection
+
+    monkeypatch.setattr(repo, "_connect", connect_with_busy_first_commit)
+    portable_commit_calls = 0
+
+    with pytest.raises(DomainError) as raised:
+        with repo.commit_guard(job.job_id, attempt.attempt_id, authority):
+            portable_commit_calls += 1
+
+    assert raised.value.code == "job_store_busy"
+    assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert portable_commit_calls == 1
+    assert repo.get_job(job.job_id).state is JobState.RUNNING
 
 
 @pytest.mark.parametrize("terminal_state", (JobState.SUCCEEDED, JobState.CANCELLED))

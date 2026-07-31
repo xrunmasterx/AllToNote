@@ -233,6 +233,28 @@ def _raise_schema_invalid(error: BaseException | None = None) -> None:
     ) from error
 
 
+def _raise_if_job_store_busy(error: sqlite3.DatabaseError) -> None:
+    result_code = getattr(error, "sqlite_errorcode", None)
+    if type(result_code) is not int:
+        return
+    primary_result = result_code & 0xFF
+    result_name = {
+        sqlite3.SQLITE_BUSY: "busy",
+        sqlite3.SQLITE_LOCKED: "locked",
+    }.get(primary_result)
+    if result_name is None:
+        return
+    raise DomainError(
+        "job_store_busy",
+        ErrorCategory.RETRYABLE_RUNTIME,
+        "The workspace job store is busy; retry the operation",
+        {
+            "sqlite_result": result_name,
+            "busy_timeout_ms": _BUSY_TIMEOUT_MS,
+        },
+    ) from error
+
+
 class SqliteJobRepository:
     def __init__(
         self, machine_root: Path, *, clock: Callable[[], int]
@@ -263,33 +285,52 @@ class SqliteJobRepository:
         return repository
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.database_path,
-            timeout=_BUSY_TIMEOUT_MS / 1_000,
-            isolation_level=None,
-        )
+        connection: sqlite3.Connection | None = None
         try:
+            connection = sqlite3.connect(
+                self.database_path,
+                timeout=_BUSY_TIMEOUT_MS / 1_000,
+                isolation_level=None,
+            )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             connection.execute("PRAGMA journal_mode = WAL")
-        except BaseException:
-            connection.close()
+        except sqlite3.DatabaseError as error:
+            if connection is not None:
+                connection.close()
+            _raise_if_job_store_busy(error)
             raise
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
+        assert connection is not None
         return connection
 
     @contextmanager
     def _transaction(self, *, immediate: bool) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self._connect()
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield connection
             connection.commit()
+        except sqlite3.DatabaseError as error:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.DatabaseError:
+                    pass
+            _raise_if_job_store_busy(error)
+            raise
         except BaseException:
-            connection.rollback()
+            if connection is not None:
+                connection.rollback()
             raise
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def _initialize_schema(self) -> None:
         with self._transaction(immediate=True) as connection:
@@ -1288,7 +1329,7 @@ class SqliteJobRepository:
         *,
         expected_step_id: str | None = None,
     ) -> None:
-        with self._connect() as connection:
+        with self._transaction(immediate=False) as connection:
             attempt = self._assert_execution_authority(
                 connection,
                 job_id,
@@ -1946,9 +1987,7 @@ class SqliteJobRepository:
         attempt_id: str,
         authority: ExecutionAuthority,
     ) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        with self._transaction(immediate=True) as connection:
             self._assert_commit_guard(
                 connection, job_id, attempt_id, authority
             )
@@ -1956,12 +1995,6 @@ class SqliteJobRepository:
             self._finish_commit_guard(
                 connection, job_id, attempt_id, authority
             )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def commit_video_result_atomic(
         self,

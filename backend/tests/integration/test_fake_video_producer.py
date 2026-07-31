@@ -40,7 +40,7 @@ from app.core.application.video_service import (
 )
 from app.core.application.video_checkpoints import decode_draft, encode_draft
 from app.core.domain.ids import sha256_digest
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.resource_lease import ResourceOwner
 
 
@@ -1626,6 +1626,31 @@ def test_concurrent_waits_on_one_runtime_execute_job_once(
     assert all(item.state is JobState.SUCCEEDED for item in snapshots)
     assert calls.download == calls.transcribe == calls.model == 1
     assert calls.commit == 1
+
+
+def test_job_store_busy_does_not_fail_video_job(
+    runtime_factory: Callable[..., tuple[object, object]],
+    workspace_root: Path,
+) -> None:
+    runtime, calls = runtime_factory()
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="job-store-busy")
+    )
+
+    def busy(*_args: object, **_kwargs: object) -> object:
+        raise DomainError(
+            "job_store_busy",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "The workspace JobStore is busy; retry the operation",
+        )
+
+    runtime.video_service._execute = busy
+
+    with pytest.raises(DomainError, match="job_store_busy"):
+        runtime.wait_job(submitted.job_id)
+
+    assert runtime.get_job(submitted.job_id).state is JobState.RUNNING
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
 
 
 def test_distinct_jobs_on_one_runtime_execute_serially(
