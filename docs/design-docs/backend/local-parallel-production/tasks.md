@@ -217,6 +217,13 @@ Capacity-2 内部正确性 Gate（2026-08-02）：
 - focused Video/Document/Engine 集成回归为 `159 passed`，完整 Engine 为 `116 passed, 1 skipped`，dispatcher 单文件为 `35 passed`，完整 Backend 为 `2640 passed, 3 skipped, 3 warnings, 3 subtests passed`；独立最终 Gate `task_627221a16480` 为 P0/P1=0；验收见 [`Engine capacity-2 internal Gate`](../../../acceptance/2026-08-02-engine-capacity2-internal-gate.md)。
 - 该能力仍为显式内部开关，默认容量保持 1，`parallel_job_execution_enabled=false` 不变。真实双 Docling/FFmpeg 的内存与吞吐、双进程故障矩阵、Windows portable/clean-machine Gate 未通过前，不对用户启用 capacity 2，因此 Task 5/6 仍未完成。
 
+Capacity-2 跨进程与 Docling 负载 Gate（2026-08-02）：
+
+- 同一 Workspace 上的三个 Document 或三个本地 Video detached Job 已通过真实 Host + 独立 Worker process 验证：两个不同 PID 同时运行，第三个 Job 无 Attempt/launch 消耗地等待；一个 Worker 非零退出后第三个补位、同伴不受影响、失败 Job 由新 Worker 自动恢复，最终三份 Portable commit 完整；完整 detached E2E 为 `5 passed`；
+- 两份冻结真实 PDF 的并行 Docling doctor + parse 墙钟为 27.762 s，峰值进程树 RSS 为 3.015 GiB，结构 Oracle 仍为英文 4 页/82 block/1 表、中文 6 页/109 block/8 表，源哈希不变；证据见 [`Engine capacity-2 跨进程与 Docling 负载 Gate`](../../../acceptance/2026-08-02-engine-capacity2-process-and-docling-load-gate.md)；
+- 该结构仍是一套 ProduceService/Registry 承载两条 Recipe；本轮没有引入第二套 Job 或发布状态机；相关矩阵为 `218 passed, 1 skipped`，完整 backend 回归为 `2642 passed, 3 skipped, 3 warnings, 3 subtests passed`，独立最终 Gate `task_086020d968ed` 为 P0/P1=0；
+- 实测证明并发有吞吐收益，也证明不能对低内存机器无条件默认双开。预期 SQLite/resource/publish contention 仍可能作为通用非零退出消耗三次 Worker launch budget，当前开发 SQLite 3.50.4 也未通过 3.50.7 准入下限；最终 portable Runtime + 签名 Pack 的真实双 Document、真实双 Video/混合负载、可用内存准入和 Windows clean-machine 故障矩阵仍未关闭，因此默认容量与发布布尔值不变。
+
 ## Task 6: [ ] 加入最小资源准入与 workspace publish 控制
 
 - 风险：高

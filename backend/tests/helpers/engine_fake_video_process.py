@@ -129,6 +129,12 @@ def _run_worker(args: argparse.Namespace) -> int:
         )
 
     try:
+        if (
+            args.worker_crash_once is not None
+            and args.worker_crash_once.is_file()
+        ):
+            args.worker_crash_once.unlink()
+            return 91
         execute_engine_job(
             paths,
             workspace_instance_id=args.workspace_instance_id,
@@ -144,6 +150,10 @@ def _run_worker(args: argparse.Namespace) -> int:
 def _run_host(args: argparse.Namespace) -> int:
     paths = _runtime_paths(args)
 
+    if args.worker_control_dir is not None:
+        for name in ("started", "release", "finished", "crash-once"):
+            (args.worker_control_dir / name).mkdir(parents=True, exist_ok=True)
+
     if os.name != "nt":
         def terminate_host(_signum, _frame) -> None:
             raise KeyboardInterrupt
@@ -152,6 +162,27 @@ def _run_host(args: argparse.Namespace) -> int:
 
     def worker_runner(launch: EngineWorkerLaunchV1, check_running) -> int:
         reference = launch.reference
+        if args.worker_control_dir is None:
+            worker_started = args.worker_started
+            worker_release = args.worker_release
+            worker_finished = args.worker_finished
+        else:
+            worker_started = args.worker_control_dir / "started" / reference.job_id
+            worker_release = args.worker_control_dir / "release" / reference.job_id
+            worker_finished = args.worker_control_dir / "finished" / reference.job_id
+        if not all(
+            isinstance(value, Path)
+            for value in (worker_started, worker_release, worker_finished)
+        ):
+            raise RuntimeError("worker_control_paths_required")
+        crash_arguments = (
+            (
+                "--worker-crash-once",
+                str(args.worker_control_dir / "crash-once" / reference.job_id),
+            )
+            if args.worker_control_dir is not None
+            else ()
+        )
         command = (
             str(Path(sys.executable).resolve()),
             "-I",
@@ -166,11 +197,12 @@ def _run_host(args: argparse.Namespace) -> int:
             "--recipe-kind",
             args.recipe_kind,
             "--worker-started",
-            str(args.worker_started),
+            str(worker_started),
             "--worker-release",
-            str(args.worker_release),
+            str(worker_release),
             "--worker-finished",
-            str(args.worker_finished),
+            str(worker_finished),
+            *crash_arguments,
             "--call-log",
             str(args.call_log),
         )
@@ -189,6 +221,7 @@ def _run_host(args: argparse.Namespace) -> int:
         runtime_paths,
         worker_runner=worker_runner,
         reconcile_interval_seconds=0.1,
+        maximum_active_workers=args.maximum_active_workers,
     )
     return run_engine_host(paths=paths, idle_seconds=60.0)
 
@@ -218,9 +251,10 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--cache-dir", required=True, type=Path)
         child.add_argument("--state-dir", required=True, type=Path)
         child.add_argument("--log-dir", required=True, type=Path)
-        child.add_argument("--worker-started", required=True, type=Path)
-        child.add_argument("--worker-release", required=True, type=Path)
-        child.add_argument("--worker-finished", required=True, type=Path)
+        child.add_argument("--worker-started", type=Path)
+        child.add_argument("--worker-release", type=Path)
+        child.add_argument("--worker-finished", type=Path)
+        child.add_argument("--worker-crash-once", type=Path)
         child.add_argument("--call-log", required=True, type=Path)
         child.add_argument(
             "--recipe-kind",
@@ -230,6 +264,14 @@ def _parser() -> argparse.ArgumentParser:
         if mode == "worker":
             child.add_argument("--workspace-instance-id", required=True)
             child.add_argument("--job-id", required=True)
+        else:
+            child.add_argument("--worker-control-dir", type=Path)
+            child.add_argument(
+                "--maximum-active-workers",
+                type=int,
+                choices=(1, 2),
+                default=1,
+            )
     return parser
 
 
