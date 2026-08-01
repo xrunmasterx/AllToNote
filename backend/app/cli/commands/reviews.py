@@ -64,6 +64,9 @@ def _human_lines(data: Mapping[str, object]) -> tuple[str, ...]:
         lines.append(str(label))
     if isinstance(quality, Mapping):
         lines.append(f"Quality: {quality.get('overall')}")
+        admission = quality.get("admission")
+        if isinstance(admission, Mapping) and admission.get("status") != "pass":
+            lines.append(f"Publish: blocked — {admission.get('reason')}")
         reports = quality.get("reports")
         if isinstance(reports, list):
             for report in reports:

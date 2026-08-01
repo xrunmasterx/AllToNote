@@ -15,7 +15,11 @@ from app.cli.errors import (
     map_domain_error,
     map_error_detail,
 )
-from app.cli.render import render_json_lines, render_result
+from app.cli.render import (
+    configure_standard_streams,
+    render_json_lines,
+    render_result,
+)
 from app.core.domain.ids import new_typed_id
 from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import (
@@ -2032,4 +2036,5 @@ def _default_runtime(
 
 
 def entrypoint() -> None:
+    configure_standard_streams()
     raise SystemExit(main())

@@ -10,6 +10,7 @@ from iwiki.workspace import open_workspace
 
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.cli.main import main
+from app.core.application import review_candidate_service as review_candidates
 from app.core.application.review_candidate_service import ReviewCandidateService
 from app.core.domain.ids import new_typed_id
 from app.core.errors import DomainError
@@ -178,11 +179,16 @@ def test_review_show_returns_bounded_video_candidate_and_exact_evidence(
     }
     assert data["quality"]["overall"] == "pass"
     assert data["quality"]["publish_eligible"] is True
+    assert data["quality"]["admission"] == {
+        "status": "pass",
+        "reason": "quality-profile-supported",
+    }
     assert data["quality"]["reports"] == [
         {
             "artifact_id": QUALITY_ARTIFACT_ID,
             "profile": {"id": "alltonote.video-course-note", "version": 1},
             "overall": "pass",
+            "method": {"kind": "deterministic"},
             "checks": data["quality"]["reports"][0]["checks"],
             "messages": [],
         }
@@ -237,6 +243,11 @@ def test_review_show_resolves_document_note_item_to_verified_source_blocks(
         "page_count": 1,
     }
     assert data["quality"]["overall"] == "pass"
+    assert data["quality"]["publish_eligible"] is True
+    assert data["quality"]["admission"] == {
+        "status": "pass",
+        "reason": "quality-profile-supported",
+    }
     assert data["quality"]["reports"][0]["checks"]
     assert data["focus"]["kind"] == "note_item"
     assert data["focus"]["note_item_id"] == "title-0001"
@@ -261,6 +272,40 @@ def test_review_show_resolves_document_note_item_to_verified_source_blocks(
         }
     ]
     assert captured.err == ""
+
+
+def test_review_show_admits_verified_document_without_exposing_model_identities(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    draft_id, _ = _commit_document(workspace_root)
+    before = _file_snapshot(workspace_root)
+
+    code = main(
+        [
+            "review",
+            "show",
+            draft_id,
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)["data"]
+
+    assert code == 0
+    assert data["quality"]["publish_eligible"] is True
+    assert data["quality"]["admission"] == {
+        "status": "pass",
+        "reason": "quality-profile-supported",
+    }
+    assert data["quality"]["reports"][0]["method"] == {"kind": "model"}
+    assert "focus" not in data
+    assert "fixture/model-v1" not in captured.out
+    assert "fixture/verifier-v1" not in captured.out
+    assert captured.err == ""
+    assert _file_snapshot(workspace_root) == before
 
 
 def test_review_show_human_output_is_readable_and_omits_internal_ids(
@@ -313,6 +358,10 @@ def test_review_show_exposes_complete_failure_reasons_without_loading_focus(
     assert code == 0
     assert data["quality"]["overall"] == "fail"
     assert data["quality"]["publish_eligible"] is False
+    assert data["quality"]["admission"] == {
+        "status": "blocked",
+        "reason": "quality-report-not-publishable",
+    }
     report = data["quality"]["reports"][0]
     assert {
         "id": "knowledge-note-quality",
@@ -321,6 +370,116 @@ def test_review_show_exposes_complete_failure_reasons_without_loading_focus(
     } in report["checks"]
     assert "knowledge-note-semantic-quality-not-evaluated" in report["messages"]
     assert "focus" not in data
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "reason"),
+    (
+        (
+            "alltonote.document-note",
+            "legacy-document-quality-profile-not-publishable",
+        ),
+        (
+            "alltonote.document-native-extraction",
+            "document-native-extraction-not-publishable",
+        ),
+    ),
+)
+def test_legacy_document_quality_flag_cannot_admit_publication(
+    profile_id: str,
+    reason: str,
+) -> None:
+    admission = review_candidates._publication_admission(
+        stored_publish_eligible=True,
+        reports=(
+            {
+                "profile": {
+                    "id": profile_id,
+                    "version": 1,
+                },
+                "overall": "pass",
+            },
+        ),
+    )
+
+    assert admission == {
+        "status": "blocked",
+        "reason": reason,
+    }
+
+
+def test_historical_document_quality_profile_requires_independent_proof() -> None:
+    admission = review_candidates._publication_admission(
+        stored_publish_eligible=True,
+        reports=(
+            {
+                "profile": {
+                    "id": "alltonote.document-knowledge-note",
+                    "version": 1,
+                },
+                "overall": "pass",
+                "method": {"kind": "deterministic"},
+                "checks": (
+                    {"id": "knowledge-note-quality", "status": "pass"},
+                    {"id": "source-coverage", "status": "pass"},
+                ),
+            },
+        ),
+        document_independently_verified=False,
+    )
+
+    assert admission == {
+        "status": "blocked",
+        "reason": "document-independent-verification-not-proven",
+    }
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    (
+        "alltonote.video-course-note",
+        "alltonote.video-faithful-edition",
+    ),
+)
+def test_supported_video_quality_with_warnings_remains_publishable(
+    profile_id: str,
+) -> None:
+    admission = review_candidates._publication_admission(
+        stored_publish_eligible=True,
+        reports=(
+            {
+                "profile": {"id": profile_id, "version": 1},
+                "overall": "pass_with_warnings",
+                "method": {"kind": "deterministic"},
+                "checks": (),
+            },
+        ),
+        document_independently_verified=None,
+    )
+
+    assert admission == {
+        "status": "pass",
+        "reason": "quality-profile-supported",
+    }
+
+
+def test_unknown_quality_profile_is_not_admitted() -> None:
+    admission = review_candidates._publication_admission(
+        stored_publish_eligible=True,
+        reports=(
+            {
+                "profile": {"id": "untrusted.profile", "version": 1},
+                "overall": "pass",
+                "method": {"kind": "deterministic"},
+                "checks": (),
+            },
+        ),
+    )
+
+    assert admission == {
+        "status": "blocked",
+        "reason": "quality-profile-unsupported",
+    }
 
 
 def test_review_show_reports_missing_focus_without_disclosing_bundle_details(

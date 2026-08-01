@@ -72,6 +72,8 @@ Gate：每个 Publisher 操作有已发布 API；否则停止实施该操作。
 
 状态（2026-08-01）：P0 单 Candidate 只读切片已完成。`alltonote review show <draft-id>` 从已提交 Portable Bundle 重建 Candidate，默认返回 Source 与完整 Quality checks/messages；`--evidence-id` 按需展开一个 Video time-range/transcript excerpt，`--note-item-id` 按需展开一个 Document semantic claim 及其 page/bbox/source blocks。所有投影均绑定 Draft hash、source revision 与 artifact parent lineage，保持有界、只读、无模型调用且不保存第二份正文。
 
+后续真实性修正（2026-08-01）：共享 CLI renderer 已在 CP936/GBK stdout/stderr 上改为严格 UTF-8，真实 V03 的 `🚀` 标题在 human/JSON Review 中可逆保留；ReviewCandidate 同时增加当前 Quality admission。旧 `alltonote.document-note@1`/native-extraction 历史 flag 不再获得当前发布资格；历史同名 Document Knowledge Note 也必须由已提交 Quality Report 与 Knowledge Map 证明独立语义验证，不能仅凭 profile 名称准入；Video `pass_with_warnings` 保持可发布，未知 profile fail closed。该修正只收紧只读投影，不回写旧 Bundle，也不表示 ReviewRecord 或 Publisher 已完成。验收见 [`CLI Unicode 与 Review 发布准入验收`](../../acceptance/2026-08-01-cli-unicode-quality-admission.md)。
+
 本切片基于最小必要面没有提前创建 `review_store.py` 或 ReviewRecord 领域对象；它们仍属于 RP-01/RP-03 的 decision/approval 阶段。RP-02 尚未完成 list/filter/cursor，也未包含审批、发布或 Desktop UI。
 
 目标文件：

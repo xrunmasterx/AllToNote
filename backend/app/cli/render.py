@@ -36,6 +36,52 @@ _COMMON_TOKEN_VALUE = re.compile(
 _WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]:\\|\\\\)[^\r\n\t\"']+")
 
 
+def _is_strict_utf8_stream(stream: TextIO) -> bool:
+    encoding = getattr(stream, "encoding", None)
+    errors = getattr(stream, "errors", None)
+    if encoding is None:
+        return True
+    normalized = encoding.casefold().replace("-", "").replace("_", "")
+    return normalized == "utf8" and errors == "strict"
+
+
+def _configure_utf8_stream(stream: TextIO) -> bool:
+    if _is_strict_utf8_stream(stream):
+        return True
+    reconfigure = getattr(stream, "reconfigure", None)
+    if not callable(reconfigure):
+        return False
+    try:
+        reconfigure(encoding="utf-8", errors="strict")
+    except (OSError, ValueError):
+        return False
+    return _is_strict_utf8_stream(stream)
+
+
+def configure_standard_streams() -> None:
+    """Make the CLI's process streams lossless before argparse or rendering."""
+
+    _configure_utf8_stream(sys.stdout)
+    _configure_utf8_stream(sys.stderr)
+
+
+def _write_line(stream: TextIO, value: str, *, flush: bool = False) -> None:
+    payload = value + "\n"
+    if _is_strict_utf8_stream(stream):
+        stream.write(payload)
+    else:
+        buffer = getattr(stream, "buffer", None)
+        if buffer is not None:
+            stream.flush()
+            buffer.write(payload.encode("utf-8"))
+        elif _configure_utf8_stream(stream):
+            stream.write(payload)
+        else:
+            raise UnicodeError("CLI output stream does not support strict UTF-8")
+    if flush:
+        stream.flush()
+
+
 def _is_absolute_path(value: str) -> bool:
     if "://" in value:
         return False
@@ -169,37 +215,37 @@ def render_result(
     output = stdout or sys.stdout
     diagnostics = stderr or sys.stderr
     if json_mode:
-        print(
+        _write_line(
+            output,
             json.dumps(
                 json_envelope(result, show_paths=show_paths),
                 separators=(",", ":"),
                 ensure_ascii=False,
                 allow_nan=False,
             ),
-            file=output,
             flush=True,
         )
         return
 
     if result.ok:
         for line in result.human_lines:
-            print(_redact_text(line, show_paths=show_paths), file=output)
+            _write_line(output, _redact_text(line, show_paths=show_paths))
     else:
         assert result.error is not None
-        print(
+        _write_line(
+            diagnostics,
             f"Error [{result.error.code}]: "
             f"{_redact_text(result.error.message, show_paths=show_paths)}",
-            file=diagnostics,
         )
         for action in result.error.next_actions:
-            print(
+            _write_line(
+                diagnostics,
                 f"Action: {_redact_text(action, show_paths=show_paths)}",
-                file=diagnostics,
             )
     for warning in result.warnings:
-        print(
+        _write_line(
+            diagnostics,
             f"Warning: {_redact_text(warning, show_paths=show_paths)}",
-            file=diagnostics,
         )
 
 
@@ -210,16 +256,21 @@ def render_json_lines(
 ) -> None:
     output = stdout or sys.stdout
     for record in records:
-        print(
+        _write_line(
+            output,
             json.dumps(
                 _safe_mapping(record),
                 separators=(",", ":"),
                 ensure_ascii=False,
                 allow_nan=False,
             ),
-            file=output,
             flush=True,
         )
 
 
-__all__ = ["json_envelope", "render_json_lines", "render_result"]
+__all__ = [
+    "configure_standard_streams",
+    "json_envelope",
+    "render_json_lines",
+    "render_result",
+]

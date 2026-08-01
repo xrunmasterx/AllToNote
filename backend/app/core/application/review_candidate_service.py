@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
@@ -36,6 +36,15 @@ _MAX_CHECKS = 256
 _MAX_MESSAGES = 256
 _MAX_SOURCE_BLOCKS = 64
 _MAX_TEXT = 1_000_000
+_SUPPORTED_PUBLICATION_QUALITY_PROFILES = frozenset(
+    {
+        ("alltonote.video-course-note", 1),
+        ("alltonote.video-course-note", 2),
+        ("alltonote.video-faithful-edition", 1),
+        ("alltonote.document-knowledge-note", 1),
+    }
+)
+_QUALITY_OVERALLS = frozenset({"pass", "pass_with_warnings", "fail"})
 _SEMANTIC_STATUSES = frozenset(
     {"supported", "unsupported", "insufficient-evidence", "contradicted"}
 )
@@ -138,6 +147,25 @@ class ReviewCandidateService:
             metadata,
         )
         reports = self._quality_reports(workspace_root, inspected, draft, artifacts)
+        document_independently_verified = (
+            self._document_independently_verified(
+                workspace_root,
+                inspected,
+                draft,
+                reports,
+            )
+            if any(
+                report.get("profile")
+                == {"id": "alltonote.document-knowledge-note", "version": 1}
+                for report in reports
+            )
+            else None
+        )
+        admission = _publication_admission(
+            stored_publish_eligible=inspected.quality.publish_eligible,
+            reports=reports,
+            document_independently_verified=document_independently_verified,
+        )
         data: dict[str, object] = {
             "candidate": {
                 "draft_id": draft.artifact_id,
@@ -148,7 +176,8 @@ class ReviewCandidateService:
             "source": source,
             "quality": {
                 "overall": inspected.quality.overall,
-                "publish_eligible": inspected.quality.publish_eligible,
+                "publish_eligible": admission["status"] == "pass",
+                "admission": admission,
                 "reports": reports,
             },
         }
@@ -410,6 +439,87 @@ class ReviewCandidateService:
             "excerpt": excerpt,
         }
 
+    def _document_independently_verified(
+        self,
+        workspace_root: Path,
+        inspected: PortableInspectionRecord,
+        draft: PortableArtifactQueryRecord,
+        reports: Sequence[Mapping[str, object]],
+    ) -> bool:
+        matching_reports = [
+            report
+            for report in reports
+            if report.get("profile")
+            == {"id": "alltonote.document-knowledge-note", "version": 1}
+        ]
+        if len(matching_reports) != 1:
+            return False
+        report = matching_reports[0]
+        if report.get("method") != {"kind": "model"}:
+            return False
+        checks = report.get("checks")
+        if not isinstance(checks, Sequence):
+            return False
+        check_status = {
+            check.get("id"): check.get("status")
+            for check in checks
+            if isinstance(check, Mapping)
+        }
+        if check_status.get("knowledge-note-quality") != "pass" or (
+            check_status.get("source-coverage") != "pass"
+        ):
+            return False
+
+        matches = [
+            artifact
+            for artifact in inspected.artifacts
+            if artifact.kind == "document.knowledge-map.v1"
+        ]
+        if len(matches) != 1:
+            return False
+        knowledge_artifact = matches[0]
+        if (
+            knowledge_artifact.artifact_id not in draft.parent_artifact_ids
+            or knowledge_artifact.source_revision_ids != draft.source_revision_ids
+        ):
+            return False
+        knowledge = _json_document(
+            self._payload(
+                workspace_root,
+                inspected,
+                knowledge_artifact,
+                expected_kind="document.knowledge-map.v1",
+                limit=_MAX_KNOWLEDGE_MAP_BYTES,
+            )
+        )
+        if knowledge.get("knowledge_map_schema_version") != 1:
+            return False
+        composer_identity = knowledge.get("model_identity")
+        verification = knowledge.get("semantic_verification")
+        if type(composer_identity) is not str or not isinstance(verification, Mapping):
+            return False
+        verifier_identity = verification.get("model_identity")
+        if (
+            type(verifier_identity) is not str
+            or not composer_identity.strip()
+            or not verifier_identity.strip()
+            or composer_identity == verifier_identity
+        ):
+            return False
+        items = _mapping_list(knowledge.get("items"), _MAX_RECORDS)
+        claims = _mapping_list(verification.get("claims"), _MAX_RECORDS)
+        item_ids = [
+            _bounded_string(item.get("note_item_id"), 128) for item in items
+        ]
+        claim_ids: list[str] = []
+        for claim in claims:
+            if claim.get("status") != "supported":
+                return False
+            claim_ids.append(_bounded_string(claim.get("claim_id"), 128))
+        return bool(item_ids) and len(set(item_ids)) == len(item_ids) and (
+            sorted(item_ids) == sorted(claim_ids)
+        )
+
     def _note_item_focus(
         self,
         workspace_root: Path,
@@ -556,13 +666,66 @@ def _quality_projection(
         _bounded_string(message, 512)
         for message in _list(document.get("messages"), _MAX_MESSAGES)
     ]
+    method = _mapping(document.get("method"))
+    method_projection = {"kind": _bounded_string(method.get("kind"), 64)}
+    overall = _bounded_string(document.get("overall"), 32)
+    if overall not in _QUALITY_OVERALLS:
+        raise _invalid_error()
     return {
         "artifact_id": artifact_id,
         "profile": profile_projection,
-        "overall": _bounded_string(document.get("overall"), 32),
+        "overall": overall,
+        "method": method_projection,
         "checks": check_projection,
         "messages": messages,
     }
+
+
+def _publication_admission(
+    *,
+    stored_publish_eligible: bool,
+    reports: Sequence[Mapping[str, object]],
+    document_independently_verified: bool | None = None,
+) -> Mapping[str, str]:
+    if not stored_publish_eligible or any(
+        report.get("overall") not in {"pass", "pass_with_warnings"}
+        for report in reports
+    ):
+        return {
+            "status": "blocked",
+            "reason": "quality-report-not-publishable",
+        }
+    for report in reports:
+        profile = report.get("profile")
+        if not isinstance(profile, Mapping):
+            return {
+                "status": "blocked",
+                "reason": "quality-profile-unsupported",
+            }
+        identity = (profile.get("id"), profile.get("version"))
+        if identity == ("alltonote.document-note", 1):
+            return {
+                "status": "blocked",
+                "reason": "legacy-document-quality-profile-not-publishable",
+            }
+        if identity == ("alltonote.document-native-extraction", 1):
+            return {
+                "status": "blocked",
+                "reason": "document-native-extraction-not-publishable",
+            }
+        if identity == ("alltonote.document-knowledge-note", 1) and not (
+            document_independently_verified
+        ):
+            return {
+                "status": "blocked",
+                "reason": "document-independent-verification-not-proven",
+            }
+        if identity not in _SUPPORTED_PUBLICATION_QUALITY_PROFILES:
+            return {
+                "status": "blocked",
+                "reason": "quality-profile-unsupported",
+            }
+    return {"status": "pass", "reason": "quality-profile-supported"}
 
 
 def _block_projection(
