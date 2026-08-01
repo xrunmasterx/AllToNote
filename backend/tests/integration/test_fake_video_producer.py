@@ -42,6 +42,7 @@ from app.core.application.video_checkpoints import decode_draft, encode_draft
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.resource_lease import ResourceOwner
+from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
@@ -1735,6 +1736,102 @@ def test_machine_lease_store_busy_does_not_fail_video_job(
 
     assert runtime.get_job(submitted.job_id).state is JobState.RUNNING
     assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+
+
+def test_video_holds_workspace_publish_slot_only_across_atomic_commit(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    store = MachineResourceLeaseStore.open(tmp_path / "publish-machine")
+    coordinator = WorkspacePublishCoordinator(
+        store,
+        ResourceOwner("workspace-id", "video-publisher", process_id=101),
+        workspace_root=workspace_root,
+    )
+    competing = ResourceOwner(
+        "workspace-id",
+        "other-publisher",
+        process_id=202,
+    )
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "publish-video-machine",
+        workspace_publish_coordinator=coordinator,
+    )
+    delegate = runtime.video_service._portable
+
+    class ObservePublishBoundary:
+        def __getattr__(self, name: str) -> object:
+            return getattr(delegate, name)
+
+        def prepare_candidate(self, *args: object, **kwargs: object) -> object:
+            lease = store.acquire(
+                coordinator.resource_name,
+                competing,
+                ttl_seconds=300,
+            )
+            assert lease.release()
+            return delegate.prepare_candidate(*args, **kwargs)
+
+        def commit_prepared(self, *args: object, **kwargs: object) -> object:
+            with pytest.raises(DomainError, match="resource_busy"):
+                store.acquire(
+                    coordinator.resource_name,
+                    competing,
+                    ttl_seconds=300,
+                )
+            return delegate.commit_prepared(*args, **kwargs)
+
+    runtime.video_service._portable = ObservePublishBoundary()
+    completed = runtime.wait_job(
+        runtime.submit_video(
+            valid_request(workspace_root, client_request_id="publish-boundary")
+        ).job_id
+    )
+
+    assert completed.state is JobState.SUCCEEDED
+    recovered = store.acquire(
+        coordinator.resource_name,
+        competing,
+        ttl_seconds=300,
+    )
+    assert recovered.release()
+
+
+def test_workspace_publish_busy_does_not_fail_video_job(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    store = MachineResourceLeaseStore.open(tmp_path / "publish-busy-machine")
+    coordinator = WorkspacePublishCoordinator(
+        store,
+        ResourceOwner("workspace-id", "video-publisher", process_id=101),
+        workspace_root=workspace_root,
+    )
+    competing = store.acquire(
+        coordinator.resource_name,
+        ResourceOwner("workspace-id", "other-publisher", process_id=202),
+        ttl_seconds=300,
+    )
+    runtime = _create_fake_runtime(
+        runtime_module,
+        tmp_path / "publish-busy-video-machine",
+        workspace_publish_coordinator=coordinator,
+    )
+    submitted = runtime.submit_video(
+        valid_request(workspace_root, client_request_id="publish-busy")
+    )
+
+    try:
+        with pytest.raises(DomainError, match="resource_busy"):
+            runtime.wait_job(submitted.job_id)
+        assert runtime.get_job(submitted.job_id).state is JobState.RUNNING
+    finally:
+        assert competing.release()
+
+    assert runtime.wait_job(submitted.job_id).state is JobState.SUCCEEDED
 
 
 def test_distinct_jobs_on_one_runtime_execute_serially(

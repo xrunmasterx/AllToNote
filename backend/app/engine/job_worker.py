@@ -216,9 +216,9 @@ def _persist_permanent_failure(
             ),
             ttl_seconds=_RECOVERY_CLAIM_TTL_SECONDS,
         )
+        authority = claim.authority
         if expected_authority is not None and claim.authority != expected_authority:
             return
-        authority = claim.authority
         if claim.job.state in {
             JobState.SUCCEEDED,
             JobState.FAILED,

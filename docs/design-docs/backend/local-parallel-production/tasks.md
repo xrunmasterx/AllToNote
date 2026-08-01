@@ -193,7 +193,7 @@ Stop condition：
 - supervisor 从预 claim 到 Worker 退出持续 heartbeat 精确 Job 与源/已 adopt 资源，轮询 durable cancel；权限丢失或取消宽限到期复用既有 process-tree kill，永久 pre-runtime failure 只使用 dispatcher 持有的 expected authority 收敛；
 - Video 与 Document Service 已支持“前台自行准入”或“Engine 已 adopt + expected authority”两个互斥模式；Engine 模式不再二次获取全局资源，checkpoint heartbeat 与最终 stale-safe release 继续复用既有路径；
 - 三种跨进程 detach 验收（fixture Video、local Video、Document）均证明提交者退出后独立 Worker 使用新 launch envelope 完成原 Job；完整后端回归为 `2586 passed, 3 skipped, 3 subtests passed`；
-- 这只是 Task 5/6 的 capacity-1 正确性地基，不宣称并发 Worker、资源池、排队可观测、workspace publish slot 或公开发布完成。dispatcher 仍只有一个 active Worker，`parallel_job_execution_enabled=false` 保持不变，因此 Task 5 与 Task 6 继续未完成。
+- 这只是 Task 5/6 的 capacity-1 正确性地基，不宣称并发 Worker、资源池、排队可观测或公开发布完成。dispatcher 仍只有一个 active Worker，`parallel_job_execution_enabled=false` 保持不变，因此 Task 5 与 Task 6 继续未完成。
 
 Worker 自动恢复预算与 schema v6 硬化进度（2026-08-01）：
 
@@ -201,6 +201,13 @@ Worker 自动恢复预算与 schema v6 硬化进度（2026-08-01）：
 - 普通 Worker runner 异常被限制在单次监督边界，取消继续优先；未知外部结果进入 WAITING_FOR_INPUT。`create_challenge` 与 `pause_for_external_outcome_atomic` 在提交 WAITING 的同一 SQLite 事务中清零预算，关闭 Engine 在状态提交与父进程清理之间退出时遗留旧预算的窗口；
 - idle deadline 在 dispatcher 有 work 时不再重复执行 registry + SQLite reconcile；Windows release 的 legacy JobStore migration Gate 也已同步要求 schema v6；
 - 独立最终 Gate `task_81a684c5fd74` 为 P0/P1=0；最终完整后端回归为 `2622 passed, 3 skipped`。这仍是 capacity-1 的有界失败收敛，不代表 Task 5 完成，也没有启用 `parallel_job_execution_enabled`。
+
+Workspace portable publish 前置闭环（2026-08-02）：
+
+- Video 与 Document 的 Workspace Runtime 现在按 `workspace_id + canonical physical root` 生成不泄露路径的 `workspace:publish:v1:<sha256>` Machine Resource key；前台执行与 Engine adopted Worker 共用同一 machine lease store，因此同一物理 Workspace 的最终 portable publish 互斥，复制到不同路径的 Vault 不会被误当成同一物理写目标；
+- publish claim 只在 `prepare_candidate` 完成后获取，并覆盖 portable `commit_prepared` callback、结果/source binding 的 SQLite commit 或 rollback；Docling、转写、模型调用和 candidate 组装等长计算不持有该 claim；
+- Worker 永久失败恢复与 dispatcher 取消收敛在重新 claim 得到不同 generation 时，都会释放该 replacement claim，避免被 fencing 的恢复路径泄漏 300 秒 Job authority；
+- Video/Document publish 边界、资源释放、异常释放、publish 争用不终态化和两条 replacement-claim RED 回归均已覆盖；完整后端回归为 `2630 passed, 3 skipped, 3 subtests passed`，独立最终 Gate `task_f9aa97be8d60` 为 P0/P1=0。本增量仍保持单 active Worker 和全局 `produce:heavy:v1`，资源等待事件、capacity > 1 监督与 CLI/Desktop 排队可观测仍属于后续 Task 5/6。
 
 ## Task 6: [ ] 加入最小资源准入与 workspace publish 控制
 
@@ -219,7 +226,7 @@ Worker 自动恢复预算与 schema v6 硬化进度（2026-08-01）：
 - [ ] gpu:<device> shared/exclusive；
 - [ ] cpu:ffmpeg 与 cpu:ocr slot；
 - [ ] memory watermark；
-- [ ] workspace.publish:<workspace> exclusive；
+- [x] workspace.publish:<workspace> exclusive（Video/Document capacity-1 前置闭环）；
 - [ ] repo.write:<worktree> exclusive。
 
 验收：
@@ -228,8 +235,8 @@ Worker 自动恢复预算与 schema v6 硬化进度（2026-08-01）：
 - [ ] 排队原因可在 CLI/Desktop 观察；
 - [ ] 用户可覆盖默认并发，但不能绕过真实互斥资源；
 - [ ] Job 内 fan-out 继承预算，避免 Job 数乘以内部并发形成无界爆炸；
-- [ ] 长计算不持有 workspace.publish；
-- [ ] 最终 source/portable commit 保持原子；
+- [x] 长计算不持有 workspace.publish；
+- [x] 最终 source/portable commit 保持原子；
 - [ ] 资源不足不会被写成 Job failure；
 - [ ] 无通用资源 DSL、优化求解器或 DAG。
 

@@ -141,6 +141,7 @@ from app.core.jobs.resource_lease import (
     ResourceLeaseStorePort,
     ResourceOwner,
 )
+from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 from app.core.packs.events import (
     ExecutionPackIdentity,
     JobPackEnvironmentSnapshot,
@@ -1769,6 +1770,7 @@ def _create_platform_video_runtime_components(
     resource_owner: ResourceOwner | None = None,
     adopted_resource_lease: ResourceLease | None = None,
     expected_job_authority: JobExecutionAuthority | None = None,
+    workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
     require_existing_job_store: bool = False,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve(
@@ -1866,6 +1868,7 @@ def _create_platform_video_runtime_components(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
     )
     return (
         _create_video_runtime(
@@ -1898,6 +1901,7 @@ def create_platform_video_runtime(
     resource_owner: ResourceOwner | None = None,
     adopted_resource_lease: ResourceLease | None = None,
     expected_job_authority: JobExecutionAuthority | None = None,
+    workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
     require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_platform_video_runtime_components(
@@ -1920,6 +1924,7 @@ def create_platform_video_runtime(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
         require_existing_job_store=require_existing_job_store,
     )
     return runtime
@@ -1944,6 +1949,7 @@ def create_document_runtime(
     resource_owner: ResourceOwner | None = None,
     adopted_resource_lease: ResourceLease | None = None,
     expected_job_authority: JobExecutionAuthority | None = None,
+    workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
     require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     verifier_options = (
@@ -2058,6 +2064,7 @@ def create_document_runtime(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
     )
     return _create_document_runtime(
         service,
@@ -2157,6 +2164,20 @@ def _workspace_resource_admission(
     )
 
 
+def _workspace_publish_admission(
+    paths: RuntimePaths,
+    instance: WorkspaceInstance,
+    owner: ResourceOwner,
+    *,
+    store: MachineResourceLeaseStore | None = None,
+) -> WorkspacePublishCoordinator:
+    return WorkspacePublishCoordinator(
+        store or MachineResourceLeaseStore.open(paths.data_dir / "machine"),
+        owner,
+        workspace_root=instance.canonical_root,
+    )
+
+
 def create_document_runtime_for_workspace(
     workspace_root: Path,
     *,
@@ -2210,6 +2231,17 @@ def create_document_runtime_for_workspace(
         process_instance_id = adopted_resource_lease.owner.process_instance_id
         resource_lease_store = None
         resource_owner = None
+    publish_owner = (
+        resource_owner
+        if resource_owner is not None
+        else adopted_resource_lease.owner
+    )
+    workspace_publish_coordinator = _workspace_publish_admission(
+        paths,
+        instance,
+        publish_owner,
+        store=resource_lease_store,
+    )
     status = CodexAppServerStatusService.get_status()
     snapshot_values = (
         current_config_snapshot.values
@@ -2364,6 +2396,7 @@ def create_document_runtime_for_workspace(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
         require_existing_job_store=require_existing_job_store,
     )
 
@@ -2508,6 +2541,7 @@ def _create_fake_runtime_components(
     resource_owner: ResourceOwner | None = None,
     adopted_resource_lease: ResourceLease | None = None,
     expected_job_authority: JobExecutionAuthority | None = None,
+    workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     call_counts = calls or FakeCallCounts()
     resolved_machine_root = Path(machine_root).resolve()
@@ -2550,6 +2584,7 @@ def _create_fake_runtime_components(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
     )
     return (
         _create_video_runtime(
@@ -2581,6 +2616,7 @@ def create_fake_runtime(
     resource_owner: ResourceOwner | None = None,
     adopted_resource_lease: ResourceLease | None = None,
     expected_job_authority: JobExecutionAuthority | None = None,
+    workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_fake_runtime_components(
         machine_root,
@@ -2601,6 +2637,7 @@ def create_fake_runtime(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
     )
     return runtime
 
@@ -2626,6 +2663,12 @@ def create_fake_runtime_for_workspace(
     process_instance_id, resource_lease_store, resource_owner = (
         _workspace_resource_admission(paths, instance)
     )
+    workspace_publish_coordinator = _workspace_publish_admission(
+        paths,
+        instance,
+        resource_owner,
+        store=resource_lease_store,
+    )
     return create_fake_runtime(
         instance.machine_root,
         owner_id=process_instance_id,
@@ -2635,6 +2678,7 @@ def create_fake_runtime_for_workspace(
         operation_hooks=operation_hooks,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        workspace_publish_coordinator=workspace_publish_coordinator,
     )
 
 
@@ -2853,6 +2897,17 @@ def create_codex_app_server_runtime_for_workspace(
         process_instance_id = adopted_resource_lease.owner.process_instance_id
         resource_lease_store = None
         resource_owner = None
+    publish_owner = (
+        resource_owner
+        if resource_owner is not None
+        else adopted_resource_lease.owner
+    )
+    workspace_publish_coordinator = _workspace_publish_admission(
+        paths,
+        instance,
+        publish_owner,
+        store=resource_lease_store,
+    )
     return create_platform_video_runtime(
         instance.machine_root,
         source=source,
@@ -2872,6 +2927,7 @@ def create_codex_app_server_runtime_for_workspace(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
         require_existing_job_store=require_existing_job_store,
     )
 

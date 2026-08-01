@@ -118,6 +118,7 @@ class _WorkerAdmission:
                 ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
             )
             if claim.authority != self.launch.job_authority:
+                self.repository.release_job_claim(claim.authority)
                 return
         except (DomainError, OSError, RuntimeError, ValueError):
             return

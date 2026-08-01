@@ -474,11 +474,15 @@ def test_document_workspace_factory_reuses_process_identity_and_frozen_model(
     instance = registry["instances"][0]
     resource_owner = captured["resource_owner"]
     resource_lease_store = captured["resource_lease_store"]
+    publish_coordinator = captured["workspace_publish_coordinator"]
 
     assert created is sentinel
     assert captured["local_instance_id"] == instance["instance_id"]
     assert captured["workspace_instance_id"] == instance["instance_id"]
     assert captured["owner_id"] == resource_owner.process_instance_id
+    assert publish_coordinator._store is resource_lease_store
+    assert publish_coordinator._owner == resource_owner
+    assert publish_coordinator.resource_name.startswith("workspace:publish:v1:")
     assert captured["model"].model_identity == "fixture/frozen-model"
     assert (
         captured["model_execution_binding"].model_identity

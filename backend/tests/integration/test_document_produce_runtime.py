@@ -73,6 +73,7 @@ from app.core.jobs.resource_lease import (
     ResourceLease,
     ResourceOwner,
 )
+from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 from app.core.packs.events import ExecutionPackIdentity, JobPackEnvironmentSnapshot
 from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -552,6 +553,7 @@ def _service(
     resource_owner: ResourceOwner | None = None,
     adopted_resource_lease: ResourceLease | None = None,
     expected_job_authority: JobExecutionAuthority | None = None,
+    workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
     knowledge_compiler: _KnowledgeCompiler | None = None,
     pack_environment: JobPackEnvironmentSnapshot | None = (
         _DOCUMENT_PACK_ENVIRONMENT
@@ -595,6 +597,7 @@ def _service(
         resource_owner=resource_owner,
         adopted_resource_lease=adopted_resource_lease,
         expected_job_authority=expected_job_authority,
+        workspace_publish_coordinator=workspace_publish_coordinator,
     )
     return service, repository
 
@@ -2254,6 +2257,99 @@ def test_machine_lease_store_busy_does_not_fail_document_job(
 
     assert router.get_job(job_id).state is JobState.RUNNING
     assert parser.calls == 0
+
+
+def test_document_holds_workspace_publish_slot_only_across_atomic_commit(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    store = MachineResourceLeaseStore.open(tmp_path / "document-publish-machine")
+    coordinator = WorkspacePublishCoordinator(
+        store,
+        ResourceOwner("workspace-id", "document-publisher", process_id=101),
+        workspace_root=workspace,
+    )
+    competing = ResourceOwner(
+        "workspace-id",
+        "other-publisher",
+        process_id=202,
+    )
+    delegate = IWikiPortableGateway()
+
+    class ObservePublishBoundary:
+        def __getattr__(self, name: str) -> object:
+            return getattr(delegate, name)
+
+        def prepare_candidate(self, *args: object, **kwargs: object) -> object:
+            lease = store.acquire(
+                coordinator.resource_name,
+                competing,
+                ttl_seconds=300,
+            )
+            assert lease.release()
+            return delegate.prepare_candidate(*args, **kwargs)
+
+        def commit_prepared(self, *args: object, **kwargs: object) -> object:
+            with pytest.raises(DomainError, match="resource_busy"):
+                store.acquire(
+                    coordinator.resource_name,
+                    competing,
+                    ttl_seconds=300,
+                )
+            return delegate.commit_prepared(*args, **kwargs)
+
+    service, repository = _service(
+        tmp_path / "document-publish-job",
+        _Parser(),
+        ObservePublishBoundary(),
+        owner_id="document-publisher",
+        workspace_publish_coordinator=coordinator,
+    )
+    job_id, router = _submit(service, repository, workspace, source)
+
+    assert router.wait_job(job_id).state is JobState.SUCCEEDED
+    recovered = store.acquire(
+        coordinator.resource_name,
+        competing,
+        ttl_seconds=300,
+    )
+    assert recovered.release()
+
+
+def test_workspace_publish_busy_does_not_fail_document_job(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    store = MachineResourceLeaseStore.open(tmp_path / "document-publish-busy-machine")
+    coordinator = WorkspacePublishCoordinator(
+        store,
+        ResourceOwner("workspace-id", "document-publisher", process_id=101),
+        workspace_root=workspace,
+    )
+    competing = store.acquire(
+        coordinator.resource_name,
+        ResourceOwner("workspace-id", "other-publisher", process_id=202),
+        ttl_seconds=300,
+    )
+    service, repository = _service(
+        tmp_path / "document-publish-busy-job",
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="document-publisher",
+        workspace_publish_coordinator=coordinator,
+    )
+    job_id, router = _submit(service, repository, workspace, source)
+
+    try:
+        with pytest.raises(DomainError, match="resource_busy"):
+            router.wait_job(job_id)
+        assert router.get_job(job_id).state is JobState.RUNNING
+    finally:
+        assert competing.release()
+
+    assert router.wait_job(job_id).state is JobState.SUCCEEDED
 
 
 def test_document_worker_consumes_adopted_resource_and_exact_job_authority(

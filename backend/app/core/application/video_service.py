@@ -8,6 +8,7 @@ import shutil
 import stat as stat_module
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from errno import EACCES, ENOSYS
@@ -78,6 +79,7 @@ from app.core.jobs.resource_lease import (
     ResourceLeaseStorePort,
     ResourceOwner,
 )
+from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
     JobPackEnvironmentSnapshot,
@@ -516,6 +518,7 @@ class VideoService:
         resource_owner: ResourceOwner | None = None,
         adopted_resource_lease: ResourceLease | None = None,
         expected_job_authority: JobExecutionAuthority | None = None,
+        workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
     ) -> None:
         if (resource_lease_store is None) != (resource_owner is None):
             raise ValueError("resource_admission_pair_required")
@@ -561,6 +564,7 @@ class VideoService:
         self._resource_owner = resource_owner
         self._adopted_resource_lease = adopted_resource_lease
         self._expected_job_authority = expected_job_authority
+        self._workspace_publish_coordinator = workspace_publish_coordinator
         self._active_resource_lease: ResourceLease | None = None
         self._submitted_config_snapshots: dict[str, JobConfigSnapshot] = {}
         self._execution_lock = threading.Lock()
@@ -764,6 +768,7 @@ class VideoService:
                     if error.code in {
                         "job_store_busy",
                         "machine_lease_store_busy",
+                        "resource_busy",
                     }:
                         raise
                     try:
@@ -2247,15 +2252,21 @@ class VideoService:
             )
 
         try:
-            self._heartbeat_resource_lease()
-            self._repository.commit_video_result_atomic(
-                attempt.job_id,
-                attempt.attempt_id,
-                authority,
-                result_plan=result_plan,
-                source_identity=source_identity,
-                commit=commit,
+            publish_scope = (
+                self._workspace_publish_coordinator.hold()
+                if self._workspace_publish_coordinator is not None
+                else nullcontext()
             )
+            with publish_scope:
+                self._heartbeat_resource_lease()
+                self._repository.commit_video_result_atomic(
+                    attempt.job_id,
+                    attempt.attempt_id,
+                    authority,
+                    result_plan=result_plan,
+                    source_identity=source_identity,
+                    commit=commit,
+                )
         except BaseException:
             if not callback_entered:
                 self._portable.discard_prepared(prepared)

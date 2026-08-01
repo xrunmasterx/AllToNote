@@ -3,9 +3,11 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import app.engine.job_dispatcher as job_dispatcher_module
 from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
@@ -18,6 +20,7 @@ from app.core.jobs.model import (
 )
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
+    JobExecutionAuthority,
     ResourceOwner,
 )
 from app.engine.contracts import EngineJobReference, EngineWorkerLaunchV1
@@ -841,6 +844,46 @@ def test_worker_watchdog_settles_durable_cancellation_and_releases_admission(
         assert lease.release()
     finally:
         dispatcher.close(force=True)
+
+
+def test_cancellation_settlement_releases_replacement_claim_when_authority_is_fenced(
+    tmp_path: Path,
+) -> None:
+    _paths, repository, job, reference = _registered_job(
+        tmp_path,
+        client_request_id="fenced-cancellation-settlement",
+    )
+    expected = repository.claim_job(job.job_id, "engine-worker", ttl_seconds=30)
+    attempt = repository.create_attempt(
+        job.job_id,
+        "produce",
+        authority=expected.authority,
+    )
+    repository.start_attempt(attempt.attempt_id, expected.authority)
+    repository.cancel_job(job.job_id)
+    assert repository.release_job_claim(expected.authority)
+
+    admission = job_dispatcher_module._WorkerAdmission(
+        repository=repository,
+        resource_store=SimpleNamespace(),
+        source_lease=SimpleNamespace(),
+        launch=SimpleNamespace(
+            reference=reference,
+            job_authority=expected.authority,
+        ),
+    )
+    admission.settle_cancellation()
+
+    replacement_authority = JobExecutionAuthority(
+        expected.authority.owner_id,
+        expected.authority.fencing_token + 1,
+        job.job_id,
+    )
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repository.heartbeat_job_claim(
+            replacement_authority,
+            ttl_seconds=30,
+        )
 
 
 def test_graceful_shutdown_waits_for_active_worker_without_killing_it(

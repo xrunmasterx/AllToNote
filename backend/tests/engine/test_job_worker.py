@@ -267,6 +267,33 @@ def test_worker_permanent_failure_uses_dispatcher_preclaim(
     assert repository.get_job_error(job.job_id).code == "document_pack_unavailable"
 
 
+def test_permanent_failure_releases_replacement_claim_when_expected_authority_is_fenced(
+    tmp_path: Path,
+) -> None:
+    _paths, _workspace, _instance, repository, job = _registered_job(tmp_path)
+    expected = repository.claim_job(job.job_id, "engine-worker", ttl_seconds=30)
+    assert repository.release_job_claim(expected.authority)
+
+    job_worker_module._persist_permanent_failure(
+        repository,
+        job.job_id,
+        DomainError(
+            "document_pack_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "Install the compatible document Pack",
+        ),
+        expected_authority=expected.authority,
+    )
+
+    replacement = repository.claim_job(
+        job.job_id,
+        "replacement-worker",
+        ttl_seconds=30,
+    )
+    assert replacement.authority.owner_id == "replacement-worker"
+    assert repository.release_job_claim(replacement.authority)
+
+
 def test_worker_executes_existing_engine_job_using_registry_ids_only(
     tmp_path: Path,
 ) -> None:

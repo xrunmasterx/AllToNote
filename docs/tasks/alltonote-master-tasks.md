@@ -549,7 +549,7 @@ alltonote vault index-status
 
 完成 Gate：杀死 Desktop、CLI、Worker 或 Engine 后不产生半提交 Artifact，Job 状态可确定恢复。
 
-当前实现（2026-08-01）：按需单实例 Engine、Video/Document detach、Job-scoped generation、跨进程恢复、控制面事件跟随和 `stage.changed.v1` 已闭环。阶段事件只由 JobStore 根据持久化后的 Attempt 行在同一事务生成，覆盖 pending、running、接管、暂停、取消、失败与成功；终态 Job 事件保持最后。当前仍是单 active Worker，未开放资源感知并行、batch/max-parallel 或 Production MCP，因此本任务保持 partial。
+当前实现（2026-08-02）：按需单实例 Engine、Video/Document detach、Job-scoped generation、跨进程恢复、控制面事件跟随和 `stage.changed.v1` 已闭环。阶段事件只由 JobStore 根据持久化后的 Attempt 行在同一事务生成，覆盖 pending、running、接管、暂停、取消、失败与成功；终态 Job 事件保持最后。Video/Document 已补齐短持有的 Workspace portable publish 互斥，覆盖 portable callback 与 SQLite commit/rollback；publish 争用保留可重试 Job，且两条 recovery/cancellation replacement claim 泄漏路径已修复。长计算不持有该 publish claim。当前仍是单 active Worker，未开放资源感知并行、batch/max-parallel、资源等待可观测或 Production MCP，因此本任务保持 partial。
 
 ### RECIPE-WEB-01：Article/Wiki Recipe
 

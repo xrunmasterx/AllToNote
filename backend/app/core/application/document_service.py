@@ -6,6 +6,7 @@ import os
 import stat as stat_module
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from errno import EACCES, ENOSYS
 from pathlib import Path
@@ -57,6 +58,7 @@ from app.core.jobs.resource_lease import (
     ResourceLeaseStorePort,
     ResourceOwner,
 )
+from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 from app.core.portable.document_bundle_assembler import DocumentBundleAssembler
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
@@ -281,6 +283,7 @@ class DocumentService:
         resource_owner: ResourceOwner | None = None,
         adopted_resource_lease: ResourceLease | None = None,
         expected_job_authority: JobExecutionAuthority | None = None,
+        workspace_publish_coordinator: WorkspacePublishCoordinator | None = None,
     ) -> None:
         if (resource_lease_store is None) != (resource_owner is None):
             raise ValueError("resource_admission_pair_required")
@@ -320,6 +323,7 @@ class DocumentService:
         self._resource_owner = resource_owner
         self._adopted_resource_lease = adopted_resource_lease
         self._expected_job_authority = expected_job_authority
+        self._workspace_publish_coordinator = workspace_publish_coordinator
         self._active_resource_lease: ResourceLease | None = None
         self._job_service = JobService(repository)
         self._execution_lock = threading.Lock()
@@ -494,6 +498,7 @@ class DocumentService:
                     if error.code in {
                         "job_store_busy",
                         "machine_lease_store_busy",
+                        "resource_busy",
                     }:
                         raise
                     try:
@@ -1114,38 +1119,44 @@ class DocumentService:
             )
 
         try:
-            self._heartbeat_resource_lease()
-            connector_id, canonical_identity = self._checkpoint_source_identity(
-                request,
-                checkpoint,
+            publish_scope = (
+                self._workspace_publish_coordinator.hold()
+                if self._workspace_publish_coordinator is not None
+                else nullcontext()
             )
-            self._repository.commit_recipe_result_atomic(
-                attempt.job_id,
-                attempt.attempt_id,
-                authority,
-                result_plan=RecipeResultPlan(
-                    result_kind="document-note",
-                    job_id=attempt.job_id,
-                    run_id=checkpoint.run_id,
-                    bundle_id=checkpoint.bundle_id,
-                    manifest_sha256=checkpoint.manifest_sha256,
-                    source_id=checkpoint.source_id,
-                    source_revision_id=checkpoint.source_revision_id,
-                    artifacts=checkpoint.artifacts,
-                    quality_overall=checkpoint.quality_overall,
-                    publish_eligible=checkpoint.publish_eligible,
-                    usage=checkpoint.usage,
-                    warnings=checkpoint.warnings,
-                ),
-                source_identity=SourceIdentityBinding(
-                    connector_id=connector_id,
-                    canonical_identity=canonical_identity,
-                    source_id=checkpoint.source_id,
-                    owning_bundle_id=checkpoint.bundle_id,
-                    manifest_sha256=checkpoint.manifest_sha256,
-                ),
-                commit=commit,
-            )
+            with publish_scope:
+                self._heartbeat_resource_lease()
+                connector_id, canonical_identity = self._checkpoint_source_identity(
+                    request,
+                    checkpoint,
+                )
+                self._repository.commit_recipe_result_atomic(
+                    attempt.job_id,
+                    attempt.attempt_id,
+                    authority,
+                    result_plan=RecipeResultPlan(
+                        result_kind="document-note",
+                        job_id=attempt.job_id,
+                        run_id=checkpoint.run_id,
+                        bundle_id=checkpoint.bundle_id,
+                        manifest_sha256=checkpoint.manifest_sha256,
+                        source_id=checkpoint.source_id,
+                        source_revision_id=checkpoint.source_revision_id,
+                        artifacts=checkpoint.artifacts,
+                        quality_overall=checkpoint.quality_overall,
+                        publish_eligible=checkpoint.publish_eligible,
+                        usage=checkpoint.usage,
+                        warnings=checkpoint.warnings,
+                    ),
+                    source_identity=SourceIdentityBinding(
+                        connector_id=connector_id,
+                        canonical_identity=canonical_identity,
+                        source_id=checkpoint.source_id,
+                        owning_bundle_id=checkpoint.bundle_id,
+                        manifest_sha256=checkpoint.manifest_sha256,
+                    ),
+                    commit=commit,
+                )
         except BaseException:
             if not callback_entered:
                 self._portable.discard_prepared(prepared)
