@@ -16,6 +16,7 @@ import pytest
 
 import app.runtime as runtime_module
 import app.core.application.document_service as document_service_module
+from app.job_runtime import JobRuntime
 from app.adapters.documents.document_basic_pack import PACK_VERSION
 from app.adapters.models.legacy_gpt import (
     LegacyModelBinding,
@@ -47,6 +48,7 @@ from app.core.application.document_knowledge_verifier import (
     document_knowledge_claims,
 )
 from app.core.application.job_execution_router import JobExecutionRouter
+from app.core.application.job_service import JobService
 from app.core.application.produce_service import ProduceService
 from app.core.domain.document import (
     DocumentBlock,
@@ -58,10 +60,10 @@ from app.core.domain.document import (
 )
 from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.domain.production import RecipeProduceResult
-from app.core.domain.video import VideoProduceRequest
+from app.core.domain.video import RetryJobRequest, VideoProduceRequest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
-from app.core.jobs.model import AttemptState, JobState
+from app.core.jobs.model import AttemptState, JobExecutionOwner, JobState
 from app.core.jobs.resource_lease import ResourceOwner
 from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -573,6 +575,8 @@ def _submit(
     repository: SqliteJobRepository,
     workspace: Path,
     source: Path,
+    *,
+    execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
 ) -> tuple[str, JobExecutionRouter]:
     registry = RecipeRegistry(
         ((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(service)),)
@@ -584,13 +588,474 @@ def _submit(
             InputDescriptor("file", str(source)),
             str(workspace),
             ("knowledge-note",),
-        )
+        ),
+        execution_owner=execution_owner,
     )
     router = JobExecutionRouter(
         repository,
         ((service.execution_binding, service),),
     )
     return submission.job_id, router
+
+
+def _submit_detached_document_in_process(
+    machine_root: str,
+    workspace: str,
+    source: str,
+    owner_id: str,
+    ready_queue,
+    start_event,
+    result_queue,
+) -> None:
+    service, repository = _service(
+        Path(machine_root),
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id=owner_id,
+    )
+    ready_queue.put(owner_id)
+    start_event.wait()
+    try:
+        job_id, _router = _submit(
+            service,
+            repository,
+            Path(workspace),
+            Path(source),
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+    except BaseException as error:
+        result_queue.put(("error", type(error).__name__, str(error)))
+    else:
+        result_queue.put(("ok", job_id))
+
+
+def test_detached_document_uses_managed_snapshot_after_original_is_deleted(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "原始文档 有空格.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    job_id, router = _submit(
+        service,
+        repository,
+        workspace,
+        source,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    stored_request = json.loads(repository.get_job_request(job_id))
+    assert stored_request["input_path"] == str(source.resolve())
+    snapshot_events = tuple(
+        event
+        for event in repository.list_events(job_id)
+        if event.event_type == "document.input-snapshot.v1"
+    )
+    assert len(snapshot_events) == 1
+    snapshot_binding = json.loads(snapshot_events[0].payload_json)
+    expected_digest = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    assert snapshot_binding == {
+        "byte_length": source.stat().st_size,
+        "schema_version": 1,
+        "sha256": expected_digest,
+    }
+    assert "path" not in snapshot_events[0].payload_json
+    source.unlink()
+
+    completed = router.wait_job(job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert parser.calls == 1
+
+
+def test_tampered_detached_document_snapshot_fails_before_parser(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    job_id, router = _submit(
+        service,
+        repository,
+        workspace,
+        source,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    snapshots = tuple(
+        (machine_root / "attempts" / "document-inputs").rglob("source.pdf")
+    )
+    assert len(snapshots) == 1
+    snapshots[0].write_bytes(b"%PDF-1.7\ntampered\n")
+
+    completed = router.wait_job(job_id)
+
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert completed.error.code == "document_input_changed"
+    assert parser.calls == 0
+
+
+def test_concurrent_detached_document_submissions_reuse_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "shared paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nshared fixture\n")
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+
+    def submit() -> str:
+        job_id, _router = _submit(
+            service,
+            repository,
+            workspace,
+            source,
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+        return job_id
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        job_ids = tuple(executor.map(lambda _index: submit(), range(8)))
+
+    assert len(set(job_ids)) == 8
+    assert len(tuple((machine_root / "attempts" / "document-inputs").rglob("source.pdf"))) == 1
+    assert all(
+        sum(
+            event.event_type == "document.input-snapshot.v1"
+            for event in repository.list_events(job_id)
+        )
+        == 1
+        for job_id in job_ids
+    )
+
+
+def test_cross_process_detached_document_submissions_reuse_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "shared process paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nshared process fixture\n")
+    machine_root = tmp_path / "machine"
+    _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="initializer",
+    )
+    context = multiprocessing.get_context("spawn")
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    start_event = context.Event()
+    processes = tuple(
+        context.Process(
+            target=_submit_detached_document_in_process,
+            args=(
+                str(machine_root),
+                str(workspace),
+                str(source),
+                f"submitter-{index}",
+                ready_queue,
+                start_event,
+                result_queue,
+            ),
+        )
+        for index in range(4)
+    )
+    for process in processes:
+        process.start()
+    for _process in processes:
+        ready_queue.get(timeout=20)
+    start_event.set()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    results = tuple(result_queue.get(timeout=5) for _process in processes)
+
+    assert all(result[0] == "ok" for result in results), results
+    assert len({result[1] for result in results}) == 4
+    assert len(
+        tuple((machine_root / "attempts" / "document-inputs").rglob("source.pdf"))
+    ) == 1
+    reopened = SqliteJobRepository.open(machine_root / "job-store")
+    assert all(
+        sum(
+            event.event_type == "document.input-snapshot.v1"
+            for event in reopened.list_events(result[1])
+        )
+        == 1
+        for result in results
+    )
+
+
+def test_detached_document_rejects_linked_snapshot_ancestor_before_write(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_root = machine_root / "attempts" / "document-inputs"
+    try:
+        os.symlink(outside, linked_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink unavailable: {error}")
+
+    with pytest.raises(DomainError) as caught:
+        _submit(
+            service,
+            repository,
+            workspace,
+            source,
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+
+    assert caught.value.code == "document_input_snapshot_unavailable"
+    assert tuple(outside.iterdir()) == ()
+
+
+def test_detached_document_rejects_snapshot_ancestor_replaced_before_execution(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    parser = _Parser()
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    job_id, router = _submit(
+        service,
+        repository,
+        workspace,
+        source,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    snapshot_root = machine_root / "attempts" / "document-inputs"
+    outside = tmp_path / "outside"
+    snapshot_root.rename(outside)
+    try:
+        os.symlink(outside, snapshot_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink unavailable: {error}")
+
+    completed = router.wait_job(job_id)
+
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert completed.error.code == "document_input_changed"
+    assert parser.calls == 0
+
+
+def test_detached_document_rejects_hardlinked_snapshot_lock_without_mutation(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    raw = b"%PDF-1.7\nfixture\n"
+    source.write_bytes(raw)
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    digest = hashlib.sha256(raw).hexdigest()
+    snapshot_parent = (
+        machine_root
+        / "attempts"
+        / "document-inputs"
+        / digest[:2]
+        / digest
+    )
+    snapshot_parent.mkdir(parents=True)
+    canary = tmp_path / "canary.lock"
+    canary.write_bytes(b"do not truncate")
+    os.link(canary, snapshot_parent / ".snapshot.lock")
+
+    with pytest.raises(DomainError) as caught:
+        _submit(
+            service,
+            repository,
+            workspace,
+            source,
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+
+    assert caught.value.code == "document_input_snapshot_unavailable"
+    assert canary.read_bytes() == b"do not truncate"
+
+
+def test_legacy_engine_document_without_snapshot_event_uses_original_input(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "legacy paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nlegacy fixture\n")
+    source_stat = source.stat()
+    parser = _Parser()
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-after-upgrade",
+    )
+    request = DocumentProduceRequest(
+        request_schema_version=1,
+        workspace_root=workspace,
+        input_path=source.resolve(),
+        expected_source_sha256=(
+            "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+        ),
+        expected_source_size=source_stat.st_size,
+        expected_source_mtime_ns=source_stat.st_mtime_ns,
+    )
+    submitted = JobService(repository).submit(
+        request,
+        execution_binding=service.execution_binding,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    completed = service.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert parser.calls == 1
+    assert not (machine_root / "attempts" / "document-inputs").exists()
+
+
+def test_document_retry_inherits_detached_input_snapshot_binding(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nretry fixture\n")
+    machine_root = tmp_path / "machine"
+    first_service, first_repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    job_id, _first_router = _submit(
+        first_service,
+        first_repository,
+        workspace,
+        source,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    source.unlink()
+    cancelled = first_service.cancel_job(job_id)
+    assert cancelled.state is JobState.CANCELLED
+
+    parser = _Parser()
+    second_service, second_repository = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-two",
+    )
+    retried = JobRuntime(
+        second_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        execution_owner=JobExecutionOwner.ENGINE,
+    ).retry_job(
+        job_id,
+        RetryJobRequest(1, "retry-document-snapshot", JobState.CANCELLED),
+    )
+    retry_events = tuple(
+        event
+        for event in second_repository.list_events(retried.snapshot.job_id)
+        if event.event_type == "document.input-snapshot.v1"
+    )
+
+    completed = second_service.wait_job(retried.snapshot.job_id)
+
+    assert len(retry_events) == 1
+    assert completed.state is JobState.SUCCEEDED
+    assert parser.calls == 1
+
+
+def test_legacy_document_does_not_adopt_unbound_content_snapshot(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    raw = b"%PDF-1.7\nshared legacy fixture\n"
+    current_source = tmp_path / "current.pdf"
+    legacy_source = tmp_path / "legacy.pdf"
+    current_source.write_bytes(raw)
+    legacy_source.write_bytes(raw)
+    parser = _Parser()
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+    )
+    _submit(
+        service,
+        repository,
+        workspace,
+        current_source,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    assert len(tuple((machine_root / "attempts" / "document-inputs").rglob("source.pdf"))) == 1
+    legacy_stat = legacy_source.stat()
+    legacy_request = DocumentProduceRequest(
+        request_schema_version=1,
+        workspace_root=workspace,
+        input_path=legacy_source.resolve(),
+        expected_source_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+        expected_source_size=legacy_stat.st_size,
+        expected_source_mtime_ns=legacy_stat.st_mtime_ns,
+    )
+    legacy = JobService(repository).submit(
+        legacy_request,
+        execution_binding=service.execution_binding,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    legacy_source.unlink()
+
+    completed = service.wait_job(legacy.job_id)
+
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert completed.error.code == "document_input_unavailable"
+    assert parser.calls == 0
 
 
 def test_document_recipe_uses_generic_submit_and_survives_reopen(tmp_path: Path) -> None:

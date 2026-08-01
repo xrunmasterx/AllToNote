@@ -12,6 +12,7 @@ from app.core.errors import DomainError, ErrorCategory
 
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 MAX_BORN_DIGITAL_PDF_BYTES = 64 * 1024 * 1024
+DOCUMENT_INPUT_SNAPSHOT_EVENT = "document.input-snapshot.v1"
 
 
 def _invalid(message: str) -> DomainError:

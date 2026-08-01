@@ -21,6 +21,7 @@ from app.core.application.job_query_service import (
 from app.core.application.job_service import JobService
 from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
+from app.core.domain.document import DOCUMENT_INPUT_SNAPSHOT_EVENT
 from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import (
@@ -309,6 +310,42 @@ class JobRuntime:
                 ) from error
             initial_events.append(
                 (JOB_PACK_ENVIRONMENT_EVENT, pack_environment)
+            )
+        document_input_events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == DOCUMENT_INPUT_SNAPSHOT_EVENT
+        )
+        if len(document_input_events) > 1:
+            raise DomainError(
+                "document_input_snapshot_invalid",
+                ErrorCategory.CONFLICT,
+                "The Document input snapshot binding is unavailable or invalid",
+            )
+        if document_input_events:
+            try:
+                document_input = json.loads(document_input_events[0].payload_json)
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DomainError(
+                    "document_input_snapshot_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored Document input snapshot binding is invalid",
+                ) from error
+            if (
+                type(document_input) is not dict
+                or frozenset(document_input)
+                != frozenset({"schema_version", "sha256", "byte_length"})
+                or type(document_input.get("schema_version")) is not int
+                or type(document_input.get("sha256")) is not str
+                or type(document_input.get("byte_length")) is not int
+            ):
+                raise DomainError(
+                    "document_input_snapshot_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored Document input snapshot binding is invalid",
+                )
+            initial_events.append(
+                (DOCUMENT_INPUT_SNAPSHOT_EVENT, document_input)
             )
         retried = self._jobs.retry(
             job_id,

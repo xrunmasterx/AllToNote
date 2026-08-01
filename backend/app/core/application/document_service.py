@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat as stat_module
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from errno import EACCES, ENOSYS
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
+
+from filelock import FileLock, Timeout
 
 from app.core.application.checkpoint_runner import (
     CheckpointedStepExecutionContext,
@@ -25,6 +31,7 @@ from app.core.application.document_checkpoints import (
 )
 from app.core.application.job_service import JobService
 from app.core.domain.document import (
+    DOCUMENT_INPUT_SNAPSHOT_EVENT,
     DocumentKnowledgeProduceRequest,
     DocumentProduceRequest,
     ParsedDocument,
@@ -36,6 +43,7 @@ from app.core.jobs.model import (
     Attempt,
     AttemptState,
     CheckpointMetadata,
+    JobEvent,
     JobExecutionBinding,
     JobExecutionOwner,
     JobSnapshot,
@@ -67,6 +75,8 @@ _LEASE_TTL_SECONDS = 300
 _HEARTBEAT_SECONDS = 30.0
 _LOCAL_DOCUMENT_PATH_CONNECTOR = "local-document-path-v1"
 _LEGACY_DOCUMENT_CONTENT_CONNECTOR = "local-document-sha256"
+_DOCUMENT_INPUT_DIRECTORY = "document-inputs"
+_COPY_CHUNK_BYTES = 1024 * 1024
 _BINDING = JobExecutionBinding(
     recipe_id="alltonote.document-note",
     recipe_version=1,
@@ -75,6 +85,97 @@ _BINDING = JobExecutionBinding(
     pack_id="document-basic",
     pack_version="docling-2.117.0-tableformer-v2.3.0",
 )
+
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+
+def _snapshot_lock_is_ordinary(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return (
+        stat_module.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and not bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+    )
+
+
+def _open_snapshot_lock_matches(path: Path, descriptor: int) -> bool:
+    try:
+        metadata = path.lstat()
+        opened = os.fstat(descriptor)
+    except OSError:
+        return False
+    return (
+        _snapshot_lock_is_ordinary(path)
+        and metadata.st_dev == opened.st_dev
+        and metadata.st_ino == opened.st_ino
+    )
+
+
+class _DocumentInputFileLock(FileLock):
+    """Lock one stable ordinary file without truncating a linked target."""
+
+    def _acquire(self) -> None:
+        lock_path = Path(self.lock_file)
+        if os.path.lexists(lock_path) and not _snapshot_lock_is_ordinary(lock_path):
+            raise OSError("Document input snapshot lock is unsafe")
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, self._context.mode)
+        except OSError as error:
+            if os.path.lexists(lock_path) and not _snapshot_lock_is_ordinary(
+                lock_path
+            ):
+                raise OSError("Document input snapshot lock is unsafe") from error
+            if os.name == "nt" and error.errno == EACCES:
+                return
+            raise
+        if not _open_snapshot_lock_matches(lock_path, descriptor):
+            os.close(descriptor)
+            raise OSError("Document input snapshot lock is unsafe")
+        try:
+            if os.name == "nt":
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            os.close(descriptor)
+            if os.name == "nt":
+                if error.errno != EACCES:
+                    raise
+            elif error.errno == ENOSYS:
+                raise OSError(
+                    "Document input snapshot filesystem does not support locking"
+                ) from error
+            return
+        if not _open_snapshot_lock_matches(lock_path, descriptor):
+            os.close(descriptor)
+            raise OSError("Document input snapshot lock is unsafe")
+        self._context.lock_file_fd = descriptor
+
+    def _release(self) -> None:
+        descriptor = self._context.lock_file_fd
+        if descriptor is None:
+            return
+        self._context.lock_file_fd = None
+        if os.name == "nt":
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 _REQUEST_FIELDS = frozenset(
     {
         "expected_source_mtime_ns",
@@ -146,7 +247,11 @@ class _DocumentServiceRepositoryPort(
     JobClaimRepositoryPort,
     Protocol,
 ):
-    pass
+    def list_events(
+        self,
+        job_id: str,
+        after_sequence: int = 0,
+    ) -> tuple[JobEvent, ...]: ...
 
 
 class DocumentService:
@@ -220,8 +325,18 @@ class DocumentService:
                 ErrorCategory.INVALID_REQUEST,
                 "Document request must use the versioned contract",
             )
+        initial_events: tuple[tuple[str, object], ...] = ()
+        if execution_owner is JobExecutionOwner.ENGINE:
+            self._snapshot_detached_input(request)
+            initial_events = (
+                (
+                    DOCUMENT_INPUT_SNAPSHOT_EVENT,
+                    self._snapshot_event_payload(request),
+                ),
+            )
         return self._job_service.submit(
             request,
+            initial_events=initial_events,
             execution_binding=_BINDING,
             execution_owner=execution_owner,
         )
@@ -381,13 +496,22 @@ class DocumentService:
         if isinstance(request, DocumentKnowledgeProduceRequest):
             self._require_knowledge_compiler()
         self._portable.inspect(request.workspace_root)
-        self._verify_source_stat(request)
+        input_path, detached = self._execution_input(job_id, request)
+        if detached:
+            self._verify_detached_input(request, input_path)
+        else:
+            self._verify_source_stat(request)
         parsed = self._checkpoint_runner.run(
             job_id,
             "parse_document",
             job.request_hash,
             authority,
-            lambda _execution: self._parse(request, job_id),
+            lambda _execution: self._parse(
+                request,
+                job_id,
+                input_path=input_path,
+                detached=detached,
+            ),
             encode=encode_parsed_document,
             decode=decode_parsed_document,
             resumed_attempt=resumed_attempt,
@@ -424,20 +548,271 @@ class DocumentService:
         attempt = self._repository.start_attempt(attempt.attempt_id, authority)
         return self._commit(request, checkpoint, attempt, authority)
 
-    def _parse(self, request: DocumentRequest, job_id: str) -> ParsedDocument:
+    def _parse(
+        self,
+        request: DocumentRequest,
+        job_id: str,
+        *,
+        input_path: Path,
+        detached: bool,
+    ) -> ParsedDocument:
         parsed = self._parser.parse(
-            request.input_path,
+            input_path,
             work_root=self._work_root,
             cancellation_token=CancellationToken(self._repository, job_id),
         )
-        self._verify_source_stat(request)
+        if detached:
+            self._verify_detached_input(request, input_path)
+        else:
+            self._verify_source_stat(request)
         if parsed.source_sha256 != request.expected_source_sha256:
             raise DomainError(
                 "document_input_changed",
                 ErrorCategory.CONFLICT,
                 "Document input changed after submission",
             )
+        if detached and parsed.source_name != request.input_path.name:
+            parsed = replace(parsed, source_name=request.input_path.name)
         return parsed
+
+    def _detached_input_path(self, request: DocumentRequest) -> Path:
+        digest = request.expected_source_sha256.removeprefix("sha256:")
+        return (
+            self._work_root
+            / _DOCUMENT_INPUT_DIRECTORY
+            / digest[:2]
+            / digest
+            / "source.pdf"
+        )
+
+    def _snapshot_event_payload(self, request: DocumentRequest) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "sha256": request.expected_source_sha256,
+            "byte_length": request.expected_source_size,
+        }
+
+    def _execution_input(
+        self,
+        job_id: str,
+        request: DocumentRequest,
+    ) -> tuple[Path, bool]:
+        events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == DOCUMENT_INPUT_SNAPSHOT_EVENT
+        )
+        if len(events) > 1:
+            raise DomainError(
+                "document_input_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Document input snapshot binding is invalid",
+            )
+        path = self._detached_input_path(request)
+        if events:
+            try:
+                payload = json.loads(events[0].payload_json)
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DomainError(
+                    "document_input_snapshot_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored Document input snapshot binding is invalid",
+                ) from error
+            if (
+                type(payload) is not dict
+                or frozenset(payload)
+                != frozenset({"schema_version", "sha256", "byte_length"})
+                or type(payload.get("schema_version")) is not int
+                or type(payload.get("sha256")) is not str
+                or type(payload.get("byte_length")) is not int
+                or payload != self._snapshot_event_payload(request)
+            ):
+                raise DomainError(
+                    "document_input_snapshot_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored Document input snapshot binding is invalid",
+                )
+            return path, True
+        return request.input_path, False
+
+    def _snapshot_detached_input(self, request: DocumentRequest) -> None:
+        target = self._detached_input_path(request)
+        try:
+            self._ensure_detached_input_directory(target.parent, create=True)
+            lock_path = target.parent / ".snapshot.lock"
+            self._ensure_detached_input_lock(lock_path)
+            with _DocumentInputFileLock(str(lock_path), timeout=30):
+                self._ensure_detached_input_lock(lock_path)
+                if os.path.lexists(target):
+                    self._verify_detached_input(request, target)
+                    return
+                self._write_detached_input(request, target)
+        except Timeout as error:
+            raise DomainError(
+                "document_input_snapshot_unavailable",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Document input snapshot is busy",
+            ) from error
+        except OSError as error:
+            raise DomainError(
+                "document_input_snapshot_unavailable",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Document input snapshot storage is unavailable",
+            ) from error
+
+    def _write_detached_input(
+        self,
+        request: DocumentRequest,
+        target: Path,
+    ) -> None:
+        temporary = target.parent / f".source-{uuid4().hex}.tmp"
+        try:
+            initial = request.input_path.stat()
+            digest = hashlib.sha256()
+            total_bytes = 0
+            with request.input_path.open("rb") as source, temporary.open("xb") as output:
+                opened = os.fstat(source.fileno())
+                if (
+                    not os.path.samestat(initial, opened)
+                    or not stat_module.S_ISREG(opened.st_mode)
+                    or opened.st_size != request.expected_source_size
+                    or opened.st_mtime_ns != request.expected_source_mtime_ns
+                ):
+                    raise self._document_input_changed()
+                while True:
+                    chunk = source.read(_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > request.expected_source_size:
+                        raise self._document_input_changed()
+                    digest.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+                final = os.fstat(source.fileno())
+            current = request.input_path.stat()
+            if (
+                not os.path.samestat(opened, final)
+                or not os.path.samestat(opened, current)
+                or total_bytes != request.expected_source_size
+                or final.st_size != opened.st_size
+                or final.st_mtime_ns != opened.st_mtime_ns
+                or "sha256:" + digest.hexdigest()
+                != request.expected_source_sha256
+            ):
+                raise self._document_input_changed()
+            self._ensure_detached_input_directory(target.parent, create=False)
+            os.replace(temporary, target)
+            self._verify_detached_input(request, target)
+        except DomainError:
+            raise
+        except OSError as error:
+            raise DomainError(
+                "document_input_snapshot_unavailable",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Document input snapshot could not be created",
+            ) from error
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _ensure_detached_input_lock(path: Path) -> None:
+        if not os.path.lexists(path):
+            return
+        if not _snapshot_lock_is_ordinary(path):
+            raise OSError("Document input snapshot lock is unsafe")
+
+    @staticmethod
+    def _document_input_changed() -> DomainError:
+        return DomainError(
+            "document_input_changed",
+            ErrorCategory.CONFLICT,
+            "Document input changed after submission",
+        )
+
+    def _verify_detached_input(
+        self,
+        request: DocumentRequest,
+        path: Path,
+    ) -> None:
+        try:
+            self._ensure_detached_input_directory(path.parent, create=False)
+            initial = path.lstat()
+            reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if (
+                not stat_module.S_ISREG(initial.st_mode)
+                or initial.st_nlink != 1
+                or bool(getattr(initial, "st_file_attributes", 0) & reparse_flag)
+            ):
+                raise self._document_input_changed()
+            digest = hashlib.sha256()
+            total_bytes = 0
+            with path.open("rb") as source:
+                opened = os.fstat(source.fileno())
+                if not os.path.samestat(initial, opened):
+                    raise self._document_input_changed()
+                while True:
+                    chunk = source.read(_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > request.expected_source_size:
+                        raise self._document_input_changed()
+                    digest.update(chunk)
+                final = os.fstat(source.fileno())
+            current = path.lstat()
+        except DomainError:
+            raise
+        except OSError as error:
+            raise self._document_input_changed() from error
+        if (
+            not os.path.samestat(opened, final)
+            or not os.path.samestat(opened, current)
+            or opened.st_size != final.st_size
+            or opened.st_mtime_ns != final.st_mtime_ns
+            or total_bytes != request.expected_source_size
+            or "sha256:" + digest.hexdigest() != request.expected_source_sha256
+        ):
+            raise self._document_input_changed()
+
+    def _ensure_detached_input_directory(
+        self,
+        directory: Path,
+        *,
+        create: bool,
+    ) -> None:
+        try:
+            relative = directory.relative_to(self._work_root)
+        except ValueError as error:
+            raise OSError("Document input snapshot escaped managed storage") from error
+        root = self._work_root
+        root_resolved = root.resolve(strict=True)
+        current = root
+        for component in (None, *relative.parts):
+            if component is not None:
+                current /= component
+            if not os.path.lexists(current):
+                if not create:
+                    raise OSError("Document input snapshot directory is missing")
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    pass
+            current_stat = current.lstat()
+            reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if (
+                not stat_module.S_ISDIR(current_stat.st_mode)
+                or bool(
+                    getattr(current_stat, "st_file_attributes", 0) & reparse_flag
+                )
+            ):
+                raise OSError("Document input snapshot directory is unsafe")
+            if not current.resolve(strict=True).is_relative_to(root_resolved):
+                raise OSError("Document input snapshot escaped managed storage")
 
     def _assemble(
         self,

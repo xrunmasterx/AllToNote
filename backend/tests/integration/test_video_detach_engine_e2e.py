@@ -245,6 +245,8 @@ def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
         worker_pid = int(worker_started.read_text(encoding="ascii"))
         assert len({host.pid, submit_pid, worker_pid}) == 3
         assert submitter.is_alive() is False
+        if recipe_kind == "document":
+            source.unlink()
 
         probe = context.Process(
             target=_run_job_wait,

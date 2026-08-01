@@ -76,6 +76,8 @@ Knowledge Note + deterministic Quality；来源语言/中文；section-aware inp
 
 当前增量（2026-08-01）：统一 `produce` CLI 已允许 `alltonote.document-note@1` 使用 `--detach`；Job 先以 `execution_owner=engine` 持久化，再用 Registry 的 `workspace_instance_id` 通知现有 Engine，直接参数和 request-file 两条入口共用同一提交路径。Document Workspace Runtime 现在显式携带该 machine-local instance identity；没有新增 Document 专用 Engine、JobStore 或协议。Windows `spawn` E2E 已让提交 CLI 在 Worker 放行前退出，并使用真实 `LocalEngineClient`、Host、Dispatcher、独立 Worker、Document Runtime、SQLite JobStore 与 Portable commit 完成同一 Job；Parser/Model 是受控外部 fixture。该结果与既有 Document 真重启零重放 Gate 共同关闭本地 detach 语义，但仍不等于带真实 Docling Pack、真实模型和正式签名 Runtime 的 clean-user 发布验收。
 
+同日补齐 detach 输入所有权：只有 Engine-owned Document 在 Job 创建前把 PDF 复制到 machine-state 的内容寻址快照，并把不含路径的 `document.input-snapshot.v1` 与 Job 原子持久化；执行前后都校验大小与 SHA-256，缺失、篡改、hardlink 或 reparse 路径禁止回退原文件。相同内容的并发提交通过持久文件锁复用同一快照；retry 显式继承绑定，历史无绑定 Job 仍只认原始输入。未引入 Vault blob、GC 或通用对象存储，验证边界见 [`Document detach 输入快照`](../../acceptance/2026-08-01-document-detached-input-snapshot.md)。
+
 ## 9. Task DOC-07：局部 OCR Pack
 
 manifest/probe/languages；只处理 classified pages/regions；render DPI/rotation/deskew；text+bbox+confidence；与 native去重；per-page checkpoint；OCR低置信/语言错误；不覆盖原PDF。
