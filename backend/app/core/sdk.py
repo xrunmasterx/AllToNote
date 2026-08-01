@@ -5,6 +5,7 @@ from typing import Protocol
 
 from app.core.application.produce_service import ProduceService
 from app.core.domain.video import JobSnapshot, VideoProduceRequest
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
 
 
@@ -31,11 +32,27 @@ class AllToNoteSDK:
         self._job_control = job_control
         self._legacy_video_adapter = legacy_video_adapter
 
-    def submit(self, request: ProduceRequest) -> ProduceSubmission:
-        return self._produce_service.submit(request)
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission:
+        return self._produce_service.submit(
+            request,
+            execution_owner=execution_owner,
+        )
 
-    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
-        submission = self.submit(self._legacy_video_adapter(request))
+    def submit_video(
+        self,
+        request: VideoProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> JobSnapshot:
+        submission = self.submit(
+            self._legacy_video_adapter(request),
+            execution_owner=execution_owner,
+        )
         return self._job_control.get_job(submission.job_id)
 
     def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:

@@ -13,7 +13,7 @@ from app.cli.main import main
 from app.core.domain.video import JobState, VideoProduceRequest
 from app.core.errors import ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
-from app.core.jobs.model import AttemptState
+from app.core.jobs.model import AttemptState, JobExecutionOwner
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
     parse_job_pack_environment_payload,
@@ -347,6 +347,71 @@ def test_job_wait_timeout_does_not_execute_or_cancel_job(
     assert envelope["error"]["retryable"] is True
     assert persisted.state is JobState.QUEUED
     assert persisted.cancellation_requested is False
+
+
+def test_job_wait_observes_engine_owned_job_without_foreground_execution(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "engine-owned-wait"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    foreground_calls: list[str] = []
+    sleep_calls = 0
+
+    def foreground_wait(job_id: str):
+        foreground_calls.append(job_id)
+        raise AssertionError("ENGINE-owned Job was executed by the waiting CLI")
+
+    def finish_from_engine(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        runtime.cancel_job(submitted.job_id)
+
+    job_runtime = JobRuntime(
+        runtime.job_repository,
+        wait_job=foreground_wait,
+        current_config_snapshot=None,
+        sleep=finish_from_engine,
+    )
+
+    observed = job_runtime.wait_for_job(submitted.job_id)
+
+    assert observed.snapshot.state is JobState.CANCELLED
+    assert sleep_calls == 1
+    assert foreground_calls == []
+
+
+def test_engine_authorized_job_runtime_executes_engine_owned_job(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "engine-authorized-wait"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    execution_calls: list[str] = []
+
+    def engine_wait(job_id: str):
+        execution_calls.append(job_id)
+        return runtime.cancel_job(job_id)
+
+    job_runtime = JobRuntime(
+        runtime.job_repository,
+        wait_job=engine_wait,
+        current_config_snapshot=None,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    observed = job_runtime.wait_for_job(submitted.job_id)
+
+    assert observed.snapshot.state is JobState.CANCELLED
+    assert execution_calls == [submitted.job_id]
 
 
 @pytest.mark.parametrize("timeout", ("0", "-1", "nan", "inf"))

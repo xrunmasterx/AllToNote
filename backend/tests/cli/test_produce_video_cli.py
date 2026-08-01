@@ -19,6 +19,8 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
+from app.core.jobs.model import JobExecutionOwner
+from app.engine.contracts import EngineJobReference
 from app.core.packs.events import (
     ExecutionPackIdentity,
     JobPackEnvironmentSnapshot,
@@ -195,6 +197,420 @@ def test_human_usage_error_uses_stderr_only(
     assert captured.out == ""
     assert "Error [cli_usage_invalid]" in captured.err
     assert "Action:" in captured.err
+
+
+class _EngineNotifySpy:
+    def __init__(
+        self,
+        error: BaseException | None = None,
+        *,
+        scheduled: bool = True,
+    ) -> None:
+        self.error = error
+        self.scheduled = scheduled
+        self.references: list[EngineJobReference] = []
+
+    def notify_job(self, reference: EngineJobReference) -> dict[str, object]:
+        self.references.append(reference)
+        if self.error is not None:
+            raise self.error
+        return {
+            "engine_id": "engine_test",
+            "workspace_instance_id": reference.workspace_instance_id,
+            "job_id": reference.job_id,
+            "state": "queued",
+            "scheduled": self.scheduled,
+        }
+
+
+def test_produce_video_detach_persists_engine_owned_job_and_notifies_once(
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instance_id = "a" * 32
+    runtime, calls = runtime_factory(
+        local_instance_id=instance_id,
+        workspace_instance_id=instance_id,
+    )
+    client = _EngineNotifySpy()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+
+    assert code == 0
+    assert envelope["ok"] is True
+    assert envelope["command"] == "produce video"
+    assert envelope["data"]["state"] == "queued"
+    assert client.references == [
+        EngineJobReference(instance_id, envelope["data"]["job_id"])
+    ]
+    assert runtime.job_repository.get_job(
+        envelope["data"]["job_id"]
+    ).execution_owner is JobExecutionOwner.ENGINE
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+
+
+def test_foreground_default_keeps_foreground_owner_and_never_notifies_engine(
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _ = runtime_factory()
+    client = _EngineNotifySpy()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert runtime.job_repository.get_job(
+        envelope["data"]["job_id"]
+    ).execution_owner is JobExecutionOwner.FOREGROUND
+    assert client.references == []
+
+
+def test_generic_video_detach_uses_the_same_engine_owned_submission_path(
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instance_id = "b" * 32
+    runtime, calls = runtime_factory(
+        local_instance_id=instance_id,
+        workspace_instance_id=instance_id,
+    )
+    client = _EngineNotifySpy(scheduled=False)
+
+    code = main(
+        [
+            "produce",
+            "fixture://course",
+            "--recipe",
+            "alltonote.video-producer@2",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert envelope["command"] == "produce"
+    assert envelope["data"]["state"] == "queued"
+    assert client.references == [
+        EngineJobReference(instance_id, envelope["data"]["job_id"])
+    ]
+    assert runtime.job_repository.get_job(
+        envelope["data"]["job_id"]
+    ).execution_owner is JobExecutionOwner.ENGINE
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+
+
+def test_request_file_video_detach_reuses_the_same_engine_job_on_retry(
+    tmp_path: Path,
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instance_id = "d" * 32
+    runtime, calls = runtime_factory(
+        local_instance_id=instance_id,
+        workspace_instance_id=instance_id,
+    )
+    request_path = tmp_path / "detach request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.video-course-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "source", "value": "fixture://course"},
+                "workspace_ref": str(workspace_root),
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {},
+                "client_request_id": "stable-detach-request",
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _EngineNotifySpy()
+
+    observed_job_ids: list[str] = []
+    for _ in range(2):
+        assert main(
+            [
+                "produce",
+                "--request",
+                str(request_path),
+                "--detach",
+                "--json",
+            ],
+            runtime=runtime,
+            engine_client=client,
+        ) == 0
+        observed_job_ids.append(
+            json.loads(capsys.readouterr().out)["data"]["job_id"]
+        )
+
+    assert observed_job_ids[0] == observed_job_ids[1]
+    assert [reference.job_id for reference in client.references] == observed_job_ids
+    assert runtime.job_repository.get_job(
+        observed_job_ids[0]
+    ).execution_owner is JobExecutionOwner.ENGINE
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+
+
+def test_detach_notification_failure_keeps_durable_engine_owned_job_visible(
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, calls = runtime_factory(
+        local_instance_id="c" * 32,
+        workspace_instance_id="c" * 32,
+    )
+    client = _EngineNotifySpy(
+        DomainError(
+            "engine_start_failed",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "Engine failed to start",
+        )
+    )
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+    job_id = envelope["data"]["job_id"]
+
+    assert code == 30
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "engine_start_failed"
+    assert envelope["data"] == {"job_id": job_id, "state": "queued"}
+    assert envelope["job"]["job_id"] == job_id
+    assert runtime.job_repository.get_job(
+        job_id
+    ).execution_owner is JobExecutionOwner.ENGINE
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 0
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_exit"),
+    (
+        (RuntimeError("private engine detail"), "engine_notification_failed", 70),
+        (KeyboardInterrupt(), "interrupted", 130),
+    ),
+)
+def test_detach_notification_unexpected_or_interrupt_keeps_job_reference(
+    failure: BaseException,
+    expected_code: str,
+    expected_exit: int,
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _ = runtime_factory(
+        local_instance_id="e" * 32,
+        workspace_instance_id="e" * 32,
+    )
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=_EngineNotifySpy(failure),
+    )
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+
+    assert code == expected_exit
+    assert envelope["error"]["code"] == expected_code
+    assert envelope["data"]["job_id"] == envelope["job"]["job_id"]
+    assert runtime.job_repository.get_job(
+        envelope["data"]["job_id"]
+    ).execution_owner is JobExecutionOwner.ENGINE
+    assert "private engine detail" not in captured.out
+
+
+def test_detach_notification_failure_human_output_names_the_durable_job(
+    runtime_factory,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _ = runtime_factory(
+        local_instance_id="f" * 32,
+        workspace_instance_id="f" * 32,
+    )
+    client = _EngineNotifySpy(
+        DomainError(
+            "engine_start_failed",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "Engine failed to start",
+        )
+    )
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 30
+    assert captured.out == ""
+    assert "Error [engine_start_failed]" in captured.err
+    assert client.references[0].job_id in captured.err
+    assert "alltonote engine ensure" in captured.err
+
+
+def test_wait_and_detach_are_mutually_exclusive(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--wait",
+            "--detach",
+            "--json",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert envelope["command"] == "produce video"
+    assert envelope["error"]["code"] == "cli_usage_invalid"
+
+
+def test_document_detach_is_rejected_before_submission_or_notification(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _GenericCaptureRuntime()
+    client = _EngineNotifySpy()
+
+    code = main(
+        [
+            "produce",
+            str(workspace_root / "document.pdf"),
+            "--recipe",
+            "alltonote.document-note@1",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert envelope["error"]["code"] == "detach_recipe_unsupported"
+    assert runtime.requests == []
+    assert client.references == []
+
+
+class _UnregisteredDetachRuntime:
+    workspace_instance_id = None
+
+    def submit_video(self, request: object, **options: object) -> object:
+        del request, options
+        raise AssertionError("an unregistered runtime must not submit a detached Job")
+
+
+def test_detach_rejects_unregistered_low_level_runtime_before_submission(
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _EngineNotifySpy()
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        runtime=_UnregisteredDetachRuntime(),
+        engine_client=client,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 10
+    assert envelope["error"]["code"] == "engine_workspace_instance_unavailable"
+    assert client.references == []
 
 
 def test_preflight_failure_is_one_safe_envelope_and_nonzero_exit(
@@ -1381,6 +1797,67 @@ def test_default_runtime_uses_real_codex_factory_and_never_fake(
     assert json.loads(captured.out)["data"]["state"] == "succeeded"
     assert requested_workspaces == [workspace_root.resolve()]
     assert calls.commit == 1
+
+
+def test_detach_binds_default_runtime_and_engine_to_same_custom_paths(
+    tmp_path: Path,
+    runtime_factory,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.runtime_config import RuntimeConfigService
+    from app.runtime_paths import resolve_runtime_paths
+
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "机器 状态")
+    instance_id = "1" * 32
+    runtime, _ = runtime_factory(
+        local_instance_id=instance_id,
+        workspace_instance_id=instance_id,
+    )
+    runtime_module = importlib.import_module("app.runtime")
+    engine_client_module = importlib.import_module("app.engine.client")
+    observed: dict[str, object] = {}
+
+    def create_real_runtime(workspace: Path, **options: object):
+        observed["workspace"] = workspace
+        observed["runtime_paths"] = options["runtime_paths"]
+        return runtime
+
+    class CapturingClient(_EngineNotifySpy):
+        def __init__(self, client_paths: object) -> None:
+            super().__init__()
+            observed["client_paths"] = client_paths
+
+    monkeypatch.setattr(
+        runtime_module,
+        "create_codex_app_server_runtime_for_workspace",
+        create_real_runtime,
+    )
+    monkeypatch.setattr(engine_client_module, "LocalEngineClient", CapturingClient)
+
+    code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ],
+        config_service=RuntimeConfigService(paths=paths, environ={}),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert envelope["data"]["state"] == "queued"
+    assert observed == {
+        "workspace": workspace_root.resolve(),
+        "runtime_paths": paths,
+        "client_paths": paths,
+    }
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ from app.core.domain.document import (
     MAX_BORN_DIGITAL_PDF_BYTES,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission, RecipeKey
 
 
@@ -166,7 +167,12 @@ class DocumentRecipeAdapter:
     def __init__(self, service: DocumentService) -> None:
         self._service = service
 
-    def submit(self, request: ProduceRequest) -> ProduceSubmission:
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission:
         if not isinstance(request, ProduceRequest) or request.recipe_key != _KEY:
             raise _invalid("document_recipe_unsupported", "Document Recipe is not supported")
         if request.input.kind != "file" or request.input.attributes:
@@ -219,7 +225,10 @@ class DocumentRecipeAdapter:
                 request_schema_version=1,
                 **common,
             )
-        snapshot = self._service.submit_document(document_request)
+        snapshot = self._service.submit_document(
+            document_request,
+            execution_owner=execution_owner,
+        )
         return ProduceSubmission(snapshot.job_id, request.recipe_key, snapshot.state)
 
 

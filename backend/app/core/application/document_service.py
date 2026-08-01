@@ -37,6 +37,7 @@ from app.core.jobs.model import (
     AttemptState,
     CheckpointMetadata,
     JobExecutionBinding,
+    JobExecutionOwner,
     JobSnapshot,
     JobState,
 )
@@ -204,7 +205,12 @@ class DocumentService:
     def execution_binding(self) -> JobExecutionBinding:
         return _BINDING
 
-    def submit_document(self, request: DocumentRequest) -> JobSnapshot:
+    def submit_document(
+        self,
+        request: DocumentRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> JobSnapshot:
         if not isinstance(
             request,
             (DocumentProduceRequest, DocumentKnowledgeProduceRequest),
@@ -214,7 +220,11 @@ class DocumentService:
                 ErrorCategory.INVALID_REQUEST,
                 "Document request must use the versioned contract",
             )
-        return self._job_service.submit(request, execution_binding=_BINDING)
+        return self._job_service.submit(
+            request,
+            execution_binding=_BINDING,
+            execution_owner=execution_owner,
+        )
 
     def get_job(self, job_id: str) -> JobSnapshot:
         return self._job_service.get(job_id)

@@ -9,6 +9,7 @@ import app.core.recipes.document.adapter as adapter_module
 from app.core.domain.document import MAX_BORN_DIGITAL_PDF_BYTES
 from app.core.domain.video import JobState
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
 from app.core.recipes.document.adapter import DocumentRecipeAdapter
 
@@ -17,8 +18,13 @@ class _Service:
     def __init__(self) -> None:
         self.submissions = 0
 
-    def submit_document(self, request: object) -> object:
-        del request
+    def submit_document(
+        self,
+        request: object,
+        *,
+        execution_owner: JobExecutionOwner,
+    ) -> object:
+        del request, execution_owner
         self.submissions += 1
         raise AssertionError("unsupported input must not create a Job")
 
@@ -245,7 +251,13 @@ def test_independent_verifier_selection_creates_frozen_v3_request(
         def knowledge_model_identity(self) -> str:
             return "fixture/composer-v1"
 
-        def submit_document(self, request: object) -> object:
+        def submit_document(
+            self,
+            request: object,
+            *,
+            execution_owner: JobExecutionOwner,
+        ) -> object:
+            del execution_owner
             self.request = request
             return SimpleNamespace(job_id="job_fixture", state=JobState.QUEUED)
 

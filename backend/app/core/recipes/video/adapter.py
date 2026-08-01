@@ -16,6 +16,7 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import (
     InputDescriptor,
     ProduceRequest,
@@ -213,7 +214,12 @@ class VideoRecipeAdapter:
     def __init__(self, video_service: VideoService) -> None:
         self._video_service = video_service
 
-    def submit(self, request: ProduceRequest) -> ProduceSubmission:
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission:
         if not isinstance(request, ProduceRequest):
             raise _invalid("produce_request_invalid", "request must be a ProduceRequest")
         schema_version = _SUPPORTED_KEYS.get(request.recipe_key)
@@ -265,7 +271,10 @@ class VideoRecipeAdapter:
                 provided_transcript=_transcript(request.parameters.get("provided_transcript")),
                 config_snapshot=_config_snapshot(request.parameters.get("config_snapshot")),
             )
-        snapshot = self._video_service.submit_video(video_request)
+        snapshot = self._video_service.submit_video(
+            video_request,
+            execution_owner=execution_owner,
+        )
         return ProduceSubmission(snapshot.job_id, request.recipe_key, snapshot.state)
 
 

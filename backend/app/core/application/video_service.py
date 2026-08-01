@@ -59,6 +59,7 @@ from app.core.jobs.model import (
     AttemptState,
     CheckpointMetadata,
     JobExecutionBinding,
+    JobExecutionOwner,
 )
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
@@ -475,7 +476,12 @@ class VideoService:
             ),
         )
 
-    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
+    def submit_video(
+        self,
+        request: VideoProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> JobSnapshot:
         if not isinstance(request, VideoProduceRequest):
             raise DomainError(
                 "video_produce_request_invalid",
@@ -515,6 +521,7 @@ class VideoService:
                 bound_recipe_id,
                 bound_recipe_version,
             ),
+            execution_owner=execution_owner,
         )
         if config_snapshot is not None:
             self._submitted_config_snapshots[snapshot.job_id] = config_snapshot

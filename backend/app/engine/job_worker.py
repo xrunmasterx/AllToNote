@@ -108,6 +108,7 @@ def execute_engine_job(
             workspace_root,
             runtime_paths=paths,
             current_config_snapshot=config_snapshot,
+            execution_owner=JobExecutionOwner.ENGINE,
             require_existing_job_store=True,
         )
         return runtime.wait_for_job(job_id)

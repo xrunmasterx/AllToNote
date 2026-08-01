@@ -23,7 +23,11 @@ from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
 from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import JobExecutionBinding, LOCAL_USER_PRINCIPAL
+from app.core.jobs.model import (
+    JobExecutionBinding,
+    JobExecutionOwner,
+    LOCAL_USER_PRINCIPAL,
+)
 from app.core.jobs.state_machine import TERMINAL_JOB_STATES
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
@@ -77,6 +81,7 @@ class JobRuntime:
         wait_job: Callable[[str], JobSnapshot] | None,
         current_config_snapshot: JobConfigSnapshot | None,
         principal: str = LOCAL_CLI_PRINCIPAL,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -86,6 +91,7 @@ class JobRuntime:
         self._wait_job = wait_job
         self._current_config_snapshot = current_config_snapshot
         self._principal = principal
+        self._execution_owner = execution_owner
         self._monotonic = monotonic
         self._sleep = sleep
 
@@ -156,6 +162,14 @@ class JobRuntime:
                         },
                     )
                 self._sleep(min(0.05, remaining))
+                current = self.get_job(job_id)
+            return current
+        if (
+            self._repository.get_job(job_id).execution_owner
+            is not self._execution_owner
+        ):
+            while not _is_wait_boundary(current.snapshot.state):
+                self._sleep(0.05)
                 current = self.get_job(job_id)
             return current
         if self._wait_job is None:
@@ -286,6 +300,7 @@ def create_job_runtime_for_workspace(
     local_app_data: Path | None = None,
     runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None,
+    execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
     require_existing_job_store: bool = False,
 ) -> JobRuntime:
     from iwiki.workspace import open_workspace
@@ -390,6 +405,7 @@ def create_job_runtime_for_workspace(
         repository,
         wait_job=execute,
         current_config_snapshot=current_config_snapshot,
+        execution_owner=execution_owner,
     )
 
 

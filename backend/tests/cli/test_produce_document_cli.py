@@ -191,12 +191,14 @@ def test_generic_document_produce_selects_document_runtime_by_recipe(
     def create(
         workspace_root: Path,
         *,
+        runtime_paths=None,
         current_config_snapshot=None,
         requested_model_identity=None,
         requested_provider_profile=None,
         requested_verifier_model_identity=None,
         requested_verifier_provider_profile=None,
     ) -> _DocumentRuntime:
+        assert runtime_paths is None
         assert current_config_snapshot is not None
         assert requested_model_identity is None
         assert requested_provider_profile == "default"
@@ -373,8 +375,9 @@ def test_document_request_file_builds_runtime_from_frozen_v3_models(
     assert selected == [
         (
             workspace.resolve(),
-            {
-                "current_config_snapshot": None,
+                {
+                    "runtime_paths": None,
+                    "current_config_snapshot": None,
                 "requested_model_identity": "fixture/composer-v1",
                 "requested_provider_profile": "composer",
                 "requested_verifier_model_identity": "fixture/reviewer-v1",

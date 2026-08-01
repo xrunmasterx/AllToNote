@@ -18,6 +18,7 @@ from app.core.domain.video import (
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
 from app.core.recipes.video.adapter import (
     VideoRecipeAdapter,
@@ -33,10 +34,17 @@ from app.core.recipes.video.descriptor import (
 class _VideoServiceSpy:
     def __init__(self, state: JobState = JobState.QUEUED) -> None:
         self.requests: list[VideoProduceRequest] = []
+        self.execution_owners: list[JobExecutionOwner] = []
         self.state = state
 
-    def submit_video(self, request: VideoProduceRequest) -> object:
+    def submit_video(
+        self,
+        request: VideoProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner,
+    ) -> object:
         self.requests.append(request)
+        self.execution_owners.append(execution_owner)
         return SimpleNamespace(job_id="job_spy", state=self.state)
 
 
@@ -248,7 +256,13 @@ def test_video_adapter_propagates_video_service_error_by_identity() -> None:
     sentinel = DomainError("video_failed", ErrorCategory.RECIPE_FAILED, "Video failed")
 
     class FailingService:
-        def submit_video(self, request: VideoProduceRequest) -> object:
+        def submit_video(
+            self,
+            request: VideoProduceRequest,
+            *,
+            execution_owner: JobExecutionOwner,
+        ) -> object:
+            del request, execution_owner
             raise sentinel
 
     with pytest.raises(DomainError) as raised:

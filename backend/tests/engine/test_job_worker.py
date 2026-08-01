@@ -86,9 +86,11 @@ def test_worker_executes_existing_engine_job_using_registry_ids_only(
         *,
         runtime_paths: RuntimePaths,
         current_config_snapshot,
+        execution_owner: JobExecutionOwner,
         require_existing_job_store: bool = False,
     ):
         assert require_existing_job_store is True
+        assert execution_owner is JobExecutionOwner.ENGINE
         calls.append(
             (
                 "runtime",
@@ -464,9 +466,11 @@ def test_worker_restores_persisted_configuration_snapshot(
         *,
         runtime_paths: RuntimePaths,
         current_config_snapshot,
+        execution_owner: JobExecutionOwner,
         require_existing_job_store: bool = False,
     ):
         assert require_existing_job_store is True
+        assert execution_owner is JobExecutionOwner.ENGINE
         observed.append((runtime_paths, current_config_snapshot))
         return Runtime()
 

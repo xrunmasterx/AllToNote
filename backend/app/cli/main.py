@@ -28,6 +28,7 @@ from app.core.domain.video import (
     VideoProduceResult,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission, RecipeKey
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from app.job_runtime import JobRuntime
     from app.cli.pack_commands import PackService
     from app.runtime_config import EffectiveRuntimeConfig, RuntimeConfigService
+    from app.runtime_paths import RuntimePaths
 
 
 RUNTIME_VERSION = "0.1.0"
@@ -44,9 +46,21 @@ _DOCUMENT_NOTE_V1 = RecipeKey("alltonote.document-note", 1)
 
 
 class _VideoRuntime(Protocol):
-    def submit(self, request: ProduceRequest) -> ProduceSubmission: ...
+    workspace_instance_id: str | None
 
-    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot: ...
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission: ...
+
+    def submit_video(
+        self,
+        request: VideoProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> JobSnapshot: ...
 
     def get_job(self, job_id: str) -> JobSnapshot: ...
 
@@ -55,6 +69,12 @@ class _VideoRuntime(Protocol):
 
 class _CliUsageError(Exception):
     pass
+
+
+class _DetachedJobNotificationError(DomainError):
+    def __init__(self, error: DomainError, snapshot: JobSnapshot) -> None:
+        super().__init__(error.code, error.category, error.message, error.details)
+        self.snapshot = snapshot
 
 
 class _CliArgumentParser(argparse.ArgumentParser):
@@ -196,7 +216,10 @@ def _build_parser(
     generic_parser.add_argument("--recipe")
     generic_parser.add_argument("--request", type=Path)
     generic_parser.add_argument("--workspace", type=Path)
-    generic_parser.add_argument("--wait", action="store_true", default=True)
+    generic_mode = generic_parser.add_mutually_exclusive_group()
+    generic_mode.add_argument("--wait", dest="wait", action="store_true")
+    generic_mode.add_argument("--detach", dest="wait", action="store_false")
+    generic_parser.set_defaults(wait=True)
     generic_parser.add_argument("--json", action="store_true")
     video_parser = produce_subparsers.add_parser("video")
     video_parser.add_argument(
@@ -210,7 +233,10 @@ def _build_parser(
         help="video URL or local video path",
     )
     video_parser.add_argument("--workspace", type=Path)
-    video_parser.add_argument("--wait", action="store_true", default=True)
+    video_mode = video_parser.add_mutually_exclusive_group()
+    video_mode.add_argument("--wait", dest="wait", action="store_true")
+    video_mode.add_argument("--detach", dest="wait", action="store_false")
+    video_parser.set_defaults(wait=True)
     video_parser.add_argument("--json", action="store_true")
     video_parser.add_argument("--recipe-version", choices=(1, 2), type=int)
     video_parser.add_argument("--config-profile")
@@ -668,11 +694,29 @@ def main(
                 runtime,
                 correlation_id,
                 config_service=config_service,
+                engine_client=engine_client,
             )
             result, exit_code = _video_snapshot_result(
                 snapshot,
                 correlation_id,
                 command="produce",
+            )
+        except _DetachedJobNotificationError as error:
+            mapped = _map_detached_notification_error(error)
+            result = _failure_result(
+                command="produce",
+                correlation_id=correlation_id,
+                mapped=mapped,
+                data={
+                    "job_id": error.snapshot.job_id,
+                    "state": error.snapshot.state.value,
+                },
+                job=_job_projection(error.snapshot),
+            )
+            exit_code = (
+                ExitCode.INTERRUPTED
+                if error.code == "interrupted"
+                else mapped.exit_code
             )
         except DomainError as error:
             mapped = map_domain_error(error)
@@ -709,8 +753,26 @@ def main(
             runtime,
             correlation_id,
             config_service=config_service,
+            engine_client=engine_client,
         )
         result, exit_code = _video_snapshot_result(snapshot, correlation_id)
+    except _DetachedJobNotificationError as error:
+        mapped = _map_detached_notification_error(error)
+        result = _failure_result(
+            command="produce video",
+            correlation_id=correlation_id,
+            mapped=mapped,
+            data={
+                "job_id": error.snapshot.job_id,
+                "state": error.snapshot.state.value,
+            },
+            job=_job_projection(error.snapshot),
+        )
+        exit_code = (
+            ExitCode.INTERRUPTED
+            if error.code == "interrupted"
+            else mapped.exit_code
+        )
     except DomainError as error:
         mapped = map_domain_error(error)
         result = _failure_result(
@@ -760,17 +822,27 @@ def _produce_generic(
     correlation_id: str,
     *,
     config_service: RuntimeConfigService | None,
+    engine_client: object | None,
 ) -> JobSnapshot:
     from app.cli.produce_request import load_produce_request, parse_recipe_selector
     from app.core.recipes.contracts import InputDescriptor
 
     if args.request is not None:
         request = load_produce_request(args.request)
+        if not args.wait and request.recipe_key == _DOCUMENT_NOTE_V1:
+            raise DomainError(
+                "detach_recipe_unsupported",
+                ErrorCategory.INVALID_REQUEST,
+                "Detached execution is supported only for Video Recipes",
+            )
         workspace_root = Path(request.workspace_ref).resolve()
         if request.recipe_key == _DOCUMENT_NOTE_V1:
             request = replace(request, workspace_ref=str(workspace_root))
             active_runtime = runtime or _default_runtime(
                 workspace_root,
+                runtime_paths=(
+                    config_service.paths if config_service is not None else None
+                ),
                 recipe_key=request.recipe_key,
                 document_provider_profile=request.parameters.get(
                     "provider_profile"
@@ -815,10 +887,19 @@ def _produce_generic(
             )
             active_runtime = runtime or _default_runtime(
                 workspace_root,
+                runtime_paths=(
+                    config_service.paths if config_service is not None else None
+                ),
                 current_config_snapshot=config_snapshot,
             )
     else:
         key = parse_recipe_selector(args.recipe)
+        if not args.wait and key == _DOCUMENT_NOTE_V1:
+            raise DomainError(
+                "detach_recipe_unsupported",
+                ErrorCategory.INVALID_REQUEST,
+                "Detached execution is supported only for Video Recipes",
+            )
         requested_outputs = ("knowledge-note",)
         if key == _DOCUMENT_NOTE_V1:
             effective_args = argparse.Namespace(
@@ -910,6 +991,9 @@ def _produce_generic(
             )
             active_runtime = runtime or _default_runtime(
                 workspace_root,
+                runtime_paths=(
+                    config_service.paths if config_service is not None else None
+                ),
                 current_config_snapshot=config_snapshot,
                 recipe_key=key,
                 document_provider_profile=provider_profile,
@@ -971,12 +1055,30 @@ def _produce_generic(
             )
             active_runtime = runtime or _default_runtime(
                 workspace_root,
+                runtime_paths=(
+                    config_service.paths if config_service is not None else None
+                ),
                 current_config_snapshot=effective.job_snapshot(),
             )
 
-    submission = active_runtime.submit(request)
+    if not args.wait:
+        _require_detachable_runtime(active_runtime)
+    submission = (
+        active_runtime.submit(request)
+        if args.wait
+        else active_runtime.submit(
+            request,
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+    )
     snapshot = active_runtime.get_job(submission.job_id)
-    return _wait_for_submitted_job(active_runtime, snapshot, wait=args.wait)
+    return _complete_submitted_job(
+        active_runtime,
+        snapshot,
+        wait=args.wait,
+        engine_client=engine_client,
+        config_service=config_service,
+    )
 
 
 def _produce_video(
@@ -985,6 +1087,7 @@ def _produce_video(
     correlation_id: str,
     *,
     config_service: RuntimeConfigService | None,
+    engine_client: object | None,
 ) -> JobSnapshot:
     effective = _effective_video_config(
         args,
@@ -1003,6 +1106,9 @@ def _produce_video(
     config_snapshot = effective.job_snapshot()
     active_runtime = runtime or _default_runtime(
         workspace_root,
+        runtime_paths=(
+            config_service.paths if config_service is not None else None
+        ),
         current_config_snapshot=config_snapshot,
     )
     output_requested = bool(args.output)
@@ -1060,8 +1166,139 @@ def _produce_video(
         client_request_id=correlation_id,
         config_snapshot=config_snapshot,
     )
-    snapshot = active_runtime.submit_video(request)
-    return _wait_for_submitted_job(active_runtime, snapshot, wait=args.wait)
+    if not args.wait:
+        _require_detachable_runtime(active_runtime)
+    snapshot = (
+        active_runtime.submit_video(request)
+        if args.wait
+        else active_runtime.submit_video(
+            request,
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+    )
+    return _complete_submitted_job(
+        active_runtime,
+        snapshot,
+        wait=args.wait,
+        engine_client=engine_client,
+        config_service=config_service,
+    )
+
+
+def _complete_submitted_job(
+    runtime: _VideoRuntime,
+    snapshot: JobSnapshot,
+    *,
+    wait: bool,
+    engine_client: object | None,
+    config_service: RuntimeConfigService | None,
+) -> JobSnapshot:
+    if not wait:
+        _notify_detached_job(
+            runtime,
+            snapshot,
+            engine_client=engine_client,
+            config_service=config_service,
+        )
+        return snapshot
+    return _wait_for_submitted_job(runtime, snapshot, wait=True)
+
+
+def _notify_detached_job(
+    runtime: _VideoRuntime,
+    snapshot: JobSnapshot,
+    *,
+    engine_client: object | None,
+    config_service: RuntimeConfigService | None,
+) -> None:
+    from app.engine.contracts import EngineJobReference, EngineProtocolError
+
+    instance_id = _require_detachable_runtime(runtime)
+    try:
+        reference = EngineJobReference(instance_id, snapshot.job_id)
+    except EngineProtocolError as error:
+        raise _DetachedJobNotificationError(
+            DomainError(
+                "engine_job_reference_invalid",
+                ErrorCategory.INTERNAL,
+                "Detached Job notification reference is invalid",
+            ),
+            snapshot,
+        ) from error
+    client = engine_client
+    if client is None:
+        from app.engine.client import LocalEngineClient
+        from app.runtime_paths import resolve_runtime_paths
+
+        client = LocalEngineClient(
+            config_service.paths
+            if config_service is not None
+            else resolve_runtime_paths()
+        )
+    notify = getattr(client, "notify_job", None)
+    if not callable(notify):
+        raise _DetachedJobNotificationError(
+            DomainError(
+                "engine_client_invalid",
+                ErrorCategory.INTERNAL,
+                "Engine client does not support Job notification",
+            ),
+            snapshot,
+        )
+    try:
+        notify(reference)
+    except KeyboardInterrupt as error:
+        raise _DetachedJobNotificationError(
+            DomainError(
+                "interrupted",
+                ErrorCategory.CANCELLED,
+                "Command was interrupted after the detached Job was persisted",
+            ),
+            snapshot,
+        ) from error
+    except DomainError as error:
+        raise _DetachedJobNotificationError(error, snapshot) from error
+    except Exception as error:
+        raise _DetachedJobNotificationError(
+            DomainError(
+                "engine_notification_failed",
+                ErrorCategory.INTERNAL,
+                "Engine Job notification failed",
+            ),
+            snapshot,
+        ) from error
+
+
+def _require_detachable_runtime(runtime: _VideoRuntime) -> str:
+    instance_id = getattr(runtime, "workspace_instance_id", None)
+    if (
+        type(instance_id) is not str
+        or len(instance_id) != 32
+        or any(character not in "0123456789abcdef" for character in instance_id)
+    ):
+        raise DomainError(
+            "engine_workspace_instance_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "Detached execution requires a registered Workspace instance",
+        )
+    return instance_id
+
+
+def _map_detached_notification_error(
+    error: _DetachedJobNotificationError,
+) -> MappedCliError:
+    mapped = map_domain_error(error)
+    job_action = (
+        f"Job {error.snapshot.job_id} remains durable; run alltonote engine ensure "
+        f"and then alltonote job wait {error.snapshot.job_id}"
+    )
+    return replace(
+        mapped,
+        error=replace(
+            mapped.error,
+            next_actions=(job_action, *mapped.error.next_actions),
+        ),
+    )
 
 
 def _wait_for_submitted_job(
@@ -1492,9 +1729,7 @@ def _job_runtime_for_args(
         )
     return create_job_runtime_for_workspace(
         workspace_root,
-        local_app_data=(
-            service.paths.workspace_registry_parent if service is not None else None
-        ),
+        runtime_paths=(service.paths if service is not None else None),
         current_config_snapshot=snapshot,
     )
 
@@ -1697,6 +1932,7 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
 def _default_runtime(
     workspace_root: Path,
     *,
+    runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
     recipe_key: RecipeKey | None = None,
     document_provider_profile: object = None,
@@ -1709,6 +1945,7 @@ def _default_runtime(
 
         return create_document_runtime_for_workspace(
             workspace_root,
+            runtime_paths=runtime_paths,
             current_config_snapshot=current_config_snapshot,
             requested_model_identity=(
                 document_model_identity
@@ -1735,6 +1972,7 @@ def _default_runtime(
 
     return create_codex_app_server_runtime_for_workspace(
         workspace_root,
+        runtime_paths=runtime_paths,
         current_config_snapshot=current_config_snapshot,
     )
 

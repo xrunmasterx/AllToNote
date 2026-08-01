@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import Mapping, Protocol
 
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import JobState
+from app.core.jobs.model import JobExecutionOwner, JobState
 
 
 def _error(code: str, message: str) -> DomainError:
@@ -146,7 +146,12 @@ class ProduceSubmission:
 
 
 class RecipeEndpoint(Protocol):
-    def submit(self, request: ProduceRequest) -> ProduceSubmission: ...
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission: ...
 
 
 __all__ = [

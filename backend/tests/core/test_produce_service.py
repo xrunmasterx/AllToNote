@@ -9,7 +9,7 @@ import pytest
 
 from app.core.application.produce_service import ProduceService
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import JobState
+from app.core.jobs.model import JobExecutionOwner, JobState
 from app.core.recipes.contracts import (
     InputDescriptor, ProduceRequest, ProduceSubmission, RecipeDescriptor, RecipeKey,
 )
@@ -20,9 +20,16 @@ class Endpoint:
     def __init__(self, submission: object) -> None:
         self.submission = submission
         self.requests: list[ProduceRequest] = []
+        self.execution_owners: list[JobExecutionOwner] = []
 
-    def submit(self, request: ProduceRequest) -> object:
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner,
+    ) -> object:
         self.requests.append(request)
+        self.execution_owners.append(execution_owner)
         return self.submission
 
 
@@ -90,7 +97,13 @@ def test_submit_propagates_the_exact_endpoint_error() -> None:
     sentinel = DomainError("endpoint_failed", ErrorCategory.RECIPE_FAILED, "Endpoint failed")
 
     class FailingEndpoint:
-        def submit(self, request: ProduceRequest) -> ProduceSubmission:
+        def submit(
+            self,
+            request: ProduceRequest,
+            *,
+            execution_owner: JobExecutionOwner,
+        ) -> ProduceSubmission:
+            del request, execution_owner
             raise sentinel
 
     key = RecipeKey("recipe.a", 1)

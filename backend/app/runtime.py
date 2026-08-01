@@ -127,7 +127,11 @@ from app.core.domain.video import (
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.external_operation import ExternalOperationGuard
-from app.core.jobs.model import CheckpointMetadata, JobExecutionBinding
+from app.core.jobs.model import (
+    CheckpointMetadata,
+    JobExecutionBinding,
+    JobExecutionOwner,
+)
 from app.core.jobs.resource_lease import ResourceLeaseStorePort, ResourceOwner
 from app.core.packs.events import (
     ExecutionPackIdentity,
@@ -1571,15 +1575,35 @@ class AllToNoteRuntime:
         self,
         sdk: AllToNoteSDK,
         job_repository: SqliteJobRepository,
+        *,
+        workspace_instance_id: str | None = None,
     ) -> None:
         self._sdk = sdk
         self.job_repository = job_repository
+        self._workspace_instance_id = workspace_instance_id
 
-    def submit(self, request: ProduceRequest) -> ProduceSubmission:
-        return self._sdk.submit(request)
+    @property
+    def workspace_instance_id(self) -> str | None:
+        return self._workspace_instance_id
 
-    def submit_video(self, request: VideoProduceRequest) -> JobSnapshot:
-        return self._sdk.submit_video(request)
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission:
+        return self._sdk.submit(request, execution_owner=execution_owner)
+
+    def submit_video(
+        self,
+        request: VideoProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> JobSnapshot:
+        return self._sdk.submit_video(
+            request,
+            execution_owner=execution_owner,
+        )
 
     def wait_job(self, job_id: str, event_sink: object | None = None) -> JobSnapshot:
         return self._sdk.wait_job(job_id, event_sink)
@@ -1594,6 +1618,8 @@ class AllToNoteRuntime:
 def _create_video_runtime(
     service: VideoService,
     repository: SqliteJobRepository,
+    *,
+    workspace_instance_id: str | None = None,
 ) -> AllToNoteRuntime:
     endpoint = VideoRecipeAdapter(service)
     registry = RecipeRegistry(
@@ -1627,7 +1653,11 @@ def _create_video_runtime(
         job_control,
         adapt_video_produce_request,
     )
-    return AllToNoteRuntime(sdk, repository)
+    return AllToNoteRuntime(
+        sdk,
+        repository,
+        workspace_instance_id=workspace_instance_id,
+    )
 
 
 def _create_document_runtime(
@@ -1719,6 +1749,7 @@ def _create_platform_video_runtime_components(
     pack_port_resolver: _PackPortResolver | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
+    workspace_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
@@ -1816,7 +1847,14 @@ def _create_platform_video_runtime_components(
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
-    return _create_video_runtime(service, repository), service
+    return (
+        _create_video_runtime(
+            service,
+            repository,
+            workspace_instance_id=workspace_instance_id,
+        ),
+        service,
+    )
 
 
 def create_platform_video_runtime(
@@ -1834,6 +1872,7 @@ def create_platform_video_runtime(
     pack_port_resolver: _PackPortResolver | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
+    workspace_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
@@ -1853,6 +1892,7 @@ def create_platform_video_runtime(
         pack_port_resolver=pack_port_resolver,
         owner_id=owner_id,
         local_instance_id=local_instance_id,
+        workspace_instance_id=workspace_instance_id,
         clock=clock,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
@@ -2336,6 +2376,7 @@ def _create_fake_runtime_components(
     call_log_path: Path | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
+    workspace_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
     screenshot_requests: tuple[ScreenshotRequest, ...] = (),
@@ -2381,7 +2422,14 @@ def _create_fake_runtime_components(
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
-    return _create_video_runtime(service, repository), service
+    return (
+        _create_video_runtime(
+            service,
+            repository,
+            workspace_instance_id=workspace_instance_id,
+        ),
+        service,
+    )
 
 
 def create_fake_runtime(
@@ -2395,6 +2443,7 @@ def create_fake_runtime(
     call_log_path: Path | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
+    workspace_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     operation_hooks: Mapping[str, Callable[[Callable[[], None]], None]] | None = None,
     screenshot_requests: tuple[ScreenshotRequest, ...] = (),
@@ -2412,6 +2461,7 @@ def create_fake_runtime(
         call_log_path=call_log_path,
         owner_id=owner_id,
         local_instance_id=local_instance_id,
+        workspace_instance_id=workspace_instance_id,
         clock=clock,
         operation_hooks=operation_hooks,
         screenshot_requests=screenshot_requests,
@@ -2447,6 +2497,7 @@ def create_fake_runtime_for_workspace(
         instance.machine_root,
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
+        workspace_instance_id=instance.instance_id,
         current_config_snapshot=current_config_snapshot,
         operation_hooks=operation_hooks,
         resource_lease_store=resource_lease_store,
@@ -2663,6 +2714,7 @@ def create_codex_app_server_runtime_for_workspace(
         model_execution_profile="default",
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
+        workspace_instance_id=instance.instance_id,
         current_config_snapshot=current_config_snapshot,
         pack_environment=pack_environment,
         pack_port_resolver=resolve_pack_ports,
