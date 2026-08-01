@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -29,6 +30,7 @@ from app.core.jobs.model import (
 )
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
+    HEAVY_PRODUCTION_RESOURCE_NAMES,
     JobExecutionAuthority,
     ResourceLease,
     ResourceLeaseHandoff,
@@ -48,6 +50,24 @@ WORKER_HEARTBEAT_INTERVAL_SECONDS = 30.0
 WORKER_CANCELLATION_POLL_SECONDS = 0.25
 WORKER_CANCELLATION_GRACE_SECONDS = 5.0
 MAXIMUM_AUTOMATIC_WORKER_LAUNCHES = 3
+DEFAULT_MAXIMUM_ACTIVE_WORKERS = 1
+MAXIMUM_ACTIVE_WORKERS = len(HEAVY_PRODUCTION_RESOURCE_NAMES)
+_SCHEDULER_WAITING_EVENT = "scheduler.waiting.v1"
+_SCHEDULER_ADMITTED_EVENT = "scheduler.admitted.v1"
+_SCHEDULER_WAITING_PAYLOAD = json.dumps(
+    {
+        "schema_version": 1,
+        "reason": "resource_capacity",
+        "resource_class": "produce:heavy",
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
+_SCHEDULER_ADMITTED_PAYLOAD = json.dumps(
+    {"schema_version": 1, "resource_class": "produce:heavy"},
+    sort_keys=True,
+    separators=(",", ":"),
+)
 
 WorkerRunner = Callable[[EngineWorkerLaunchV1, Callable[[], None]], int]
 
@@ -153,12 +173,16 @@ class EngineJobDispatcher:
         *,
         worker_runner: WorkerRunner | None = None,
         maximum_pending_jobs: int = MAXIMUM_PENDING_JOBS,
+        maximum_active_workers: int = DEFAULT_MAXIMUM_ACTIVE_WORKERS,
         reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS,
     ) -> None:
         if (
             type(maximum_pending_jobs) is not int
             or maximum_pending_jobs < 1
             or maximum_pending_jobs > 1_000
+            or type(maximum_active_workers) is not int
+            or not 1 <= maximum_active_workers <= MAXIMUM_ACTIVE_WORKERS
+            or maximum_pending_jobs < maximum_active_workers
             or type(reconcile_interval_seconds) not in {int, float}
             or isinstance(reconcile_interval_seconds, bool)
             or not math.isfinite(float(reconcile_interval_seconds))
@@ -168,11 +192,14 @@ class EngineJobDispatcher:
         self._paths = paths
         self._worker_runner = worker_runner or self._run_worker
         self._maximum_pending_jobs = maximum_pending_jobs
+        self._maximum_active_workers = maximum_active_workers
         self._reconcile_interval = float(reconcile_interval_seconds)
         self._condition = threading.Condition()
         self._pending: deque[EngineJobReference] = deque()
         self._known: set[EngineJobReference] = set()
-        self._active: EngineJobReference | None = None
+        self._active: set[EngineJobReference] = set()
+        self._worker_threads: set[threading.Thread] = set()
+        self._reconcile_requested = False
         self._reconciling = False
         self._reconcile_failed = False
         self._scan_cursors: dict[str, tuple[str, str] | None] = {}
@@ -256,7 +283,7 @@ class EngineJobDispatcher:
             return bool(
                 self._draining
                 and not self._pending
-                and self._active is None
+                and not self._active
                 and not self._reconciling
             )
 
@@ -419,69 +446,178 @@ class EngineJobDispatcher:
 
     def _run(self) -> None:
         next_reconcile = 0.0
-        while not self._stop.is_set():
-            now = time.monotonic()
-            if now >= next_reconcile:
+        try:
+            while not self._stop.is_set():
+                with self._condition:
+                    if self._reconcile_requested:
+                        next_reconcile = 0.0
+                        self._reconcile_requested = False
+                now = time.monotonic()
+                if now >= next_reconcile:
+                    try:
+                        self.reconcile()
+                    except (DomainError, OSError, ValueError):
+                        pass
+                    next_reconcile = time.monotonic() + self._reconcile_interval
+                reference = self._next_reference(next_reconcile)
+                if reference is None:
+                    continue
+                admission: _WorkerAdmission | None = None
                 try:
-                    self.reconcile()
-                except (DomainError, OSError, ValueError):
-                    pass
-                next_reconcile = time.monotonic() + self._reconcile_interval
-            reference = self._next_reference(next_reconcile)
-            if reference is None:
-                continue
-            exit_code: int | None = None
-            launch_count: int | None = None
-            admission: _WorkerAdmission | None = None
-            controlled_stop = False
+                    admission = self._admit_worker(reference)
+                    if admission is None:
+                        self._finish_reference(reference, reconcile=True)
+                        continue
+                    self._record_resource_admitted(
+                        admission.repository,
+                        reference.job_id,
+                    )
+                    self._start_worker(reference, admission)
+                except DomainError as error:
+                    if error.code == "resource_busy":
+                        try:
+                            self._record_resource_waiting(reference)
+                        except (DomainError, OSError, RuntimeError, ValueError):
+                            pass
+                    if admission is not None:
+                        admission.release()
+                    self._finish_reference(reference)
+                except Exception:
+                    if admission is not None:
+                        admission.release()
+                    self._finish_reference(reference)
+        finally:
+            self._join_worker_threads()
+
+    def _start_worker(
+        self,
+        reference: EngineJobReference,
+        admission: _WorkerAdmission,
+    ) -> None:
+        worker = threading.Thread(
+            target=self._supervise_worker,
+            args=(reference, admission),
+            name=f"alltonote-engine-worker-{reference.job_id}",
+            daemon=False,
+        )
+        with self._condition:
+            self._worker_threads.add(worker)
+        try:
+            worker.start()
+        except BaseException:
+            with self._condition:
+                self._worker_threads.discard(worker)
+            raise
+
+    def _supervise_worker(
+        self,
+        reference: EngineJobReference,
+        admission: _WorkerAdmission,
+    ) -> None:
+        exit_code: int | None = None
+        launch_count: int | None = None
+        controlled_stop = False
+        try:
+            launch_count = admission.repository.record_engine_worker_launch(
+                reference.job_id,
+                admission.launch.job_authority,
+            )
+            exit_code = self._worker_runner(
+                admission.launch,
+                lambda: admission.check_running(self._check_running),
+            )
+        except (_DispatcherStopping, _WorkerCancellationRequested):
+            controlled_stop = True
+        except Exception:
+            pass
+        finally:
             try:
-                admission = self._admit_worker(reference)
-                if admission is None:
-                    exit_code = 0
-                else:
-                    launch_count = (
-                        admission.repository.record_engine_worker_launch(
+                try:
+                    admission.settle_cancellation()
+                    job = admission.repository.get_job(reference.job_id)
+                    if job.state not in {JobState.QUEUED, JobState.RUNNING}:
+                        admission.repository.clear_engine_worker_launches(
                             reference.job_id,
                             admission.launch.job_authority,
                         )
-                    )
-                    exit_code = self._worker_runner(
-                        admission.launch,
-                        lambda: admission.check_running(self._check_running),
-                    )
-            except (_DispatcherStopping, _WorkerCancellationRequested):
-                controlled_stop = True
-            except Exception:
-                pass
+                    elif (
+                        not controlled_stop
+                        and launch_count is not None
+                        and launch_count >= MAXIMUM_AUTOMATIC_WORKER_LAUNCHES
+                    ):
+                        self._settle_worker_exhaustion(
+                            admission,
+                            launch_count,
+                        )
+                except Exception:
+                    with self._condition:
+                        self._reconcile_failed = True
             finally:
-                if admission is not None:
-                    admission.settle_cancellation()
-                    try:
-                        job = admission.repository.get_job(reference.job_id)
-                        if job.state not in {JobState.QUEUED, JobState.RUNNING}:
-                            admission.repository.clear_engine_worker_launches(
-                                reference.job_id,
-                                admission.launch.job_authority,
-                            )
-                        elif (
-                            not controlled_stop
-                            and launch_count is not None
-                            and launch_count >= MAXIMUM_AUTOMATIC_WORKER_LAUNCHES
-                        ):
-                            self._settle_worker_exhaustion(
-                                admission,
-                                launch_count,
-                            )
-                    except (DomainError, OSError, RuntimeError, ValueError):
-                        with self._condition:
-                            self._reconcile_failed = True
-                    admission.release()
+                admission.release()
+                self._finish_reference(reference, reconcile=exit_code == 0)
                 with self._condition:
-                    self._active = None
-                    self._known.discard(reference)
+                    self._worker_threads.discard(threading.current_thread())
                     self._condition.notify_all()
-            if exit_code == 0:
-                next_reconcile = 0.0
+
+    def _finish_reference(
+        self,
+        reference: EngineJobReference,
+        *,
+        reconcile: bool = False,
+    ) -> None:
+        with self._condition:
+            self._active.discard(reference)
+            self._known.discard(reference)
+            if reconcile:
+                self._reconcile_requested = True
+            self._condition.notify_all()
+
+    def _join_worker_threads(self) -> None:
+        while True:
+            with self._condition:
+                workers = tuple(self._worker_threads)
+            if not workers:
+                return
+            for worker in workers:
+                worker.join()
+                with self._condition:
+                    if not worker.is_alive():
+                        self._worker_threads.discard(worker)
+
+    @staticmethod
+    def _latest_scheduler_event(repository, job_id: str) -> str | None:
+        for event in reversed(repository.list_events(job_id)):
+            if event.event_type in {
+                _SCHEDULER_WAITING_EVENT,
+                _SCHEDULER_ADMITTED_EVENT,
+            }:
+                return event.event_type
+        return None
+
+    def _record_resource_waiting(self, reference: EngineJobReference) -> None:
+        _instance, repository = self._resolve_repository(reference)
+        if (
+            self._latest_scheduler_event(repository, reference.job_id)
+            == _SCHEDULER_WAITING_EVENT
+        ):
+            return
+        repository.append_event(
+            reference.job_id,
+            _SCHEDULER_WAITING_EVENT,
+            _SCHEDULER_WAITING_PAYLOAD,
+        )
+
+    def _record_resource_admitted(self, repository, job_id: str) -> None:
+        if (
+            self._latest_scheduler_event(repository, job_id)
+            != _SCHEDULER_WAITING_EVENT
+        ):
+            return
+        repository.append_event(
+            job_id,
+            _SCHEDULER_ADMITTED_EVENT,
+            _SCHEDULER_ADMITTED_PAYLOAD,
+        )
 
     def _settle_worker_exhaustion(
         self,
@@ -589,15 +725,33 @@ class EngineJobDispatcher:
         resource_store = MachineResourceLeaseStore.open(
             self._paths.data_dir / "machine"
         )
-        source_lease = resource_store.acquire(
-            HEAVY_PRODUCTION_RESOURCE_NAME,
-            ResourceOwner(
-                instance.workspace_identity,
-                f"engine-supervisor-{uuid4().hex}",
-                process_id=os.getpid(),
-            ),
-            ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+        resource_owner = ResourceOwner(
+            instance.workspace_identity,
+            f"engine-supervisor-{uuid4().hex}",
+            process_id=os.getpid(),
         )
+        last_busy: DomainError | None = None
+        source_lease: ResourceLease | None = None
+        resource_names = (
+            (HEAVY_PRODUCTION_RESOURCE_NAME,)
+            if self._maximum_active_workers == 1
+            else HEAVY_PRODUCTION_RESOURCE_NAMES
+        )
+        for resource_name in resource_names:
+            try:
+                source_lease = resource_store.acquire(
+                    resource_name,
+                    resource_owner,
+                    ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+                )
+                break
+            except DomainError as error:
+                if error.code != "resource_busy":
+                    raise
+                last_busy = error
+        if source_lease is None:
+            assert last_busy is not None
+            raise last_busy
         handoff: ResourceLeaseHandoff | None = None
         authority: JobExecutionAuthority | None = None
         try:
@@ -645,17 +799,43 @@ class EngineJobDispatcher:
             raise
 
     def _next_reference(self, next_reconcile: float) -> EngineJobReference | None:
-        with self._condition:
-            while not self._stop.is_set() and not self._pending:
+        while not self._stop.is_set():
+            waiting_reference: EngineJobReference | None = None
+            with self._condition:
+                if self._reconcile_requested:
+                    return None
+                if (
+                    self._pending
+                    and len(self._active) < self._maximum_active_workers
+                ):
+                    reference = self._pending.popleft()
+                    self._active.add(reference)
+                    return reference
+                if self._pending:
+                    waiting_reference = self._pending[0]
+                remaining = max(0.0, next_reconcile - time.monotonic())
+                if remaining == 0:
+                    return None
+                if waiting_reference is None:
+                    self._condition.wait(timeout=remaining)
+                    continue
+            try:
+                self._record_resource_waiting(waiting_reference)
+            except (DomainError, OSError, RuntimeError, ValueError):
+                pass
+            with self._condition:
+                if (
+                    self._stop.is_set()
+                    or self._reconcile_requested
+                    or not self._pending
+                    or len(self._active) < self._maximum_active_workers
+                ):
+                    continue
                 remaining = max(0.0, next_reconcile - time.monotonic())
                 if remaining == 0:
                     return None
                 self._condition.wait(timeout=remaining)
-            if self._stop.is_set() or not self._pending:
-                return None
-            reference = self._pending.popleft()
-            self._active = reference
-            return reference
+        return None
 
     def _check_running(self) -> None:
         if self._stop.is_set():
@@ -699,8 +879,10 @@ class EngineJobDispatcher:
 
 
 __all__ = [
+    "DEFAULT_MAXIMUM_ACTIVE_WORKERS",
     "DEFAULT_RECONCILE_INTERVAL_SECONDS",
     "EngineJobDispatchReceipt",
     "EngineJobDispatcher",
     "MAXIMUM_PENDING_JOBS",
+    "MAXIMUM_ACTIVE_WORKERS",
 ]

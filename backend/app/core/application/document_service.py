@@ -57,6 +57,7 @@ from app.core.jobs.resource_lease import (
     ResourceLease,
     ResourceLeaseStorePort,
     ResourceOwner,
+    is_heavy_production_resource_name,
 )
 from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 from app.core.portable.document_bundle_assembler import DocumentBundleAssembler
@@ -297,8 +298,9 @@ class DocumentService:
         ):
             raise ValueError("resource_admission_owner_mismatch")
         if adopted_resource_lease is not None and (
-            adopted_resource_lease.resource_name
-            != HEAVY_PRODUCTION_RESOURCE_NAME
+            not is_heavy_production_resource_name(
+                adopted_resource_lease.resource_name
+            )
             or owner_id != adopted_resource_lease.owner.process_instance_id
             or expected_job_authority is None
             or owner_id != expected_job_authority.owner_id

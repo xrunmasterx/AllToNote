@@ -13,6 +13,11 @@ from app.core.jobs.model import Attempt, Job, JobExecutionBinding
 MIN_LEASE_TTL_SECONDS = 1
 MAX_LEASE_TTL_SECONDS = 300
 HEAVY_PRODUCTION_RESOURCE_NAME = "produce:heavy:v1"
+SECONDARY_HEAVY_PRODUCTION_RESOURCE_NAME = "produce:heavy:slot-2:v1"
+HEAVY_PRODUCTION_RESOURCE_NAMES = (
+    HEAVY_PRODUCTION_RESOURCE_NAME,
+    SECONDARY_HEAVY_PRODUCTION_RESOURCE_NAME,
+)
 _HANDOFF_NONCE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
@@ -26,6 +31,10 @@ def validate_lease_ttl(ttl_seconds: int) -> None:
             ErrorCategory.INVALID_REQUEST,
             "Resource lease TTL is outside the supported bounds",
         )
+
+
+def is_heavy_production_resource_name(resource_name: object) -> bool:
+    return resource_name in HEAVY_PRODUCTION_RESOURCE_NAMES
 
 
 @dataclass(frozen=True)
@@ -184,6 +193,7 @@ class ResourceLeaseStorePort(Protocol):
 __all__ = [
     "ExecutionAuthority",
     "HEAVY_PRODUCTION_RESOURCE_NAME",
+    "HEAVY_PRODUCTION_RESOURCE_NAMES",
     "JobExecutionAuthority",
     "MAX_LEASE_TTL_SECONDS",
     "MIN_LEASE_TTL_SECONDS",
@@ -192,5 +202,7 @@ __all__ = [
     "ResourceLeaseHandoff",
     "ResourceLeaseStorePort",
     "ResourceOwner",
+    "SECONDARY_HEAVY_PRODUCTION_RESOURCE_NAME",
+    "is_heavy_production_resource_name",
     "validate_lease_ttl",
 ]

@@ -20,6 +20,7 @@ from app.core.jobs.model import (
 )
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
+    HEAVY_PRODUCTION_RESOURCE_NAMES,
     JobExecutionAuthority,
     ResourceOwner,
 )
@@ -36,6 +37,37 @@ _BINDING = JobExecutionBinding(
     pack_id="document-basic",
     pack_version="docling-2.117.0-tableformer-v2.3.0",
 )
+_VIDEO_BINDING = JobExecutionBinding(
+    recipe_id="alltonote.legacy",
+    recipe_version=1,
+    executor_id="alltonote.video",
+    executor_version=1,
+    pack_id="media-basic",
+    pack_version="legacy-v1",
+)
+
+
+@pytest.mark.parametrize("capacity", (0, 3, True))
+def test_dispatcher_rejects_unsupported_active_worker_capacity(
+    tmp_path: Path,
+    capacity: object,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local data")
+
+    with pytest.raises(ValueError, match="engine_dispatcher_configuration_invalid"):
+        EngineJobDispatcher(paths, maximum_active_workers=capacity)  # type: ignore[arg-type]
+
+
+
+def test_dispatcher_capacity_must_fit_the_bounded_wake_queue(tmp_path: Path) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local data")
+
+    with pytest.raises(ValueError, match="engine_dispatcher_configuration_invalid"):
+        EngineJobDispatcher(
+            paths,
+            maximum_pending_jobs=1,
+            maximum_active_workers=2,
+        )
 
 
 def test_default_worker_command_preserves_all_runtime_roots(
@@ -142,27 +174,425 @@ def test_dispatcher_resource_busy_starts_no_worker_and_keeps_job_durable(
         client_request_id="resource-busy",
     )
     store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
-    competing = store.acquire(
-        HEAVY_PRODUCTION_RESOURCE_NAME,
-        ResourceOwner("another-workspace", "another-runtime"),
-        ttl_seconds=30,
+    competing = tuple(
+        store.acquire(
+            resource_name,
+            ResourceOwner("another-workspace", f"another-runtime-{index}"),
+            ttl_seconds=30,
+        )
+        for index, resource_name in enumerate(HEAVY_PRODUCTION_RESOURCE_NAMES)
     )
     called = threading.Event()
     dispatcher = EngineJobDispatcher(
         paths,
         worker_runner=lambda _launch, _check: called.set() or 0,
+        maximum_active_workers=2,
         reconcile_interval_seconds=60,
     )
     try:
         dispatcher.start()
         dispatcher.notify(reference)
-        threading.Event().wait(0.2)
+        for _index in range(500):
+            if any(
+                event.event_type == "scheduler.waiting.v1"
+                for event in repository.list_events(job.job_id)
+            ):
+                break
+            threading.Event().wait(0.01)
     finally:
         dispatcher.close(force=True)
-        competing.release()
+        for lease in competing:
+            lease.release()
 
     assert called.is_set() is False
     assert repository.get_job(job.job_id).state is JobState.QUEUED
+    waiting = tuple(
+        event
+        for event in repository.list_events(job.job_id)
+        if event.event_type == "scheduler.waiting.v1"
+    )
+    assert len(waiting) == 1
+    assert waiting[0].payload_json == (
+        '{"reason":"resource_capacity","resource_class":"produce:heavy",'
+        '"schema_version":1}'
+    )
+    resumed = threading.Event()
+
+    def run_resumed(launch: EngineWorkerLaunchV1, _check_running) -> int:
+        repository.cancel_job(launch.reference.job_id)
+        resumed.set()
+        return 0
+
+    replacement = EngineJobDispatcher(
+        paths,
+        worker_runner=run_resumed,
+        maximum_active_workers=2,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        replacement.start()
+        replacement.notify(reference)
+        assert resumed.wait(timeout=5)
+    finally:
+        replacement.close(force=True)
+
+    scheduler_events = tuple(
+        event.event_type
+        for event in repository.list_events(job.job_id)
+        if event.event_type.startswith("scheduler.")
+    )
+    assert scheduler_events == (
+        "scheduler.waiting.v1",
+        "scheduler.admitted.v1",
+    )
+
+
+@pytest.mark.parametrize(
+    "second_binding",
+    (_BINDING, _VIDEO_BINDING),
+    ids=("two-documents", "document-and-video"),
+)
+def test_dispatcher_capacity_two_runs_two_workers_and_bounds_the_third(
+    tmp_path: Path,
+    second_binding: JobExecutionBinding,
+) -> None:
+    paths, repository, first, first_reference = _registered_job(
+        tmp_path,
+        client_request_id="capacity-two-first",
+    )
+    second = repository.create_job(
+        request_hash="sha256:" + "b" * 64,
+        principal="local-user",
+        client_request_id="capacity-two-second",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=second_binding,
+    )
+    third = repository.create_job(
+        request_hash="sha256:" + "c" * 64,
+        principal="local-user",
+        client_request_id="capacity-two-third",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=_BINDING,
+    )
+    references = (
+        first_reference,
+        EngineJobReference(first_reference.workspace_instance_id, second.job_id),
+        EngineJobReference(first_reference.workspace_instance_id, third.job_id),
+    )
+    started: list[str] = []
+    started_resources: list[str] = []
+    started_lock = threading.Lock()
+    two_started = threading.Event()
+    release_one = threading.Event()
+    release_all = threading.Event()
+
+    def run_worker(launch: EngineWorkerLaunchV1, check_running) -> int:
+        with started_lock:
+            started.append(launch.reference.job_id)
+            started_resources.append(launch.resource_handoff.resource_name)
+            position = len(started)
+            if position == 2:
+                two_started.set()
+        if position <= 2:
+            assert release_one.wait(timeout=5)
+        else:
+            assert release_all.wait(timeout=5)
+        check_running()
+        repository.cancel_job(launch.reference.job_id)
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        maximum_active_workers=2,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        for reference in references:
+            dispatcher.notify(reference)
+        dispatcher.start()
+        assert two_started.wait(timeout=5)
+        with started_lock:
+            assert len(started) == 2
+            assert set(started_resources) == set(HEAVY_PRODUCTION_RESOURCE_NAMES)
+        for _index in range(500):
+            if any(
+                event.event_type == "scheduler.waiting.v1"
+                for event in repository.list_events(third.job_id)
+            ):
+                break
+            threading.Event().wait(0.01)
+        assert repository.get_engine_worker_launch_count(third.job_id) == 0
+        assert tuple(
+            event.event_type
+            for event in repository.list_events(third.job_id)
+            if event.event_type.startswith("scheduler.")
+        ) == ("scheduler.waiting.v1",)
+        release_one.set()
+        for _index in range(500):
+            with started_lock:
+                if len(started) == 3:
+                    break
+            threading.Event().wait(0.01)
+        with started_lock:
+            assert len(started) == 3
+        release_all.set()
+        for _index in range(500):
+            if not dispatcher.has_work:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        release_one.set()
+        release_all.set()
+        dispatcher.close(force=True)
+
+    assert dispatcher.has_work is False
+    assert tuple(
+        event.event_type
+        for event in repository.list_events(third.job_id)
+        if event.event_type.startswith("scheduler.")
+    ) == ("scheduler.waiting.v1", "scheduler.admitted.v1")
+    assert {
+        repository.get_job(first.job_id).state,
+        repository.get_job(second.job_id).state,
+        repository.get_job(third.job_id).state,
+    } == {JobState.CANCELLED}
+
+
+def test_legacy_heavy_holder_consumes_one_capacity_two_slot(tmp_path: Path) -> None:
+    paths, repository, _first, first_reference = _registered_job(
+        tmp_path,
+        client_request_id="legacy-holder-first",
+    )
+    second = repository.create_job(
+        request_hash="sha256:" + "f" * 64,
+        principal="local-user",
+        client_request_id="legacy-holder-second",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=_VIDEO_BINDING,
+    )
+    second_reference = EngineJobReference(
+        first_reference.workspace_instance_id,
+        second.job_id,
+    )
+    store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+    legacy_holder = store.acquire(
+        HEAVY_PRODUCTION_RESOURCE_NAME,
+        ResourceOwner("foreground-workspace", "foreground-runtime"),
+        ttl_seconds=30,
+    )
+    started: list[EngineWorkerLaunchV1] = []
+    started_event = threading.Event()
+    release = threading.Event()
+
+    def run_worker(launch: EngineWorkerLaunchV1, check_running) -> int:
+        started.append(launch)
+        started_event.set()
+        assert release.wait(timeout=5)
+        check_running()
+        repository.cancel_job(launch.reference.job_id)
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        maximum_active_workers=2,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        dispatcher.notify(first_reference)
+        dispatcher.notify(second_reference)
+        dispatcher.start()
+        assert started_event.wait(timeout=5)
+        for _index in range(500):
+            waiting_count = sum(
+                event.event_type == "scheduler.waiting.v1"
+                for event in repository.list_events(second.job_id)
+            )
+            if waiting_count == 1:
+                break
+            threading.Event().wait(0.01)
+        assert len(started) == 1
+        assert (
+            started[0].resource_handoff.resource_name
+            == HEAVY_PRODUCTION_RESOURCE_NAMES[1]
+        )
+        assert waiting_count == 1
+        dispatcher.begin_graceful_shutdown()
+        release.set()
+        for _index in range(500):
+            if dispatcher.ready_to_close:
+                break
+            threading.Event().wait(0.01)
+        assert dispatcher.ready_to_close is True
+        dispatcher.close()
+    finally:
+        release.set()
+        legacy_holder.release()
+        if not dispatcher.ready_to_close:
+            dispatcher.close(force=True)
+
+
+def test_one_parallel_worker_failure_does_not_stop_its_peer(
+    tmp_path: Path,
+) -> None:
+    paths, repository, failed, failed_reference = _registered_job(
+        tmp_path,
+        client_request_id="parallel-worker-failure",
+    )
+    healthy = repository.create_job(
+        request_hash="sha256:" + "d" * 64,
+        principal="local-user",
+        client_request_id="parallel-worker-healthy",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=_VIDEO_BINDING,
+    )
+    healthy_reference = EngineJobReference(
+        failed_reference.workspace_instance_id,
+        healthy.job_id,
+    )
+    healthy_started = threading.Event()
+    release_healthy = threading.Event()
+
+    def run_worker(launch: EngineWorkerLaunchV1, check_running) -> int:
+        if launch.reference == failed_reference:
+            raise OSError("isolated worker failure")
+        healthy_started.set()
+        assert release_healthy.wait(timeout=5)
+        check_running()
+        repository.cancel_job(healthy.job_id)
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        maximum_active_workers=2,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        dispatcher.notify(failed_reference)
+        dispatcher.notify(healthy_reference)
+        dispatcher.start()
+        assert healthy_started.wait(timeout=5)
+        assert dispatcher.has_work is True
+        release_healthy.set()
+        for _index in range(500):
+            if repository.get_job(healthy.job_id).state is JobState.CANCELLED:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        release_healthy.set()
+        dispatcher.close(force=True)
+
+    assert repository.get_job(failed.job_id).state in {
+        JobState.QUEUED,
+        JobState.RUNNING,
+    }
+    assert repository.get_job(healthy.job_id).state is JobState.CANCELLED
+
+
+def test_cleanup_exception_releases_slot_and_does_not_stop_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, failed, failed_reference = _registered_job(
+        tmp_path,
+        client_request_id="cleanup-exception-first",
+    )
+    peer = repository.create_job(
+        request_hash="sha256:" + "1" * 64,
+        principal="local-user",
+        client_request_id="cleanup-exception-peer",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=_VIDEO_BINDING,
+    )
+    replacement = repository.create_job(
+        request_hash="sha256:" + "2" * 64,
+        principal="local-user",
+        client_request_id="cleanup-exception-replacement",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=_BINDING,
+    )
+    peer_reference = EngineJobReference(
+        failed_reference.workspace_instance_id,
+        peer.job_id,
+    )
+    replacement_reference = EngineJobReference(
+        failed_reference.workspace_instance_id,
+        replacement.job_id,
+    )
+    original_settle = job_dispatcher_module._WorkerAdmission.settle_cancellation
+
+    def settle_with_failure(admission) -> None:
+        if admission.launch.reference == failed_reference:
+            raise TypeError("injected cleanup failure")
+        original_settle(admission)
+
+    monkeypatch.setattr(
+        job_dispatcher_module._WorkerAdmission,
+        "settle_cancellation",
+        settle_with_failure,
+    )
+    peer_started = threading.Event()
+    release_peer = threading.Event()
+    replacement_started = threading.Event()
+
+    def run_worker(launch: EngineWorkerLaunchV1, check_running) -> int:
+        if launch.reference == failed_reference:
+            return 0
+        if launch.reference == peer_reference:
+            peer_started.set()
+            assert release_peer.wait(timeout=5)
+            check_running()
+            repository.cancel_job(peer.job_id)
+            return 0
+        replacement_started.set()
+        repository.cancel_job(replacement.job_id)
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        maximum_active_workers=2,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        for reference in (
+            failed_reference,
+            peer_reference,
+            replacement_reference,
+        ):
+            dispatcher.notify(reference)
+        dispatcher.start()
+        assert peer_started.wait(timeout=5)
+        assert replacement_started.wait(timeout=5)
+        recovered_claim = repository.claim_job(
+            failed.job_id,
+            "cleanup-recovery-check",
+            ttl_seconds=30,
+        )
+        repository.release_job_claim(recovered_claim.authority)
+        assert repository.get_job(peer.job_id).state is JobState.RUNNING
+        release_peer.set()
+        for _index in range(500):
+            if repository.get_job(peer.job_id).state is JobState.CANCELLED:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        release_peer.set()
+        dispatcher.close(force=True)
+
+    store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+    reacquired = tuple(
+        store.acquire(
+            resource_name,
+            ResourceOwner("cleanup-check", f"cleanup-check-{index}"),
+            ttl_seconds=30,
+        )
+        for index, resource_name in enumerate(HEAVY_PRODUCTION_RESOURCE_NAMES)
+    )
+    for lease in reacquired:
+        lease.release()
 
 
 def test_dispatcher_spawn_failure_releases_both_preclaims(
@@ -925,4 +1355,68 @@ def test_graceful_shutdown_waits_for_active_worker_without_killing_it(
     finally:
         if not dispatcher.ready_to_close:
             release.set()
+            dispatcher.close(force=True)
+
+
+def test_graceful_shutdown_waits_for_both_parallel_workers(
+    tmp_path: Path,
+) -> None:
+    paths, repository, first, first_reference = _registered_job(
+        tmp_path,
+        client_request_id="graceful-parallel-first",
+    )
+    second = repository.create_job(
+        request_hash="sha256:" + "e" * 64,
+        principal="local-user",
+        client_request_id="graceful-parallel-second",
+        execution_owner=JobExecutionOwner.ENGINE,
+        execution_binding=_VIDEO_BINDING,
+    )
+    second_reference = EngineJobReference(
+        first_reference.workspace_instance_id,
+        second.job_id,
+    )
+    started = threading.Barrier(3)
+    releases = {
+        first.job_id: threading.Event(),
+        second.job_id: threading.Event(),
+    }
+
+    def run_worker(launch: EngineWorkerLaunchV1, check_running) -> int:
+        started.wait(timeout=5)
+        assert releases[launch.reference.job_id].wait(timeout=5)
+        check_running()
+        repository.cancel_job(launch.reference.job_id)
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        maximum_active_workers=2,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        dispatcher.notify(first_reference)
+        dispatcher.notify(second_reference)
+        dispatcher.start()
+        started.wait(timeout=5)
+        dispatcher.begin_graceful_shutdown()
+        assert dispatcher.ready_to_close is False
+        releases[first.job_id].set()
+        for _index in range(500):
+            if repository.get_job(first.job_id).state is JobState.CANCELLED:
+                break
+            threading.Event().wait(0.01)
+        assert dispatcher.ready_to_close is False
+        releases[second.job_id].set()
+        for _index in range(500):
+            if dispatcher.ready_to_close:
+                break
+            threading.Event().wait(0.01)
+        assert dispatcher.ready_to_close is True
+        dispatcher.close()
+    finally:
+        for release in releases.values():
+            release.set()
+        if not dispatcher.ready_to_close:
             dispatcher.close(force=True)

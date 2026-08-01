@@ -209,6 +209,14 @@ Workspace portable publish 前置闭环（2026-08-02）：
 - Worker 永久失败恢复与 dispatcher 取消收敛在重新 claim 得到不同 generation 时，都会释放该 replacement claim，避免被 fencing 的恢复路径泄漏 300 秒 Job authority；
 - Video/Document publish 边界、资源释放、异常释放、publish 争用不终态化和两条 replacement-claim RED 回归均已覆盖；完整后端回归为 `2630 passed, 3 skipped, 3 subtests passed`，独立最终 Gate `task_f9aa97be8d60` 为 P0/P1=0。本增量仍保持单 active Worker 和全局 `produce:heavy:v1`，资源等待事件、capacity > 1 监督与 CLI/Desktop 排队可观测仍属于后续 Task 5/6。
 
+Capacity-2 内部正确性 Gate（2026-08-02）：
+
+- dispatcher 已把 scalar active Worker 改为有界集合；显式 `maximum_active_workers=2` 时由两个独立 supervisor thread 管理既有独立 Worker process，第三个 Job 在容量释放前不会启动，单 Worker runner 异常不会停止同伴，graceful shutdown 等待全部活动 Worker；
+- 首个资源模型保留 legacy `produce:heavy:v1` 作为 slot 1，只增加固定的 `produce:heavy:slot-2:v1`；显式容量 2 按固定顺序申请两个槽，约束 machine-wide `active_total <= 2`，同时保证 legacy/foreground holder 与新 Engine 不会形成三个互不相交的重任务。Worker handoff、精确 Job authority、Video/Document adopted-resource 校验与 stale-safe release 保持原合同，没有引入 Recipe 资源策略、资源 DSL、slot registry、DAG 或第二套 scheduler state；
+- `scheduler.waiting.v1` / `scheduler.admitted.v1` 通过既有 Job event stream 提供不含路径的资源等待原因；资源不足保持 Job 可恢复且不写 failure，Engine 重启后 waiting 事件去重并可在后续准入时闭合；
+- focused Video/Document/Engine 集成回归为 `159 passed`，完整 Engine 为 `116 passed, 1 skipped`，dispatcher 单文件为 `35 passed`，完整 Backend 为 `2640 passed, 3 skipped, 3 warnings, 3 subtests passed`；独立最终 Gate `task_627221a16480` 为 P0/P1=0；验收见 [`Engine capacity-2 internal Gate`](../../../acceptance/2026-08-02-engine-capacity2-internal-gate.md)。
+- 该能力仍为显式内部开关，默认容量保持 1，`parallel_job_execution_enabled=false` 不变。真实双 Docling/FFmpeg 的内存与吞吐、双进程故障矩阵、Windows portable/clean-machine Gate 未通过前，不对用户启用 capacity 2，因此 Task 5/6 仍未完成。
+
 ## Task 6: [ ] 加入最小资源准入与 workspace publish 控制
 
 - 风险：高
@@ -237,8 +245,8 @@ Workspace portable publish 前置闭环（2026-08-02）：
 - [ ] Job 内 fan-out 继承预算，避免 Job 数乘以内部并发形成无界爆炸；
 - [x] 长计算不持有 workspace.publish；
 - [x] 最终 source/portable commit 保持原子；
-- [ ] 资源不足不会被写成 Job failure；
-- [ ] 无通用资源 DSL、优化求解器或 DAG。
+- [x] 资源不足不会被写成 Job failure；
+- [x] 无通用资源 DSL、优化求解器或 DAG。
 
 Stop condition：
 

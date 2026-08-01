@@ -41,7 +41,10 @@ from app.core.application.video_service import (
 from app.core.application.video_checkpoints import decode_draft, encode_draft
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.resource_lease import ResourceOwner
+from app.core.jobs.resource_lease import (
+    HEAVY_PRODUCTION_RESOURCE_NAMES,
+    ResourceOwner,
+)
 from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 
 
@@ -2205,7 +2208,9 @@ def test_video_worker_consumes_adopted_resource_and_exact_job_authority(
     store = MachineResourceLeaseStore.open(tmp_path / "video-adopted-resource")
     supervisor = ResourceOwner("workspace-a", "engine-supervisor", process_id=101)
     worker = ResourceOwner("workspace-a", "engine-worker", process_id=202)
-    source_lease = store.acquire("produce:heavy:v1", supervisor, ttl_seconds=300)
+    source_lease = store.acquire(
+        HEAVY_PRODUCTION_RESOURCE_NAMES[0], supervisor, ttl_seconds=300
+    )
     adopted = store.adopt(
         store.handoff(source_lease, worker, ttl_seconds=300),
         ttl_seconds=300,
@@ -2227,7 +2232,7 @@ def test_video_worker_consumes_adopted_resource_and_exact_job_authority(
     assert worker_runtime.wait_job(submitted.job_id).state is JobState.SUCCEEDED
     assert calls.download == calls.transcribe == calls.model == calls.commit == 1
     next_lease = store.acquire(
-        "produce:heavy:v1",
+        HEAVY_PRODUCTION_RESOURCE_NAMES[0],
         ResourceOwner("workspace-b", "other-worker", process_id=303),
         ttl_seconds=300,
     )

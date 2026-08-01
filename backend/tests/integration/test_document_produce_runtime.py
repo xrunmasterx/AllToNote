@@ -69,6 +69,7 @@ from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState, JobExecutionOwner, JobState
 from app.core.jobs.resource_lease import (
+    HEAVY_PRODUCTION_RESOURCE_NAMES,
     JobExecutionAuthority,
     ResourceLease,
     ResourceOwner,
@@ -2369,7 +2370,9 @@ def test_document_worker_consumes_adopted_resource_and_exact_job_authority(
     store = MachineResourceLeaseStore.open(tmp_path / "document-adopted-resource")
     supervisor = ResourceOwner("document-workspace", "engine-supervisor", 101)
     worker = ResourceOwner("document-workspace", "engine-worker", 202)
-    source_lease = store.acquire("produce:heavy:v1", supervisor, ttl_seconds=300)
+    source_lease = store.acquire(
+        HEAVY_PRODUCTION_RESOURCE_NAMES[1], supervisor, ttl_seconds=300
+    )
     handoff = store.handoff(source_lease, worker, ttl_seconds=300)
     adopted = store.adopt(handoff, ttl_seconds=300)
     authority = repository.claim_job(
@@ -2392,7 +2395,7 @@ def test_document_worker_consumes_adopted_resource_and_exact_job_authority(
     assert router.wait_job(job_id).state is JobState.SUCCEEDED
     assert parser.calls == 1
     next_lease = store.acquire(
-        "produce:heavy:v1",
+        HEAVY_PRODUCTION_RESOURCE_NAMES[1],
         ResourceOwner("other-workspace", "other-worker", 303),
         ttl_seconds=300,
     )

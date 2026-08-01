@@ -20,6 +20,7 @@ from app.core.jobs.model import (
 )
 from app.core.jobs.resource_lease import (
     HEAVY_PRODUCTION_RESOURCE_NAME,
+    HEAVY_PRODUCTION_RESOURCE_NAMES,
     JobExecutionAuthority,
     ResourceLeaseHandoff,
     ResourceOwner,
@@ -90,7 +91,7 @@ def _preclaimed_launch(paths, instance, repository, job):
     )
     worker = ResourceOwner(WORKSPACE_ID, "engine-worker")
     source = store.acquire(
-        HEAVY_PRODUCTION_RESOURCE_NAME,
+        HEAVY_PRODUCTION_RESOURCE_NAMES[1],
         supervisor,
         ttl_seconds=30,
     )
@@ -200,6 +201,7 @@ def test_worker_adopts_launch_before_runtime_and_passes_exact_authorities(
     )
 
     assert observed[0][0].owner == launch.resource_handoff.owner
+    assert observed[0][0].resource_name == HEAVY_PRODUCTION_RESOURCE_NAMES[1]
     assert (
         observed[0][0].expires_at_ms
         - launch.resource_handoff.expires_at_ms
