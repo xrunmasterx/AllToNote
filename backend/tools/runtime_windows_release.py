@@ -10,8 +10,10 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +33,23 @@ _ENGINE_START_SAMPLES = 20
 _ENGINE_ENSURE_CONCURRENCY = 32
 _ENGINE_START_P95_LIMIT_MILLISECONDS = 2000.0
 _ENGINE_IDLE_RSS_LIMIT_BYTES = 100 * 1024 * 1024
+_MAX_CANDIDATE_CONTROL_BYTES = 16 * 1024 * 1024
+_MAX_CANDIDATE_FILES = 100_000
+_MAX_CANDIDATE_FILE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_CANDIDATE_BYTES = 8 * 1024 * 1024 * 1024
+_FILE_MANIFEST_PATH = "release/file-manifest.json"
+_FILE_MANIFEST_SCOPE = "all ordinary files except release/file-manifest.json"
+_REQUIRED_ACCEPTANCE_CHECKS = frozenset(
+    {
+        "version",
+        "runtime_info",
+        "runtime_doctor",
+        "engine_lifecycle",
+        "unicode_workspace_init",
+        "sqlite_wal_gate",
+        "legacy_jobstore_migration",
+    }
+)
 _PIP_CONSOLE_SCRIPTS = {
     "alltonote.exe",
     "cffi-gen-src.exe",
@@ -883,25 +902,323 @@ def _run_legacy_jobstore_migration(
     return payload
 
 
-def _file_manifest(root: Path) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    for path in sorted((item for item in root.rglob("*") if item.is_file()), key=lambda item: item.as_posix()):
-        relative = path.relative_to(root).as_posix()
-        if relative == "release/file-manifest.json":
-            continue
-        rows.append(
-            {
-                "path": relative,
-                "byte_length": path.stat().st_size,
-                "sha256": _hash(path),
-            }
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _same_open_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+    )
+
+
+def _portable_candidate_path(relative: str) -> str:
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or len(relative) > 1024
+        or relative != unicodedata.normalize("NFC", relative)
+        or relative.startswith("/")
+        or "\\" in relative
+        or ":" in relative
+        or any(
+            part in ("", ".", "..") or part.endswith((" ", "."))
+            for part in pure.parts
         )
+    ):
+        raise ReleaseError("Runtime candidate contains an unsafe path")
+    return relative
+
+
+def _candidate_file_row(path: Path, relative: str) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+        if (
+            _is_link_or_reparse(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > _MAX_CANDIDATE_FILE_BYTES
+        ):
+            raise OSError("unsafe_file")
+        digest = hashlib.sha256()
+        byte_count = 0
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not _same_open_file(metadata, opened):
+                raise OSError("file_changed_before_read")
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                byte_count += len(chunk)
+                digest.update(chunk)
+            finished = os.fstat(stream.fileno())
+        if byte_count != metadata.st_size or not _same_open_file(opened, finished):
+            raise OSError("file_changed_during_read")
+    except OSError as error:
+        raise ReleaseError("Runtime candidate contains an unsafe file") from error
+    return {
+        "path": relative,
+        "byte_length": byte_count,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _candidate_file_rows(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    total_bytes = 0
+    entry_count = 0
+
+    def traversal_failed(error: OSError) -> None:
+        raise error
+
+    try:
+        for current, directories, filenames in os.walk(
+            root,
+            followlinks=False,
+            onerror=traversal_failed,
+        ):
+            current_path = Path(current)
+            directories.sort(key=str.casefold)
+            filenames.sort(key=str.casefold)
+            for name in (*directories, *filenames):
+                entry_count += 1
+                if entry_count > _MAX_CANDIDATE_FILES:
+                    raise OSError("entry_limit")
+                target = current_path / name
+                metadata = target.lstat()
+                if _is_link_or_reparse(metadata):
+                    raise OSError("unsafe_entry")
+                if name in directories and not stat.S_ISDIR(metadata.st_mode):
+                    raise OSError("unsafe_directory")
+            for filename in filenames:
+                target = current_path / filename
+                relative = _portable_candidate_path(
+                    target.relative_to(root).as_posix()
+                )
+                folded = relative.casefold()
+                if folded in seen:
+                    raise OSError("path_collision")
+                seen.add(folded)
+                if relative == _FILE_MANIFEST_PATH:
+                    continue
+                row = _candidate_file_row(target, relative)
+                total_bytes += row["byte_length"]
+                if total_bytes > _MAX_CANDIDATE_BYTES:
+                    raise OSError("byte_limit")
+                rows.append(row)
+    except ReleaseError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ReleaseError("Runtime candidate contains unsafe filesystem entries") from error
+    rows.sort(key=lambda row: row["path"])
+    return rows
+
+
+def _file_manifest(root: Path) -> dict[str, Any]:
+    rows = _candidate_file_rows(root)
     return {
         "schema_version": 1,
         "hash_algorithm": "sha256",
-        "scope": "all ordinary files except release/file-manifest.json",
+        "scope": _FILE_MANIFEST_SCOPE,
         "file_count": len(rows),
         "files": rows,
+    }
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate JSON member")
+        payload[key] = value
+    return payload
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _read_candidate_control(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
+    try:
+        metadata = path.lstat()
+        if (
+            _is_link_or_reparse(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > _MAX_CANDIDATE_CONTROL_BYTES
+        ):
+            raise OSError("unsafe_control")
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not _same_open_file(metadata, opened):
+                raise OSError("control_changed_before_read")
+            content = stream.read(_MAX_CANDIDATE_CONTROL_BYTES + 1)
+            finished = os.fstat(stream.fileno())
+        if (
+            len(content) > _MAX_CANDIDATE_CONTROL_BYTES
+            or len(content) != finished.st_size
+            or not _same_open_file(opened, finished)
+        ):
+            raise OSError("control_changed_during_read")
+        payload = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ReleaseError(f"Runtime candidate {label} is invalid") from error
+    if type(payload) is not dict or content != _canonical_json(payload):
+        raise ReleaseError(f"Runtime candidate {label} is invalid")
+    return payload, content
+
+
+def _manifest_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if (
+        set(payload) != {
+            "schema_version",
+            "hash_algorithm",
+            "scope",
+            "file_count",
+            "files",
+        }
+        or type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or payload.get("hash_algorithm") != "sha256"
+        or payload.get("scope") != _FILE_MANIFEST_SCOPE
+        or type(payload.get("file_count")) is not int
+        or type(payload.get("files")) is not list
+        or payload["file_count"] != len(payload["files"])
+        or payload["file_count"] > _MAX_CANDIDATE_FILES
+    ):
+        raise ReleaseError("Runtime candidate file manifest is incompatible")
+    rows: list[dict[str, Any]] = []
+    previous = ""
+    seen: set[str] = set()
+    for item in payload["files"]:
+        if (
+            type(item) is not dict
+            or set(item) != {"path", "byte_length", "sha256"}
+            or type(item.get("path")) is not str
+            or type(item.get("byte_length")) is not int
+            or item["byte_length"] < 0
+            or item["byte_length"] > _MAX_CANDIDATE_FILE_BYTES
+            or type(item.get("sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+        ):
+            raise ReleaseError("Runtime candidate file manifest is incompatible")
+        relative = _portable_candidate_path(item["path"])
+        folded = relative.casefold()
+        if relative == _FILE_MANIFEST_PATH or folded in seen or relative <= previous:
+            raise ReleaseError("Runtime candidate file manifest is incompatible")
+        seen.add(folded)
+        previous = relative
+        rows.append(item)
+    if sum(item["byte_length"] for item in rows) > _MAX_CANDIDATE_BYTES:
+        raise ReleaseError("Runtime candidate file manifest is incompatible")
+    return rows
+
+
+def verify_runtime_candidate(
+    candidate: Path,
+    *,
+    expected_manifest_sha256: str,
+    expected_source_commit: str | None = None,
+) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256) is None:
+        raise ReleaseError("Runtime expected manifest hash is invalid")
+    if (
+        expected_source_commit is not None
+        and re.fullmatch(r"[0-9a-f]{40}", expected_source_commit) is None
+    ):
+        raise ReleaseError("Runtime expected source commit is invalid")
+    root = _ordinary_directory(candidate, "Runtime candidate")
+    manifest, manifest_bytes = _read_candidate_control(
+        root / "release" / "file-manifest.json",
+        "file manifest",
+    )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if manifest_sha256 != expected_manifest_sha256:
+        raise ReleaseError("Runtime expected manifest hash does not match the candidate")
+    expected_rows = _manifest_rows(manifest)
+    actual_rows = _candidate_file_rows(root)
+    if actual_rows != expected_rows:
+        raise ReleaseError("Runtime candidate files do not match the manifest")
+
+    runtime_inputs, runtime_inputs_bytes = _read_candidate_control(
+        root / "release" / "runtime-inputs.json",
+        "Runtime inputs metadata",
+    )
+    wheelhouse, wheelhouse_bytes = _read_candidate_control(
+        root / "release" / "wheelhouse-lock.json",
+        "wheelhouse metadata",
+    )
+    acceptance, acceptance_bytes = _read_candidate_control(
+        root / "release" / "acceptance.json",
+        "acceptance metadata",
+    )
+    actual_by_path = {item["path"]: item for item in actual_rows}
+    for relative, content in (
+        ("release/runtime-inputs.json", runtime_inputs_bytes),
+        ("release/wheelhouse-lock.json", wheelhouse_bytes),
+        ("release/acceptance.json", acceptance_bytes),
+    ):
+        row = actual_by_path.get(relative)
+        if (
+            row is None
+            or row["byte_length"] != len(content)
+            or row["sha256"] != hashlib.sha256(content).hexdigest()
+        ):
+            raise ReleaseError("Runtime candidate files changed during verification")
+    source_commit = runtime_inputs.get("runtime_source_commit")
+    checks = acceptance.get("checks")
+    wal_gate = acceptance.get("wal_gate")
+    wheels = wheelhouse.get("wheels")
+    if (
+        type(runtime_inputs.get("schema_version")) is not int
+        or runtime_inputs.get("schema_version") != 1
+        or runtime_inputs.get("platform") != "windows-x86_64"
+        or type(runtime_inputs.get("runtime_version")) is not str
+        or not runtime_inputs["runtime_version"]
+        or type(source_commit) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+    ):
+        raise ReleaseError("Runtime candidate Runtime inputs metadata is invalid")
+    if (
+        type(wheelhouse.get("schema_version")) is not int
+        or wheelhouse.get("schema_version") != 1
+        or wheelhouse.get("python_abi") != "cp314-win_amd64"
+        or type(wheelhouse.get("wheel_count")) is not int
+        or type(wheels) is not list
+        or wheelhouse["wheel_count"] != len(wheels)
+    ):
+        raise ReleaseError("Runtime candidate wheelhouse metadata is invalid")
+    if (
+        type(acceptance.get("schema_version")) is not int
+        or acceptance.get("schema_version") != 1
+        or acceptance.get("status") != "candidate-pass"
+        or acceptance.get("runtime_source_commit") != source_commit
+        or type(checks) is not dict
+        or any(checks.get(name) is not True for name in _REQUIRED_ACCEPTANCE_CHECKS)
+        or type(wal_gate) is not dict
+        or wal_gate.get("scenarios_passed") is not True
+        or wal_gate.get("parallel_job_execution_enabled") is not False
+    ):
+        raise ReleaseError("Runtime candidate acceptance metadata is invalid")
+    if expected_source_commit is not None and source_commit != expected_source_commit:
+        raise ReleaseError("Runtime expected source commit does not match the candidate")
+    return {
+        "manifest_sha256": manifest_sha256,
+        "runtime_source_commit": source_commit,
+        "runtime_version": runtime_inputs["runtime_version"],
+        "platform": runtime_inputs["platform"],
+        "status": acceptance["status"],
+        "file_count": len(actual_rows),
+        "total_bytes": sum(item["byte_length"] for item in actual_rows),
     }
 
 
@@ -1115,9 +1432,23 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _verify_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Verify a published Windows Runtime candidate")
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--expected-manifest-sha256", required=True)
+    parser.add_argument("--expected-source-commit")
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
+    arguments = list(argv) if argv is not None else sys.argv[1:]
     try:
-        payload = assemble_runtime(**vars(_parser().parse_args(argv)))
+        if arguments[:1] == ["verify"]:
+            payload = verify_runtime_candidate(
+                **vars(_verify_parser().parse_args(arguments[1:]))
+            )
+        else:
+            payload = assemble_runtime(**vars(_parser().parse_args(arguments)))
     except ReleaseError as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
         return 1

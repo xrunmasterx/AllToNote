@@ -28,6 +28,7 @@ from tools.runtime_windows_release import (
     _run_engine_lifecycle_gate,
     _run_legacy_jobstore_migration,
     _verify_inputs,
+    verify_runtime_candidate,
 )
 
 
@@ -37,6 +38,55 @@ LOCK = ROOT / "runtime-windows-x86_64.lock.json"
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _runtime_candidate(tmp_path: Path) -> tuple[Path, str]:
+    candidate = tmp_path / "Runtime 候选 有空格"
+    release = candidate / "release"
+    release.mkdir(parents=True)
+    (candidate / "alltonote.py").write_text("print('ok')\n", encoding="utf-8")
+    controls = {
+        "runtime-inputs.json": {
+            "schema_version": 1,
+            "runtime_source_commit": "1" * 40,
+            "runtime_version": "0.1.0",
+            "platform": "windows-x86_64",
+            "python": {},
+            "sqlite": {},
+            "legacy_jobstore_fixture": {},
+        },
+        "wheelhouse-lock.json": {
+            "schema_version": 1,
+            "python_abi": "cp314-win_amd64",
+            "wheel_count": 1,
+            "wheels": [{"filename": "runtime.whl"}],
+        },
+        "acceptance.json": {
+            "schema_version": 1,
+            "status": "candidate-pass",
+            "runtime_source_commit": "1" * 40,
+            "identity": {},
+            "checks": {
+                "version": True,
+                "runtime_info": True,
+                "runtime_doctor": True,
+                "engine_lifecycle": True,
+                "unicode_workspace_init": True,
+                "sqlite_wal_gate": True,
+                "legacy_jobstore_migration": True,
+            },
+            "wal_gate": {
+                "scenarios_passed": True,
+                "parallel_job_execution_enabled": False,
+            },
+        },
+    }
+    for name, payload in controls.items():
+        (release / name).write_bytes(release_module._canonical_json(payload))
+    (release / "file-manifest.json").write_bytes(
+        release_module._canonical_json(_file_manifest(candidate))
+    )
+    return candidate, _sha256(release / "file-manifest.json")
 
 
 def _fixture(tmp_path: Path) -> tuple[dict[str, object], Path, Path]:
@@ -562,3 +612,165 @@ def test_file_manifest_uses_unique_relative_paths_and_excludes_itself(
         "nested/b.txt",
     ]
     assert len(json.dumps(manifest)) > 0
+
+
+def test_runtime_candidate_verifier_accepts_exact_read_only_tree(
+    tmp_path: Path,
+) -> None:
+    candidate, manifest_sha256 = _runtime_candidate(tmp_path)
+    before = {
+        path.relative_to(candidate).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in candidate.rglob("*")
+        if path.is_file()
+    }
+
+    result = verify_runtime_candidate(
+        candidate,
+        expected_manifest_sha256=manifest_sha256,
+        expected_source_commit="1" * 40,
+    )
+
+    after = {
+        path.relative_to(candidate).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in candidate.rglob("*")
+        if path.is_file()
+    }
+    assert result == {
+        "manifest_sha256": manifest_sha256,
+        "runtime_source_commit": "1" * 40,
+        "runtime_version": "0.1.0",
+        "platform": "windows-x86_64",
+        "status": "candidate-pass",
+        "file_count": 4,
+        "total_bytes": sum(len(content) for content, _mtime in before.values())
+        - len(before["release/file-manifest.json"][0]),
+    }
+    assert after == before
+
+
+def test_runtime_candidate_verifier_requires_external_manifest_digest(
+    tmp_path: Path,
+) -> None:
+    candidate, _manifest_sha256 = _runtime_candidate(tmp_path)
+
+    with pytest.raises(ReleaseError, match="expected manifest hash"):
+        verify_runtime_candidate(
+            candidate,
+            expected_manifest_sha256="0" * 64,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("tamper", "extra", "missing"))
+def test_runtime_candidate_verifier_rejects_tree_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    candidate, manifest_sha256 = _runtime_candidate(tmp_path)
+    payload = candidate / "alltonote.py"
+    if mutation == "tamper":
+        payload.write_text("print('tampered')\n", encoding="utf-8")
+    elif mutation == "extra":
+        (candidate / "extra.txt").write_text("extra", encoding="utf-8")
+    else:
+        payload.unlink()
+
+    with pytest.raises(ReleaseError, match="candidate files"):
+        verify_runtime_candidate(
+            candidate,
+            expected_manifest_sha256=manifest_sha256,
+        )
+
+
+def test_runtime_candidate_verifier_rejects_unsafe_acceptance_claim(
+    tmp_path: Path,
+) -> None:
+    candidate, _manifest_sha256 = _runtime_candidate(tmp_path)
+    acceptance = candidate / "release" / "acceptance.json"
+    payload = json.loads(acceptance.read_text(encoding="utf-8"))
+    payload["wal_gate"]["parallel_job_execution_enabled"] = True
+    acceptance.write_bytes(release_module._canonical_json(payload))
+    manifest = _file_manifest(candidate)
+    (candidate / "release" / "file-manifest.json").write_bytes(
+        release_module._canonical_json(manifest)
+    )
+
+    with pytest.raises(ReleaseError, match="acceptance metadata"):
+        verify_runtime_candidate(
+            candidate,
+            expected_manifest_sha256=_sha256(
+                candidate / "release" / "file-manifest.json"
+            ),
+        )
+
+
+def test_file_manifest_rejects_directory_traversal_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_walk(_root, *, followlinks, onerror=None):
+        assert followlinks is False
+        if onerror is not None:
+            onerror(PermissionError("denied"))
+        return []
+
+    monkeypatch.setattr(release_module.os, "walk", failed_walk)
+
+    with pytest.raises(ReleaseError, match="filesystem entries"):
+        _file_manifest(tmp_path)
+
+
+def test_runtime_candidate_verifier_rejects_control_swap_after_tree_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, manifest_sha256 = _runtime_candidate(tmp_path)
+    acceptance = candidate / "release" / "acceptance.json"
+    original_rows = release_module._candidate_file_rows
+
+    def rows_then_swap(root: Path):
+        rows = original_rows(root)
+        payload = json.loads(acceptance.read_text(encoding="utf-8"))
+        payload["note"] = "swapped after tree hash"
+        acceptance.write_bytes(release_module._canonical_json(payload))
+        return rows
+
+    monkeypatch.setattr(release_module, "_candidate_file_rows", rows_then_swap)
+
+    with pytest.raises(ReleaseError, match="candidate files"):
+        verify_runtime_candidate(
+            candidate,
+            expected_manifest_sha256=manifest_sha256,
+        )
+
+
+def test_runtime_candidate_verify_cli_outputs_path_free_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate, manifest_sha256 = _runtime_candidate(tmp_path)
+
+    exit_code = release_module.main(
+        [
+            "verify",
+            "--candidate",
+            str(candidate),
+            "--expected-manifest-sha256",
+            manifest_sha256,
+            "--expected-source-commit",
+            "1" * 40,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["data"]["manifest_sha256"] == manifest_sha256
+    assert str(candidate) not in captured.out
+    assert captured.err == ""
