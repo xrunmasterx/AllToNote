@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
+import stat as stat_module
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from errno import EACCES, ENOSYS
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from uuid import UUID
+from uuid import UUID, uuid4
+
+from filelock import FileLock, Timeout
 
 from app.core.application.checkpoint_runner import (
     CheckpointedStepExecutionContext,
@@ -52,6 +58,9 @@ from app.core.domain.video import (
     VideoDocumentKind,
     VideoProducedDocument,
     VideoProduceRequest,
+    VIDEO_INPUT_SNAPSHOT_EVENT,
+    parse_video_input_snapshot_payload,
+    video_input_snapshot_payload,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.model import (
@@ -119,6 +128,8 @@ if TYPE_CHECKING:
 
 RUNTIME_VERSION = "0.1.0"
 CHECKPOINT_SCHEMA = "video-step.v1"
+_VIDEO_INPUT_DIRECTORY = "video-inputs"
+_VIDEO_INPUT_COPY_CHUNK_BYTES = 1024 * 1024
 _CANDIDATE_ASSEMBLY_BEHAVIOR = "portable-output-profile-v2"
 _DOCUMENT_COMPILATION_BEHAVIOR = (
     "projection-v2/finalization-v1/citation-format-v1"
@@ -127,6 +138,96 @@ _HISTORICAL_COMMIT_CANDIDATE_BEHAVIORS_V1 = (
     "linked-screenshot-draft-v1",
     "linked-screenshot-draft-v2",
 )
+
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+
+def _video_snapshot_lock_is_ordinary(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat_module.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and not VideoService._stat_is_reparse_point(metadata)
+    )
+
+
+def _open_video_snapshot_lock_matches(path: Path, descriptor: int) -> bool:
+    try:
+        metadata = path.lstat()
+        opened = os.fstat(descriptor)
+    except OSError:
+        return False
+    return (
+        _video_snapshot_lock_is_ordinary(path)
+        and metadata.st_dev == opened.st_dev
+        and metadata.st_ino == opened.st_ino
+    )
+
+
+class _VideoInputFileLock(FileLock):
+    """Lock one stable ordinary file without truncating a linked target."""
+
+    def _acquire(self) -> None:
+        lock_path = Path(self.lock_file)
+        if os.path.lexists(lock_path) and not _video_snapshot_lock_is_ordinary(
+            lock_path
+        ):
+            raise OSError("Video input snapshot lock is unsafe")
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, self._context.mode)
+        except OSError as error:
+            if os.path.lexists(lock_path) and not _video_snapshot_lock_is_ordinary(
+                lock_path
+            ):
+                raise OSError("Video input snapshot lock is unsafe") from error
+            if os.name == "nt" and error.errno == EACCES:
+                return
+            raise
+        if not _open_video_snapshot_lock_matches(lock_path, descriptor):
+            os.close(descriptor)
+            raise OSError("Video input snapshot lock is unsafe")
+        try:
+            if os.name == "nt":
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            os.close(descriptor)
+            if os.name == "nt":
+                if error.errno != EACCES:
+                    raise
+            elif error.errno == ENOSYS:
+                raise OSError(
+                    "Video input snapshot filesystem does not support locking"
+                ) from error
+            return
+        if not _open_video_snapshot_lock_matches(lock_path, descriptor):
+            os.close(descriptor)
+            raise OSError("Video input snapshot lock is unsafe")
+        self._context.lock_file_fd = descriptor
+
+    def _release(self) -> None:
+        descriptor = self._context.lock_file_fd
+        if descriptor is None:
+            return
+        self._context.lock_file_fd = None
+        if os.name == "nt":
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 _SUPPORTED_VIDEO_RECIPE_KEYS = frozenset(
     {
         ("alltonote.video-course-note", 1),
@@ -374,6 +475,14 @@ class VideoFaithfulCompilerPort(Protocol):
     ) -> FaithfulCompiledVideoDocument: ...
 
 
+@dataclass(frozen=True)
+class _DetachedVideoInput:
+    path: Path
+    sha256: str
+    byte_length: int
+    original_title: str
+
+
 class _VideoServiceRepositoryPort(
     VideoExecutionRepositoryPort,
     JobClaimRepositoryPort,
@@ -488,6 +597,11 @@ class VideoService:
                 ErrorCategory.INVALID_REQUEST,
                 "Video production requires a versioned request",
             )
+        detached_input = (
+            self._snapshot_detached_input(request)
+            if execution_owner is JobExecutionOwner.ENGINE
+            else None
+        )
         config_snapshot = request.config_snapshot or self._current_config_snapshot
         initial_events = tuple(
             event
@@ -503,6 +617,17 @@ class VideoService:
                         self._submission_pack_environment,
                     )
                     if self._submission_pack_environment is not None
+                    else None
+                ),
+                (
+                    (
+                        VIDEO_INPUT_SNAPSHOT_EVENT,
+                        video_input_snapshot_payload(
+                            detached_input.sha256,
+                            detached_input.byte_length,
+                        ),
+                    )
+                    if detached_input is not None
                     else None
                 ),
             )
@@ -658,6 +783,262 @@ class VideoService:
         except Exception:
             pass
 
+    def _snapshot_detached_input(
+        self,
+        request: VideoProduceRequest,
+    ) -> _DetachedVideoInput | None:
+        candidate = Path(request.input_value.strip()).expanduser().absolute()
+        if not os.path.lexists(candidate):
+            return None
+        source = self._validated_local_input(candidate)
+        staging = self._work_root / _VIDEO_INPUT_DIRECTORY / ".staging"
+        temporary = staging / f".source-{uuid4().hex}.tmp"
+        try:
+            self._ensure_video_input_directory(staging, create=True)
+            initial = source.lstat()
+            digest = hashlib.sha256()
+            byte_length = 0
+            with source.open("rb") as input_stream, temporary.open("xb") as output:
+                opened = os.fstat(input_stream.fileno())
+                if not self._ordinary_input_stat(opened) or not os.path.samestat(
+                    initial, opened
+                ):
+                    raise self._video_input_changed()
+                while True:
+                    chunk = input_stream.read(_VIDEO_INPUT_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    byte_length += len(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+                final = os.fstat(input_stream.fileno())
+            current = source.lstat()
+            if (
+                not os.path.samestat(opened, final)
+                or not os.path.samestat(opened, current)
+                or not self._ordinary_input_stat(final)
+                or final.st_size != opened.st_size
+                or final.st_mtime_ns != opened.st_mtime_ns
+                or byte_length != opened.st_size
+            ):
+                raise self._video_input_changed()
+            sha256 = "sha256:" + digest.hexdigest()
+            target = self._detached_input_path(request, sha256)
+            self._ensure_video_input_directory(target.parent, create=True)
+            snapshot = _DetachedVideoInput(
+                path=target,
+                sha256=sha256,
+                byte_length=byte_length,
+                original_title=source.stem or "video",
+            )
+            lock_path = target.parent / ".snapshot.lock"
+            self._ensure_video_input_lock(lock_path)
+            with _VideoInputFileLock(str(lock_path), timeout=30):
+                self._ensure_video_input_lock(lock_path)
+                self._ensure_video_input_directory(target.parent, create=False)
+                if os.path.lexists(target):
+                    self._verify_detached_input(snapshot)
+                else:
+                    os.replace(temporary, target)
+                    self._verify_detached_input(snapshot)
+            return snapshot
+        except Timeout as error:
+            raise DomainError(
+                "video_input_snapshot_unavailable",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Local Video input snapshot is busy",
+            ) from error
+        except DomainError:
+            raise
+        except OSError as error:
+            raise DomainError(
+                "video_input_snapshot_unavailable",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Local video input could not be snapshotted for Engine execution",
+            ) from error
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _execution_input(
+        self,
+        job_id: str,
+        request: VideoProduceRequest,
+    ) -> _DetachedVideoInput | None:
+        events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == VIDEO_INPUT_SNAPSHOT_EVENT
+        )
+        if not events:
+            return None
+        if len(events) != 1:
+            raise DomainError(
+                "video_input_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored local Video input snapshot binding is invalid",
+            )
+        try:
+            payload = parse_video_input_snapshot_payload(events[0].payload_json)
+        except ValueError as error:
+            raise DomainError(
+                "video_input_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored local Video input snapshot binding is invalid",
+            ) from error
+        sha256 = payload["sha256"]
+        byte_length = payload["byte_length"]
+        assert isinstance(sha256, str)
+        assert type(byte_length) is int
+        snapshot = _DetachedVideoInput(
+            path=self._detached_input_path(request, sha256),
+            sha256=sha256,
+            byte_length=byte_length,
+            original_title=Path(request.input_value.strip()).stem.strip() or "video",
+        )
+        self._verify_detached_input(snapshot)
+        return snapshot
+
+    def _detached_input_path(
+        self,
+        request: VideoProduceRequest,
+        sha256: str,
+    ) -> Path:
+        suffix = Path(request.input_value.strip()).suffix
+        if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix) is None:
+            suffix = ".media"
+        digest = sha256.removeprefix("sha256:")
+        return (
+            self._work_root
+            / _VIDEO_INPUT_DIRECTORY
+            / digest[:2]
+            / digest
+            / f"source{suffix}"
+        )
+
+    def _verify_detached_input(self, snapshot: _DetachedVideoInput) -> None:
+        try:
+            self._ensure_video_input_directory(snapshot.path.parent, create=False)
+            initial = snapshot.path.lstat()
+            if not self._ordinary_input_stat(initial):
+                raise OSError("Video input snapshot is unsafe")
+            digest = hashlib.sha256()
+            byte_length = 0
+            with snapshot.path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if not self._ordinary_input_stat(opened) or not os.path.samestat(
+                    initial, opened
+                ):
+                    raise OSError("Video input snapshot changed")
+                while True:
+                    chunk = stream.read(_VIDEO_INPUT_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    byte_length += len(chunk)
+                    if byte_length > snapshot.byte_length:
+                        raise OSError("Video input snapshot size changed")
+                    digest.update(chunk)
+                final = os.fstat(stream.fileno())
+            current = snapshot.path.lstat()
+            if (
+                not os.path.samestat(opened, final)
+                or not os.path.samestat(opened, current)
+                or opened.st_size != final.st_size
+                or opened.st_mtime_ns != final.st_mtime_ns
+                or byte_length != snapshot.byte_length
+                or "sha256:" + digest.hexdigest() != snapshot.sha256
+            ):
+                raise OSError("Video input snapshot changed")
+        except OSError as error:
+            raise DomainError(
+                "video_input_snapshot_invalid",
+                ErrorCategory.CONFLICT,
+                "The Engine-bound local Video input snapshot is missing or invalid",
+            ) from error
+
+    def _ensure_video_input_directory(
+        self,
+        directory: Path,
+        *,
+        create: bool,
+    ) -> None:
+        try:
+            relative = directory.relative_to(self._work_root)
+        except ValueError as error:
+            raise OSError("Video input snapshot escaped managed storage") from error
+        root_resolved = self._work_root.resolve(strict=True)
+        current = self._work_root
+        for component in (None, *relative.parts):
+            if component is not None:
+                current /= component
+            if not os.path.lexists(current):
+                if not create:
+                    raise OSError("Video input snapshot directory is missing")
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    pass
+            current_stat = current.lstat()
+            if (
+                not stat_module.S_ISDIR(current_stat.st_mode)
+                or self._stat_is_reparse_point(current_stat)
+                or not current.resolve(strict=True).is_relative_to(root_resolved)
+            ):
+                raise OSError("Video input snapshot directory is unsafe")
+
+    @staticmethod
+    def _ensure_video_input_lock(path: Path) -> None:
+        if not os.path.lexists(path):
+            return
+        if not _video_snapshot_lock_is_ordinary(path):
+            raise OSError("Video input snapshot lock is unsafe")
+
+    def _validated_local_input(self, path: Path) -> Path:
+        try:
+            for component in (path, *path.parents):
+                if not os.path.lexists(component):
+                    continue
+                component_stat = component.lstat()
+                if self._stat_is_reparse_point(component_stat):
+                    raise OSError("Local video input path contains a reparse point")
+            resolved = path.resolve(strict=True)
+            if not self._ordinary_input_stat(resolved.lstat()):
+                raise OSError("Local video input is not an ordinary file")
+            return resolved
+        except OSError as error:
+            raise DomainError(
+                "video_input_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Local video input must be a safe ordinary file",
+            ) from error
+
+    @classmethod
+    def _ordinary_input_stat(cls, value: os.stat_result) -> bool:
+        return (
+            stat_module.S_ISREG(value.st_mode)
+            and value.st_nlink == 1
+            and not cls._stat_is_reparse_point(value)
+        )
+
+    @staticmethod
+    def _stat_is_reparse_point(value: os.stat_result) -> bool:
+        reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return stat_module.S_ISLNK(value.st_mode) or bool(
+            getattr(value, "st_file_attributes", 0) & reparse_flag
+        )
+
+    @staticmethod
+    def _video_input_changed() -> DomainError:
+        return DomainError(
+            "video_input_changed",
+            ErrorCategory.CONFLICT,
+            "Local video input changed while it was being snapshotted",
+        )
+
     def _execute(
         self,
         job_id: str,
@@ -667,6 +1048,12 @@ class VideoService:
         resumed_attempt: Attempt | None,
     ) -> JobSnapshot:
         request_hash = self._request_hash(request)
+        detached_input = self._execution_input(job_id, request)
+        execution_request = (
+            replace(request, input_value=str(detached_input.path))
+            if detached_input is not None
+            else request
+        )
         self._checkpointed(
             job_id,
             "preflight",
@@ -687,7 +1074,7 @@ class VideoService:
             request_hash,
             authority,
             lambda _execution: self._operations.resolve_source(
-                request,
+                execution_request,
                 source_id=ids["source"],
                 source_revision_id=ids["revision"],
             ),
@@ -695,6 +1082,15 @@ class VideoService:
             decode=_decode_source,
             resumed_attempt=resumed_attempt,
         )
+        if detached_input is not None and (
+            source.connector_id != "local"
+            or source.content_sha256 != detached_input.sha256
+        ):
+            raise DomainError(
+                "video_input_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Resolved local Video input does not match its Engine binding",
+            )
         source_id = ids["source"]
         if self._source_identity_resolver is not None:
             binding = self._source_identity_resolver(
@@ -718,7 +1114,7 @@ class VideoService:
             request_hash,
             authority,
             lambda execution: self._operations.acquire(
-                request,
+                execution_request,
                 source,
                 source_id=source_id,
                 source_revision_id=ids["revision"],
@@ -728,6 +1124,14 @@ class VideoService:
             decode=_decode_acquired,
             resumed_attempt=resumed_attempt,
         )
+        if detached_input is not None:
+            acquired = replace(
+                acquired,
+                metadata=replace(
+                    acquired.metadata,
+                    title=detached_input.original_title,
+                ),
+            )
         acquisition_checkpoint = self._repository.latest_checkpoint(job_id, "acquire")
         if acquisition_checkpoint is None:
             raise _checkpoint_error()

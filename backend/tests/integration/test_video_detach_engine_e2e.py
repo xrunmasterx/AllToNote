@@ -68,6 +68,30 @@ def _run_detached_submit(
             "--detach",
             "--json",
         ]
+    elif recipe_kind == "video-local":
+        from tests.integration.test_local_media_golden_path import _create_runtime
+
+        registry = WorkspaceInstanceRegistry(
+            paths.workspace_registry_parent,
+            inspect_workspace=lambda root: open_workspace(
+                root, writable=False
+            ).manifest.workspace_id,
+        )
+        instance = registry.resolve(workspace_root)
+        runtime = _create_runtime(
+            instance.machine_root,
+            workspace_instance_id=instance.instance_id,
+        )
+        arguments = [
+            "produce",
+            "video",
+            "--input",
+            input_value,
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ]
     else:
         from app.runtime import create_fake_runtime_for_workspace
 
@@ -129,6 +153,16 @@ def _run_job_wait(
     (
         ("video", ("download", "transcribe", "model", "portable_commit")),
         (
+            "video-local",
+            (
+                "source_resolve",
+                "source_acquire",
+                "transcriber",
+                "model",
+                "portable_commit",
+            ),
+        ),
+        (
             "document",
             (
                 "parse_document",
@@ -155,6 +189,10 @@ def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
     if recipe_kind == "document":
         source = tmp_path / "detached document.pdf"
         source.write_bytes(b"%PDF-1.7\nfixture\n")
+        input_value = str(source)
+    elif recipe_kind == "video-local":
+        source = tmp_path / "detached local course.mp4"
+        source.write_bytes(b"detached local video fixture")
         input_value = str(source)
     else:
         input_value = "fixture://detached-cross-process"
@@ -245,7 +283,7 @@ def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
         worker_pid = int(worker_started.read_text(encoding="ascii"))
         assert len({host.pid, submit_pid, worker_pid}) == 3
         assert submitter.is_alive() is False
-        if recipe_kind == "document":
+        if recipe_kind in {"document", "video-local"}:
             source.unlink()
 
         probe = context.Process(

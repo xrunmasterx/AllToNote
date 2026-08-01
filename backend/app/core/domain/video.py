@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -22,6 +23,57 @@ _SEGMENT_ID_PATTERN = re.compile(r"seg_[0-9]{6,}\Z")
 _ARTIFACT_ID_PATTERN = re.compile(
     r"art_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
+_SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+VIDEO_INPUT_SNAPSHOT_EVENT = "video.input-snapshot.v1"
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("video_input_snapshot_invalid")
+        result[key] = value
+    return result
+
+
+def video_input_snapshot_payload(
+    sha256: str,
+    byte_length: int,
+) -> dict[str, object]:
+    if (
+        type(sha256) is not str
+        or _SHA256_PATTERN.fullmatch(sha256) is None
+        or type(byte_length) is not int
+        or byte_length < 0
+    ):
+        raise ValueError("video_input_snapshot_invalid")
+    return {
+        "schema_version": 1,
+        "sha256": sha256,
+        "byte_length": byte_length,
+    }
+
+
+def parse_video_input_snapshot_payload(payload_json: str) -> dict[str, object]:
+    try:
+        payload = json.loads(payload_json, object_pairs_hook=_unique_json_object)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("video_input_snapshot_invalid") from error
+    if (
+        type(payload) is not dict
+        or frozenset(payload)
+        != frozenset({"schema_version", "sha256", "byte_length"})
+        or payload.get("schema_version") != 1
+        or type(payload.get("schema_version")) is not int
+    ):
+        raise ValueError("video_input_snapshot_invalid")
+    canonical = video_input_snapshot_payload(
+        payload.get("sha256"),
+        payload.get("byte_length"),
+    )
+    if payload != canonical:
+        raise ValueError("video_input_snapshot_invalid")
+    return canonical
 
 
 class ScreenshotPolicy(StrEnum):

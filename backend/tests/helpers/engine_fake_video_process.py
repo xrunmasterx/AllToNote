@@ -82,6 +82,16 @@ def _run_worker(args: argparse.Namespace) -> int:
                 call_log=args.call_log,
                 require_existing_job_store=True,
             )
+        elif args.recipe_kind == "video-local":
+            from tests.integration.test_local_media_golden_path import _create_runtime
+
+            runtime = _create_runtime(
+                instance.machine_root,
+                call_log=args.call_log,
+                owner_id="engine-local-video-worker",
+                workspace_instance_id=instance.instance_id,
+                current_config_snapshot=current_config_snapshot,
+            )
         else:
             from app.runtime import create_fake_runtime
 
@@ -191,7 +201,7 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--call-log", required=True, type=Path)
         child.add_argument(
             "--recipe-kind",
-            choices=("video", "document"),
+            choices=("video", "video-local", "document"),
             required=True,
         )
         if mode == "worker":

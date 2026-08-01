@@ -22,7 +22,13 @@ from app.core.application.job_service import JobService
 from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
 from app.core.domain.document import DOCUMENT_INPUT_SNAPSHOT_EVENT
-from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
+from app.core.domain.video import (
+    VIDEO_INPUT_SNAPSHOT_EVENT,
+    JobSnapshot,
+    JobState,
+    RetryJobRequest,
+    parse_video_input_snapshot_payload,
+)
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import (
     JobEvent,
@@ -351,6 +357,29 @@ class JobRuntime:
             initial_events.append(
                 (DOCUMENT_INPUT_SNAPSHOT_EVENT, document_input)
             )
+        video_input_events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == VIDEO_INPUT_SNAPSHOT_EVENT
+        )
+        if len(video_input_events) > 1:
+            raise DomainError(
+                "video_input_snapshot_invalid",
+                ErrorCategory.CONFLICT,
+                "The local Video input snapshot binding is unavailable or invalid",
+            )
+        if video_input_events:
+            try:
+                video_input = parse_video_input_snapshot_payload(
+                    video_input_events[0].payload_json
+                )
+            except ValueError as error:
+                raise DomainError(
+                    "video_input_snapshot_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored local Video input snapshot binding is invalid",
+                ) from error
+            initial_events.append((VIDEO_INPUT_SNAPSHOT_EVENT, video_input))
         retried = self._jobs.retry(
             job_id,
             request,

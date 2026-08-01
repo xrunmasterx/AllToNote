@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
 from app.adapters.screenshots.ffmpeg import FFmpegScreenshotAdapter
 from app.adapters.sources.legacy_video import LegacyVideoSourceAdapter
 from app.core.application import video_acquisition
+from app.core.application.job_service import JobService
 from app.core.application.video_checkpoints import (
     CandidateCheckpoint,
     decode_acquired,
@@ -31,9 +34,12 @@ from app.core.application.video_checkpoints import (
 )
 from app.core.application.video_checkpoints import decode_source
 from app.core.application.video_service import VideoService
+from app.core.config.model import JobConfigSnapshot
 from app.core.domain.ids import sha256_digest
 from app.core.domain.video import (
+    JobSnapshot,
     JobState,
+    RetryJobRequest,
     ScreenshotPolicy,
     TranscriptDocument,
     TranscriptSegment,
@@ -41,10 +47,12 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
+from app.core.jobs.model import JobExecutionOwner
 from app.core.jobs.resource_lease import JobExecutionAuthority
 from app.core.portable.bundle_assembler import DisplayAssetInput
 from app.core.portable.quality import evaluate_video_draft
 from app.core.ports.transcript import MediaInput
+from app.job_runtime import JobRuntime
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures"
@@ -374,6 +382,8 @@ def _create_runtime(
     now_ms: int | None = None,
     transcriber: object | None = None,
     screenshot_process_factory: _ScreenshotProcessFactory | None = None,
+    workspace_instance_id: str | None = None,
+    current_config_snapshot: JobConfigSnapshot | None = None,
 ) -> object:
     factory = getattr(runtime_module, "_create_local_video_runtime_components", None)
     assert callable(factory), "Task 16A.1 local runtime composition is missing"
@@ -402,6 +412,7 @@ def _create_runtime(
         transcriber=transcriber or _TranscriptFake(observed, call_log),
         model=model,
         owner_id=owner_id,
+        current_config_snapshot=current_config_snapshot,
         clock=(None if now_ms is None else lambda: now_ms),
         screenshot_adapter_factory=(
             None
@@ -416,6 +427,12 @@ def _create_runtime(
             )
         ),
     )
+    if workspace_instance_id is not None:
+        runtime = runtime_module._create_video_runtime(
+            service,
+            runtime.job_repository,
+            workspace_instance_id=workspace_instance_id,
+        )
     service._portable = _RecordingPortableGateway(
         service._portable,
         observed,
@@ -570,6 +587,331 @@ def test_local_video_copies_and_transcribes_once_then_commits_private_safe_bundl
         "kind": "external_local",
         "external_ref_id": f"ext_{source_id.removeprefix('src_')}",
     }
+
+
+def test_engine_local_video_snapshots_before_job_creation_and_survives_source_delete(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-detached-machine"
+    raw = local_video.read_bytes()
+    expected_sha256 = "sha256:" + hashlib.sha256(raw).hexdigest()
+    calls = Calls()
+    runtime = _create_runtime(machine_root, calls=calls)
+
+    submitted = runtime.submit_video(
+        _request(local_video, workspace_root, "engine-detached-local"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    events = tuple(
+        event
+        for event in runtime.job_repository.list_events(submitted.job_id)
+        if event.event_type == "video.input-snapshot.v1"
+    )
+    snapshots = tuple(
+        (machine_root / "attempts" / "video-inputs").rglob("source.mp4")
+    )
+
+    assert len(events) == 1
+    assert json.loads(events[0].payload_json) == {
+        "schema_version": 1,
+        "sha256": expected_sha256,
+        "byte_length": len(raw),
+    }
+    assert str(local_video.resolve()) not in events[0].payload_json
+    assert len(snapshots) == 1
+    assert snapshots[0].read_bytes() == raw
+
+    local_video.unlink()
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert calls.resolve == 1
+    assert calls.acquire == 1
+    assert calls.transcriber == 1
+    assert calls.model == 1
+
+
+def test_engine_local_video_snapshot_tamper_fails_closed_without_original_fallback(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-detached-tamper-machine"
+    calls = Calls()
+    runtime = _create_runtime(machine_root, calls=calls)
+    submitted = runtime.submit_video(
+        _request(local_video, workspace_root, "engine-detached-tamper"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    snapshots = tuple(
+        (machine_root / "attempts" / "video-inputs").rglob("source.mp4")
+    )
+    assert len(snapshots) == 1
+    snapshots[0].write_bytes(b"tampered-managed-snapshot")
+
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert completed.error.code == "video_input_snapshot_invalid"
+    assert calls.resolve == 0
+    assert calls.acquire == 0
+    assert calls.transcriber == 0
+    assert local_video.exists()
+
+
+def test_engine_local_video_snapshot_preserves_original_human_title(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-detached-title-machine"
+    runtime = _create_runtime(machine_root)
+    runtime.video_service._operations._source_metadata = {
+        "local": {**LOCAL_METADATA, "title": "source"}
+    }
+    provided = TranscriptDocument(
+        "en",
+        (TranscriptSegment("seg_000001", 0, 1_000, "Local course content."),),
+    )
+    submitted = runtime.submit_video(
+        _request(
+            local_video,
+            workspace_root,
+            "engine-detached-title",
+            provided_transcript=provided,
+        ),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    local_video.unlink()
+
+    completed = runtime.wait_job(submitted.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    bundle = workspace_root / completed.result.workspace_relative_bundle_path
+    metadata = json.loads((bundle / "sources" / "video-metadata.json").read_text())
+    assert metadata["title"] == "private course"
+
+
+def test_foreground_local_video_does_not_create_detached_input_binding(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "foreground-local-machine"
+    runtime = _create_runtime(machine_root)
+
+    submitted = runtime.submit_video(
+        _request(local_video, workspace_root, "foreground-local")
+    )
+
+    assert not any(
+        event.event_type == "video.input-snapshot.v1"
+        for event in runtime.job_repository.list_events(submitted.job_id)
+    )
+    assert not (machine_root / "attempts" / "video-inputs").exists()
+    assert runtime.wait_job(submitted.job_id).state is JobState.SUCCEEDED
+
+
+def test_video_retry_inherits_detached_input_snapshot_binding(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-detached-retry-machine"
+    calls = Calls()
+    runtime = _create_runtime(machine_root, calls=calls)
+    original = runtime.submit_video(
+        _request(local_video, workspace_root, "engine-detached-retry"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    assert runtime.cancel_job(original.job_id).state is JobState.CANCELLED
+    local_video.unlink()
+
+    retried = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        execution_owner=JobExecutionOwner.ENGINE,
+    ).retry_job(
+        original.job_id,
+        RetryJobRequest(1, "retry-video-snapshot", JobState.CANCELLED),
+    )
+    retry_events = tuple(
+        event
+        for event in runtime.job_repository.list_events(retried.snapshot.job_id)
+        if event.event_type == "video.input-snapshot.v1"
+    )
+
+    completed = runtime.wait_job(retried.snapshot.job_id)
+
+    assert len(retry_events) == 1
+    assert completed.state is JobState.SUCCEEDED
+    assert calls.resolve == 1
+    assert calls.acquire == 1
+
+
+def test_concurrent_engine_local_video_submissions_share_one_content_snapshot(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-detached-concurrent-machine"
+    runtime = _create_runtime(machine_root)
+
+    def submit(index: int) -> JobSnapshot:
+        return runtime.submit_video(
+            _request(
+                local_video,
+                workspace_root,
+                f"engine-detached-concurrent-{index}",
+            ),
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        submitted = tuple(executor.map(submit, range(8)))
+
+    assert len({snapshot.job_id for snapshot in submitted}) == 8
+    assert len(
+        tuple((machine_root / "attempts" / "video-inputs").rglob("source.mp4"))
+    ) == 1
+    for snapshot in submitted:
+        assert sum(
+            event.event_type == "video.input-snapshot.v1"
+            for event in runtime.job_repository.list_events(snapshot.job_id)
+        ) == 1
+
+
+def test_engine_remote_video_submission_does_not_snapshot_or_touch_network(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-remote-machine"
+    calls = Calls()
+    runtime = _create_runtime(machine_root, calls=calls)
+    request = replace(
+        _request(local_video, workspace_root, "engine-remote"),
+        input_value="https://www.bilibili.com/video/BV1test12345/",
+    )
+
+    submitted = runtime.submit_video(
+        request,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    assert not any(
+        event.event_type == "video.input-snapshot.v1"
+        for event in runtime.job_repository.list_events(submitted.job_id)
+    )
+    assert not (machine_root / "attempts" / "video-inputs").exists()
+    assert calls.resolve == 0
+    assert calls.acquire == 0
+
+
+def test_engine_local_video_rejects_hardlinked_input_before_job_creation(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+) -> None:
+    machine_root = tmp_path / "engine-hardlink-machine"
+    linked = tmp_path / "linked course.mp4"
+    os.link(local_video, linked)
+    runtime = _create_runtime(machine_root)
+
+    with pytest.raises(DomainError) as caught:
+        runtime.submit_video(
+            _request(linked, workspace_root, "engine-hardlink"),
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+
+    assert caught.value.code == "video_input_invalid"
+    assert not (machine_root / "attempts" / "video-inputs").exists()
+    assert (
+        JobRuntime(
+            runtime.job_repository,
+            wait_job=None,
+            current_config_snapshot=None,
+        ).list_jobs().jobs
+        == ()
+    )
+
+
+def test_engine_local_video_snapshot_storage_failure_creates_no_job(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine_root = tmp_path / "engine-snapshot-storage-failure-machine"
+    runtime = _create_runtime(machine_root)
+
+    def fail_snapshot_storage(_directory: Path, *, create: bool) -> None:
+        del create
+        raise PermissionError("snapshot storage unavailable")
+
+    monkeypatch.setattr(
+        runtime.video_service,
+        "_ensure_video_input_directory",
+        fail_snapshot_storage,
+    )
+
+    with pytest.raises(DomainError) as caught:
+        runtime.submit_video(
+            _request(local_video, workspace_root, "engine-snapshot-storage-failure"),
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+
+    assert caught.value.code == "video_input_snapshot_unavailable"
+    assert caught.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    assert (
+        JobRuntime(
+            runtime.job_repository,
+            wait_job=None,
+            current_config_snapshot=None,
+        ).list_jobs().jobs
+        == ()
+    )
+
+
+def test_legacy_engine_video_job_does_not_adopt_unbound_content_snapshot(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    machine_root = tmp_path / "engine-legacy-unbound-machine"
+    raw = b"same local video content"
+    current_source = tmp_path / "current course.mp4"
+    legacy_source = tmp_path / "legacy course.mp4"
+    current_source.write_bytes(raw)
+    legacy_source.write_bytes(raw)
+    calls = Calls()
+    runtime = _create_runtime(machine_root, calls=calls)
+    runtime.submit_video(
+        _request(current_source, workspace_root, "engine-bound-current"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    legacy_request = _request(legacy_source, workspace_root, "engine-legacy-unbound")
+    legacy = JobService(runtime.job_repository).submit(
+        runtime.video_service._job_request_payload(legacy_request),
+        execution_binding=runtime.video_service.execution_binding(
+            legacy_request.recipe_id,
+            legacy_request.recipe_version,
+        ),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    legacy_source.unlink()
+
+    completed = runtime.wait_job(legacy.job_id)
+
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert completed.error.code in {"source_local_unreadable", "source_unsupported"}
+    assert calls.resolve == 1
+    assert calls.acquire == 0
 
 
 def test_platform_runtime_routes_local_source_without_platform_uri(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,8 @@ from app.core.domain.video import (
     VideoDocumentKind,
     VideoProduceRequest,
     VideoProduceResult,
+    parse_video_input_snapshot_payload,
+    video_input_snapshot_payload,
 )
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.ports.credentials import CredentialBrokerPort
@@ -407,6 +410,33 @@ def test_request_and_generated_draft_are_frozen_and_own_collection_snapshots(
         request.input_value = "changed"  # type: ignore[misc]
     with pytest.raises(TypeError):
         draft.usage["input_tokens"] = 20  # type: ignore[index]
+
+
+def test_video_input_snapshot_event_contract_is_exact_and_fail_closed() -> None:
+    digest = "sha256:" + "a" * 64
+    payload = video_input_snapshot_payload(digest, 42)
+
+    assert payload == {
+        "schema_version": 1,
+        "sha256": digest,
+        "byte_length": 42,
+    }
+    assert parse_video_input_snapshot_payload(json.dumps(payload)) == payload
+    invalid = (
+        "[]",
+        '{"schema_version":true,"sha256":"' + digest + '","byte_length":42}',
+        '{"schema_version":1,"sha256":"bad","byte_length":42}',
+        '{"schema_version":1,"sha256":"' + digest + '","byte_length":-1}',
+        '{"schema_version":1,"sha256":"'
+        + digest
+        + '","byte_length":42,"extra":1}',
+        '{"schema_version":1,"schema_version":1,"sha256":"'
+        + digest
+        + '","byte_length":42}',
+    )
+    for value in invalid:
+        with pytest.raises(ValueError, match="video_input_snapshot_invalid"):
+            parse_video_input_snapshot_payload(value)
 
 
 def test_v2_request_defaults_to_one_knowledge_note(tmp_path: Path) -> None:
