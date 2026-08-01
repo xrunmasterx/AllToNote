@@ -21,6 +21,17 @@ _ENTRY_KEYS = frozenset(
     {"instance_id", "workspace_identity", "canonical_root"}
 )
 _INSTANCE_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_MAXIMUM_REGISTRY_BYTES = 1024 * 1024
+_MAXIMUM_REGISTRY_INSTANCES = 4096
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_key")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,8 @@ class WorkspaceInstanceRegistry:
                 registry["instances"], workspace_identity, normalized_root
             )
             if instance is None:
+                if len(registry["instances"]) >= _MAXIMUM_REGISTRY_INSTANCES:
+                    raise ValueError("workspace_instance_registry_full")
                 instance = {
                     "instance_id": uuid4().hex,
                     "workspace_identity": workspace_identity,
@@ -155,15 +168,57 @@ class WorkspaceInstanceRegistry:
 
     def _read_registry(self) -> dict[str, object]:
         self._validate_read_only_paths()
+        descriptor: int | None = None
         try:
-            with self._registry_path.open("r", encoding="utf-8") as registry_file:
-                registry = json.load(registry_file)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self._registry_path, flags)
+            if not self._registry_handle_matches(descriptor):
+                raise ValueError("workspace_instance_registry_invalid")
+            chunks: list[bytes] = []
+            remaining = _MAXIMUM_REGISTRY_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if len(payload) > _MAXIMUM_REGISTRY_BYTES or not (
+                self._registry_handle_matches(descriptor)
+            ):
+                raise ValueError("workspace_instance_registry_invalid")
+            registry = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+            )
         except FileNotFoundError:
             return {"version": _REGISTRY_VERSION, "instances": []}
         except (OSError, UnicodeError, ValueError, RecursionError) as error:
             raise ValueError("workspace_instance_registry_invalid") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         self._validate_registry(registry)
         return registry
+
+    def _registry_handle_matches(self, descriptor: int) -> bool:
+        try:
+            path_metadata = self._registry_path.lstat()
+            opened_metadata = os.fstat(descriptor)
+        except OSError:
+            return False
+        is_reparse = bool(
+            getattr(path_metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        return (
+            not is_reparse
+            and stat.S_ISREG(path_metadata.st_mode)
+            and path_metadata.st_nlink == 1
+            and path_metadata.st_dev == opened_metadata.st_dev
+            and path_metadata.st_ino == opened_metadata.st_ino
+        )
 
     def _validate_read_only_paths(self) -> None:
         controlled_paths = (
@@ -208,6 +263,7 @@ class WorkspaceInstanceRegistry:
             or type(registry["version"]) is not int
             or registry["version"] != _REGISTRY_VERSION
             or type(registry["instances"]) is not list
+            or len(registry["instances"]) > _MAXIMUM_REGISTRY_INSTANCES
         ):
             raise ValueError("workspace_instance_registry_invalid")
 
@@ -254,25 +310,27 @@ class WorkspaceInstanceRegistry:
 
     def _write_registry(self, registry: dict[str, object]) -> None:
         temporary_path: Path | None = None
+        payload = (
+            json.dumps(
+                registry,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        if len(payload) > _MAXIMUM_REGISTRY_BYTES:
+            raise ValueError("workspace_instance_registry_full")
         try:
             with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                newline="\n",
+                "wb",
                 prefix=f"{self._registry_path.name}.",
                 suffix=".tmp",
                 dir=self._app_root,
                 delete=False,
             ) as temporary_file:
                 temporary_path = Path(temporary_file.name)
-                json.dump(
-                    registry,
-                    temporary_file,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                temporary_file.write("\n")
+                temporary_file.write(payload)
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
             os.replace(temporary_path, self._registry_path)

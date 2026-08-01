@@ -7,14 +7,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
 from typing import Mapping
-from uuid import UUID
+from uuid import RFC_4122, UUID
 
 
 DESCRIPTOR_VERSION = 1
-ENGINE_PROTOCOL_VERSION = 1
+ENGINE_PROTOCOL_VERSION = 2
 RUNTIME_COMPATIBILITY_MAJOR = 0
 MAX_DESCRIPTOR_BYTES = 16 * 1024
 MAX_FRAME_BYTES = 1024 * 1024
+MAX_JOB_NOTIFY_BYTES = 4 * 1024
 
 _DESCRIPTOR_KEYS = frozenset(
     {
@@ -43,8 +44,11 @@ _REQUEST_KEYS = frozenset(
 _RESPONSE_KEYS = frozenset(
     {"engine_protocol_version", "request_id", "ok", "data", "error"}
 )
-_METHODS = frozenset({"hello", "health", "shutdown"})
+_METHODS = frozenset({"hello", "health", "shutdown", "job.notify"})
+_LIFECYCLE_METHODS = frozenset({"hello", "health", "shutdown"})
+_JOB_REFERENCE_KEYS = frozenset({"workspace_instance_id", "job_id"})
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_INSTANCE_ID = re.compile(r"[0-9a-f]{32}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
@@ -76,7 +80,12 @@ def _decode_json(payload: bytes, *, maximum: int) -> dict[str, object]:
             object_pairs_hook=_pairs,
             parse_constant=_reject_constant,
         )
-    except (EngineProtocolError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        EngineProtocolError,
+        RecursionError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
         if isinstance(error, EngineProtocolError):
             raise
         raise EngineProtocolError() from error
@@ -193,6 +202,31 @@ class EngineDescriptor:
 
 
 @dataclass(frozen=True)
+class EngineJobReference:
+    workspace_instance_id: str
+    job_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.workspace_instance_id) is not str
+            or _INSTANCE_ID.fullmatch(self.workspace_instance_id) is None
+            or type(self.job_id) is not str
+            or not self.job_id.startswith("job_")
+        ):
+            raise EngineProtocolError("engine_job_reference_invalid")
+        try:
+            parsed = UUID(self.job_id[4:])
+        except ValueError as error:
+            raise EngineProtocolError("engine_job_reference_invalid") from error
+        if (
+            parsed.version != 7
+            or parsed.variant != RFC_4122
+            or str(parsed) != self.job_id[4:]
+        ):
+            raise EngineProtocolError("engine_job_reference_invalid")
+
+
+@dataclass(frozen=True)
 class EngineRequest:
     engine_protocol_version: int
     request_id: str
@@ -213,6 +247,25 @@ class EngineRequest:
         if type(self.params) is not dict:
             raise EngineProtocolError()
         object.__setattr__(self, "params", MappingProxyType(dict(self.params)))
+        if self.method in _LIFECYCLE_METHODS:
+            if self.params:
+                raise EngineProtocolError()
+        elif frozenset(self.params) != _JOB_REFERENCE_KEYS:
+            raise EngineProtocolError("engine_job_reference_invalid")
+        else:
+            EngineJobReference(
+                workspace_instance_id=self.params["workspace_instance_id"],
+                job_id=self.params["job_id"],
+            )
+
+    @property
+    def job_reference(self) -> EngineJobReference | None:
+        if self.method != "job.notify":
+            return None
+        return EngineJobReference(
+            workspace_instance_id=self.params["workspace_instance_id"],
+            job_id=self.params["job_id"],
+        )
 
 
 def encode_request(
@@ -241,6 +294,8 @@ def encode_request(
     )
     if len(payload) > MAX_FRAME_BYTES:
         raise EngineProtocolError()
+    if method == "job.notify" and len(payload) > MAX_JOB_NOTIFY_BYTES:
+        raise EngineProtocolError()
     return payload
 
 
@@ -249,9 +304,12 @@ def decode_request(payload: bytes) -> EngineRequest:
     if frozenset(value) != _REQUEST_KEYS:
         raise EngineProtocolError()
     try:
-        return EngineRequest(**value)
+        request = EngineRequest(**value)
     except TypeError as error:
         raise EngineProtocolError() from error
+    if request.method == "job.notify" and len(payload) > MAX_JOB_NOTIFY_BYTES:
+        raise EngineProtocolError()
+    return request
 
 
 def encode_response(
@@ -263,6 +321,10 @@ def encode_response(
     _string(request_id, maximum=128)
     if (data is None) == (error is None):
         raise EngineProtocolError()
+    if error is not None:
+        if frozenset(error) != {"code"}:
+            raise EngineProtocolError()
+        _string(error["code"], maximum=128)
     payload = _canonical_bytes(
         {
             "engine_protocol_version": ENGINE_PROTOCOL_VERSION,
@@ -292,8 +354,17 @@ def decode_response(payload: bytes, *, request_id: str) -> dict[str, object]:
     if value["ok"]:
         if type(value["data"]) is not dict or value["error"] is not None:
             raise EngineProtocolError()
-    elif type(value["error"]) is not dict or value["data"] is not None:
-        raise EngineProtocolError()
+    else:
+        error = value["error"]
+        if (
+            type(error) is not dict
+            or frozenset(error) != {"code"}
+            or type(error["code"]) is not str
+            or not error["code"]
+            or len(error["code"]) > 128
+            or value["data"] is not None
+        ):
+            raise EngineProtocolError()
     return value
 
 
@@ -301,10 +372,12 @@ __all__ = [
     "DESCRIPTOR_VERSION",
     "ENGINE_PROTOCOL_VERSION",
     "EngineDescriptor",
+    "EngineJobReference",
     "EngineProtocolError",
     "EngineRequest",
     "MAX_DESCRIPTOR_BYTES",
     "MAX_FRAME_BYTES",
+    "MAX_JOB_NOTIFY_BYTES",
     "RUNTIME_COMPATIBILITY_MAJOR",
     "decode_request",
     "decode_response",

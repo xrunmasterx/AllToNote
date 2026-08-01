@@ -719,6 +719,7 @@ class SqliteJobRepository:
     def list_engine_execution_candidates(
         self,
         *,
+        principal: str,
         after_created_at: str | None,
         after_job_id: str | None,
         limit: int,
@@ -739,6 +740,8 @@ class SqliteJobRepository:
                 cursor_valid = False
         if (
             not cursor_valid
+            or type(principal) is not str
+            or not principal
             or type(limit) is not int
             or limit < 1
             or limit > 1000
@@ -750,12 +753,20 @@ class SqliteJobRepository:
             )
         clauses = [
             "execution_owner = ?",
+            "principal = ?",
             "state IN (?, ?)",
+            "NOT EXISTS ("
+            "SELECT 1 FROM leases "
+            "WHERE lease_name = 'scheduler' "
+            "AND CAST(expires_at AS INTEGER) > ?"
+            ")",
         ]
         parameters: list[object] = [
             JobExecutionOwner.ENGINE.value,
+            principal,
             JobState.QUEUED.value,
             JobState.RUNNING.value,
+            self._clock(),
         ]
         if after_created_at is not None and after_job_id is not None:
             clauses.append("(created_at > ? OR (created_at = ? AND job_id > ?))")

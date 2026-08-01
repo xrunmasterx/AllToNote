@@ -6,6 +6,9 @@ from enum import StrEnum
 from app.core.errors import ErrorDetail
 
 
+LOCAL_USER_PRINCIPAL = "local-user"
+
+
 class JobState(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import signal
 import threading
@@ -13,8 +14,16 @@ from uuid import uuid4
 import pytest
 
 from app.core.errors import DomainError
+from app.core.jobs.model import JobExecutionOwner
+from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.engine.client import LocalEngineClient
-from app.engine.contracts import ENGINE_PROTOCOL_VERSION, EngineDescriptor
+from app.engine.contracts import (
+    ENGINE_PROTOCOL_VERSION,
+    EngineDescriptor,
+    EngineJobReference,
+    encode_request,
+)
 from app.engine.host import run_engine_host
 from app.engine.instance import (
     EngineInstancePaths,
@@ -23,6 +32,7 @@ from app.engine.instance import (
     ensure_instance_root,
     publish_descriptor,
 )
+from app.engine.transport import connect_engine
 from app.runtime_paths import resolve_runtime_paths
 
 
@@ -44,11 +54,9 @@ def _ensure_in_spawned_process(machine_root: str, barrier, results) -> None:
     results.put((status.engine_id, status.started))
 
 
-def _run_short_idle_host(engine_root: str, log_root: str, scope_id: str) -> None:
+def _run_short_idle_host(runtime_paths) -> None:
     run_engine_host(
-        engine_root=Path(engine_root),
-        log_root=Path(log_root),
-        scope_id=scope_id,
+        paths=runtime_paths,
         idle_seconds=0.3,
     )
 
@@ -148,6 +156,48 @@ def test_concurrent_ensure_calls_converge_on_one_engine(tmp_path: Path) -> None:
         client.stop()
 
 
+def test_shutdown_commits_before_best_effort_ack(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    client.ensure()
+    descriptor = EngineDescriptor.from_bytes(client.descriptor_path.read_bytes())
+    connection = connect_engine(
+        descriptor.endpoint_name,
+        authkey=base64.urlsafe_b64decode(descriptor.nonce + "="),
+        expected_pid=descriptor.pid,
+        timeout_seconds=5,
+    )
+    try:
+        connection.send_bytes(
+            encode_request(
+                request_id=f"req_{uuid4().hex}",
+                method="shutdown",
+                nonce=descriptor.nonce,
+                params={},
+            )
+        )
+    finally:
+        connection.close()
+
+    stopped = False
+    deadline = time.monotonic() + 10
+    try:
+        while time.monotonic() < deadline:
+            try:
+                status = client.status()
+            except DomainError as error:
+                if error.code != "engine_state_root_unsafe":
+                    raise
+            else:
+                if status.state is EngineState.STOPPED:
+                    stopped = True
+                    break
+            time.sleep(0.02)
+        assert stopped is True
+    finally:
+        if not stopped:
+            client.stop()
+
+
 def test_spawned_concurrent_ensure_calls_converge_on_one_engine(tmp_path: Path) -> None:
     machine_root = tmp_path / "spawned machine state"
     client = LocalEngineClient(
@@ -180,11 +230,10 @@ def test_spawned_concurrent_ensure_calls_converge_on_one_engine(tmp_path: Path) 
 
 def test_idle_engine_exits_and_removes_only_owned_descriptor(tmp_path: Path) -> None:
     paths = resolve_runtime_paths(machine_state_root=tmp_path / "idle machine")
-    instance = EngineInstancePaths.from_runtime_paths(paths)
     context = get_context("spawn")
     process = context.Process(
         target=_run_short_idle_host,
-        args=(str(instance.root), str(instance.log_root), instance.scope_id),
+        args=(paths,),
     )
     process.start()
     client = LocalEngineClient(paths)
@@ -253,11 +302,10 @@ def test_stop_serializes_against_successor_ensure(tmp_path: Path) -> None:
 
 def test_ensure_heartbeat_prevents_idle_exit(tmp_path: Path) -> None:
     paths = resolve_runtime_paths(machine_state_root=tmp_path / "idle heartbeat")
-    instance = EngineInstancePaths.from_runtime_paths(paths)
     context = get_context("spawn")
     process = context.Process(
         target=_run_short_idle_host,
-        args=(str(instance.root), str(instance.log_root), instance.scope_id),
+        args=(paths,),
     )
     process.start()
     client = LocalEngineClient(paths, startup_timeout_seconds=10)
@@ -277,6 +325,74 @@ def test_ensure_heartbeat_prevents_idle_exit(tmp_path: Path) -> None:
     process.join(timeout=10)
     assert process.exitcode == 0
     assert client.status().state.value == "stopped"
+
+
+def test_job_notify_round_trips_persisted_terminal_state(tmp_path: Path) -> None:
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "notify machine")
+    local_parent = paths.workspace_registry_parent
+    local_parent.mkdir(parents=True)
+    workspace = tmp_path / "notify workspace"
+    workspace.mkdir()
+    identity = "notify-workspace-id"
+    registry = WorkspaceInstanceRegistry(
+        local_parent,
+        inspect_workspace=lambda _root: identity,
+    )
+    instance = registry.resolve(workspace)
+    repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    job = repository.create_job(
+        request_hash="sha256:" + "a" * 64,
+        principal="local-user",
+        client_request_id="terminal-notify",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    repository.cancel_job(job.job_id)
+    client = LocalEngineClient(paths, startup_timeout_seconds=10)
+    try:
+        receipt = client.notify_job(
+            EngineJobReference(instance.instance_id, job.job_id)
+        )
+
+        assert receipt == {
+            "engine_id": client.status().engine_id,
+            "workspace_instance_id": instance.instance_id,
+            "job_id": job.job_id,
+            "state": "cancelled",
+            "scheduled": False,
+        }
+    finally:
+        client.stop()
+
+
+def test_job_notify_preserves_remote_authority_error(tmp_path: Path) -> None:
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "denied machine")
+    local_parent = paths.workspace_registry_parent
+    local_parent.mkdir(parents=True)
+    workspace = tmp_path / "denied workspace"
+    workspace.mkdir()
+    registry = WorkspaceInstanceRegistry(
+        local_parent,
+        inspect_workspace=lambda _root: "denied-workspace-id",
+    )
+    instance = registry.resolve(workspace)
+    repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    job = repository.create_job(
+        request_hash="sha256:" + "b" * 64,
+        principal="remote-agent",
+        client_request_id="denied-notify",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    client = LocalEngineClient(paths, startup_timeout_seconds=10)
+    try:
+        with pytest.raises(DomainError) as raised:
+            client.notify_job(
+                EngineJobReference(instance.instance_id, job.job_id)
+            )
+
+        assert raised.value.code == "engine_job_authority_denied"
+        assert raised.value.category.value == "policy_denied"
+    finally:
+        client.stop()
 
 
 def test_stop_does_not_claim_success_for_a_live_unauthenticated_engine(

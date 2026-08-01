@@ -10,10 +10,15 @@ from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import JobExecutionBinding, JobExecutionOwner
+from app.core.jobs.model import (
+    AttemptState,
+    JobExecutionBinding,
+    JobExecutionOwner,
+    JobState,
+)
 from app.engine.job_worker import execute_engine_job, main
 from app.job_runtime import LOCAL_CLI_PRINCIPAL
-from app.runtime_paths import resolve_runtime_paths
+from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
 
 WORKSPACE_ID = "worker-workspace-id"
@@ -79,7 +84,7 @@ def test_worker_executes_existing_engine_job_using_registry_ids_only(
     def runtime_factory(
         workspace_root: Path,
         *,
-        local_app_data: Path,
+        runtime_paths: RuntimePaths,
         current_config_snapshot,
         require_existing_job_store: bool = False,
     ):
@@ -88,7 +93,7 @@ def test_worker_executes_existing_engine_job_using_registry_ids_only(
             (
                 "runtime",
                 workspace_root,
-                local_app_data,
+                runtime_paths,
                 current_config_snapshot,
             )
         )
@@ -104,7 +109,7 @@ def test_worker_executes_existing_engine_job_using_registry_ids_only(
 
     assert result is expected
     assert calls == [
-        ("runtime", workspace.resolve(), paths.workspace_registry_parent, None),
+        ("runtime", workspace.resolve(), paths, None),
         ("wait", job.job_id),
     ]
 
@@ -142,11 +147,205 @@ def test_worker_rejects_jobs_outside_engine_local_user_authority(
     assert raised.value.category is ErrorCategory.POLICY_DENIED
 
 
-def test_worker_revalidates_registry_workspace_identity_before_jobstore_open(
+def test_worker_persists_permanent_preflight_failure(tmp_path: Path) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+
+    with pytest.raises(DomainError, match="document_pack_unavailable"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DomainError(
+                    "document_pack_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Install the compatible document Pack",
+                )
+            ),
+        )
+
+    failed = repository.get_job(job.job_id)
+    stored = repository.get_job_error(job.job_id)
+    assert failed.state is JobState.FAILED
+    assert stored is not None
+    assert stored.code == "document_pack_unavailable"
+    assert repository.list_engine_execution_candidates(
+        principal=LOCAL_CLI_PRINCIPAL,
+        after_created_at=None,
+        after_job_id=None,
+        limit=10,
+    ) == ()
+
+
+def test_worker_persists_frozen_pack_snapshot_conflict(tmp_path: Path) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+
+    with pytest.raises(DomainError, match="execution_pack_snapshot_missing"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DomainError(
+                    "execution_pack_snapshot_missing",
+                    ErrorCategory.CONFLICT,
+                    "The Job has no frozen Pack environment",
+                )
+            ),
+        )
+
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    assert repository.get_job_error(job.job_id).code == (
+        "execution_pack_snapshot_missing"
+    )
+
+
+def test_worker_does_not_persist_unknown_exception(tmp_path: Path) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+
+    with pytest.raises(RuntimeError, match="unexpected bug"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("unexpected bug")
+            ),
+        )
+
+    assert repository.get_job(job.job_id).state is JobState.QUEUED
+    assert repository.get_job_error(job.job_id) is None
+
+
+def test_worker_cancellation_wins_permanent_failure_settlement(
+    tmp_path: Path,
+) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+    repository.cancel_job(job.job_id)
+
+    with pytest.raises(DomainError, match="document_pack_unavailable"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DomainError(
+                    "document_pack_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Install the compatible document Pack",
+                )
+            ),
+        )
+
+    assert repository.get_job(job.job_id).state is JobState.CANCELLED
+    assert repository.get_job_error(job.job_id) is None
+
+
+@pytest.mark.parametrize(
+    ("code", "category"),
+    (
+        ("job_store_busy", ErrorCategory.RETRYABLE_RUNTIME),
+        ("scheduler_busy", ErrorCategory.CONFLICT),
+        ("resource_busy", ErrorCategory.CONFLICT),
+        ("job_claim_fenced", ErrorCategory.CONFLICT),
+    ),
+)
+def test_worker_does_not_persist_recoverable_failure(
+    tmp_path: Path,
+    code: str,
+    category: ErrorCategory,
+) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+
+    with pytest.raises(DomainError, match=code):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DomainError(code, category, "retry later")
+            ),
+        )
+
+    assert repository.get_job(job.job_id).state is JobState.QUEUED
+    assert repository.get_job_error(job.job_id) is None
+
+
+def test_worker_failure_settlement_never_overrides_live_claim(
+    tmp_path: Path,
+) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+    live = repository.claim_job(job.job_id, "other-worker", ttl_seconds=30)
+    try:
+        with pytest.raises(DomainError, match="document_pack_unavailable"):
+            execute_engine_job(
+                paths,
+                workspace_instance_id=instance.instance_id,
+                job_id=job.job_id,
+                inspect_workspace=_inspect_workspace,
+                runtime_factory=lambda *_args, **_kwargs: (
+                    _ for _ in ()
+                ).throw(
+                    DomainError(
+                        "document_pack_unavailable",
+                        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                        "Install the compatible document Pack",
+                    )
+                ),
+            )
+
+        assert repository.get_job(job.job_id).state is JobState.RUNNING
+        assert repository.get_job_error(job.job_id) is None
+    finally:
+        repository.release_scheduler_lease(live.authority)
+
+
+def test_worker_failure_settlement_takes_over_expired_attempt(
+    tmp_path: Path,
+) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+    previous = repository.claim_job(job.job_id, "lost-worker", ttl_seconds=30)
+    attempt = repository.create_attempt(
+        job.job_id,
+        "preflight",
+        authority=previous.authority,
+    )
+    repository.start_attempt(attempt.attempt_id, previous.authority)
+    repository.release_scheduler_lease(previous.authority)
+
+    with pytest.raises(DomainError, match="job_request_invalid"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DomainError(
+                    "job_request_invalid",
+                    ErrorCategory.INTERNAL,
+                    "Stored Job request is invalid",
+                )
+            ),
+        )
+
+    attempts = repository.list_attempts(job.job_id)
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    assert tuple(item.state for item in attempts) == (
+        AttemptState.INTERRUPTED,
+        AttemptState.FAILED,
+    )
+    assert attempts[1].fencing_token > attempts[0].fencing_token
+
+
+def test_worker_persists_registry_workspace_identity_mismatch(
     tmp_path: Path,
 ) -> None:
     paths, workspace, instance, repository, job = _registered_job(tmp_path)
-    database_bytes = repository.database_path.read_bytes()
     (workspace / "workspace-id.txt").write_text("changed-id", encoding="utf-8")
 
     with pytest.raises(DomainError) as raised:
@@ -161,7 +360,10 @@ def test_worker_revalidates_registry_workspace_identity_before_jobstore_open(
         )
 
     assert raised.value.code == "workspace_instance_identity_mismatch"
-    assert repository.database_path.read_bytes() == database_bytes
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    stored = repository.get_job_error(job.job_id)
+    assert stored is not None
+    assert stored.code == "workspace_instance_identity_mismatch"
 
 
 def test_worker_missing_jobstore_fails_without_creating_machine_state(
@@ -260,12 +462,12 @@ def test_worker_restores_persisted_configuration_snapshot(
     def runtime_factory(
         _workspace_root: Path,
         *,
-        local_app_data: Path,
+        runtime_paths: RuntimePaths,
         current_config_snapshot,
         require_existing_job_store: bool = False,
     ):
         assert require_existing_job_store is True
-        observed.append((local_app_data, current_config_snapshot))
+        observed.append((runtime_paths, current_config_snapshot))
         return Runtime()
 
     execute_engine_job(
@@ -277,7 +479,7 @@ def test_worker_restores_persisted_configuration_snapshot(
     )
 
     assert len(observed) == 1
-    assert observed[0][0] == paths.workspace_registry_parent
+    assert observed[0][0] == paths
     assert observed[0][1].values == values
     assert observed[0][1].semantic_digest == digest
 
@@ -300,8 +502,16 @@ def test_private_worker_main_maps_domain_failure_without_output(
 
     exit_code = main(
         [
-            "--local-data-parent",
-            str(tmp_path),
+            "--config-dir",
+            str(tmp_path / "config" / "AllToNote"),
+            "--data-dir",
+            str(tmp_path / "data" / "AllToNote"),
+            "--cache-dir",
+            str(tmp_path / "cache" / "AllToNote"),
+            "--state-dir",
+            str(tmp_path / "state" / "AllToNote"),
+            "--log-dir",
+            str(tmp_path / "log" / "AllToNote"),
             "--workspace-instance-id",
             "1" * 32,
             "--job-id",
@@ -311,3 +521,43 @@ def test_private_worker_main_maps_domain_failure_without_output(
 
     assert exit_code == 30
     assert capsys.readouterr() == ("", "")
+
+
+def test_private_worker_main_preserves_all_runtime_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: list[RuntimePaths] = []
+    expected = RuntimePaths(
+        config_dir=tmp_path / "config root" / "AllToNote",
+        data_dir=tmp_path / "data root" / "AllToNote",
+        cache_dir=tmp_path / "cache root" / "AllToNote",
+        state_dir=tmp_path / "state root" / "AllToNote",
+        log_dir=tmp_path / "log root" / "AllToNote",
+    )
+    monkeypatch.setattr(
+        "app.engine.job_worker.execute_engine_job",
+        lambda paths, **_kwargs: observed.append(paths),
+    )
+
+    exit_code = main(
+        [
+            "--config-dir",
+            str(expected.config_dir),
+            "--data-dir",
+            str(expected.data_dir),
+            "--cache-dir",
+            str(expected.cache_dir),
+            "--state-dir",
+            str(expected.state_dir),
+            "--log-dir",
+            str(expected.log_dir),
+            "--workspace-instance-id",
+            "1" * 32,
+            "--job-id",
+            "job_018f0000-0000-7000-8000-000000000001",
+        ]
+    )
+
+    assert exit_code == 0
+    assert observed == [expected]

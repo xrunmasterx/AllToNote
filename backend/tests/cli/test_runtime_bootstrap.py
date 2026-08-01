@@ -155,6 +155,40 @@ def test_engine_status_is_cold_and_does_not_import_execution_modules() -> None:
     } & set(report["imported_modules"])
 
 
+def test_engine_host_import_does_not_load_worker_recipe_or_pack_modules() -> None:
+    backend_root = Path(__file__).resolve().parents[2]
+    script = (
+        "import json,sys;"
+        f"sys.path.insert(0,{str(backend_root)!r});"
+        "import app.engine.host;"
+        "print(json.dumps(sorted(sys.modules)))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    imported = set(json.loads(result.stdout))
+
+    assert not {
+        "app.runtime",
+        "app.job_runtime",
+        "app.engine.job_worker",
+        "app.core.application.video_service",
+        "app.core.application.document_service",
+        "app.core.recipes.video.adapter",
+        "app.core.recipes.document.adapter",
+        "app.adapters.video_packs.official_pack_process",
+        "app.adapters.documents.docling_worker_parser",
+        "torch",
+        "faster_whisper",
+        "yt_dlp",
+        "openai",
+    } & imported
+
+
 def test_runtime_lock_is_available_as_a_package_resource():
     lock_resource = resources.files("app").joinpath("runtime-lock.json")
 

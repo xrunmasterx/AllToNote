@@ -2,22 +2,25 @@ from __future__ import annotations
 
 import argparse
 import json
-import stat
 from collections.abc import Callable
 from pathlib import Path
-from uuid import RFC_4122, UUID
+from uuid import RFC_4122, UUID, uuid4
 
-from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import (
     WorkspaceInstance,
     WorkspaceInstanceRegistry,
 )
 from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
-from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import JobExecutionOwner
-from app.job_runtime import LOCAL_CLI_PRINCIPAL
-from app.runtime_paths import RuntimePaths, resolve_runtime_paths
+from app.core.errors import DomainError, ErrorCategory, ErrorDetail
+from app.core.jobs.model import (
+    AttemptState,
+    LOCAL_USER_PRINCIPAL,
+    JobExecutionOwner,
+    JobState,
+)
+from app.engine.job_store import open_engine_job_store
+from app.runtime_paths import RuntimePaths
 
 
 _EXIT_CODES = {
@@ -30,6 +33,24 @@ _EXIT_CODES = {
     ErrorCategory.CANCELLED: 60,
     ErrorCategory.INTERNAL: 70,
 }
+_PERSISTENT_FAILURE_CATEGORIES = frozenset(
+    {
+        ErrorCategory.INVALID_REQUEST,
+        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+        ErrorCategory.POLICY_DENIED,
+        ErrorCategory.RECIPE_FAILED,
+        ErrorCategory.INTERNAL,
+    }
+)
+_PERSISTENT_CONFLICT_CODES = frozenset(
+    {
+        "effective_config_drift",
+        "effective_config_unavailable",
+        "execution_pack_snapshot_invalid",
+        "execution_pack_snapshot_missing",
+    }
+)
+_RECOVERY_CLAIM_TTL_SECONDS = 30
 
 
 def execute_engine_job(
@@ -65,30 +86,109 @@ def execute_engine_job(
             ErrorCategory.INVALID_REQUEST,
             "Workspace instance does not exist",
         )
-    workspace_root = _validated_workspace(paths, instance, inspector)
-    repository = _open_existing_job_store(paths, instance)
+    repository = open_engine_job_store(paths, instance)
     job = repository.get_job(job_id)
     if (
         job.execution_owner is not JobExecutionOwner.ENGINE
-        or job.principal != LOCAL_CLI_PRINCIPAL
+        or job.principal != LOCAL_USER_PRINCIPAL
     ):
         raise DomainError(
             "engine_job_authority_denied",
             ErrorCategory.POLICY_DENIED,
             "Engine is not authorized to execute this Job",
         )
-    config_snapshot = _load_config_snapshot(repository, job_id)
-    if runtime_factory is None:
-        from app.job_runtime import create_job_runtime_for_workspace
+    try:
+        workspace_root = _validated_workspace(paths, instance, inspector)
+        config_snapshot = _load_config_snapshot(repository, job_id)
+        if runtime_factory is None:
+            from app.job_runtime import create_job_runtime_for_workspace
 
-        runtime_factory = create_job_runtime_for_workspace
-    runtime = runtime_factory(
-        workspace_root,
-        local_app_data=paths.workspace_registry_parent,
-        current_config_snapshot=config_snapshot,
-        require_existing_job_store=True,
-    )
-    return runtime.wait_for_job(job_id)
+            runtime_factory = create_job_runtime_for_workspace
+        runtime = runtime_factory(
+            workspace_root,
+            runtime_paths=paths,
+            current_config_snapshot=config_snapshot,
+            require_existing_job_store=True,
+        )
+        return runtime.wait_for_job(job_id)
+    except DomainError as error:
+        _persist_permanent_failure(repository, job_id, error)
+        raise
+
+
+def _persist_permanent_failure(
+    repository: SqliteJobRepository,
+    job_id: str,
+    error: DomainError,
+) -> None:
+    if not (
+        error.category in _PERSISTENT_FAILURE_CATEGORIES
+        or error.code in _PERSISTENT_CONFLICT_CODES
+    ):
+        return
+    authority = None
+    try:
+        job = repository.get_job(job_id)
+        if (
+            job.execution_owner is not JobExecutionOwner.ENGINE
+            or job.principal != LOCAL_USER_PRINCIPAL
+            or job.state not in {JobState.QUEUED, JobState.RUNNING}
+        ):
+            return
+        claim = repository.claim_job(
+            job_id,
+            f"engine-recovery-{uuid4().hex}",
+            ttl_seconds=_RECOVERY_CLAIM_TTL_SECONDS,
+        )
+        authority = claim.authority
+        if claim.job.state in {
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.WAITING_FOR_INPUT,
+        }:
+            return
+        attempt = claim.active_attempt
+        if (
+            attempt is not None
+            and attempt.state is AttemptState.RUNNING
+            and attempt.fencing_token != authority.fencing_token
+        ):
+            attempt = repository.take_over_running_attempt(
+                job_id,
+                attempt.attempt_id,
+                authority,
+            )
+            unknown = repository.reconcile_external_operations_after_process_loss(
+                job_id,
+                authority,
+            )
+            if unknown:
+                repository.pause_for_external_outcome_atomic(
+                    job_id,
+                    attempt.attempt_id,
+                    authority,
+                )
+                return
+        repository.fail_job_atomic(
+            job_id,
+            ErrorDetail(
+                error.code,
+                error.category,
+                error.message,
+                error.details,
+            ),
+            attempt_id=(attempt.attempt_id if attempt is not None else None),
+            authority=authority,
+        )
+    except Exception:
+        return
+    finally:
+        if authority is not None:
+            try:
+                repository.release_scheduler_lease(authority)
+            except Exception:
+                pass
 
 
 def _validated_workspace(
@@ -126,52 +226,6 @@ def _validated_workspace(
             "Registered Workspace identity has changed",
         )
     return workspace_root
-
-
-def _open_existing_job_store(
-    paths: RuntimePaths,
-    instance: WorkspaceInstance,
-) -> SqliteJobRepository:
-    expected_machine_root = paths.workspace_machine_parent / instance.instance_id
-    job_store = expected_machine_root / "job-store"
-    database = job_store / "jobs.sqlite"
-    if instance.machine_root != expected_machine_root:
-        _raise_job_store_unavailable()
-    for directory in (
-        paths.workspace_machine_parent,
-        expected_machine_root,
-        job_store,
-    ):
-        _require_exact_ordinary_path(directory, directory=True)
-    _require_exact_ordinary_path(database, directory=False)
-    return SqliteJobRepository.open_existing(job_store)
-
-
-def _require_exact_ordinary_path(path: Path, *, directory: bool) -> None:
-    try:
-        resolved = path.resolve(strict=True)
-        metadata = path.lstat()
-    except (OSError, RuntimeError, ValueError):
-        _raise_job_store_unavailable()
-    is_reparse = bool(
-        getattr(metadata, "st_file_attributes", 0)
-        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    )
-    valid_kind = (
-        stat.S_ISDIR(metadata.st_mode)
-        if directory
-        else stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
-    )
-    if resolved != path or is_reparse or not valid_kind:
-        _raise_job_store_unavailable()
-
-
-def _raise_job_store_unavailable() -> None:
-    raise DomainError(
-        "engine_job_store_unavailable",
-        ErrorCategory.WORKSPACE_INCOMPATIBLE,
-        "Engine JobStore is unavailable",
-    )
 
 
 def _load_config_snapshot(
@@ -236,13 +290,23 @@ def _is_typed_job_id(value: object) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="alltonote-engine-job-worker-private")
-    parser.add_argument("--local-data-parent", required=True, type=Path)
+    parser.add_argument("--config-dir", required=True, type=Path)
+    parser.add_argument("--data-dir", required=True, type=Path)
+    parser.add_argument("--cache-dir", required=True, type=Path)
+    parser.add_argument("--state-dir", required=True, type=Path)
+    parser.add_argument("--log-dir", required=True, type=Path)
     parser.add_argument("--workspace-instance-id", required=True)
     parser.add_argument("--job-id", required=True)
     args = parser.parse_args(argv)
     try:
         execute_engine_job(
-            resolve_runtime_paths(local_data_parent=args.local_data_parent),
+            RuntimePaths(
+                config_dir=args.config_dir,
+                data_dir=args.data_dir,
+                cache_dir=args.cache_dir,
+                state_dir=args.state_dir,
+                log_dir=args.log_dir,
+            ),
             workspace_instance_id=args.workspace_instance_id,
             job_id=args.job_id,
         )
@@ -259,4 +323,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["execute_engine_job", "main"]
+__all__ = ["execute_engine_job", "main", "open_engine_job_store"]

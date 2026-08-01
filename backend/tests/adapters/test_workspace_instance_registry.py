@@ -471,7 +471,11 @@ def test_registry_rejects_string_subclass_values(
     entry = _valid_entry(tmp_path / "stale")
     entry[field] = StringSubclass(entry[field])
     payload = {"version": 1, "instances": [entry]}
-    monkeypatch.setattr(registry_module.json, "load", lambda _stream: payload)
+    monkeypatch.setattr(
+        registry_module.json,
+        "loads",
+        lambda _raw, **_kwargs: payload,
+    )
 
     with pytest.raises(ValueError, match="^workspace_instance_registry_invalid$"):
         instance_registry.resolve(workspace_root)
@@ -587,6 +591,55 @@ def test_registry_wraps_json_and_unicode_parse_failures(
 
     with pytest.raises(ValueError, match="^workspace_instance_registry_invalid$"):
         instance_registry.resolve(workspace_root)
+
+
+def test_registry_rejects_duplicate_json_members(
+    instance_registry: WorkspaceInstanceRegistry,
+    workspace_root: Path,
+    local_app_data: Path,
+) -> None:
+    _registry_path(local_app_data).write_text(
+        '{"version":1,"version":1,"instances":[]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="^workspace_instance_registry_invalid$"):
+        instance_registry.resolve(workspace_root)
+
+
+def test_registry_rejects_oversized_input_before_json_decode(
+    instance_registry: WorkspaceInstanceRegistry,
+    workspace_root: Path,
+    local_app_data: Path,
+) -> None:
+    _registry_path(local_app_data).write_bytes(b" " * (1024 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="^workspace_instance_registry_invalid$"):
+        instance_registry.resolve(workspace_root)
+
+
+def test_registry_capacity_failure_does_not_rewrite_existing_entries(
+    instance_registry: WorkspaceInstanceRegistry,
+    workspace_root: Path,
+    local_app_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = instance_registry.resolve(workspace_root)
+    original = _registry_path(local_app_data).read_bytes()
+    second_workspace = tmp_path / "second-workspace"
+    second_workspace.mkdir()
+    (second_workspace / "workspace-id.txt").write_text(
+        "second-identity",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry_module, "_MAXIMUM_REGISTRY_INSTANCES", 1)
+
+    with pytest.raises(ValueError, match="^workspace_instance_registry_full$"):
+        instance_registry.resolve(second_workspace)
+
+    assert first.instance_id == VALID_INSTANCE_ID or len(first.instance_id) == 32
+    assert _registry_path(local_app_data).read_bytes() == original
 
 
 def test_registry_wraps_file_read_failures(

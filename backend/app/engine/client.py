@@ -17,10 +17,12 @@ from app.engine.contracts import (
     ENGINE_PROTOCOL_VERSION,
     MAX_FRAME_BYTES,
     EngineDescriptor,
+    EngineJobReference,
     EngineProtocolError,
     decode_response,
     encode_request,
 )
+from app.engine.errors import ENGINE_REMOTE_ERROR_CATEGORIES
 from app.engine.instance import (
     EngineFileLock,
     EngineInstancePaths,
@@ -52,6 +54,7 @@ class LocalEngineClient:
                 "Engine lifecycle is unsupported on this platform",
             )
         self._paths = EngineInstancePaths.from_runtime_paths(paths)
+        self._runtime_paths = paths
         self._startup_timeout = startup_timeout_seconds
         self._shutdown_timeout = shutdown_timeout_seconds
         self._ipc_timeout = ipc_timeout_seconds
@@ -110,53 +113,125 @@ class LocalEngineClient:
                 "Engine startup is busy",
             ) from error
         try:
-            current = self.status()
-            if current.running:
-                descriptor = read_descriptor(self._paths.descriptor)
-                if descriptor is None or not self._identity_matches(descriptor):
-                    raise DomainError(
-                        "engine_state_inconsistent",
-                        ErrorCategory.CONFLICT,
-                        "Engine lifecycle state is inconsistent",
-                    )
-                self._request(descriptor, "hello")
-                return current
-            if not self._lifetime_lock_is_free():
+            return self._ensure_locked()
+        finally:
+            launch_lock.release()
+
+    def notify_job(self, reference: EngineJobReference) -> dict[str, object]:
+        if not isinstance(reference, EngineJobReference):
+            raise DomainError(
+                "engine_job_reference_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Engine Job reference is invalid",
+            )
+        ensure_instance_root(self._paths)
+        launch_lock = EngineFileLock(
+            self._paths.launch_lock,
+            timeout=self._startup_timeout,
+        )
+        try:
+            launch_lock.acquire()
+        except Timeout as error:
+            raise DomainError(
+                "engine_start_busy",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Engine startup is busy",
+            ) from error
+        try:
+            status = self._ensure_locked()
+            descriptor = read_descriptor(self._paths.descriptor)
+            if descriptor is None or not self._identity_matches(descriptor):
                 raise DomainError(
                     "engine_state_inconsistent",
                     ErrorCategory.CONFLICT,
                     "Engine lifecycle state is inconsistent",
                 )
-            self._remove_stale_descriptor()
-            child = self._launch()
-            deadline = time.monotonic() + self._startup_timeout
-            while time.monotonic() < deadline:
-                status = self.status()
-                if status.running:
-                    return EngineStatus(
-                        EngineState.RUNNING,
-                        True,
-                        engine_id=status.engine_id,
-                        started_at=status.started_at,
-                        started=True,
-                    )
-                if child.poll() is not None:
-                    break
-                time.sleep(0.02)
-            if child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait(timeout=2)
-            raise DomainError(
-                "engine_start_timeout",
-                ErrorCategory.RETRYABLE_RUNTIME,
-                "Engine did not become ready",
+            data = self._request(
+                descriptor,
+                "job.notify",
+                params={
+                    "workspace_instance_id": reference.workspace_instance_id,
+                    "job_id": reference.job_id,
+                },
             )
+            if (
+                frozenset(data)
+                != {
+                    "engine_id",
+                    "workspace_instance_id",
+                    "job_id",
+                    "state",
+                    "scheduled",
+                }
+                or data["engine_id"] != status.engine_id
+                or data["workspace_instance_id"] != reference.workspace_instance_id
+                or data["job_id"] != reference.job_id
+                or data["state"]
+                not in {
+                    "queued",
+                    "running",
+                    "waiting_for_input",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }
+                or type(data["scheduled"]) is not bool
+            ):
+                raise DomainError(
+                    "engine_response_invalid",
+                    ErrorCategory.RETRYABLE_RUNTIME,
+                    "Engine response is invalid",
+                )
+            return data
         finally:
             launch_lock.release()
+
+    def _ensure_locked(self) -> EngineStatus:
+        current = self.status()
+        if current.running:
+            descriptor = read_descriptor(self._paths.descriptor)
+            if descriptor is None or not self._identity_matches(descriptor):
+                raise DomainError(
+                    "engine_state_inconsistent",
+                    ErrorCategory.CONFLICT,
+                    "Engine lifecycle state is inconsistent",
+                )
+            self._request(descriptor, "hello")
+            return current
+        if not self._lifetime_lock_is_free():
+            raise DomainError(
+                "engine_state_inconsistent",
+                ErrorCategory.CONFLICT,
+                "Engine lifecycle state is inconsistent",
+            )
+        self._remove_stale_descriptor()
+        child = self._launch()
+        deadline = time.monotonic() + self._startup_timeout
+        while time.monotonic() < deadline:
+            status = self.status()
+            if status.running:
+                return EngineStatus(
+                    EngineState.RUNNING,
+                    True,
+                    engine_id=status.engine_id,
+                    started_at=status.started_at,
+                    started=True,
+                )
+            if child.poll() is not None:
+                break
+            time.sleep(0.02)
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=2)
+        raise DomainError(
+            "engine_start_timeout",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "Engine did not become ready",
+        )
 
     def stop(self) -> EngineStatus:
         validate_instance_root_if_present(self._paths)
@@ -231,6 +306,8 @@ class LocalEngineClient:
         self,
         descriptor: EngineDescriptor,
         method: str,
+        *,
+        params: dict[str, object] | None = None,
     ) -> dict[str, object]:
         request_id = f"req_{uuid4().hex}"
         authkey = base64.urlsafe_b64decode(descriptor.nonce + "=")
@@ -247,7 +324,7 @@ class LocalEngineClient:
                         request_id=request_id,
                         method=method,
                         nonce=descriptor.nonce,
-                        params={},
+                        params=params or {},
                     )
                 )
                 response = decode_response(
@@ -279,6 +356,16 @@ class LocalEngineClient:
             )
             raise DomainError(code, category, "Engine is unavailable") from error
         if not response["ok"]:
+            remote_error = response["error"]
+            assert isinstance(remote_error, dict)
+            remote_code = remote_error["code"]
+            category = ENGINE_REMOTE_ERROR_CATEGORIES.get(remote_code)
+            if category is not None:
+                raise DomainError(
+                    remote_code,
+                    category,
+                    "Engine request was rejected",
+                )
             raise DomainError(
                 "engine_request_failed",
                 ErrorCategory.RETRYABLE_RUNTIME,
@@ -353,6 +440,16 @@ class LocalEngineClient:
             str(self._paths.log_root),
             "--scope-id",
             self._paths.scope_id,
+            "--config-dir",
+            str(self._runtime_paths.config_dir),
+            "--data-dir",
+            str(self._runtime_paths.data_dir),
+            "--cache-dir",
+            str(self._runtime_paths.cache_dir),
+            "--state-dir",
+            str(self._runtime_paths.state_dir),
+            "--runtime-log-dir",
+            str(self._runtime_paths.log_dir),
         ]
         options: dict[str, object] = {
             "stdin": subprocess.DEVNULL,

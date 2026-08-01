@@ -15,6 +15,22 @@ _WAIT_SECONDS = 5.0
 _CREATE_SUSPENDED = 0x00000004
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_ENVIRONMENT_KEYS = frozenset(
+    {
+        "COMSPEC",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "PATH",
+        "PATHEXT",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "WINDIR",
+    }
+)
 
 
 class WorkerProcessTimeout(TimeoutError):
@@ -23,6 +39,26 @@ class WorkerProcessTimeout(TimeoutError):
 
 class WorkerProcessUnavailable(OSError):
     pass
+
+
+def minimal_worker_environment(
+    source: Mapping[str, str] | None = None,
+    *,
+    overrides: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    values = os.environ if source is None else source
+    environment = {
+        key: value
+        for key in _ENVIRONMENT_KEYS
+        if type(value := values.get(key)) is str and value
+    }
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    for key, value in (overrides or {}).items():
+        if type(key) is not str or not key or type(value) is not str:
+            raise ValueError("Worker environment override is invalid")
+        environment[key] = value
+    return environment
 
 
 class _WindowsJob:
@@ -289,5 +325,6 @@ def run_worker_process(
 __all__ = [
     "WorkerProcessTimeout",
     "WorkerProcessUnavailable",
+    "minimal_worker_environment",
     "run_worker_process",
 ]

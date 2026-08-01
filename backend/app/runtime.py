@@ -2034,6 +2034,7 @@ def create_document_runtime_for_workspace(
     workspace_root: Path,
     *,
     local_app_data: Path | None = None,
+    runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
     requested_model_identity: str | None = None,
     requested_provider_profile: str | None = None,
@@ -2041,8 +2042,12 @@ def create_document_runtime_for_workspace(
     requested_verifier_provider_profile: str | None = None,
     require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
-    trusted_root = local_app_data or _default_local_app_data()
-    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    if local_app_data is not None and runtime_paths is not None:
+        raise ValueError("runtime_path_override_conflict")
+    paths = runtime_paths or resolve_runtime_paths(
+        local_data_parent=local_app_data or _default_local_app_data()
+    )
+    trusted_root = paths.workspace_registry_parent
     paths.assert_outside_workspace(workspace_root)
     worker_config = _resolve_document_worker_config(paths, os.environ)
     trusted_root.mkdir(parents=True, exist_ok=True)
@@ -2471,6 +2476,7 @@ def create_codex_app_server_runtime_for_workspace(
     workspace_root: Path,
     *,
     local_app_data: Path | None = None,
+    runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
     execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
     require_existing_job_store: bool = False,
@@ -2484,8 +2490,12 @@ def create_codex_app_server_runtime_for_workspace(
             ErrorCategory.POLICY_DENIED,
             "The local Codex CLI must be installed, signed in, and have a default model",
     )
-    trusted_root = local_app_data or _default_local_app_data()
-    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    if local_app_data is not None and runtime_paths is not None:
+        raise ValueError("runtime_path_override_conflict")
+    paths = runtime_paths or resolve_runtime_paths(
+        local_data_parent=local_app_data or _default_local_app_data()
+    )
+    trusted_root = paths.workspace_registry_parent
     paths.assert_outside_workspace(workspace_root)
     trusted_root.mkdir(parents=True, exist_ok=True)
     registry = WorkspaceInstanceRegistry(

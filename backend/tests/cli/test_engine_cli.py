@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 
 from app.cli.main import main
+from app.engine.contracts import ENGINE_PROTOCOL_VERSION
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ def test_engine_status_is_read_only_and_uses_cli_protocol_v1(capsys) -> None:
     assert envelope["command"] == "engine status"
     assert envelope["data"] == {
         "engine_id": None,
-        "engine_protocol_version": 1,
+        "engine_protocol_version": ENGINE_PROTOCOL_VERSION,
         "running": False,
         "started_at": None,
         "state": "stopped",

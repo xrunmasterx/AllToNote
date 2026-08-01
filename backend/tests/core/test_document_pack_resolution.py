@@ -311,6 +311,13 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     shutil.copytree(FIXTURE_ROOT, workspace)
     local_data = tmp_path / "local-data"
     local_data.mkdir()
+    expected_paths = RuntimePaths(
+        config_dir=tmp_path / "config" / "AllToNote",
+        data_dir=local_data / "AllToNote",
+        cache_dir=tmp_path / "cache" / "AllToNote",
+        state_dir=tmp_path / "state" / "AllToNote",
+        log_dir=tmp_path / "log" / "AllToNote",
+    )
     registry = WorkspaceInstanceRegistry(
         local_data,
         inspect_workspace=lambda root: open_workspace(
@@ -386,7 +393,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     def create(
         workspace_root: Path,
         *,
-        local_app_data: Path | None = None,
+        runtime_paths: RuntimePaths,
         current_config_snapshot=None,
         requested_model_identity: str | None = None,
         requested_provider_profile: str | None = None,
@@ -399,7 +406,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         selected.append(
             (
                 workspace_root,
-                local_app_data,
+                runtime_paths,
                 requested_model_identity,
                 requested_provider_profile,
                 requested_verifier_model_identity,
@@ -415,7 +422,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     expected_existing_job_store = require_existing_job_store
     runtime = create_job_runtime_for_workspace(
         workspace,
-        local_app_data=local_data,
+        runtime_paths=expected_paths,
         current_config_snapshot=None,
         require_existing_job_store=require_existing_job_store,
     )
@@ -424,7 +431,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     assert selected == [
         (
             workspace,
-            local_data,
+            expected_paths,
             "fixture/frozen-model",
             "fixture/frozen-profile",
             verifier_model,

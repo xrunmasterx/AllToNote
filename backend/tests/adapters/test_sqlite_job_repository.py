@@ -1610,6 +1610,7 @@ def test_list_engine_execution_candidates_excludes_foreground_and_wait_boundarie
     repo.transition_job(failed.job_id, JobState.FAILED)
 
     candidates = repo.list_engine_execution_candidates(
+        principal="agent",
         after_created_at=None,
         after_job_id=None,
         limit=10,
@@ -1628,6 +1629,43 @@ def test_list_engine_execution_candidates_excludes_foreground_and_wait_boundarie
         candidate.execution_owner is JobExecutionOwner.ENGINE
         for candidate in candidates
     )
+
+
+def test_list_engine_execution_candidates_waits_for_live_scheduler_lease(
+    tmp_path: Path,
+) -> None:
+    now_ms = [1_000]
+    repository = SqliteJobRepository.open(
+        tmp_path / "candidate-live-lease",
+        clock=lambda: now_ms[0],
+    )
+    running = repository.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="engine-live-lease",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    repository.claim_job(
+        running.job_id,
+        "engine-owner",
+        ttl_seconds=10,
+    )
+
+    assert repository.list_engine_execution_candidates(
+        principal="agent",
+        after_created_at=None,
+        after_job_id=None,
+        limit=10,
+    ) == ()
+
+    now_ms[0] = 11_001
+
+    assert repository.list_engine_execution_candidates(
+        principal="agent",
+        after_created_at=None,
+        after_job_id=None,
+        limit=10,
+    ) == (repository.get_job(running.job_id),)
 
 
 def test_list_engine_execution_candidates_has_stable_forward_pagination(
@@ -1655,11 +1693,13 @@ def test_list_engine_execution_candidates_has_stable_forward_pagination(
     )
 
     first_page = repository.list_engine_execution_candidates(
+        principal="agent",
         after_created_at=None,
         after_job_id=None,
         limit=2,
     )
     second_page = repository.list_engine_execution_candidates(
+        principal="agent",
         after_created_at=first_page[-1].created_at,
         after_job_id=first_page[-1].job_id,
         limit=2,
@@ -1708,6 +1748,7 @@ def test_list_engine_execution_candidates_does_not_read_payload_columns(
     monkeypatch.setattr(repo, "_connect", guarded_connect)
 
     candidates = repo.list_engine_execution_candidates(
+        principal="agent",
         after_created_at=None,
         after_job_id=None,
         limit=10,
@@ -1740,6 +1781,7 @@ def test_list_engine_execution_candidates_rejects_invalid_cursor(
     arguments: dict[str, object],
 ) -> None:
     query = {
+        "principal": "agent",
         "after_created_at": None,
         "after_job_id": None,
         "limit": 10,

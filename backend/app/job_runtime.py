@@ -23,7 +23,7 @@ from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
 from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
-from app.core.jobs.model import JobExecutionBinding
+from app.core.jobs.model import JobExecutionBinding, LOCAL_USER_PRINCIPAL
 from app.core.jobs.state_machine import TERMINAL_JOB_STATES
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
@@ -31,10 +31,10 @@ from app.core.packs.events import (
     parse_job_pack_environment_payload,
 )
 from app.core.recipes.video.descriptor import VIDEO_DESCRIPTORS
-from app.runtime_paths import resolve_runtime_paths
+from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
 
-LOCAL_CLI_PRINCIPAL = "local-user"
+LOCAL_CLI_PRINCIPAL = LOCAL_USER_PRINCIPAL
 _DOCUMENT_EXECUTION_BINDING = JobExecutionBinding(
     recipe_id="alltonote.document-note",
     recipe_version=1,
@@ -284,13 +284,18 @@ def create_job_runtime_for_workspace(
     workspace_root: Path,
     *,
     local_app_data: Path | None = None,
+    runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None,
     require_existing_job_store: bool = False,
 ) -> JobRuntime:
     from iwiki.workspace import open_workspace
 
-    trusted_root = local_app_data or resolve_runtime_paths().workspace_registry_parent
-    paths = resolve_runtime_paths(local_data_parent=trusted_root)
+    if local_app_data is not None and runtime_paths is not None:
+        raise ValueError("runtime_path_override_conflict")
+    paths = runtime_paths or resolve_runtime_paths(
+        local_data_parent=local_app_data
+    )
+    trusted_root = paths.workspace_registry_parent
     paths.assert_outside_workspace(workspace_root)
     trusted_root.mkdir(parents=True, exist_ok=True)
     registry = WorkspaceInstanceRegistry(
@@ -353,7 +358,7 @@ def create_job_runtime_for_workspace(
                         ]
             runtime = create_document_runtime_for_workspace(
                 workspace_root,
-                local_app_data=trusted_root,
+                runtime_paths=paths,
                 current_config_snapshot=current_config_snapshot,
                 requested_model_identity=requested_model_identity,
                 requested_provider_profile=requested_provider_profile,
@@ -370,7 +375,7 @@ def create_job_runtime_for_workspace(
 
             runtime = create_codex_app_server_runtime_for_workspace(
                 workspace_root,
-                local_app_data=trusted_root,
+                runtime_paths=paths,
                 current_config_snapshot=current_config_snapshot,
                 execution_pack_environment=_job_pack_environment(
                     repository,
