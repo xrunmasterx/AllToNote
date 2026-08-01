@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from app.core.errors import DomainError, ErrorCategory
 
 
 APP_NAME = "AllToNote"
+MACHINE_STATE_ROOT_ENV = "ALLTONOTE_MACHINE_STATE_ROOT"
 _ROLE_NAMES = ("config", "data", "cache", "state", "log")
 
 
@@ -135,6 +137,17 @@ def resolve_runtime_paths(
 
     if machine_state_root is not None and local_data_parent is not None:
         raise ValueError("runtime_path_override_conflict")
+    if machine_state_root is None and local_data_parent is None:
+        environment_root = os.environ.get(MACHINE_STATE_ROOT_ENV)
+        if environment_root is not None:
+            try:
+                value = environment_root.strip()
+                candidate = Path(value).expanduser()
+                if not value or not candidate.is_absolute():
+                    raise ValueError("runtime_machine_state_root_invalid")
+                machine_state_root = candidate.resolve(strict=False)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ValueError("runtime_machine_state_root_invalid") from error
     if local_data_parent is not None:
         data_dir = Path(local_data_parent).resolve(strict=False) / APP_NAME
         return RuntimePaths(
@@ -170,4 +183,9 @@ def resolve_runtime_paths(
     )
 
 
-__all__ = ["APP_NAME", "RuntimePaths", "resolve_runtime_paths"]
+__all__ = [
+    "APP_NAME",
+    "MACHINE_STATE_ROOT_ENV",
+    "RuntimePaths",
+    "resolve_runtime_paths",
+]

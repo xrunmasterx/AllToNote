@@ -8,8 +8,11 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 import threading
+import types
 import zipfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pytest
@@ -319,6 +322,42 @@ def test_engine_lifecycle_gate_stops_partial_start_on_failure(
     assert calls[-1] == ("engine", "stop")
 
 
+def test_engine_idle_probe_uses_the_current_host_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = object()
+    calls: list[tuple[object, float]] = []
+    instance = types.SimpleNamespace(descriptor=tmp_path / "engine.json")
+
+    host_module = types.ModuleType("app.engine.host")
+
+    def fake_run_engine_host(*, paths: object, idle_seconds: float) -> int:
+        calls.append((paths, idle_seconds))
+        return 0
+
+    host_module.run_engine_host = fake_run_engine_host
+    instance_module = types.ModuleType("app.engine.instance")
+    instance_module.EngineInstancePaths = types.SimpleNamespace(
+        from_runtime_paths=lambda candidate: instance if candidate is paths else None
+    )
+    runtime_paths_module = types.ModuleType("app.runtime_paths")
+    runtime_paths_module.resolve_runtime_paths = lambda: paths
+    monkeypatch.setitem(sys.modules, "app.engine.host", host_module)
+    monkeypatch.setitem(sys.modules, "app.engine.instance", instance_module)
+    monkeypatch.setitem(sys.modules, "app.runtime_paths", runtime_paths_module)
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        exec(release_module._ENGINE_IDLE_PROBE, {})
+
+    assert calls == [(paths, 0.25)]
+    assert json.loads(output.getvalue()) == {
+        "descriptor_exists": False,
+        "exit_code": 0,
+    }
+
+
 def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     lock = _load_lock(LOCK)
 
@@ -344,6 +383,11 @@ def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
         ),
     }
     assert lock["python"]["version"] == "3.14.6"
+    assert lock["wheels"][0] == {
+        "filename": "alltonote_runtime-0.1.0-py3-none-any.whl",
+        "byte_length": 551199,
+        "sha256": "edcc3ecf6ecd44098141be7afb69a08f786ac0f3ebb3542b8d6c63f382011306",
+    }
     assert lock["sqlite"] == {
         "version": "3.53.4",
         "archive": "sqlite-dll-win-x64-3530400.zip",

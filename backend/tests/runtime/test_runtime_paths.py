@@ -164,6 +164,49 @@ def test_machine_state_override_supports_chinese_and_spaces_without_io(
     assert not root.exists()
 
 
+def test_machine_state_environment_override_is_absolute_and_side_effect_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Runtime 候选 状态"
+    monkeypatch.setenv("ALLTONOTE_MACHINE_STATE_ROOT", str(root))
+
+    paths = resolve_runtime_paths()
+
+    assert paths.data_dir == (root / "data" / "AllToNote").resolve()
+    assert paths.engine_dir == (
+        root / "state" / "AllToNote" / "engine" / "v1"
+    ).resolve()
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("value", ("", "   ", "relative/runtime-state"))
+def test_machine_state_environment_override_rejects_ambiguous_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("ALLTONOTE_MACHINE_STATE_ROOT", value)
+
+    with pytest.raises(ValueError, match="runtime_machine_state_root_invalid"):
+        resolve_runtime_paths()
+
+
+def test_explicit_runtime_path_override_wins_over_the_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ALLTONOTE_MACHINE_STATE_ROOT",
+        str(tmp_path / "environment-state"),
+    )
+
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "explicit-state")
+
+    assert paths.data_dir == (
+        tmp_path / "explicit-state" / "data" / "AllToNote"
+    ).resolve()
+
+
 def test_runtime_roots_overlapping_a_workspace_fail_closed(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path, "Vault 只读 中文")
     paths = resolve_runtime_paths(machine_state_root=workspace / "machine-state")

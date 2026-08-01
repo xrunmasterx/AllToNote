@@ -274,11 +274,10 @@ from app.engine.host import run_engine_host
 from app.engine.instance import EngineInstancePaths
 from app.runtime_paths import resolve_runtime_paths
 
-instance = EngineInstancePaths.from_runtime_paths(resolve_runtime_paths())
+paths = resolve_runtime_paths()
+instance = EngineInstancePaths.from_runtime_paths(paths)
 exit_code = run_engine_host(
-    engine_root=instance.root,
-    log_root=instance.log_root,
-    scope_id=instance.scope_id,
+    paths=paths,
     idle_seconds=0.25,
 )
 print(json.dumps({
@@ -492,7 +491,13 @@ def _verify_inputs(
     return python_archive, python_spdx, sqlite_archive, tuple(verified)
 
 
-def _run(arguments: Sequence[str], *, environment: Mapping[str, str], timeout: int) -> str:
+def _run(
+    arguments: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: int,
+    label: str,
+) -> str:
     try:
         result = subprocess.run(
             list(arguments),
@@ -505,10 +510,10 @@ def _run(arguments: Sequence[str], *, environment: Mapping[str, str], timeout: i
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise ReleaseError("Runtime release subprocess failed") from error
+        raise ReleaseError(f"{label} failed") from error
     if result.returncode != 0:
         summary = (result.stderr or result.stdout).strip()[-1000:]
-        raise ReleaseError(f"Runtime release subprocess failed: {summary}")
+        raise ReleaseError(f"{label} failed: {summary}")
     return result.stdout.strip()
 
 
@@ -630,6 +635,7 @@ def _verify_builder_toolchain(
             (str(python_executable), "-I", "-B", "-c", _BUILDER_PROBE),
             environment=environment,
             timeout=30,
+            label="Builder toolchain probe",
         )
     except ReleaseError as error:
         raise ReleaseError("Builder toolchain probe failed") from error
@@ -931,6 +937,7 @@ def _probe_runtime(root: Path, lock: Mapping[str, Any], environment: Mapping[str
         (str(python_executable), "-I", "-B", "-c", _SQLITE_PROBE),
         environment=environment,
         timeout=30,
+        label="Runtime identity probe",
     )
     try:
         probe = json.loads(output)
@@ -979,6 +986,7 @@ def _run_cli(
         ),
         environment=environment,
         timeout=timeout,
+        label="Runtime CLI Gate",
     )
     try:
         payload = json.loads(output)
@@ -1005,6 +1013,7 @@ def _run_engine_process_probe(
         ),
         environment=environment,
         timeout=30,
+        label=f"Runtime Engine {operation} probe",
     )
     try:
         payload = json.loads(output)
@@ -1029,6 +1038,7 @@ def _run_engine_idle_probe(
         ),
         environment=environment,
         timeout=30,
+        label="Runtime Engine idle probe",
     )
     try:
         payload = json.loads(output)
@@ -1196,6 +1206,7 @@ def _run_legacy_jobstore_migration(
         ),
         environment=environment,
         timeout=30,
+        label="Legacy JobStore migration probe",
     )
     try:
         payload = json.loads(output)
@@ -1801,6 +1812,7 @@ def assemble_runtime(
             ),
             environment=environment,
             timeout=_PROCESS_TIMEOUT_SECONDS,
+            label="Runtime wheel installation",
         )
         _remove_direct_url_metadata(site_packages, len(wheels))
         _remove_pip_console_scripts(site_packages)
@@ -1840,8 +1852,9 @@ def assemble_runtime(
         with tempfile.TemporaryDirectory(prefix="alltonote-runtime-smoke-", dir=gate_root) as temporary:
             smoke = Path(temporary)
             isolated_environment = dict(environment)
-            isolated_environment["LOCALAPPDATA"] = str(smoke / "local")
-            isolated_environment["APPDATA"] = str(smoke / "roaming")
+            isolated_environment["ALLTONOTE_MACHINE_STATE_ROOT"] = str(
+                smoke / "machine-state"
+            )
             _run_cli(stage, ("version",), isolated_environment)
             info = _run_cli(stage, ("runtime", "info"), isolated_environment)
             _run_cli(stage, ("runtime", "doctor"), isolated_environment)
