@@ -20,9 +20,10 @@ from app.adapters.worker_process import (
     minimal_worker_environment,
     run_worker_process,
 )
-from app.core.errors import DomainError, ErrorCategory
+from app.core.errors import DomainError, ErrorCategory, ErrorDetail
 from app.core.jobs.model import (
     LOCAL_USER_PRINCIPAL,
+    AttemptState,
     JobExecutionOwner,
     JobState,
 )
@@ -46,6 +47,7 @@ WORKER_AUTHORITY_TTL_SECONDS = 300
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 30.0
 WORKER_CANCELLATION_POLL_SECONDS = 0.25
 WORKER_CANCELLATION_GRACE_SECONDS = 5.0
+MAXIMUM_AUTOMATIC_WORKER_LAUNCHES = 3
 
 WorkerRunner = Callable[[EngineWorkerLaunchV1, Callable[[], None]], int]
 
@@ -428,28 +430,50 @@ class EngineJobDispatcher:
             if reference is None:
                 continue
             exit_code: int | None = None
+            launch_count: int | None = None
             admission: _WorkerAdmission | None = None
+            controlled_stop = False
             try:
                 admission = self._admit_worker(reference)
                 if admission is None:
                     exit_code = 0
                 else:
+                    launch_count = (
+                        admission.repository.record_engine_worker_launch(
+                            reference.job_id,
+                            admission.launch.job_authority,
+                        )
+                    )
                     exit_code = self._worker_runner(
                         admission.launch,
                         lambda: admission.check_running(self._check_running),
                     )
-            except (
-                _DispatcherStopping,
-                _WorkerCancellationRequested,
-                DomainError,
-                OSError,
-                RuntimeError,
-                ValueError,
-            ):
+            except (_DispatcherStopping, _WorkerCancellationRequested):
+                controlled_stop = True
+            except Exception:
                 pass
             finally:
                 if admission is not None:
                     admission.settle_cancellation()
+                    try:
+                        job = admission.repository.get_job(reference.job_id)
+                        if job.state not in {JobState.QUEUED, JobState.RUNNING}:
+                            admission.repository.clear_engine_worker_launches(
+                                reference.job_id,
+                                admission.launch.job_authority,
+                            )
+                        elif (
+                            not controlled_stop
+                            and launch_count is not None
+                            and launch_count >= MAXIMUM_AUTOMATIC_WORKER_LAUNCHES
+                        ):
+                            self._settle_worker_exhaustion(
+                                admission,
+                                launch_count,
+                            )
+                    except (DomainError, OSError, RuntimeError, ValueError):
+                        with self._condition:
+                            self._reconcile_failed = True
                     admission.release()
                 with self._condition:
                     self._active = None
@@ -457,6 +481,74 @@ class EngineJobDispatcher:
                     self._condition.notify_all()
             if exit_code == 0:
                 next_reconcile = 0.0
+
+    def _settle_worker_exhaustion(
+        self,
+        admission: _WorkerAdmission,
+        launch_count: int,
+    ) -> None:
+        repository = admission.repository
+        job_id = admission.launch.reference.job_id
+        claim = repository.claim_job(
+            job_id,
+            admission.launch.job_authority.owner_id,
+            ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+        )
+        try:
+            self._settle_exhausted_worker_failure(
+                repository,
+                claim,
+                launch_count,
+            )
+        finally:
+            repository.release_job_claim(claim.authority)
+
+    @staticmethod
+    def _settle_exhausted_worker_failure(
+        repository,
+        claim,
+        launch_count: int,
+    ) -> None:
+        if claim.job.state not in {JobState.QUEUED, JobState.RUNNING}:
+            return
+        attempt = claim.active_attempt
+        if (
+            attempt is not None
+            and attempt.state is AttemptState.RUNNING
+            and attempt.fencing_token != claim.authority.fencing_token
+        ):
+            attempt = repository.take_over_running_attempt(
+                claim.job.job_id,
+                attempt.attempt_id,
+                claim.authority,
+            )
+        if attempt is not None:
+            unknown = repository.reconcile_external_operations_after_process_loss(
+                claim.job.job_id,
+                claim.authority,
+            )
+            if unknown:
+                repository.pause_for_external_outcome_atomic(
+                    claim.job.job_id,
+                    attempt.attempt_id,
+                    claim.authority,
+                )
+                repository.clear_engine_worker_launches(
+                    claim.job.job_id,
+                    claim.authority,
+                )
+                return
+        repository.fail_job_atomic(
+            claim.job.job_id,
+            ErrorDetail(
+                "engine_worker_retry_exhausted",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Engine Worker repeatedly failed",
+                {"automatic_launch_count": launch_count},
+            ),
+            attempt_id=(attempt.attempt_id if attempt is not None else None),
+            authority=claim.authority,
+        )
 
     def _admit_worker(
         self,
@@ -474,6 +566,24 @@ class EngineJobDispatcher:
                 "Engine is not authorized to execute this Job",
             )
         if job.state not in {JobState.QUEUED, JobState.RUNNING}:
+            return None
+        launch_count = repository.get_engine_worker_launch_count(
+            reference.job_id
+        )
+        if launch_count >= MAXIMUM_AUTOMATIC_WORKER_LAUNCHES:
+            claim = repository.claim_job(
+                reference.job_id,
+                f"engine-recovery-{uuid4().hex}",
+                ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+            )
+            try:
+                self._settle_exhausted_worker_failure(
+                    repository,
+                    claim,
+                    launch_count,
+                )
+            finally:
+                repository.release_job_claim(claim.authority)
             return None
         resource_store = MachineResourceLeaseStore.open(
             self._paths.data_dir / "machine"

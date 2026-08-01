@@ -10,6 +10,7 @@ from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.core.errors import DomainError, ErrorCategory
+from app.core.jobs.external_operation import ExternalOutcome
 from app.core.jobs.model import (
     JobExecutionBinding,
     JobExecutionOwner,
@@ -421,6 +422,320 @@ def test_failed_oldest_job_does_not_starve_lost_notification_job(
                 break
             deadline.wait(0.01)
         assert dispatcher.has_work is False
+    finally:
+        dispatcher.close(force=True)
+
+    assert calls[:2] == [poison, healthy]
+
+
+def test_repeated_worker_failure_becomes_terminal_and_is_not_restarted(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, reference = _registered_job(
+        tmp_path,
+        client_request_id="worker-retry-exhausted",
+    )
+    terminal = threading.Event()
+    calls = 0
+
+    def fail_worker(_launch: EngineWorkerLaunchV1, _check_running) -> int:
+        nonlocal calls
+        calls += 1
+        assert repository.get_engine_worker_launch_count(job.job_id) == calls
+        if calls > 3:
+            repository.cancel_job(job.job_id)
+            terminal.set()
+        return 70
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=fail_worker,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        dispatcher.start()
+        for _index in range(1_000):
+            if repository.get_job(job.job_id).state in {
+                JobState.FAILED,
+                JobState.CANCELLED,
+            }:
+                terminal.set()
+                break
+            terminal.wait(0.01)
+        assert terminal.is_set()
+    finally:
+        dispatcher.close(force=True)
+
+    assert calls == 3
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    assert repository.get_job_error(job.job_id).code == (
+        "engine_worker_retry_exhausted"
+    )
+
+    restarted_calls = 0
+
+    def observe_restart(_launch: EngineWorkerLaunchV1, _check_running) -> int:
+        nonlocal restarted_calls
+        restarted_calls += 1
+        return 0
+
+    restarted = EngineJobDispatcher(
+        paths,
+        worker_runner=observe_restart,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        restarted.start()
+        threading.Event().wait(0.05)
+    finally:
+        restarted.close(force=True)
+
+    assert restarted_calls == 0
+
+    retry = repository.create_retry_job_atomic(
+        job.job_id,
+        expected_original_state=JobState.FAILED,
+        confirmed_unknown_operation_ids=(),
+        client_request_id="worker-retry-exhausted-user-retry",
+    )
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    assert retry.state is JobState.QUEUED
+    assert repository.get_engine_worker_launch_count(retry.job_id) == 0
+
+
+def test_unobserved_launches_exhaust_budget_across_engine_restart(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, _reference = _registered_job(
+        tmp_path,
+        client_request_id="unobserved-worker-launches",
+    )
+    for index in range(3):
+        claim = repository.claim_job(
+            job.job_id,
+            f"dead-engine-{index}",
+            ttl_seconds=30,
+        )
+        assert repository.record_engine_worker_launch(
+            job.job_id,
+            claim.authority,
+        ) == index + 1
+        assert repository.release_job_claim(claim.authority) is True
+
+    calls = 0
+
+    def worker_must_not_start(
+        _launch: EngineWorkerLaunchV1,
+        _check_running,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    restarted = EngineJobDispatcher(
+        paths,
+        worker_runner=worker_must_not_start,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        restarted.start()
+        for _index in range(500):
+            if repository.get_job(job.job_id).state is JobState.FAILED:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        restarted.close(force=True)
+
+    assert calls == 0
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    error = repository.get_job_error(job.job_id)
+    assert error is not None
+    assert error.code == "engine_worker_retry_exhausted"
+    assert error.details == {"automatic_launch_count": 3}
+
+
+def test_exhausted_worker_budget_pauses_unknown_external_outcome(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, _reference = _registered_job(
+        tmp_path,
+        client_request_id="worker-exhaustion-unknown-outcome",
+    )
+    first = repository.claim_job(job.job_id, "dead-engine", ttl_seconds=30)
+    attempt = repository.create_attempt(
+        job.job_id,
+        "model-call",
+        authority=first.authority,
+    )
+    attempt = repository.start_attempt(attempt.attempt_id, first.authority)
+    operation = repository.prepare_external_operation(
+        job_id=job.job_id,
+        step_id=attempt.step_id,
+        attempt_id=attempt.attempt_id,
+        provider="fixture/provider-v1",
+        request_hash="sha256:" + "a" * 64,
+        operation_idempotency_key=None,
+        summary_json="{}",
+        authority=first.authority,
+    )
+    repository.start_external_operation(operation.operation_id, first.authority)
+    for expected in range(1, 4):
+        assert repository.record_engine_worker_launch(
+            job.job_id,
+            first.authority,
+        ) == expected
+    assert repository.release_job_claim(first.authority) is True
+
+    calls = 0
+
+    def worker_must_not_start(
+        _launch: EngineWorkerLaunchV1,
+        _check_running,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    restarted = EngineJobDispatcher(
+        paths,
+        worker_runner=worker_must_not_start,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        restarted.start()
+        for _index in range(500):
+            if repository.get_job(job.job_id).state is JobState.WAITING_FOR_INPUT:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        restarted.close(force=True)
+
+    assert calls == 0
+    assert repository.get_job(job.job_id).state is JobState.WAITING_FOR_INPUT
+    assert repository.get_job_error(job.job_id) is None
+    assert repository.get_engine_worker_launch_count(job.job_id) == 0
+    assert (
+        repository.get_external_operation(operation.operation_id).outcome
+        is ExternalOutcome.UNKNOWN
+    )
+
+
+def test_cancellation_wins_on_last_automatic_worker_launch(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, _reference = _registered_job(
+        tmp_path,
+        client_request_id="worker-exhaustion-cancel",
+    )
+    prior = repository.claim_job(job.job_id, "prior-engine", ttl_seconds=30)
+    assert repository.record_engine_worker_launch(job.job_id, prior.authority) == 1
+    assert repository.record_engine_worker_launch(job.job_id, prior.authority) == 2
+    assert repository.release_job_claim(prior.authority) is True
+    calls = 0
+
+    def cancel_on_last_launch(
+        _launch: EngineWorkerLaunchV1,
+        _check_running,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        repository.cancel_job(job.job_id)
+        return 70
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=cancel_on_last_launch,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        dispatcher.start()
+        for _index in range(500):
+            if repository.get_job(job.job_id).state is JobState.CANCELLED:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        dispatcher.close(force=True)
+
+    assert calls == 1
+    assert repository.get_job(job.job_id).state is JobState.CANCELLED
+    assert repository.get_job_error(job.job_id) is None
+    assert repository.get_engine_worker_launch_count(job.job_id) == 0
+
+
+def test_repeated_worker_spawn_error_exhausts_same_durable_budget(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, _reference = _registered_job(
+        tmp_path,
+        client_request_id="worker-spawn-error-budget",
+    )
+    calls = 0
+
+    def fail_to_spawn(
+        _launch: EngineWorkerLaunchV1,
+        _check_running,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        raise OSError("injected spawn failure")
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=fail_to_spawn,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        dispatcher.start()
+        for _index in range(1_000):
+            if repository.get_job(job.job_id).state is JobState.FAILED:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        dispatcher.close(force=True)
+
+    assert calls == 3
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    assert repository.get_job_error(job.job_id).code == (
+        "engine_worker_retry_exhausted"
+    )
+
+
+def test_unexpected_worker_exception_does_not_kill_dispatcher_loop(
+    tmp_path: Path,
+) -> None:
+    paths, poison_repository, poison_job, poison = _registered_job(
+        tmp_path,
+        client_request_id="unexpected-worker-exception",
+    )
+    _paths, healthy_repository, healthy_job, healthy = _registered_job(
+        tmp_path,
+        client_request_id="healthy-after-unexpected-exception",
+    )
+    healthy_observed = threading.Event()
+    calls: list[EngineJobReference] = []
+
+    def run_worker(launch: EngineWorkerLaunchV1, _check_running) -> int:
+        reference = launch.reference
+        calls.append(reference)
+        if reference == poison:
+            if calls.count(poison) == 1:
+                raise TypeError("injected unexpected worker failure")
+            poison_repository.cancel_job(poison_job.job_id)
+            return 0
+        healthy_repository.cancel_job(healthy_job.job_id)
+        healthy_observed.set()
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        maximum_pending_jobs=1,
+        reconcile_interval_seconds=0.01,
+    )
+    try:
+        dispatcher.notify(poison)
+        dispatcher.start()
+        assert healthy_observed.wait(timeout=5)
     finally:
         dispatcher.close(force=True)
 

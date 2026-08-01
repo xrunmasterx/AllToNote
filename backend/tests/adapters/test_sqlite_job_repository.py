@@ -855,7 +855,7 @@ def test_corrupt_database_is_rejected_without_overwrite(tmp_path: Path) -> None:
     assert database_path.read_bytes() == corrupt_bytes
 
 
-def test_open_creates_version_five_database_with_exact_schema_and_pragmas(
+def test_open_creates_version_six_database_with_exact_schema_and_pragmas(
     repo: SqliteJobRepository,
 ) -> None:
     assert repo.database_path == repo.machine_root / "jobs.sqlite"
@@ -894,8 +894,127 @@ def test_open_creates_version_five_database_with_exact_schema_and_pragmas(
     assert journal_mode == "wal"
     assert synchronous == 2
     assert busy_timeout == 5_000
-    assert user_version == 5
+    assert user_version == 6
     assert foreign_key_violations == []
+
+
+def test_version_five_worker_failure_migration_preserves_claims(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(
+        tmp_path,
+        "migrate-v5-worker-failures",
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.create_function(
+            repository_module._WRITER_PROTOCOL_FUNCTION,
+            0,
+            lambda: 5,
+        )
+        for statement in repository_module._SCHEMA_STATEMENTS_V5:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_id, request_hash, request_json, principal,
+                client_request_id, state, cancellation_requested,
+                retry_of_job_id, result_json, error_json, created_at,
+                updated_at, execution_owner
+            ) VALUES ('job_v5', ?, NULL, 'local-user', 'v5', 'running', 0,
+                      NULL, NULL, NULL, '1', '1', 'engine')
+            """,
+            (HASH_A,),
+        )
+        connection.execute(
+            """
+            INSERT INTO job_execution_bindings (
+                job_id, recipe_id, recipe_version, executor_id,
+                executor_version, pack_id, pack_version
+            ) VALUES ('job_v5', 'alltonote.video-course-note', 1,
+                      'alltonote.video', 1, 'media-basic', 'builtin-v1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO job_execution_leases (
+                job_id, owner, generation, expires_at, heartbeat_at
+            ) VALUES ('job_v5', 'engine-owner', 7, '40000', '10000')
+            """
+        )
+        connection.execute("PRAGMA user_version = 5")
+
+    migrated = SqliteJobRepository.open_existing(
+        machine_root,
+        clock=lambda: 10_000,
+    )
+
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        lease = connection.execute(
+            """
+            SELECT owner, generation, expires_at, heartbeat_at,
+                   worker_launch_count
+            FROM job_execution_leases WHERE job_id = 'job_v5'
+            """
+        ).fetchone()
+    assert tuple(lease) == ("engine-owner", 7, "40000", "10000", 0)
+
+
+def test_version_five_worker_launch_migration_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine_root, database_path = _database_path(
+        tmp_path,
+        "migrate-v5-worker-launch-rollback",
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.create_function(
+            repository_module._WRITER_PROTOCOL_FUNCTION,
+            0,
+            lambda: 5,
+        )
+        for statement in repository_module._SCHEMA_STATEMENTS_V5:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 5")
+
+    def fail_after_lease_rename(connection: sqlite3.Connection) -> None:
+        for table in repository_module._WRITER_PROTOCOL_TABLES:
+            for operation in ("insert", "update", "delete"):
+                connection.execute(
+                    f"DROP TRIGGER writer_protocol_{table}_{operation}"
+                )
+        connection.execute(
+            "ALTER TABLE job_execution_leases RENAME TO job_execution_leases_v5"
+        )
+        raise RuntimeError("injected worker launch migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SqliteJobRepository,
+            "_migrate_v5_to_v6",
+            staticmethod(fail_after_lease_rename),
+        )
+        with pytest.raises(RuntimeError, match="worker launch migration failure"):
+            SqliteJobRepository.open_existing(machine_root)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(job_execution_leases)"
+            )
+        }
+        triggers = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchone()[0]
+    assert "worker_launch_count" not in columns
+    assert triggers == len(repository_module._WRITER_PROTOCOL_TRIGGERS_V5)
+
+    migrated = SqliteJobRepository.open_existing(machine_root)
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def _create_version_four_lifecycle_store(database_path: Path) -> None:
@@ -949,7 +1068,7 @@ def test_version_four_lifecycle_migration_backfills_current_state_once(
     migrated = SqliteJobRepository.open(machine_root, clock=lambda: 2)
 
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
     for job_id, state in (
         ("job_v4_running", "running"),
         ("job_v4_succeeded", "succeeded"),
@@ -995,7 +1114,7 @@ def test_version_four_lifecycle_migration_failure_rolls_back_and_retries(
 
     migrated = SqliteJobRepository.open(machine_root, clock=lambda: 3)
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 4
 
 
@@ -1270,7 +1389,7 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
         pack_version="legacy-v1",
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -1316,7 +1435,7 @@ def test_version_two_database_migrates_jobs_to_foreground_owner(
         JobExecutionOwner.FOREGROUND
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -1356,7 +1475,7 @@ def test_version_two_migration_failure_rolls_back_and_retry_succeeds(
 
     migrated = SqliteJobRepository.open(machine_root)
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def _create_version_three_store(
@@ -1408,7 +1527,7 @@ def test_version_three_expired_bound_lease_migrates_to_job_generation(
     migrated = SqliteJobRepository.open_existing(machine_root, clock=lambda: 1_000)
 
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("SELECT 1 FROM leases").fetchone() is None
         lease = connection.execute(
             "SELECT owner, generation, expires_at FROM job_execution_leases "
@@ -1592,6 +1711,49 @@ def test_claim_job_is_idempotent_per_job_and_distinct_jobs_are_independent(
     assert repo.get_job_details(second.job_id)[0].state is JobState.RUNNING
 
 
+def test_worker_launch_count_is_durable_and_fenced_by_job_authority(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 20_000}
+    machine_root = tmp_path / "worker-failure-count-store"
+    repo = SqliteJobRepository.open(
+        machine_root,
+        clock=lambda: now["value"],
+    )
+    job, _binding = _claim_fixture_job(
+        repo,
+        client_request_id="worker-failure-count",
+    )
+    first = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=1)
+
+    assert repo.get_engine_worker_launch_count(job.job_id) == 0
+    assert repo.record_engine_worker_launch(
+        job.job_id,
+        first.authority,
+    ) == 1
+    assert repo.release_job_claim(first.authority) is True
+
+    reopened = SqliteJobRepository.open_existing(
+        machine_root,
+        clock=lambda: now["value"],
+    )
+    assert reopened.get_engine_worker_launch_count(job.job_id) == 1
+    now["value"] = 21_001
+    second = reopened.claim_job(job.job_id, "engine-owner-b", ttl_seconds=30)
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        reopened.record_engine_worker_launch(job.job_id, first.authority)
+    assert reopened.record_engine_worker_launch(
+        job.job_id,
+        second.authority,
+    ) == 2
+
+    assert reopened.clear_engine_worker_launches(
+        job.job_id,
+        second.authority,
+    ) is True
+    assert reopened.get_engine_worker_launch_count(job.job_id) == 0
+
+
 def test_scheduler_leadership_and_job_execution_claims_are_independent(
     tmp_path: Path,
 ) -> None:
@@ -1714,6 +1876,37 @@ def test_cancel_race_after_claim_before_takeover_settles_without_replacement(
     assert settled.state is AttemptState.CANCELLED
     assert repo.get_job(job.job_id).state is JobState.CANCELLED
     assert len(repo.list_attempts(job.job_id)) == 1
+
+
+def test_cancellation_wins_before_atomic_failure_commit(tmp_path: Path) -> None:
+    repo = SqliteJobRepository.open(tmp_path / "cancel-before-failure-store")
+    job, _ = _claim_fixture_job(
+        repo,
+        client_request_id="cancel-before-failure",
+    )
+    claim = repo.claim_job(job.job_id, "engine-owner", ttl_seconds=30)
+    attempt = repo.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=claim.authority,
+    )
+    attempt = repo.start_attempt(attempt.attempt_id, claim.authority)
+    assert repo.cancel_job(job.job_id).state is JobState.RUNNING
+
+    settled = repo.fail_job_atomic(
+        job.job_id,
+        ErrorDetail(
+            "engine_worker_retry_exhausted",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            "Engine Worker repeatedly failed",
+        ),
+        attempt_id=attempt.attempt_id,
+        authority=claim.authority,
+    )
+
+    assert settled.state is JobState.CANCELLED
+    assert repo.get_job_error(job.job_id) is None
+    assert repo.list_attempts(job.job_id)[0].state is AttemptState.CANCELLED
 
 
 def test_claim_after_crash_between_create_and_start_reuses_single_pending_attempt(
@@ -3609,6 +3802,8 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
     current_authority = repo.claim_job(
         job.job_id, "next-owner", ttl_seconds=1
     ).authority
+    assert repo.record_engine_worker_launch(job.job_id, current_authority) == 1
+    assert repo.record_engine_worker_launch(job.job_id, current_authority) == 2
     replacement = repo.take_over_running_attempt(
         job.job_id, attempt.attempt_id, current_authority
     )
@@ -3631,6 +3826,8 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
 
     paused_job, _, pending = repo.get_job_details(job.job_id)
     assert paused_job.state is JobState.WAITING_FOR_INPUT
+    reopened = SqliteJobRepository.open(repo.machine_root)
+    assert reopened.get_engine_worker_launch_count(job.job_id) == 0
     assert pending == challenge
     assert json.loads(challenge.prompt_json) == {
         "code": "external_outcome_unknown",
@@ -4011,6 +4208,9 @@ def test_create_challenge_atomically_waits_for_input(
     repo: SqliteJobRepository,
 ) -> None:
     job, attempt = _create_needs_input_attempt(repo)
+    authority = _authority(repo, job.job_id)
+    assert repo.record_engine_worker_launch(job.job_id, authority) == 1
+    assert repo.record_engine_worker_launch(job.job_id, authority) == 2
 
     challenge = repo.create_challenge(
         job.job_id,
@@ -4022,6 +4222,8 @@ def test_create_challenge_atomically_waits_for_input(
     assert challenge.attempt_id == attempt.attempt_id
     assert challenge.state == "pending"
     assert repo.get_job(job.job_id).state is JobState.WAITING_FOR_INPUT
+    reopened = SqliteJobRepository.open(repo.machine_root)
+    assert reopened.get_engine_worker_launch_count(job.job_id) == 0
 
 
 def test_respond_challenge_is_hash_idempotent_across_process_reopen(

@@ -563,7 +563,7 @@ def test_legacy_jobstore_fixture_migrates_and_reopens(tmp_path: Path) -> None:
     assert source_identity is not None
     assert source_identity.source_id == "src_018cc251-f400-7000-8000-000000000006"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -586,7 +586,7 @@ def test_release_gate_accepts_only_current_jobstore_migration_schema(
 ) -> None:
     payload = {
         "schema_before": 1,
-        "schema_after": 5,
+        "schema_after": 6,
         "integrity": "ok",
         "foreign_key_errors": 0,
         "job_id": "job_legacy_release_fixture",

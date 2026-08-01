@@ -442,7 +442,7 @@ def _database_invariants_pass(invariants: Mapping[str, object]) -> bool:
         "checkpoint_busy": 0,
         "wal_frames_remaining": 0,
         "journal_mode": "wal",
-        "user_version": 5,
+        "user_version": 6,
     }
 
 

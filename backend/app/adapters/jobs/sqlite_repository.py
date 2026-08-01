@@ -54,7 +54,7 @@ from app.core.ports.job_queries import JobListRecord, JobQueryRecord
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _WRITER_PROTOCOL_FUNCTION = "alltonote_jobstore_writer_protocol"
 _BUSY_TIMEOUT_MS = 5_000
 _RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
@@ -256,6 +256,17 @@ _JOB_EXECUTION_LEASE_SCHEMA = """
         heartbeat_at TEXT NOT NULL
     )
     """
+_JOB_EXECUTION_LEASE_SCHEMA_V6 = """
+    CREATE TABLE job_execution_leases (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+        owner TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        expires_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        worker_launch_count INTEGER NOT NULL DEFAULT 0
+            CHECK (worker_launch_count >= 0)
+    )
+    """
 _SCHEMA_STATEMENTS_V4 = (
     _JOBS_SCHEMA_V3,
     *_SCHEMA_STATEMENTS_V1[1:7],
@@ -277,21 +288,33 @@ _WRITER_PROTOCOL_TABLES = (
     "job_execution_bindings",
     "job_execution_leases",
 )
-_WRITER_PROTOCOL_TRIGGERS = tuple(
-    f"""
-    CREATE TRIGGER writer_protocol_{table}_{operation.casefold()}
-    BEFORE {operation} ON {table}
-    BEGIN
-        SELECT CASE
-            WHEN {_WRITER_PROTOCOL_FUNCTION}() != {_SCHEMA_VERSION}
-            THEN RAISE(ABORT, 'job_store_writer_protocol_mismatch')
-        END;
-    END
-    """
-    for table in _WRITER_PROTOCOL_TABLES
-    for operation in ("INSERT", "UPDATE", "DELETE")
+
+
+def _writer_protocol_triggers(version: int) -> tuple[str, ...]:
+    return tuple(
+        f"""
+        CREATE TRIGGER writer_protocol_{table}_{operation.casefold()}
+        BEFORE {operation} ON {table}
+        BEGIN
+            SELECT CASE
+                WHEN {_WRITER_PROTOCOL_FUNCTION}() != {version}
+                THEN RAISE(ABORT, 'job_store_writer_protocol_mismatch')
+            END;
+        END
+        """
+        for table in _WRITER_PROTOCOL_TABLES
+        for operation in ("INSERT", "UPDATE", "DELETE")
+    )
+
+
+_WRITER_PROTOCOL_TRIGGERS_V5 = _writer_protocol_triggers(5)
+_SCHEMA_STATEMENTS_V5 = (*_SCHEMA_STATEMENTS_V4, *_WRITER_PROTOCOL_TRIGGERS_V5)
+_WRITER_PROTOCOL_TRIGGERS = _writer_protocol_triggers(_SCHEMA_VERSION)
+_SCHEMA_STATEMENTS = (
+    *_SCHEMA_STATEMENTS_V4[:-1],
+    _JOB_EXECUTION_LEASE_SCHEMA_V6,
+    *_WRITER_PROTOCOL_TRIGGERS,
 )
-_SCHEMA_STATEMENTS = (*_SCHEMA_STATEMENTS_V4, *_WRITER_PROTOCOL_TRIGGERS)
 _DEFAULT_EXECUTION_BINDING = JobExecutionBinding(
     recipe_id="alltonote.legacy",
     recipe_version=1,
@@ -444,7 +467,7 @@ class SqliteJobRepository:
             raise
         except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
             _raise_schema_invalid(error)
-        if version not in (1, 2, 3, 4, _SCHEMA_VERSION):
+        if version not in (1, 2, 3, 4, 5, _SCHEMA_VERSION):
             _raise_schema_invalid()
         repository = cls(
             resolved_root,
@@ -514,7 +537,7 @@ class SqliteJobRepository:
     def _initialize_schema(self) -> None:
         with self._transaction(immediate=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3, 4, _SCHEMA_VERSION):
+            if version not in (0, 1, 2, 3, 4, 5, _SCHEMA_VERSION):
                 raise DomainError(
                     "job_store_schema_unsupported",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
@@ -535,6 +558,7 @@ class SqliteJobRepository:
                 self._migrate_v2_to_v3(connection)
                 self._migrate_v3_to_v4(connection)
                 self._migrate_v4_to_v5(connection)
+                self._migrate_v5_to_v6(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             elif version == 2:
@@ -543,6 +567,7 @@ class SqliteJobRepository:
                 self._migrate_v2_to_v3(connection)
                 self._migrate_v3_to_v4(connection)
                 self._migrate_v4_to_v5(connection)
+                self._migrate_v5_to_v6(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             elif version == 3:
@@ -550,12 +575,20 @@ class SqliteJobRepository:
                     _raise_schema_invalid()
                 self._migrate_v3_to_v4(connection)
                 self._migrate_v4_to_v5(connection)
+                self._migrate_v5_to_v6(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             elif version == 4:
                 if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V4):
                     _raise_schema_invalid()
                 self._migrate_v4_to_v5(connection)
+                self._migrate_v5_to_v6(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
+            elif version == 5:
+                if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V5):
+                    _raise_schema_invalid()
+                self._migrate_v5_to_v6(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             if actual_schema != _expected_schema():
@@ -656,6 +689,31 @@ class SqliteJobRepository:
                 if latest_sequence == latest_state["sequence"]:
                     continue
             self._insert_job_state_event(connection, row["job_id"], state)
+        for statement in _WRITER_PROTOCOL_TRIGGERS_V5:
+            connection.execute(statement)
+
+    @staticmethod
+    def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+        for table in _WRITER_PROTOCOL_TABLES:
+            for operation in ("insert", "update", "delete"):
+                connection.execute(
+                    f"DROP TRIGGER writer_protocol_{table}_{operation}"
+                )
+        connection.execute(
+            "ALTER TABLE job_execution_leases RENAME TO job_execution_leases_v5"
+        )
+        connection.execute(_JOB_EXECUTION_LEASE_SCHEMA_V6)
+        connection.execute(
+            """
+            INSERT INTO job_execution_leases (
+                job_id, owner, generation, expires_at, heartbeat_at,
+                worker_launch_count
+            )
+            SELECT job_id, owner, generation, expires_at, heartbeat_at, 0
+            FROM job_execution_leases_v5
+            """
+        )
+        connection.execute("DROP TABLE job_execution_leases_v5")
         for statement in _WRITER_PROTOCOL_TRIGGERS:
             connection.execute(statement)
 
@@ -1409,6 +1467,85 @@ class SqliteJobRepository:
             )
             return updated.rowcount == 1
 
+    def get_engine_worker_launch_count(self, job_id: str) -> int:
+        with self._transaction(immediate=False) as connection:
+            self._get_job(connection, job_id)
+            row = connection.execute(
+                """
+                SELECT worker_launch_count FROM job_execution_leases
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            return 0 if row is None else int(row["worker_launch_count"])
+
+    def record_engine_worker_launch(
+        self,
+        job_id: str,
+        authority: JobExecutionAuthority,
+    ) -> int:
+        with self._transaction(immediate=True) as connection:
+            job = self._get_job(connection, job_id)
+            self._assert_job_authority(connection, job_id, authority)
+            if job.state is not JobState.RUNNING:
+                raise DomainError(
+                    "engine_worker_launch_not_running",
+                    ErrorCategory.CONFLICT,
+                    "Engine Worker launch requires a running Job",
+                )
+            connection.execute(
+                """
+                UPDATE job_execution_leases
+                SET worker_launch_count = worker_launch_count + 1
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            row = connection.execute(
+                """
+                SELECT worker_launch_count FROM job_execution_leases
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            assert row is not None
+            return int(row["worker_launch_count"])
+
+    def clear_engine_worker_launches(
+        self,
+        job_id: str,
+        authority: JobExecutionAuthority,
+    ) -> bool:
+        with self._transaction(immediate=True) as connection:
+            self._get_job(connection, job_id)
+            row = connection.execute(
+                """
+                SELECT worker_launch_count FROM job_execution_leases
+                WHERE job_id = ? AND owner = ? AND generation = ?
+                """,
+                (
+                    job_id,
+                    authority.owner_id,
+                    authority.fencing_token,
+                ),
+            ).fetchone()
+            if row is None:
+                self._raise_job_claim_fenced()
+            changed = int(row["worker_launch_count"]) != 0
+            if changed:
+                connection.execute(
+                    """
+                    UPDATE job_execution_leases SET worker_launch_count = 0
+                    WHERE job_id = ? AND owner = ? AND generation = ?
+                    """,
+                    (
+                        job_id,
+                        authority.owner_id,
+                        authority.fencing_token,
+                    ),
+                )
+            return changed
+
     def start_attempt(
         self, attempt_id: str, authority: JobExecutionAuthority
     ) -> Attempt:
@@ -1627,6 +1764,13 @@ class SqliteJobRepository:
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (next_state.value, now, job_id),
             )
+            connection.execute(
+                """
+                UPDATE job_execution_leases SET worker_launch_count = 0
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
             self._insert_job_state_event(connection, job_id, next_state)
             return self._get_challenge(connection, challenge_id)
 
@@ -1720,6 +1864,13 @@ class SqliteJobRepository:
             connection.execute(
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (JobState.WAITING_FOR_INPUT.value, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE job_execution_leases SET worker_launch_count = 0
+                WHERE job_id = ?
+                """,
+                (job_id,),
             )
             self._insert_job_state_event(
                 connection,
@@ -2864,6 +3015,9 @@ class SqliteJobRepository:
                     "Atomic failure requires a running Job",
                 )
             now = utc_now_millis()
+            if job.cancellation_requested:
+                self._settle_claimed_cancellation(connection, job_id, now)
+                return self._get_job(connection, job_id)
             if attempt_id is not None and authority is not None:
                 self._assert_execution_authority(
                     connection, job_id, attempt_id, authority

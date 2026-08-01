@@ -249,6 +249,89 @@ def test_idle_engine_exits_and_removes_only_owned_descriptor(tmp_path: Path) -> 
     assert not client.descriptor_path.exists()
 
 
+def test_idle_deadline_does_not_reconcile_while_dispatcher_has_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "busy idle machine")
+    listener_wakeup = threading.Event()
+    observed: dict[str, object] = {}
+
+    class FakeLock:
+        def __init__(self, _path: Path, *, timeout: int) -> None:
+            assert timeout == 0
+
+        def acquire(self) -> None:
+            return None
+
+        def release(self) -> None:
+            return None
+
+    class FakeListener:
+        def accept(self):
+            listener_wakeup.wait(timeout=0.1)
+            raise OSError("listener closed")
+
+        def close(self) -> None:
+            listener_wakeup.set()
+
+    class FakeConnection:
+        def close(self) -> None:
+            listener_wakeup.set()
+
+    class FakeDispatcher:
+        def __init__(self, _paths) -> None:
+            self.has_work_checks = 0
+            self.reconciled_while_busy = False
+            self.reconcile_calls = 0
+            observed["dispatcher"] = self
+
+        def start(self) -> None:
+            return None
+
+        @property
+        def has_work(self) -> bool:
+            self.has_work_checks += 1
+            return self.has_work_checks <= 3
+
+        def reconcile(self) -> int:
+            self.reconcile_calls += 1
+            self.reconciled_while_busy = self.has_work_checks <= 3
+            return 0
+
+        def try_begin_draining(self) -> bool:
+            return True
+
+        def close(self, *, force: bool = False) -> None:
+            assert force is False
+
+    monkeypatch.setattr("app.engine.host.EngineFileLock", FakeLock)
+    monkeypatch.setattr("app.engine.host.EngineJobDispatcher", FakeDispatcher)
+    monkeypatch.setattr("app.engine.host.ensure_instance_root", lambda _paths: None)
+    monkeypatch.setattr(
+        "app.engine.host.process_start_identity",
+        lambda _pid: "test-process-start",
+    )
+    monkeypatch.setattr(
+        "app.engine.host.create_engine_listener",
+        lambda _endpoint: FakeListener(),
+    )
+    monkeypatch.setattr("app.engine.host.publish_descriptor", lambda *_args: None)
+    monkeypatch.setattr("app.engine.host.remove_owned_descriptor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "app.engine.host.connect_engine",
+        lambda *_args, **_kwargs: FakeConnection(),
+    )
+
+    assert run_engine_host(paths=paths, idle_seconds=0.0) == 0
+
+    dispatcher = observed["dispatcher"]
+    assert isinstance(dispatcher, FakeDispatcher)
+    assert dispatcher.has_work_checks >= 4
+    assert dispatcher.reconcile_calls == 1
+    assert dispatcher.reconciled_while_busy is False
+
+
 def test_forced_engine_death_can_be_reensured_without_pid_trust(tmp_path: Path) -> None:
     client = _client(tmp_path)
     first = client.ensure()

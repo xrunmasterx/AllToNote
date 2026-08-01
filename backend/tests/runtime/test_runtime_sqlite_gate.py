@@ -100,7 +100,7 @@ def test_spawn_gate_proves_busy_recovery_and_crash_durability(
         "checkpoint_busy": 0,
         "wal_frames_remaining": 0,
         "journal_mode": "wal",
-        "user_version": 5,
+        "user_version": 6,
     }
     serialized = json.dumps(data, allow_nan=False)
     assert str(tmp_path) not in serialized

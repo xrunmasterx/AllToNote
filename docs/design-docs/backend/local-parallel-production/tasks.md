@@ -195,6 +195,13 @@ Stop condition：
 - 三种跨进程 detach 验收（fixture Video、local Video、Document）均证明提交者退出后独立 Worker 使用新 launch envelope 完成原 Job；完整后端回归为 `2586 passed, 3 skipped, 3 subtests passed`；
 - 这只是 Task 5/6 的 capacity-1 正确性地基，不宣称并发 Worker、资源池、排队可观测、workspace publish slot 或公开发布完成。dispatcher 仍只有一个 active Worker，`parallel_job_execution_enabled=false` 保持不变，因此 Task 5 与 Task 6 继续未完成。
 
+Worker 自动恢复预算与 schema v6 硬化进度（2026-08-01）：
+
+- JobStore schema v6 为每个 Job execution lease 持久化 `worker_launch_count`；dispatcher 在 spawn 前记账，同一次 activation 最多自动启动 3 次，Engine 重启不能重置 poison Worker 的隐式预算，显式 retry child 则从 0 开始；
+- 普通 Worker runner 异常被限制在单次监督边界，取消继续优先；未知外部结果进入 WAITING_FOR_INPUT。`create_challenge` 与 `pause_for_external_outcome_atomic` 在提交 WAITING 的同一 SQLite 事务中清零预算，关闭 Engine 在状态提交与父进程清理之间退出时遗留旧预算的窗口；
+- idle deadline 在 dispatcher 有 work 时不再重复执行 registry + SQLite reconcile；Windows release 的 legacy JobStore migration Gate 也已同步要求 schema v6；
+- 独立最终 Gate `task_81a684c5fd74` 为 P0/P1=0；最终完整后端回归为 `2622 passed, 3 skipped`。这仍是 capacity-1 的有界失败收敛，不代表 Task 5 完成，也没有启用 `parallel_job_execution_enabled`。
+
 ## Task 6: [ ] 加入最小资源准入与 workspace publish 控制
 
 - 风险：高

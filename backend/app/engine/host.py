@@ -206,6 +206,8 @@ def run_engine_host(
                 active = active_requests
                 expired = time.monotonic() >= last_ensure + idle_seconds
             if not active and expired:
+                if dispatcher.has_work:
+                    continue
                 candidate = EngineFileLock(engine_paths.launch_lock, timeout=0)
                 try:
                     candidate.acquire()
@@ -214,7 +216,7 @@ def run_engine_host(
                 with active_lock:
                     active = active_requests
                     expired = time.monotonic() >= last_ensure + idle_seconds
-                if active or not expired:
+                if active or not expired or dispatcher.has_work:
                     candidate.release()
                     continue
                 try:
