@@ -133,6 +133,18 @@ def _build_parser(
     config_validate_parser.add_argument("--json", action="store_true")
     config_profiles_parser = config_subparsers.add_parser("profiles")
     config_profiles_parser.add_argument("--json", action="store_true")
+    config_provider_parser = config_subparsers.add_parser("provider")
+    config_provider_subparsers = config_provider_parser.add_subparsers(
+        dest="config_provider_command", required=True
+    )
+    config_provider_set_parser = config_provider_subparsers.add_parser("set")
+    config_provider_set_parser.add_argument("profile")
+    config_provider_set_parser.add_argument(
+        "--type", dest="provider_type", required=True
+    )
+    config_provider_set_parser.add_argument("--model", required=True)
+    config_provider_set_parser.add_argument("--credential-ref")
+    config_provider_set_parser.add_argument("--json", action="store_true")
     config_set_parser = config_subparsers.add_parser("set")
     config_set_parser.add_argument(
         "key",
@@ -549,6 +561,11 @@ def main(
         return int(exit_code)
 
     if args.command == "config":
+        command = (
+            f"config provider {args.config_provider_command}"
+            if args.config_command == "provider"
+            else f"config {args.config_command}"
+        )
         try:
             result = _config_command_result(
                 args,
@@ -559,7 +576,7 @@ def main(
         except DomainError as error:
             mapped = map_domain_error(error)
             result = _failure_result(
-                command=f"config {args.config_command}",
+                command=command,
                 correlation_id=correlation_id,
                 mapped=mapped,
             )
@@ -567,7 +584,7 @@ def main(
         except Exception:
             mapped = internal_error()
             result = _failure_result(
-                command=f"config {args.config_command}",
+                command=command,
                 correlation_id=correlation_id,
                 mapped=mapped,
             )
@@ -925,11 +942,21 @@ def _produce_generic(
                 config_service=config_service,
             )
             config_snapshot = effective.job_snapshot()
+            provider_profile, model_override = _resolved_video_model_selection(
+                effective.config,
+                requested_provider_profile=request.parameters.get(
+                    "provider_profile"
+                ),
+                requested_model_identity=request.parameters.get("model_override"),
+                require_codex_runtime=runtime is None,
+            )
             request = replace(
                 request,
                 workspace_ref=str(workspace_root),
                 parameters={
                     **request.parameters,
+                    "provider_profile": provider_profile,
+                    "model_override": model_override,
                     "config_snapshot": {
                         "snapshot_version": config_snapshot.snapshot_version,
                         "values": dict(config_snapshot.values),
@@ -944,6 +971,8 @@ def _produce_generic(
                     config_service.paths if config_service is not None else None
                 ),
                 current_config_snapshot=config_snapshot,
+                video_provider_profile=provider_profile,
+                video_model_identity=model_override,
             )
     else:
         key = parse_recipe_selector(args.recipe)
@@ -1074,7 +1103,11 @@ def _produce_generic(
                 )
             workspace_root = Path(workspace_value).resolve()
             provider_profile = config.default_provider_profile
-            provider = config.providers.get(provider_profile)
+            provider_profile, model_override = _resolved_video_model_selection(
+                config,
+                requested_provider_profile=provider_profile,
+                require_codex_runtime=runtime is None,
+            )
             request = ProduceRequest(
                 1,
                 key,
@@ -1083,9 +1116,7 @@ def _produce_generic(
                 requested_outputs,
                 {
                     "provider_profile": provider_profile,
-                    "model_override": (
-                        provider.default_model if provider is not None else None
-                    ),
+                    "model_override": model_override,
                     "transcriber_profile": config.default_transcriber_profile,
                     "output_language": config.recipe_defaults.output_language,
                     "quality_preset": config.recipe_defaults.quality_preset,
@@ -1106,6 +1137,8 @@ def _produce_generic(
                     config_service.paths if config_service is not None else None
                 ),
                 current_config_snapshot=effective.job_snapshot(),
+                video_provider_profile=provider_profile,
+                video_model_identity=model_override,
             )
 
     if not args.wait:
@@ -1151,12 +1184,22 @@ def _produce_video(
         )
     workspace_root = Path(workspace_value).resolve()
     config_snapshot = effective.job_snapshot()
+    provider_profile, model_override = _resolved_video_model_selection(
+        config,
+        requested_provider_profile=(
+            args.provider_profile or config.default_provider_profile
+        ),
+        requested_model_identity=args.model,
+        require_codex_runtime=runtime is None,
+    )
     active_runtime = runtime or _default_runtime(
         workspace_root,
         runtime_paths=(
             config_service.paths if config_service is not None else None
         ),
         current_config_snapshot=config_snapshot,
+        video_provider_profile=provider_profile,
+        video_model_identity=model_override,
     )
     output_requested = bool(args.output)
     faithful_policy = FaithfulLanguagePolicy(args.faithful_language)
@@ -1175,13 +1218,6 @@ def _produce_video(
         tuple(VideoDocumentKind(value) for value in args.output)
         if output_requested
         else (VideoDocumentKind.KNOWLEDGE_NOTE,)
-    )
-    provider_profile = (
-        args.provider_profile or config.default_provider_profile
-    )
-    provider = config.providers.get(provider_profile)
-    model_override = args.model or (
-        provider.default_model if provider is not None else None
     )
     request = VideoProduceRequest(
         request_schema_version=2 if use_v2 else 1,
@@ -1637,7 +1673,39 @@ def _config_command_result(
     config_service: RuntimeConfigService | None,
 ) -> ApplicationResult:
     service = config_service or _default_config_service()
-    command = f"config {args.config_command}"
+    command = (
+        f"config provider {args.config_provider_command}"
+        if args.config_command == "provider"
+        else f"config {args.config_command}"
+    )
+    if args.config_command == "provider":
+        effective, changed = service.set_provider_profile(
+            args.profile,
+            provider_type=args.provider_type,
+            default_model=args.model,
+            credential_ref=args.credential_ref,
+        )
+        return ApplicationResult(
+            command=command,
+            correlation_id=correlation_id,
+            ok=True,
+            data={
+                "profile": args.profile,
+                "provider_type": args.provider_type,
+                "default_model": args.model,
+                "changed": changed,
+                "digest": effective.digest,
+                "semantic_digest": effective.semantic_digest,
+            },
+            versions=_versions(),
+            human_lines=(
+                (
+                    f"Provider profile configured: {args.profile}"
+                    if changed
+                    else f"Provider profile already configured: {args.profile}"
+                ),
+            ),
+        )
     if args.config_command == "profiles":
         profiles = service.list_profiles()
         return ApplicationResult(
@@ -1663,7 +1731,11 @@ def _config_command_result(
             human_lines=(f"Updated: {args.key}",),
         )
 
-    effective = service.effective(profile=args.profile)
+    effective = (
+        service.validate(profile=args.profile)
+        if args.config_command == "validate"
+        else service.effective(profile=args.profile)
+    )
     data: dict[str, object] = {
         "valid": True,
         "profile": effective.profile,
@@ -1733,6 +1805,65 @@ def _effective_video_config(
         recipe_defaults=recipe_defaults,
     )
     return effective_runtime_config(config)
+
+
+def _resolved_video_model_selection(
+    config: object,
+    *,
+    requested_provider_profile: object = None,
+    requested_model_identity: object = None,
+    require_codex_runtime: bool,
+) -> tuple[str, str | None]:
+    from app.core.portable.identity import is_executor_identity
+
+    provider_profile = (
+        requested_provider_profile
+        if type(requested_provider_profile) is str
+        else config.default_provider_profile
+    )
+    if not is_executor_identity(provider_profile):
+        raise DomainError(
+            "model_provider_profile_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Video provider profile is invalid",
+        )
+    provider = config.providers.get(provider_profile)
+    if require_codex_runtime and provider is None:
+        if provider_profile != "default":
+            raise DomainError(
+                "model_provider_unsupported",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "The configured Video provider is not supported",
+            )
+    elif require_codex_runtime and (
+        provider.provider_type != "codex-app-server"
+        or provider.base_url is not None
+        or provider.credential_ref not in {None, "codex/local-login"}
+    ):
+        raise DomainError(
+            "model_provider_unsupported",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The configured Video provider is not supported",
+        )
+
+    model_identity = (
+        requested_model_identity
+        if type(requested_model_identity) is str
+        else (provider.default_model if provider is not None else None)
+    )
+    if model_identity is not None and not is_executor_identity(model_identity):
+        raise DomainError(
+            "model_identity_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Video model identity is invalid",
+        )
+    if provider is not None and model_identity is None:
+        raise DomainError(
+            "model_identity_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Video model identity is invalid",
+        )
+    return provider_profile, model_identity
 
 
 def _job_runtime_for_args(
@@ -1967,6 +2098,8 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
     if len(arguments) >= 2 and arguments[0] == "engine":
         return f"engine {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "config":
+        if len(arguments) >= 3 and arguments[1] == "provider":
+            return f"config provider {arguments[2]}"
         return f"config {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "credential":
         return f"credential {arguments[1]}"
@@ -1993,6 +2126,8 @@ def _default_runtime(
     runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
     recipe_key: RecipeKey | None = None,
+    video_provider_profile: str | None = None,
+    video_model_identity: str | None = None,
     document_provider_profile: object = None,
     document_model_identity: object = None,
     document_verifier_provider_profile: object = None,
@@ -2032,6 +2167,8 @@ def _default_runtime(
         workspace_root,
         runtime_paths=runtime_paths,
         current_config_snapshot=current_config_snapshot,
+        requested_model_identity=video_model_identity,
+        requested_provider_profile=video_provider_profile,
     )
 
 

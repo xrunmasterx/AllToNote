@@ -11,19 +11,23 @@ from typing import Mapping
 from app.core.config.loader import (
     load_runtime_config,
     runtime_config_mapping,
-    write_runtime_config,
+    update_runtime_config,
 )
 from app.core.config.model import (
     SEMANTIC_CONFIG_KEYS,
     JobConfigSnapshot,
+    ProviderProfileConfig,
     RuntimeConfig,
 )
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory
+from app.core.portable.identity import is_executor_identity
 from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
 
 _PROFILE_ID = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?\Z")
+_SUPPORTED_PROVIDER_TYPES = frozenset({"codex-app-server"})
+_CODEX_CREDENTIAL_REF = "codex/local-login"
 _SETTABLE_KEYS = frozenset(
     {
         "default_workspace",
@@ -136,6 +140,15 @@ class RuntimeConfigService:
         )
         return effective_runtime_config(config, profile=profile)
 
+    def validate(
+        self,
+        *,
+        profile: str | None = None,
+    ) -> EffectiveRuntimeConfig:
+        effective = self.effective(profile=profile)
+        _validate_provider_defaults(effective.config)
+        return effective
+
     def list_profiles(self) -> tuple[str, ...]:
         profile_dir = self._paths.config_dir / "profiles"
         if not profile_dir.exists():
@@ -161,40 +174,107 @@ class RuntimeConfigService:
                 ErrorCategory.INVALID_REQUEST,
                 "Runtime configuration key cannot be set by this command",
             )
-        current = load_runtime_config(self._paths.config_file, {})
-        if key == "default_verifier_provider_profile":
-            verifier = current.providers.get(value)
-            composer = current.providers.get(current.default_provider_profile)
-            if verifier is None or verifier.default_model is None:
-                raise DomainError(
-                    "document_verifier_model_required",
-                    ErrorCategory.INVALID_REQUEST,
-                    "The configured Document verifier profile has no frozen model",
+        def apply(current: RuntimeConfig) -> RuntimeConfig:
+            if key.startswith("recipe_defaults."):
+                recipe_key = key.removeprefix("recipe_defaults.")
+                return replace(
+                    current,
+                    recipe_defaults=replace(
+                        current.recipe_defaults,
+                        **{recipe_key: value},
+                    ),
                 )
-            if (
-                composer is not None
-                and composer.default_model == verifier.default_model
+            if key in {"default_workspace", "ffmpeg_path", "work_directory"}:
+                return replace(current, **{key: Path(value)})
+            updated = replace(current, **{key: value})
+            if key in {
+                "default_provider_profile",
+                "default_verifier_provider_profile",
+            }:
+                _validate_provider_defaults(updated)
+            return updated
+
+        updated = update_runtime_config(apply, self._paths.config_file)
+        return effective_runtime_config(updated)
+
+    def set_provider_profile(
+        self,
+        profile: str,
+        *,
+        provider_type: str,
+        default_model: str,
+        credential_ref: str | None = None,
+    ) -> tuple[EffectiveRuntimeConfig, bool]:
+        if type(profile) is not str or _PROFILE_ID.fullmatch(profile) is None:
+            raise DomainError(
+                "config_provider_profile_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Provider profile is invalid",
+            )
+        if (
+            type(provider_type) is not str
+            or provider_type not in _SUPPORTED_PROVIDER_TYPES
+        ):
+            raise DomainError(
+                "config_provider_type_unsupported",
+                ErrorCategory.INVALID_REQUEST,
+                "Provider type is not supported",
+            )
+        if (
+            type(default_model) is not str
+            or not is_executor_identity(default_model)
+        ):
+            raise DomainError(
+                "config_provider_model_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Provider model is invalid",
+            )
+        normalized_credential_ref = (
+            _CODEX_CREDENTIAL_REF if credential_ref is None else credential_ref
+        )
+        if normalized_credential_ref != _CODEX_CREDENTIAL_REF:
+            raise DomainError(
+                "config_provider_credential_ref_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Provider credential reference is invalid",
+            )
+
+        provider = ProviderProfileConfig(
+            provider_type=provider_type,
+            default_model=default_model,
+            credential_ref=normalized_credential_ref,
+        )
+        changed = False
+
+        def apply(current: RuntimeConfig) -> RuntimeConfig:
+            nonlocal changed
+            existing = current.providers.get(profile)
+            if existing == provider:
+                return current
+            if existing is not None and (
+                existing.provider_type != provider_type
+                or existing.credential_ref != normalized_credential_ref
+                or existing.base_url is not None
             ):
                 raise DomainError(
-                    "document_verifier_not_independent",
-                    ErrorCategory.INVALID_REQUEST,
-                    "The configured Document verifier must use a different model",
+                    "config_provider_profile_conflict",
+                    ErrorCategory.CONFLICT,
+                    "Provider profile conflicts with the admitted Runtime provider",
                 )
-        if key.startswith("recipe_defaults."):
-            recipe_key = key.removeprefix("recipe_defaults.")
+            changed = True
             updated = replace(
                 current,
-                recipe_defaults=replace(
-                    current.recipe_defaults,
-                    **{recipe_key: value},
-                ),
+                providers={**current.providers, profile: provider},
             )
-        elif key in {"default_workspace", "ffmpeg_path", "work_directory"}:
-            updated = replace(current, **{key: Path(value)})
-        else:
-            updated = replace(current, **{key: value})
-        write_runtime_config(updated, self._paths.config_file)
-        return effective_runtime_config(updated)
+            if profile in {
+                current.default_provider_profile,
+                current.default_verifier_provider_profile,
+            }:
+                _validate_provider_defaults(updated)
+            return updated
+
+        updated = update_runtime_config(apply, self._paths.config_file)
+        return effective_runtime_config(updated), changed
 
     def _profile_path(self, profile: str) -> Path:
         if type(profile) is not str or _PROFILE_ID.fullmatch(profile) is None:
@@ -226,6 +306,51 @@ class RuntimeConfigService:
                 "Runtime configuration profile is invalid",
             )
         return resolved
+
+
+def _validate_provider_defaults(config: RuntimeConfig) -> None:
+    composer = config.providers.get(config.default_provider_profile)
+    if composer is None:
+        if (
+            config.default_provider_profile == "default"
+            and config.default_verifier_provider_profile is None
+        ):
+            return
+        raise DomainError(
+            "default_provider_profile_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured default provider profile is not usable",
+        )
+    if (
+        composer.provider_type != "codex-app-server"
+        or not is_executor_identity(composer.default_model)
+    ):
+        raise DomainError(
+            "default_provider_profile_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured default provider profile is not usable",
+        )
+
+    verifier_profile = config.default_verifier_provider_profile
+    if verifier_profile is None:
+        return
+    verifier = config.providers.get(verifier_profile)
+    if (
+        verifier is None
+        or verifier.provider_type != "codex-app-server"
+        or not is_executor_identity(verifier.default_model)
+    ):
+        raise DomainError(
+            "document_verifier_model_required",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Document verifier profile has no frozen model",
+        )
+    if composer.default_model == verifier.default_model:
+        raise DomainError(
+            "document_verifier_not_independent",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Document verifier must use a different model",
+        )
 
 
 __all__ = [

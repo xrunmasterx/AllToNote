@@ -141,6 +141,7 @@ from app.core.jobs.resource_lease import (
     ResourceLeaseStorePort,
     ResourceOwner,
 )
+from app.core.portable.identity import is_executor_identity
 from app.core.jobs.workspace_publish import WorkspacePublishCoordinator
 from app.core.packs.events import (
     ExecutionPackIdentity,
@@ -2700,12 +2701,48 @@ def _bilibili_cookie() -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _admit_codex_video_profile(
+    current_config_snapshot: JobConfigSnapshot | None,
+    provider_profile: str,
+) -> None:
+    if not is_executor_identity(provider_profile):
+        raise DomainError(
+            "model_provider_profile_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The configured Video provider profile is invalid",
+        )
+    if current_config_snapshot is None:
+        return
+    providers = current_config_snapshot.values.get("providers")
+    if not isinstance(providers, Mapping):
+        raise DomainError(
+            "model_provider_unsupported",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The configured Video provider is not supported",
+        )
+    provider = providers.get(provider_profile)
+    if provider is None and provider_profile == "default":
+        return
+    if not isinstance(provider, Mapping) or (
+        provider.get("type") != "codex-app-server"
+        or provider.get("base_url") is not None
+        or provider.get("credential_ref") not in {None, "codex/local-login"}
+    ):
+        raise DomainError(
+            "model_provider_unsupported",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The configured Video provider is not supported",
+        )
+
+
 def create_codex_app_server_runtime_for_workspace(
     workspace_root: Path,
     *,
     local_app_data: Path | None = None,
     runtime_paths: RuntimePaths | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    requested_model_identity: str | None = None,
+    requested_provider_profile: str | None = None,
     execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
     require_existing_job_store: bool = False,
     adopted_resource_lease: ResourceLease | None = None,
@@ -2735,7 +2772,9 @@ def create_codex_app_server_runtime_for_workspace(
         ).manifest.workspace_id,
     )
     instance = registry.resolve(workspace_root)
-    model_identity = status.default_model
+    model_identity = requested_model_identity or status.default_model
+    provider_profile = requested_provider_profile or "default"
+    _admit_codex_video_profile(current_config_snapshot, provider_profile)
     bridge = CodexAppServerCompletionBridge(model_identity=model_identity)
     model = LegacyModelBinding(
         provider_kind="codex-app-server",
@@ -2916,7 +2955,7 @@ def create_codex_app_server_runtime_for_workspace(
         generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=binding,
-        model_execution_profile="default",
+        model_execution_profile=provider_profile,
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         workspace_instance_id=instance.instance_id,

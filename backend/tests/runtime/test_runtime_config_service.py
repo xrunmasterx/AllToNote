@@ -201,6 +201,11 @@ def test_config_cli_get_validate_profiles_and_set_are_one_safe_envelope(
             user_config,
             providers={
                 **user_config.providers,
+                "user-provider": ProviderProfileConfig(
+                    provider_type="codex-app-server",
+                    default_model="user-model",
+                    credential_ref="codex/local-login",
+                ),
                 "document-reviewer": ProviderProfileConfig(
                     provider_type="codex-app-server",
                     default_model="reviewer-model",
@@ -273,6 +278,350 @@ def test_config_cli_get_validate_profiles_and_set_are_one_safe_envelope(
     assert load_runtime_config(
         paths.config_file, {}
     ).default_verifier_provider_profile == "document-reviewer"
+
+
+def test_config_provider_set_creates_an_idempotent_safe_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+    service = RuntimeConfigService(paths=paths)
+    arguments = [
+        "config",
+        "provider",
+        "set",
+        "document-composer",
+        "--type",
+        "codex-app-server",
+        "--model",
+        "openai/gpt-5.3-codex",
+        "--credential-ref",
+        "codex/local-login",
+        "--json",
+    ]
+
+    assert main(arguments, config_service=service) == 0
+    first_output = capsys.readouterr()
+    first = json.loads(first_output.out)
+    first_bytes = paths.config_file.read_bytes()
+
+    assert first_output.err == ""
+    assert first["command"] == "config provider set"
+    assert first["data"] == {
+        "profile": "document-composer",
+        "provider_type": "codex-app-server",
+        "default_model": "openai/gpt-5.3-codex",
+        "changed": True,
+        "digest": first["data"]["digest"],
+        "semantic_digest": first["data"]["semantic_digest"],
+    }
+    assert "codex/local-login" not in first_output.out
+    configured = load_runtime_config(paths.config_file, {})
+    assert configured.providers["document-composer"] == ProviderProfileConfig(
+        provider_type="codex-app-server",
+        default_model="openai/gpt-5.3-codex",
+        credential_ref="codex/local-login",
+    )
+
+    monkeypatch.setattr(
+        config_loader_module.os,
+        "replace",
+        lambda _source, _target: (_ for _ in ()).throw(
+            AssertionError("an exact repeat must not rewrite config.toml")
+        ),
+    )
+    assert main(arguments, config_service=service) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert second["data"]["changed"] is False
+    assert paths.config_file.read_bytes() == first_bytes
+
+
+def test_config_provider_set_rejects_invalid_input_without_rewriting_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+    write_runtime_config(_user_config(tmp_path), paths.config_file)
+    before = paths.config_file.read_bytes()
+    service = RuntimeConfigService(paths=paths)
+
+    exit_code = main(
+        [
+            "config",
+            "provider",
+            "set",
+            "../unsafe",
+            "--type",
+            "codex-app-server",
+            "--model",
+            "composer-model",
+            "--json",
+        ],
+        config_service=service,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert envelope["command"] == "config provider set"
+    assert envelope["error"]["code"] == "config_provider_profile_invalid"
+    assert paths.config_file.read_bytes() == before
+
+
+def test_config_provider_set_defaults_codex_identity_and_rejects_collisions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+    write_runtime_config(
+        RuntimeConfig(
+            providers={
+                "legacy": ProviderProfileConfig(
+                    provider_type="openai-compatible",
+                    base_url="https://legacy.example/v1",
+                    default_model="legacy-model",
+                    credential_ref="providers/legacy",
+                )
+            }
+        ),
+        paths.config_file,
+    )
+    service = RuntimeConfigService(paths=paths)
+
+    assert (
+        main(
+            [
+                "config",
+                "provider",
+                "set",
+                "composer",
+                "--type",
+                "codex-app-server",
+                "--model",
+                "composer-model",
+                "--json",
+            ],
+            config_service=service,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    configured = load_runtime_config(paths.config_file, {})
+    assert configured.providers["composer"].credential_ref == "codex/local-login"
+    before_conflict = paths.config_file.read_bytes()
+
+    exit_code = main(
+        [
+            "config",
+            "provider",
+            "set",
+            "legacy",
+            "--type",
+            "codex-app-server",
+            "--model",
+            "replacement-model",
+            "--json",
+        ],
+        config_service=service,
+    )
+    conflict = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 20
+    assert conflict["error"]["code"] == "config_provider_profile_conflict"
+    assert paths.config_file.read_bytes() == before_conflict
+
+
+def test_config_defaults_require_existing_usable_provider_profiles(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+    service = RuntimeConfigService(paths=paths)
+
+    exit_code = main(
+        [
+            "config",
+            "set",
+            "default_provider_profile",
+            "missing",
+            "--json",
+        ],
+        config_service=service,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert envelope["error"]["code"] == "default_provider_profile_invalid"
+    assert not paths.config_file.exists()
+
+
+def test_config_validate_rejects_dangling_provider_defaults(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+    write_runtime_config(
+        RuntimeConfig(default_provider_profile="missing"),
+        paths.config_file,
+    )
+
+    exit_code = main(
+        ["config", "validate", "--json"],
+        config_service=RuntimeConfigService(paths=paths),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert envelope["error"]["code"] == "default_provider_profile_invalid"
+
+
+def test_config_provider_update_preserves_verifier_independence(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+    write_runtime_config(
+        RuntimeConfig(
+            default_provider_profile="composer",
+            default_verifier_provider_profile="verifier",
+            providers={
+                "composer": ProviderProfileConfig(
+                    provider_type="codex-app-server",
+                    default_model="composer-model",
+                    credential_ref="codex/local-login",
+                ),
+                "verifier": ProviderProfileConfig(
+                    provider_type="codex-app-server",
+                    default_model="verifier-model",
+                    credential_ref="codex/local-login",
+                ),
+            },
+        ),
+        paths.config_file,
+    )
+    before = paths.config_file.read_bytes()
+
+    exit_code = main(
+        [
+            "config",
+            "provider",
+            "set",
+            "verifier",
+            "--type",
+            "codex-app-server",
+            "--model",
+            "composer-model",
+            "--json",
+        ],
+        config_service=RuntimeConfigService(paths=paths),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert envelope["error"]["code"] == "document_verifier_not_independent"
+    assert paths.config_file.read_bytes() == before
+
+
+def test_config_provider_set_rejects_explicit_empty_credential_ref(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+
+    exit_code = main(
+        [
+            "config",
+            "provider",
+            "set",
+            "composer",
+            "--type",
+            "codex-app-server",
+            "--model",
+            "composer-model",
+            "--credential-ref",
+            "",
+            "--json",
+        ],
+        config_service=RuntimeConfigService(paths=paths),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert envelope["error"]["code"] == "config_provider_credential_ref_invalid"
+    assert not paths.config_file.exists()
+
+
+def test_config_provider_set_never_accepts_a_plaintext_secret_option(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "provider-profile-secret-canary-4821"
+
+    exit_code = main(
+        [
+            "config",
+            "provider",
+            "set",
+            "composer",
+            "--type",
+            "codex-app-server",
+            "--model",
+            "composer-model",
+            "--api-key",
+            secret,
+            "--json",
+        ],
+        config_service=RuntimeConfigService(paths=_paths(tmp_path)),
+    )
+    output = capsys.readouterr()
+    envelope = json.loads(output.out)
+
+    assert exit_code == 2
+    assert envelope["command"] == "config provider set"
+    assert envelope["error"]["code"] == "cli_usage_invalid"
+    assert secret not in output.out
+    assert secret not in output.err
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        " composer-model",
+        "composer-model ",
+        "composer\nmodel",
+        "composer\0model",
+        "composer:model",
+        "composer\tmodel",
+        "m" * 129,
+    ),
+)
+def test_config_provider_set_rejects_noncanonical_model_identity(
+    tmp_path: Path,
+    model: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _paths(tmp_path)
+
+    exit_code = main(
+        [
+            "config",
+            "provider",
+            "set",
+            "composer",
+            "--type",
+            "codex-app-server",
+            "--model",
+            model,
+            "--json",
+        ],
+        config_service=RuntimeConfigService(paths=paths),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert envelope["error"]["code"] == "config_provider_model_invalid"
+    assert not paths.config_file.exists()
 
 
 def test_config_set_invalid_value_fails_without_rewriting_file(

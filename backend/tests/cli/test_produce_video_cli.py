@@ -887,6 +887,146 @@ def test_generic_direct_uses_provider_default_model(
     assert runtime.requests[0].parameters["model_override"] == "model-from-profile"
 
 
+def test_generic_video_factory_uses_frozen_profile_and_model_for_both_entry_paths(
+    tmp_path: Path,
+    workspace_root: Path,
+    runtime_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.core.config.loader import write_runtime_config
+    from app.core.config.model import ProviderProfileConfig, RuntimeConfig
+    from app.runtime_config import RuntimeConfigService
+    from app.runtime_paths import resolve_runtime_paths
+
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "machine-state")
+    write_runtime_config(
+        RuntimeConfig(
+            default_workspace=workspace_root,
+            default_provider_profile="video-composer",
+            providers={
+                "video-composer": ProviderProfileConfig(
+                    provider_type="codex-app-server",
+                    default_model="openai/video-composer-model",
+                    credential_ref="codex/local-login",
+                )
+            },
+        ),
+        paths.config_file,
+    )
+    service = RuntimeConfigService(paths=paths)
+    calls: list[dict[str, object]] = []
+
+    def create_runtime(_workspace: Path, **options: object):
+        calls.append(options)
+        runtime, _ = runtime_factory()
+        return runtime
+
+    monkeypatch.setattr(
+        importlib.import_module("app.runtime"),
+        "create_codex_app_server_runtime_for_workspace",
+        create_runtime,
+    )
+
+    assert main(
+        [
+            "produce",
+            "fixture://course",
+            "--recipe",
+            "alltonote.video-course-note@1",
+            "--wait",
+            "--json",
+        ],
+        config_service=service,
+    ) == 0
+    capsys.readouterr()
+
+    request_path = tmp_path / "video-request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.video-course-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "source", "value": "fixture://course"},
+                "workspace_ref": str(workspace_root),
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {
+                    "provider_profile": "video-composer",
+                    "model_override": "openai/video-composer-model",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(
+        ["produce", "--request", str(request_path), "--wait", "--json"],
+        config_service=service,
+    ) == 0
+    capsys.readouterr()
+
+    assert len(calls) == 2
+    for options in calls:
+        assert options["requested_provider_profile"] == "video-composer"
+        assert options["requested_model_identity"] == (
+            "openai/video-composer-model"
+        )
+
+
+def test_real_video_factory_rejects_non_codex_profile_before_creation(
+    tmp_path: Path,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.core.config.loader import write_runtime_config
+    from app.core.config.model import ProviderProfileConfig, RuntimeConfig
+    from app.runtime_config import RuntimeConfigService
+    from app.runtime_paths import resolve_runtime_paths
+
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "machine-state")
+    write_runtime_config(
+        RuntimeConfig(
+            default_workspace=workspace_root,
+            default_provider_profile="legacy-provider",
+            providers={
+                "legacy-provider": ProviderProfileConfig(
+                    provider_type="openai-compatible",
+                    base_url="https://legacy.example/v1",
+                    default_model="legacy-model",
+                    credential_ref="providers/legacy",
+                )
+            },
+        ),
+        paths.config_file,
+    )
+    monkeypatch.setattr(
+        importlib.import_module("app.runtime"),
+        "create_codex_app_server_runtime_for_workspace",
+        lambda *_args, **_options: pytest.fail(
+            "Unsupported provider reached the Codex Runtime factory"
+        ),
+    )
+
+    exit_code = main(
+        [
+            "produce",
+            "video",
+            "--input",
+            "fixture://course",
+            "--wait",
+            "--json",
+        ],
+        config_service=RuntimeConfigService(paths=paths),
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 10
+    assert envelope["error"]["code"] == "model_provider_unsupported"
+
+
 def test_request_file_resolves_workspace_in_submitted_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1729,18 +1869,41 @@ def test_unexpected_failures_are_one_safe_json_envelope(
 
 
 def test_default_runtime_uses_real_codex_factory_and_never_fake(
+    tmp_path: Path,
     runtime_factory,
     workspace_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    from app.core.config.loader import write_runtime_config
+    from app.core.config.model import ProviderProfileConfig, RuntimeConfig
+    from app.runtime_config import RuntimeConfigService
+    from app.runtime_paths import resolve_runtime_paths
+
     runtime, calls = runtime_factory()
     runtime_module = importlib.import_module("app.runtime")
     requested_workspaces: list[Path] = []
+    paths = resolve_runtime_paths(machine_state_root=tmp_path / "machine-state")
+    write_runtime_config(
+        RuntimeConfig(
+            default_provider_profile="video-composer",
+            providers={
+                "video-composer": ProviderProfileConfig(
+                    provider_type="codex-app-server",
+                    default_model="openai/video-composer-model",
+                )
+            },
+        ),
+        paths.config_file,
+    )
 
     def create_real_runtime(workspace: Path, **options: object):
         requested_workspaces.append(workspace)
         assert options["current_config_snapshot"].snapshot_version == 1
+        assert options["requested_provider_profile"] == "video-composer"
+        assert options["requested_model_identity"] == (
+            "openai/video-composer-model"
+        )
         return runtime
 
     monkeypatch.setattr(
@@ -1766,7 +1929,8 @@ def test_default_runtime_uses_real_codex_factory_and_never_fake(
             str(workspace_root),
             "--wait",
             "--json",
-        ]
+        ],
+        config_service=RuntimeConfigService(paths=paths),
     )
     captured = capsys.readouterr()
 
@@ -1961,6 +2125,8 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
     created = runtime_module.create_codex_app_server_runtime_for_workspace(
         workspace_root,
         local_app_data=local_app_data,
+        requested_model_identity="openai/video-composer-model",
+        requested_provider_profile="video-composer",
         execution_pack_environment=(
             frozen_environment if recover_frozen else None
         ),
@@ -2039,9 +2205,9 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
         )
         with pytest.raises(DomainError, match="pack_generation_unavailable"):
             pack_port_resolver(incompatible)
-    assert captured["model_execution_profile"] == "default"
+    assert captured["model_execution_profile"] == "video-composer"
     assert model.provider_kind == "codex-app-server"
-    assert model.model_identity == "codex-test-model"
+    assert model.model_identity == "openai/video-composer-model"
     assert binding.provider_type == "codex-app-server"
-    assert binding.model_identity == "codex-test-model"
+    assert binding.model_identity == "openai/video-composer-model"
     assert binding.credential_profile_ref == "codex/local-login"

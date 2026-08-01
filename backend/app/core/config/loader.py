@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -464,17 +464,7 @@ def write_runtime_config(config: RuntimeConfig, path: Path | None = None) -> Pat
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
         lock = FileLock(f"{resolved_path}.lock")
         with lock:
-            temporary_path = resolved_path.with_name(
-                f".{resolved_path.name}.{uuid4().hex}.tmp"
-            )
-            try:
-                with temporary_path.open("wb") as stream:
-                    tomli_w.dump(values, stream)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary_path, resolved_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+            _write_runtime_config_unlocked(values, resolved_path)
     except OSError as error:
         raise DomainError(
             "config_write_failed",
@@ -482,3 +472,44 @@ def write_runtime_config(config: RuntimeConfig, path: Path | None = None) -> Pat
             "Runtime configuration could not be written",
         ) from error
     return resolved_path
+
+
+def update_runtime_config(
+    update: Callable[[RuntimeConfig], RuntimeConfig],
+    path: Path | None = None,
+) -> RuntimeConfig:
+    resolved_path = Path(path) if path is not None else runtime_config_path()
+    try:
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(f"{resolved_path}.lock")
+        with lock:
+            current = load_runtime_config(resolved_path, {})
+            updated = update(current)
+            values = _runtime_config_to_mapping(updated)
+            _validate_partial_config(values, require_profile_type=True)
+            if updated != current:
+                _write_runtime_config_unlocked(values, resolved_path)
+    except OSError as error:
+        raise DomainError(
+            "config_write_failed",
+            ErrorCategory.POLICY_DENIED,
+            "Runtime configuration could not be written",
+        ) from error
+    return updated
+
+
+def _write_runtime_config_unlocked(
+    values: Mapping[str, object],
+    resolved_path: Path,
+) -> None:
+    temporary_path = resolved_path.with_name(
+        f".{resolved_path.name}.{uuid4().hex}.tmp"
+    )
+    try:
+        with temporary_path.open("wb") as stream:
+            tomli_w.dump(values, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, resolved_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)

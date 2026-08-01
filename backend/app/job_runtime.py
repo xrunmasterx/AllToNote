@@ -43,6 +43,7 @@ from app.core.packs.events import (
     JobPackEnvironmentSnapshot,
     parse_job_pack_environment_payload,
 )
+from app.core.portable.identity import is_executor_identity
 from app.core.recipes.video.descriptor import VIDEO_DESCRIPTORS
 from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
@@ -569,10 +570,17 @@ def create_job_runtime_for_workspace(
         else:
             from app.runtime import create_codex_app_server_runtime_for_workspace
 
+            requested_provider_profile, requested_model_identity = (
+                _stored_video_model_selection(
+                    repository.get_job_request(job_id)
+                )
+            )
             runtime = create_codex_app_server_runtime_for_workspace(
                 workspace_root,
                 runtime_paths=paths,
                 current_config_snapshot=current_config_snapshot,
+                requested_model_identity=requested_model_identity,
+                requested_provider_profile=requested_provider_profile,
                 execution_pack_environment=_job_pack_environment(
                     repository,
                     job_id,
@@ -589,6 +597,37 @@ def create_job_runtime_for_workspace(
         current_config_snapshot=current_config_snapshot,
         execution_owner=execution_owner,
         notify_engine_job=notify_engine_job,
+    )
+
+
+def _stored_video_model_selection(
+    request_json: str | None,
+) -> tuple[str | None, str | None]:
+    if request_json is None:
+        return None, None
+    try:
+        request = json.loads(request_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, None
+    if type(request) is not dict:
+        return None, None
+    provider_profile = request.get("provider_profile")
+    model_override = request.get("model_override")
+    if provider_profile is not None and not is_executor_identity(provider_profile):
+        raise DomainError(
+            "job_request_invalid",
+            ErrorCategory.INTERNAL,
+            "Stored Video request is invalid",
+        )
+    if model_override is not None and not is_executor_identity(model_override):
+        raise DomainError(
+            "job_request_invalid",
+            ErrorCategory.INTERNAL,
+            "Stored Video request is invalid",
+        )
+    return (
+        provider_profile,
+        model_override,
     )
 
 
