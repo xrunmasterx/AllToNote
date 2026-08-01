@@ -315,11 +315,16 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 
 class SqliteJobRepository:
     def __init__(
-        self, machine_root: Path, *, clock: Callable[[], int]
+        self,
+        machine_root: Path,
+        *,
+        clock: Callable[[], int],
+        require_existing: bool = False,
     ) -> None:
         self.machine_root = machine_root
         self.database_path = machine_root / "jobs.sqlite"
         self._clock = clock
+        self._require_existing = require_existing
 
     @classmethod
     def open(
@@ -342,11 +347,58 @@ class SqliteJobRepository:
             _raise_schema_invalid(error)
         return repository
 
+    @classmethod
+    def open_existing(
+        cls,
+        machine_root: Path,
+        *,
+        clock: Callable[[], int] | None = None,
+    ) -> SqliteJobRepository:
+        try:
+            resolved_root = Path(machine_root).resolve(strict=True)
+            database_path = resolved_root / "jobs.sqlite"
+            if not resolved_root.is_dir() or not database_path.is_file():
+                _raise_schema_invalid()
+            connection = sqlite3.connect(
+                database_path.as_uri() + "?mode=ro",
+                uri=True,
+                timeout=_BUSY_TIMEOUT_MS / 1_000,
+                isolation_level=None,
+            )
+            try:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            finally:
+                connection.close()
+        except DomainError:
+            raise
+        except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
+            _raise_schema_invalid(error)
+        if version not in (1, 2, _SCHEMA_VERSION):
+            _raise_schema_invalid()
+        repository = cls(
+            resolved_root,
+            clock=clock or (lambda: time.time_ns() // 1_000_000),
+            require_existing=True,
+        )
+        try:
+            repository._initialize_schema()
+        except DomainError:
+            raise
+        except sqlite3.DatabaseError as error:
+            _raise_schema_invalid(error)
+        return repository
+
     def _connect(self) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
         try:
+            target: str | Path = self.database_path
+            uri = False
+            if self._require_existing:
+                target = self.database_path.as_uri() + "?mode=rw"
+                uri = True
             connection = sqlite3.connect(
-                self.database_path,
+                target,
+                uri=uri,
                 timeout=_BUSY_TIMEOUT_MS / 1_000,
                 isolation_level=None,
             )
@@ -399,7 +451,7 @@ class SqliteJobRepository:
                 )
             actual_schema = _application_schema(connection)
             if version == 0:
-                if actual_schema:
+                if self._require_existing or actual_schema:
                     _raise_schema_invalid()
                 for statement in _SCHEMA_STATEMENTS:
                     connection.execute(statement)

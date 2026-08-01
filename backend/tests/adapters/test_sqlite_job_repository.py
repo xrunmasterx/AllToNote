@@ -200,6 +200,55 @@ def repo(tmp_path: Path) -> SqliteJobRepository:
     yield SqliteJobRepository.open(tmp_path / "machine-root")
 
 
+def test_open_existing_rejects_empty_database_without_initializing_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "empty-existing-store"
+    root.mkdir()
+    database = root / "jobs.sqlite"
+    database.write_bytes(b"")
+
+    with pytest.raises(DomainError, match="job_store_schema_invalid"):
+        SqliteJobRepository.open_existing(root)
+
+    assert database.read_bytes() == b""
+
+
+def test_open_existing_rechecks_schema_after_read_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "swapped-existing-store"
+    SqliteJobRepository.open(root)
+    database = root / "jobs.sqlite"
+    original_connect = SqliteJobRepository._connect
+    swapped = False
+
+    def swap_before_transaction(repository: SqliteJobRepository):
+        nonlocal swapped
+        if repository._require_existing and not swapped:
+            swapped = True
+            database.unlink()
+            database.write_bytes(b"")
+        return original_connect(repository)
+
+    monkeypatch.setattr(
+        SqliteJobRepository,
+        "_connect",
+        swap_before_transaction,
+    )
+
+    with pytest.raises(DomainError, match="job_store_schema_invalid"):
+        SqliteJobRepository.open_existing(root)
+
+    assert swapped is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall() == []
+
+
 def test_initial_job_event_is_atomic_with_job_creation(
     repo: SqliteJobRepository, monkeypatch: pytest.MonkeyPatch
 ) -> None:

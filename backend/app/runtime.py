@@ -1722,12 +1722,19 @@ def _create_platform_video_runtime_components(
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    require_existing_job_store: bool = False,
 ) -> tuple[AllToNoteRuntime, VideoService]:
-    resolved_machine_root = Path(machine_root).resolve()
-    resolved_machine_root.mkdir(parents=True, exist_ok=True)
-    repository = SqliteJobRepository.open(
-        resolved_machine_root / "job-store", clock=clock
+    resolved_machine_root = Path(machine_root).resolve(
+        strict=require_existing_job_store
     )
+    if not require_existing_job_store:
+        resolved_machine_root.mkdir(parents=True, exist_ok=True)
+    repository_factory = (
+        SqliteJobRepository.open_existing
+        if require_existing_job_store
+        else SqliteJobRepository.open
+    )
+    repository = repository_factory(resolved_machine_root / "job-store", clock=clock)
     storage = FileAttemptStorage(
         resolved_machine_root / "attempts",
         repository,
@@ -1830,6 +1837,7 @@ def create_platform_video_runtime(
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_platform_video_runtime_components(
         machine_root,
@@ -1848,6 +1856,7 @@ def create_platform_video_runtime(
         clock=clock,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        require_existing_job_store=require_existing_job_store,
     )
     return runtime
 
@@ -1867,6 +1876,7 @@ def create_document_runtime(
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     verifier_options = (
         verifier_model,
@@ -1893,11 +1903,18 @@ def create_document_runtime(
         )
     parser = DoclingWorkerParser(worker_config)
     parser.doctor()
-    resolved_machine_root = Path(machine_root).resolve()
-    resolved_machine_root.mkdir(parents=True, exist_ok=True)
-    repository = SqliteJobRepository.open(
-        resolved_machine_root / "job-store",
-        clock=clock,
+    resolved_machine_root = Path(machine_root).resolve(
+        strict=require_existing_job_store
+    )
+    if not require_existing_job_store:
+        resolved_machine_root.mkdir(parents=True, exist_ok=True)
+    repository_factory = (
+        SqliteJobRepository.open_existing
+        if require_existing_job_store
+        else SqliteJobRepository.open
+    )
+    repository = repository_factory(
+        resolved_machine_root / "job-store", clock=clock
     )
     storage = FileAttemptStorage(
         resolved_machine_root / "attempts",
@@ -2022,6 +2039,7 @@ def create_document_runtime_for_workspace(
     requested_provider_profile: str | None = None,
     requested_verifier_model_identity: str | None = None,
     requested_verifier_provider_profile: str | None = None,
+    require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     trusted_root = local_app_data or _default_local_app_data()
     paths = resolve_runtime_paths(local_data_parent=trusted_root)
@@ -2188,6 +2206,7 @@ def create_document_runtime_for_workspace(
         local_instance_id=instance.instance_id,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        require_existing_job_store=require_existing_job_store,
     )
 
 
@@ -2454,6 +2473,7 @@ def create_codex_app_server_runtime_for_workspace(
     local_app_data: Path | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
     execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
+    require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     """Create the real URL producer using the locally authenticated Codex CLI."""
 
@@ -2638,6 +2658,7 @@ def create_codex_app_server_runtime_for_workspace(
         pack_port_resolver=resolve_pack_ports,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        require_existing_job_store=require_existing_job_store,
     )
 
 

@@ -7,6 +7,9 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
 
+from app.adapters.documents.document_basic_pack import (
+    PACK_VERSION as DOCUMENT_PACK_VERSION,
+)
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.core.application.job_query_service import (
@@ -27,10 +30,31 @@ from app.core.packs.events import (
     JobPackEnvironmentSnapshot,
     parse_job_pack_environment_payload,
 )
+from app.core.recipes.video.descriptor import VIDEO_DESCRIPTORS
 from app.runtime_paths import resolve_runtime_paths
 
 
 LOCAL_CLI_PRINCIPAL = "local-user"
+_DOCUMENT_EXECUTION_BINDING = JobExecutionBinding(
+    recipe_id="alltonote.document-note",
+    recipe_version=1,
+    executor_id="alltonote.document",
+    executor_version=1,
+    pack_id="document-basic",
+    pack_version=DOCUMENT_PACK_VERSION,
+)
+_LEGACY_VIDEO_EXECUTION_BINDING = JobExecutionBinding(
+    recipe_id="alltonote.legacy",
+    recipe_version=1,
+    executor_id="alltonote.video",
+    executor_version=1,
+    pack_id="media-basic",
+    pack_version="legacy-v1",
+)
+_VIDEO_RECIPE_KEYS = frozenset(
+    (descriptor.key.recipe_id, descriptor.key.recipe_version)
+    for descriptor in VIDEO_DESCRIPTORS
+)
 
 
 class JobExecutionRuntime(Protocol):
@@ -261,6 +285,7 @@ def create_job_runtime_for_workspace(
     *,
     local_app_data: Path | None = None,
     current_config_snapshot: JobConfigSnapshot | None,
+    require_existing_job_store: bool = False,
 ) -> JobRuntime:
     from iwiki.workspace import open_workspace
 
@@ -275,14 +300,16 @@ def create_job_runtime_for_workspace(
         ).manifest.workspace_id,
     )
     instance = registry.resolve(workspace_root)
-    repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    repository_factory = (
+        SqliteJobRepository.open_existing
+        if require_existing_job_store
+        else SqliteJobRepository.open
+    )
+    repository = repository_factory(instance.machine_root / "job-store")
 
     def execute(job_id: str) -> JobSnapshot:
-        binding = repository.get_job_execution_binding(job_id)
-        if (
-            binding.recipe_id == "alltonote.document-note"
-            and binding.recipe_version == 1
-        ):
+        binding = _require_supported_execution_binding(repository, job_id)
+        if binding == _DOCUMENT_EXECUTION_BINDING:
             from app.runtime import create_document_runtime_for_workspace
 
             requested_model_identity = None
@@ -336,6 +363,7 @@ def create_job_runtime_for_workspace(
                 requested_verifier_provider_profile=(
                     requested_verifier_provider_profile
                 ),
+                require_existing_job_store=require_existing_job_store,
             )
         else:
             from app.runtime import create_codex_app_server_runtime_for_workspace
@@ -349,6 +377,7 @@ def create_job_runtime_for_workspace(
                     job_id,
                     binding,
                 ),
+                require_existing_job_store=require_existing_job_store,
             )
         return runtime.wait_job(job_id)
 
@@ -356,6 +385,31 @@ def create_job_runtime_for_workspace(
         repository,
         wait_job=execute,
         current_config_snapshot=current_config_snapshot,
+    )
+
+
+def _require_supported_execution_binding(
+    repository: SqliteJobRepository,
+    job_id: str,
+) -> JobExecutionBinding:
+    binding = repository.get_job_execution_binding(job_id)
+    if binding in {
+        _DOCUMENT_EXECUTION_BINDING,
+        _LEGACY_VIDEO_EXECUTION_BINDING,
+    }:
+        return binding
+    if (
+        (binding.recipe_id, binding.recipe_version) in _VIDEO_RECIPE_KEYS
+        and binding.executor_id == "alltonote.video"
+        and binding.executor_version == 1
+        and binding.pack_id == "media-basic"
+    ):
+        _job_pack_environment(repository, job_id, binding)
+        return binding
+    raise DomainError(
+        "job_executor_unavailable",
+        ErrorCategory.WORKSPACE_INCOMPATIBLE,
+        "The exact persisted Job executor is unavailable",
     )
 
 

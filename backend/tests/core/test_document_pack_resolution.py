@@ -16,7 +16,7 @@ from app.adapters.pack_layout import (
 )
 from app.adapters.video_packs.official_video_pack import MEDIA_BASIC
 from app.core.domain.ids import sha256_digest
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import JobExecutionBinding, JobSnapshot, JobState
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
@@ -287,10 +287,16 @@ def test_document_pack_missing_or_partial_installation_fails_closed(
 
 
 @pytest.mark.parametrize(
-    ("request_schema_version", "verifier_profile", "verifier_model"),
     (
-        (2, None, None),
-        (3, "fixture/reviewer-profile", "fixture/reviewer-model"),
+        "request_schema_version",
+        "verifier_profile",
+        "verifier_model",
+        "require_existing_job_store",
+    ),
+    (
+        (2, None, None, False),
+        (3, "fixture/reviewer-profile", "fixture/reviewer-model", False),
+        (2, None, None, True),
     ),
 )
 def test_job_wait_selects_document_runtime_from_persisted_binding(
@@ -299,6 +305,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
     request_schema_version: int,
     verifier_profile: str | None,
     verifier_model: str | None,
+    require_existing_job_store: bool,
 ) -> None:
     workspace = tmp_path / "workspace"
     shutil.copytree(FIXTURE_ROOT, workspace)
@@ -385,8 +392,10 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         requested_provider_profile: str | None = None,
         requested_verifier_model_identity: str | None = None,
         requested_verifier_provider_profile: str | None = None,
+        require_existing_job_store: bool = False,
     ) -> Runtime:
         assert current_config_snapshot is None
+        assert require_existing_job_store is expected_existing_job_store
         selected.append(
             (
                 workspace_root,
@@ -403,10 +412,12 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         "app.runtime.create_document_runtime_for_workspace",
         create,
     )
+    expected_existing_job_store = require_existing_job_store
     runtime = create_job_runtime_for_workspace(
         workspace,
         local_app_data=local_data,
         current_config_snapshot=None,
+        require_existing_job_store=require_existing_job_store,
     )
 
     assert runtime.wait_for_job(job.job_id).snapshot.state is JobState.QUEUED
@@ -420,6 +431,72 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             verifier_profile,
         )
     ]
+
+
+def test_job_wait_rejects_wrong_binding_before_recipe_runtime_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    shutil.copytree(FIXTURE_ROOT, workspace)
+    local_data = tmp_path / "local-data"
+    local_data.mkdir()
+    instance = WorkspaceInstanceRegistry(
+        local_data,
+        inspect_workspace=lambda root: open_workspace(
+            root, writable=False
+        ).manifest.workspace_id,
+    ).resolve(workspace)
+    repository = SqliteJobRepository.open(instance.machine_root / "job-store")
+    job = repository.create_job(
+        request_hash="sha256:" + "a" * 64,
+        principal="local-user",
+        client_request_id="wrong-binding",
+        execution_binding=JobExecutionBinding(
+            recipe_id="alltonote.document-note",
+            recipe_version=1,
+            executor_id="wrong.executor",
+            executor_version=99,
+            pack_id="wrong-pack",
+            pack_version="wrong-version",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.runtime.create_document_runtime_for_workspace",
+        lambda *_args, **_kwargs: pytest.fail(
+            "wrong binding must fail before Recipe runtime creation"
+        ),
+    )
+    runtime = create_job_runtime_for_workspace(
+        workspace,
+        local_app_data=local_data,
+        current_config_snapshot=None,
+    )
+
+    with pytest.raises(DomainError) as raised:
+        runtime.wait_for_job(job.job_id)
+
+    assert raised.value.code == "job_executor_unavailable"
+    assert raised.value.category is ErrorCategory.WORKSPACE_INCOMPATIBLE
+
+
+def test_public_job_runtime_opens_empty_store_for_fresh_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    shutil.copytree(FIXTURE_ROOT, workspace)
+    local_data = tmp_path / "local-data"
+    local_data.mkdir()
+
+    runtime = create_job_runtime_for_workspace(
+        workspace,
+        local_app_data=local_data,
+        current_config_snapshot=None,
+    )
+
+    page = runtime.list_jobs()
+    assert page.jobs == ()
+    assert page.next_cursor is None
 
 
 def test_public_job_wait_routes_frozen_video_binding_to_exact_generation(
