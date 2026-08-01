@@ -493,6 +493,11 @@ def create_job_runtime_for_workspace(
         if binding == _DOCUMENT_EXECUTION_BINDING:
             from app.runtime import create_document_runtime_for_workspace
 
+            execution_pack_environment = _job_pack_environment(
+                repository,
+                job_id,
+                binding,
+            )
             requested_model_identity = None
             requested_provider_profile = None
             requested_verifier_model_identity = None
@@ -544,6 +549,7 @@ def create_job_runtime_for_workspace(
                 requested_verifier_provider_profile=(
                     requested_verifier_provider_profile
                 ),
+                execution_pack_environment=execution_pack_environment,
                 require_existing_job_store=require_existing_job_store,
             )
         else:

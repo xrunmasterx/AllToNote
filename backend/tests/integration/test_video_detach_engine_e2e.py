@@ -333,7 +333,7 @@ def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
             timeout=2
         )
         observed = json.loads(wait_stdout)
-        assert wait_code == 0
+        assert wait_code == 0, json.dumps(observed, ensure_ascii=False)
         assert wait_stderr == ""
         assert wait_stdout.count("\n") == 1
         assert observed["data"]["job"]["job_id"] == job_id

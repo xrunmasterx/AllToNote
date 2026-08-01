@@ -58,6 +58,11 @@ from app.core.jobs.resource_lease import (
     ResourceOwner,
 )
 from app.core.portable.document_bundle_assembler import DocumentBundleAssembler
+from app.core.packs.events import (
+    JOB_PACK_ENVIRONMENT_EVENT,
+    JobPackEnvironmentSnapshot,
+    parse_job_pack_environment_payload,
+)
 from app.core.ports.document import DocumentParserPort
 from app.core.ports.jobs import (
     AttemptStoragePort,
@@ -271,6 +276,7 @@ class DocumentService:
             SourceIdentityBinding | None,
         ],
         knowledge_compiler: DocumentKnowledgeCompilerPort | None = None,
+        pack_environment: JobPackEnvironmentSnapshot | None = None,
         resource_lease_store: ResourceLeaseStorePort | None = None,
         resource_owner: ResourceOwner | None = None,
     ) -> None:
@@ -291,6 +297,11 @@ class DocumentService:
         self._local_instance_id = local_instance_id
         self._source_identity_resolver = source_identity_resolver
         self._knowledge_compiler = knowledge_compiler
+        if pack_environment is not None:
+            if not isinstance(pack_environment, JobPackEnvironmentSnapshot):
+                raise ValueError("pack_environment_invalid")
+            pack_environment.pack(_BINDING.pack_id)
+        self._pack_environment = pack_environment
         self._resource_lease_store = resource_lease_store
         self._resource_owner = resource_owner
         self._active_resource_lease: ResourceLease | None = None
@@ -325,10 +336,25 @@ class DocumentService:
                 ErrorCategory.INVALID_REQUEST,
                 "Document request must use the versioned contract",
             )
-        initial_events: tuple[tuple[str, object], ...] = ()
+        if (
+            execution_owner is JobExecutionOwner.ENGINE
+            and self._pack_environment is None
+        ):
+            raise DomainError(
+                "pack_generation_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Engine-owned Document production requires a frozen Pack generation",
+            )
+        initial_events: tuple[tuple[str, object], ...] = (
+            (
+                (JOB_PACK_ENVIRONMENT_EVENT, self._pack_environment),
+            )
+            if self._pack_environment is not None
+            else ()
+        )
         if execution_owner is JobExecutionOwner.ENGINE:
             self._snapshot_detached_input(request)
-            initial_events = (
+            initial_events += (
                 (
                     DOCUMENT_INPUT_SNAPSHOT_EVENT,
                     self._snapshot_event_payload(request),
@@ -371,6 +397,7 @@ class DocumentService:
             JobState.WAITING_FOR_INPUT,
         }:
             return snapshot
+        self._assert_pack_environment_compatible(job_id)
         self._acquire_resource_lease()
         try:
             try:
@@ -466,6 +493,41 @@ class DocumentService:
             self._resource_owner,
             ttl_seconds=_LEASE_TTL_SECONDS,
         )
+
+    def _assert_pack_environment_compatible(self, job_id: str) -> None:
+        events = tuple(
+            event
+            for event in self._repository.list_events(job_id)
+            if event.event_type == JOB_PACK_ENVIRONMENT_EVENT
+        )
+        if self._pack_environment is None:
+            if events:
+                raise DomainError(
+                    "execution_pack_snapshot_invalid",
+                    ErrorCategory.CONFLICT,
+                    "The Job execution Pack environment is unavailable or invalid",
+                )
+            return
+        if len(events) != 1:
+            raise DomainError(
+                "execution_pack_snapshot_missing",
+                ErrorCategory.CONFLICT,
+                "The Job does not contain a frozen execution Pack environment",
+            )
+        try:
+            stored = parse_job_pack_environment_payload(events[0].payload_json)
+        except (TypeError, ValueError) as error:
+            raise DomainError(
+                "execution_pack_snapshot_invalid",
+                ErrorCategory.INTERNAL,
+                "Stored Job execution Pack environment is invalid",
+            ) from error
+        if stored != self._pack_environment:
+            raise DomainError(
+                "execution_pack_snapshot_invalid",
+                ErrorCategory.CONFLICT,
+                "The Job execution Pack environment does not match the Runtime",
+            )
 
     def _heartbeat_resource_lease(self) -> None:
         if self._active_resource_lease is None:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import stat
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,6 +17,7 @@ from app.adapters.pack_layout import (
     managed_generation_root,
     managed_pack_root,
 )
+from app.core.packs.events import ExecutionPackIdentity
 
 if TYPE_CHECKING:
     from app.runtime_paths import RuntimePaths
@@ -62,6 +65,34 @@ _ACTIVE_KEYS = frozenset(
 _RECEIPT_KEYS = _ACTIVE_KEYS | {"verified"}
 _SHA256_PATTERN = re.compile(r"sha256:([0-9a-f]{64})\Z")
 _CONTROL_FILE_LIMIT = 16 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedDocumentBasicPack:
+    identity: ExecutionPackIdentity
+    python_executable: Path
+    artifacts_path: Path
+
+    @property
+    def manifest_sha256(self) -> str:
+        return self.identity.manifest_sha256
+
+
+def current_document_pack_platform() -> str:
+    if os.name == "nt":
+        return "windows-x86_64"
+    operating_system = {
+        "darwin": "macos",
+        "linux": "linux",
+    }.get(os.sys.platform, os.sys.platform)
+    architecture = platform.machine().lower()
+    normalized_architecture = {
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+    }.get(architecture, architecture)
+    return f"{operating_system}-{normalized_architecture}"
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -163,12 +194,7 @@ def _ordinary_directory_chain(root: Path, target: Path) -> bool:
     return True
 
 
-def _managed_pack_paths(
-    pack_root: Path,
-    trusted_data_root: Path,
-) -> tuple[Path, Path] | None:
-    if not _ordinary_directory_chain(trusted_data_root, pack_root):
-        return None
+def _active_manifest_sha256(pack_root: Path) -> str | None:
     pointer = _read_control_file(pack_root / "active.json")
     if pointer is None or frozenset(pointer) != _ACTIVE_KEYS:
         return None
@@ -185,6 +211,16 @@ def _managed_pack_paths(
         or pointer.get("pack_version") != PACK_VERSION
         or match is None
     ):
+        return None
+    return manifest_sha256
+
+
+def _managed_generation_paths(
+    trusted_data_root: Path,
+    manifest_sha256: str,
+) -> tuple[Path, Path] | None:
+    match = _SHA256_PATTERN.fullmatch(manifest_sha256)
+    if match is None:
         return None
 
     installs_root = managed_generation_root(trusted_data_root, PACK_ID)
@@ -216,14 +252,12 @@ def _managed_pack_paths(
     artifacts_path = generation / "artifacts"
     try:
         resolved_data_root = trusted_data_root.resolve(strict=True)
-        resolved_pack_root = pack_root.resolve(strict=True)
         resolved_installs_root = installs_root.resolve(strict=True)
         resolved_generation = generation.resolve(strict=True)
         resolved_python = python_executable.resolve(strict=True)
         resolved_artifacts = artifacts_path.resolve(strict=True)
         if (
-            not resolved_pack_root.is_relative_to(resolved_data_root)
-            or not resolved_installs_root.is_relative_to(resolved_data_root)
+            not resolved_installs_root.is_relative_to(resolved_data_root)
             or not resolved_generation.is_relative_to(resolved_installs_root)
             or not resolved_python.is_relative_to(resolved_generation)
             or not resolved_artifacts.is_relative_to(resolved_generation)
@@ -239,6 +273,74 @@ def _managed_pack_paths(
     ):
         return None
     return python_executable, artifacts_path
+
+
+def _managed_pack_paths(
+    pack_root: Path,
+    trusted_data_root: Path,
+) -> tuple[Path, Path] | None:
+    if not _ordinary_directory_chain(trusted_data_root, pack_root):
+        return None
+    manifest_sha256 = _active_manifest_sha256(pack_root)
+    if manifest_sha256 is None:
+        return None
+    return _managed_generation_paths(trusted_data_root, manifest_sha256)
+
+
+def resolve_document_basic_pack_active(
+    paths: RuntimePaths,
+    environ: Mapping[str, str],
+) -> ResolvedDocumentBasicPack | None:
+    if environ.get("ALLTONOTE_DOCUMENT_BASIC_PYTHON") or environ.get(
+        "ALLTONOTE_DOCUMENT_BASIC_ARTIFACTS"
+    ):
+        return None
+    pack_root = managed_pack_root(paths.data_dir, PACK_ID, PACK_VERSION)
+    if not _ordinary_directory_chain(paths.data_dir, pack_root):
+        return None
+    manifest_sha256 = _active_manifest_sha256(pack_root)
+    if manifest_sha256 is None:
+        return None
+    resolved = _managed_generation_paths(paths.data_dir, manifest_sha256)
+    if resolved is None:
+        return None
+    return ResolvedDocumentBasicPack(
+        identity=ExecutionPackIdentity(
+            pack_id=PACK_ID,
+            pack_version=PACK_VERSION,
+            platform=current_document_pack_platform(),
+            manifest_sha256=manifest_sha256,
+        ),
+        python_executable=resolved[0],
+        artifacts_path=resolved[1],
+    )
+
+
+def resolve_document_basic_pack_exact(
+    paths: RuntimePaths,
+    environ: Mapping[str, str],
+    identity: ExecutionPackIdentity,
+) -> ResolvedDocumentBasicPack | None:
+    if (
+        environ.get("ALLTONOTE_DOCUMENT_BASIC_PYTHON")
+        or environ.get("ALLTONOTE_DOCUMENT_BASIC_ARTIFACTS")
+        or not isinstance(identity, ExecutionPackIdentity)
+        or identity.pack_id != PACK_ID
+        or identity.pack_version != PACK_VERSION
+        or identity.platform != current_document_pack_platform()
+    ):
+        return None
+    resolved = _managed_generation_paths(
+        paths.data_dir,
+        identity.manifest_sha256,
+    )
+    if resolved is None:
+        return None
+    return ResolvedDocumentBasicPack(
+        identity=identity,
+        python_executable=resolved[0],
+        artifacts_path=resolved[1],
+    )
 
 
 def resolve_document_basic_pack_paths(

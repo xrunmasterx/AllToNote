@@ -17,6 +17,9 @@ from app.adapters.documents.docling_worker_parser import (
 from app.adapters.documents.document_basic_pack import (
     PACK_ID,
     PACK_VERSION,
+    ResolvedDocumentBasicPack,
+    resolve_document_basic_pack_active,
+    resolve_document_basic_pack_exact,
     resolve_document_basic_pack_paths,
 )
 from app.adapters.jobs.file_attempt_storage import FileAttemptStorage
@@ -1914,6 +1917,7 @@ def create_document_runtime(
     verifier_model: LegacyModelBinding | None = None,
     verifier_model_execution_binding: ModelExecutionBinding | None = None,
     verifier_model_execution_profile: str | None = None,
+    pack_environment: JobPackEnvironmentSnapshot | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
     workspace_instance_id: str | None = None,
@@ -2027,6 +2031,7 @@ def create_document_runtime(
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         source_identity_resolver=resolve_source_identity,
         knowledge_compiler=knowledge_compiler,
+        pack_environment=pack_environment,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
@@ -2062,6 +2067,56 @@ def _resolve_document_worker_config(
     )
 
 
+def _document_worker_config(
+    resolved: ResolvedDocumentBasicPack,
+) -> DoclingWorkerConfig:
+    return DoclingWorkerConfig(
+        python_executable=resolved.python_executable,
+        artifacts_path=resolved.artifacts_path,
+        backend_root=Path(__file__).resolve().parent.parent,
+    )
+
+
+def _resolve_document_execution_pack(
+    paths: RuntimePaths,
+    environ: Mapping[str, str],
+    snapshot: JobPackEnvironmentSnapshot | None,
+) -> tuple[DoclingWorkerConfig, JobPackEnvironmentSnapshot | None]:
+    if snapshot is None:
+        active = resolve_document_basic_pack_active(paths, environ)
+        if active is None:
+            return _resolve_document_worker_config(paths, environ), None
+        return (
+            _document_worker_config(active),
+            JobPackEnvironmentSnapshot(
+                schema_version=1,
+                packs=(active.identity,),
+            ),
+        )
+    try:
+        identity = snapshot.pack(PACK_ID)
+    except ValueError as error:
+        raise DomainError(
+            "pack_generation_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The exact Document Pack generation is unavailable",
+        ) from error
+    if len(snapshot.packs) != 1:
+        raise DomainError(
+            "pack_generation_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The frozen Document Pack environment is unsupported",
+        )
+    resolved = resolve_document_basic_pack_exact(paths, environ, identity)
+    if resolved is None:
+        raise DomainError(
+            "pack_generation_unavailable",
+            ErrorCategory.WORKSPACE_INCOMPATIBLE,
+            "The exact Document Pack generation is unavailable",
+        )
+    return _document_worker_config(resolved), snapshot
+
+
 def _workspace_resource_admission(
     paths: RuntimePaths,
     instance: WorkspaceInstance,
@@ -2088,6 +2143,7 @@ def create_document_runtime_for_workspace(
     requested_provider_profile: str | None = None,
     requested_verifier_model_identity: str | None = None,
     requested_verifier_provider_profile: str | None = None,
+    execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
     require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     if local_app_data is not None and runtime_paths is not None:
@@ -2097,7 +2153,11 @@ def create_document_runtime_for_workspace(
     )
     trusted_root = paths.workspace_registry_parent
     paths.assert_outside_workspace(workspace_root)
-    worker_config = _resolve_document_worker_config(paths, os.environ)
+    worker_config, pack_environment = _resolve_document_execution_pack(
+        paths,
+        os.environ,
+        execution_pack_environment,
+    )
     trusted_root.mkdir(parents=True, exist_ok=True)
     registry = WorkspaceInstanceRegistry(
         trusted_root,
@@ -2255,6 +2315,7 @@ def create_document_runtime_for_workspace(
         verifier_model_execution_profile=(
             verifier_provider_profile if verifier_model is not None else None
         ),
+        pack_environment=pack_environment,
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
         workspace_instance_id=instance.instance_id,

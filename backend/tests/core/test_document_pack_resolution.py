@@ -9,7 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.adapters.documents.document_basic_pack import PACK_ID, PACK_VERSION
+from app.adapters.documents.document_basic_pack import (
+    PACK_ID,
+    PACK_VERSION,
+    resolve_document_basic_pack_active,
+    resolve_document_basic_pack_exact,
+)
 from app.adapters.pack_layout import (
     legacy_generation_root,
     managed_generation_root,
@@ -26,7 +31,10 @@ from app.core.packs.events import (
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.job_runtime import create_job_runtime_for_workspace
-from app.runtime import _resolve_document_worker_config
+from app.runtime import (
+    _resolve_document_execution_pack,
+    _resolve_document_worker_config,
+)
 from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 from iwiki.workspace import open_workspace
 
@@ -46,10 +54,12 @@ def _managed_python_relative_path() -> Path:
     return Path("python/python.exe") if os.name == "nt" else Path("python/bin/python")
 
 
-def _create_managed_install(paths: RuntimePaths) -> tuple[Path, Path]:
-    digest = "a" * 64
+def _create_managed_install(
+    paths: RuntimePaths,
+    digest: str = "a" * 64,
+) -> tuple[Path, Path]:
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
-    pack_root.mkdir(parents=True)
+    pack_root.mkdir(parents=True, exist_ok=True)
     generation = managed_generation_root(paths.data_dir, PACK_ID) / digest
     python = generation / _managed_python_relative_path()
     python.parent.mkdir(parents=True)
@@ -80,6 +90,45 @@ def _create_managed_install(paths: RuntimePaths) -> tuple[Path, Path]:
     return python, artifacts
 
 
+def _document_platform() -> str:
+    return "windows-x86_64" if os.name == "nt" else "linux-x86_64"
+
+
+def _pack_environment(digest: str = "a" * 64) -> JobPackEnvironmentSnapshot:
+    return JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=(
+            ExecutionPackIdentity(
+                pack_id=PACK_ID,
+                pack_version=PACK_VERSION,
+                platform=_document_platform(),
+                manifest_sha256=f"sha256:{digest}",
+            ),
+        ),
+    )
+
+
+def _pack_environment_payload(
+    snapshot: JobPackEnvironmentSnapshot,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": snapshot.schema_version,
+            "packs": [
+                {
+                    "pack_id": pack.pack_id,
+                    "pack_version": pack.pack_version,
+                    "platform": pack.platform,
+                    "manifest_sha256": pack.manifest_sha256,
+                }
+                for pack in snapshot.packs
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def test_document_pack_resolves_frozen_standard_installation(tmp_path: Path) -> None:
     paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
     pack_root = paths.data_dir / "packs" / PACK_ID / PACK_VERSION
@@ -104,6 +153,71 @@ def test_document_pack_resolves_verified_managed_generation(tmp_path: Path) -> N
 
     assert config.python_executable == python
     assert config.artifacts_path == artifacts
+
+
+def test_document_pack_exact_resolution_ignores_new_active_generation(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    first_python, first_artifacts = _create_managed_install(paths, "a" * 64)
+    frozen = resolve_document_basic_pack_active(paths, {})
+    assert frozen is not None
+    assert frozen.manifest_sha256 == "sha256:" + "a" * 64
+
+    _create_managed_install(paths, "b" * 64)
+    resolved = resolve_document_basic_pack_exact(paths, {}, frozen.identity)
+
+    assert resolved is not None
+    assert resolved.identity == frozen.identity
+    assert resolved.python_executable == first_python
+    assert resolved.artifacts_path == first_artifacts
+
+
+def test_document_pack_exact_resolution_fails_without_frozen_generation(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    _create_managed_install(paths, "a" * 64)
+    frozen = resolve_document_basic_pack_active(paths, {})
+    assert frozen is not None
+    shutil.rmtree(managed_generation_root(paths.data_dir, PACK_ID) / ("a" * 64))
+    _create_managed_install(paths, "b" * 64)
+
+    assert resolve_document_basic_pack_exact(paths, {}, frozen.identity) is None
+
+
+def test_document_runtime_resolves_frozen_generation_without_reading_active(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    first_python, first_artifacts = _create_managed_install(paths, "a" * 64)
+    frozen = _pack_environment("a" * 64)
+    _create_managed_install(paths, "b" * 64)
+
+    config, selected = _resolve_document_execution_pack(paths, {}, frozen)
+
+    assert selected == frozen
+    assert config.python_executable == first_python
+    assert config.artifacts_path == first_artifacts
+
+
+def test_document_runtime_rejects_mutable_override_for_frozen_job(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    _create_managed_install(paths)
+
+    with pytest.raises(DomainError) as raised:
+        _resolve_document_execution_pack(
+            paths,
+            {
+                "ALLTONOTE_DOCUMENT_BASIC_PYTHON": "developer-python",
+                "ALLTONOTE_DOCUMENT_BASIC_ARTIFACTS": "developer-artifacts",
+            },
+            _pack_environment(),
+        )
+
+    assert raised.value.code == "pack_generation_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -357,6 +471,12 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         request_json=request_json,
         principal="local-user",
         client_request_id="document-reconnect",
+        initial_events=(
+            (
+                JOB_PACK_ENVIRONMENT_EVENT,
+                _pack_environment_payload(_pack_environment()),
+            ),
+        ),
         execution_binding=JobExecutionBinding(
             recipe_id="alltonote.document-note",
             recipe_version=1,
@@ -374,6 +494,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             str | None,
             str | None,
             str | None,
+            JobPackEnvironmentSnapshot,
         ]
     ] = []
 
@@ -399,10 +520,12 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
         requested_provider_profile: str | None = None,
         requested_verifier_model_identity: str | None = None,
         requested_verifier_provider_profile: str | None = None,
+        execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
         require_existing_job_store: bool = False,
     ) -> Runtime:
         assert current_config_snapshot is None
         assert require_existing_job_store is expected_existing_job_store
+        assert execution_pack_environment is not None
         selected.append(
             (
                 workspace_root,
@@ -411,6 +534,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
                 requested_provider_profile,
                 requested_verifier_model_identity,
                 requested_verifier_provider_profile,
+                execution_pack_environment,
             )
         )
         return Runtime()
@@ -436,6 +560,7 @@ def test_job_wait_selects_document_runtime_from_persisted_binding(
             "fixture/frozen-profile",
             verifier_model,
             verifier_profile,
+            _pack_environment(),
         )
     ]
 

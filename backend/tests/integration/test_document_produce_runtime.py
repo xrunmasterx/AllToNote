@@ -17,7 +17,11 @@ import pytest
 import app.runtime as runtime_module
 import app.core.application.document_service as document_service_module
 from app.job_runtime import JobRuntime
-from app.adapters.documents.document_basic_pack import PACK_VERSION
+from app.adapters.documents.document_basic_pack import (
+    PACK_ID,
+    PACK_VERSION,
+    current_document_pack_platform,
+)
 from app.adapters.models.legacy_gpt import (
     LegacyModelBinding,
     LegacyModelCapabilities,
@@ -65,6 +69,7 @@ from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState, JobExecutionOwner, JobState
 from app.core.jobs.resource_lease import ResourceOwner
+from app.core.packs.events import ExecutionPackIdentity, JobPackEnvironmentSnapshot
 from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.model_executor import ModelExecutionBinding
 from app.core.recipes.contracts import InputDescriptor, ProduceRequest, RecipeKey
@@ -74,6 +79,17 @@ from app.core.recipes.registry import RecipeRegistry
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "workspace-v2"
+_DOCUMENT_PACK_ENVIRONMENT = JobPackEnvironmentSnapshot(
+    schema_version=1,
+    packs=(
+        ExecutionPackIdentity(
+            pack_id=PACK_ID,
+            pack_version=PACK_VERSION,
+            platform=current_document_pack_platform(),
+            manifest_sha256="sha256:" + "a" * 64,
+        ),
+    ),
+)
 
 
 class _Parser:
@@ -292,6 +308,7 @@ def _dual_model_runtime(
         verifier_model=_legacy_model_binding(verifier_identity, verifier_bridge),
         verifier_model_execution_binding=_core_model_binding(verifier_identity),
         verifier_model_execution_profile="reviewer",
+        pack_environment=_DOCUMENT_PACK_ENVIRONMENT,
         owner_id=owner_id,
         local_instance_id="document-test",
         workspace_instance_id=workspace_instance_id,
@@ -530,6 +547,9 @@ def _service(
     resource_lease_store: MachineResourceLeaseStore | None = None,
     resource_owner: ResourceOwner | None = None,
     knowledge_compiler: _KnowledgeCompiler | None = None,
+    pack_environment: JobPackEnvironmentSnapshot | None = (
+        _DOCUMENT_PACK_ENVIRONMENT
+    ),
 ) -> tuple[DocumentService, SqliteJobRepository]:
     repository = SqliteJobRepository.open(machine_root / "job-store")
     storage = FileAttemptStorage(
@@ -564,6 +584,7 @@ def _service(
         local_instance_id="document-test",
         source_identity_resolver=resolve_source_identity,
         knowledge_compiler=knowledge_compiler,
+        pack_environment=pack_environment,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
@@ -667,12 +688,59 @@ def test_detached_document_uses_managed_snapshot_after_original_is_deleted(
         "sha256": expected_digest,
     }
     assert "path" not in snapshot_events[0].payload_json
+    pack_events = tuple(
+        event
+        for event in repository.list_events(job_id)
+        if event.event_type == "execution.pack-environment.v1"
+    )
+    assert len(pack_events) == 1
+    assert json.loads(pack_events[0].payload_json) == {
+        "packs": [
+            {
+                "manifest_sha256": "sha256:" + "a" * 64,
+                "pack_id": PACK_ID,
+                "pack_version": PACK_VERSION,
+                "platform": current_document_pack_platform(),
+            }
+        ],
+        "schema_version": 1,
+    }
     source.unlink()
 
     completed = router.wait_job(job_id)
 
     assert completed.state is JobState.SUCCEEDED
     assert parser.calls == 1
+
+
+def test_detached_document_rejects_unfrozen_pack_before_snapshot(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    machine_root = tmp_path / "machine"
+    service, repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+        pack_environment=None,
+    )
+
+    with pytest.raises(DomainError) as raised:
+        _submit(
+            service,
+            repository,
+            workspace,
+            source,
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+
+    assert raised.value.code == "pack_generation_unavailable"
+    assert not tuple(
+        (machine_root / "attempts" / "document-inputs").rglob("source.pdf")
+    )
 
 
 def test_tampered_detached_document_snapshot_fails_before_parser(
@@ -918,7 +986,7 @@ def test_detached_document_rejects_hardlinked_snapshot_lock_without_mutation(
     assert canary.read_bytes() == b"do not truncate"
 
 
-def test_legacy_engine_document_without_snapshot_event_uses_original_input(
+def test_legacy_engine_document_without_pack_snapshot_fails_closed(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -949,10 +1017,11 @@ def test_legacy_engine_document_without_snapshot_event_uses_original_input(
         execution_owner=JobExecutionOwner.ENGINE,
     )
 
-    completed = service.wait_job(submitted.job_id)
+    with pytest.raises(DomainError) as raised:
+        service.wait_job(submitted.job_id)
 
-    assert completed.state is JobState.SUCCEEDED
-    assert parser.calls == 1
+    assert raised.value.code == "execution_pack_snapshot_missing"
+    assert parser.calls == 0
     assert not (machine_root / "attempts" / "document-inputs").exists()
 
 
@@ -1050,11 +1119,10 @@ def test_legacy_document_does_not_adopt_unbound_content_snapshot(
     )
     legacy_source.unlink()
 
-    completed = service.wait_job(legacy.job_id)
+    with pytest.raises(DomainError) as raised:
+        service.wait_job(legacy.job_id)
 
-    assert completed.state is JobState.FAILED
-    assert completed.error is not None
-    assert completed.error.code == "document_input_unavailable"
+    assert raised.value.code == "execution_pack_snapshot_missing"
     assert parser.calls == 0
 
 

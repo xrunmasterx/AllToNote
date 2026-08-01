@@ -289,6 +289,71 @@ def test_engine_lifecycle_gate_reconnects_and_stops_candidate(
     assert calls[-1] == ("engine", "stop")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "ok": True,
+            "data": {
+                "healthy": False,
+                "checks": [
+                    {
+                        "code": "runtime.required",
+                        "status": "fail",
+                        "action": "Repair the Runtime",
+                        "dynamic": False,
+                    }
+                ],
+            },
+        },
+        {
+            "ok": True,
+            "data": {
+                "healthy": True,
+                "checks": [
+                    {
+                        "code": "runtime.required",
+                        "status": "fail",
+                        "action": "Repair the Runtime",
+                        "dynamic": False,
+                    }
+                ],
+            },
+        },
+    ),
+)
+def test_runtime_doctor_gate_rejects_unhealthy_or_inconsistent_report(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ReleaseError, match="Runtime doctor Gate failed"):
+        release_module._require_healthy_runtime_doctor(payload)
+
+
+def test_runtime_doctor_gate_accepts_passes_and_warnings() -> None:
+    release_module._require_healthy_runtime_doctor(
+        {
+            "ok": True,
+            "data": {
+                "healthy": True,
+                "checks": [
+                    {
+                        "code": "runtime.required",
+                        "status": "pass",
+                        "action": None,
+                        "dynamic": False,
+                    },
+                    {
+                        "code": "pack.optional",
+                        "status": "warn",
+                        "action": "Install the optional Pack",
+                        "dynamic": False,
+                    },
+                ],
+            },
+        }
+    )
+
+
 def test_engine_lifecycle_gate_stops_partial_start_on_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

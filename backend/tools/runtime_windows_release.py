@@ -997,6 +997,23 @@ def _run_cli(
     return payload
 
 
+def _require_healthy_runtime_doctor(payload: Mapping[str, Any]) -> None:
+    data = payload.get("data")
+    checks = data.get("checks") if type(data) is dict else None
+    if (
+        type(data) is not dict
+        or data.get("healthy") is not True
+        or type(checks) is not list
+        or not checks
+        or any(
+            type(check) is not dict
+            or check.get("status") not in {"pass", "warn"}
+            for check in checks
+        )
+    ):
+        raise ReleaseError("Runtime doctor Gate failed")
+
+
 def _run_engine_process_probe(
     root: Path,
     environment: Mapping[str, str],
@@ -1857,7 +1874,12 @@ def assemble_runtime(
             )
             _run_cli(stage, ("version",), isolated_environment)
             info = _run_cli(stage, ("runtime", "info"), isolated_environment)
-            _run_cli(stage, ("runtime", "doctor"), isolated_environment)
+            doctor = _run_cli(
+                stage,
+                ("runtime", "doctor"),
+                isolated_environment,
+            )
+            _require_healthy_runtime_doctor(doctor)
             engine_lifecycle = _run_engine_lifecycle_gate(
                 stage,
                 isolated_environment,
