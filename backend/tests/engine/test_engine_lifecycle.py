@@ -44,6 +44,35 @@ def _client(tmp_path: Path) -> LocalEngineClient:
     )
 
 
+def test_engine_launch_preserves_local_codex_context_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Process:
+        pass
+
+    for key in ("APPDATA", "CODEX_HOME", "HOME", "LOCALAPPDATA", "USERPROFILE"):
+        monkeypatch.setenv(key, str(tmp_path / key.lower()))
+    monkeypatch.setenv("ALLTONOTE_TEST_SECRET", "must-not-cross-engine-boundary")
+    monkeypatch.setattr(
+        "app.engine.client.subprocess.Popen",
+        lambda command, **options: observed.update(
+            {"command": command, "options": options}
+        )
+        or Process(),
+    )
+    monkeypatch.setattr("app.engine.client._windows_process_in_job", lambda: False)
+
+    _client(tmp_path)._launch()
+
+    environment = observed["options"]["env"]
+    for key in ("APPDATA", "CODEX_HOME", "HOME", "LOCALAPPDATA", "USERPROFILE"):
+        assert environment[key] == str(tmp_path / key.lower())
+    assert "ALLTONOTE_TEST_SECRET" not in environment
+
+
 def _ensure_in_spawned_process(machine_root: str, barrier, results) -> None:
     client = LocalEngineClient(
         resolve_runtime_paths(machine_state_root=Path(machine_root)),

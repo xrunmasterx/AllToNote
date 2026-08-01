@@ -871,7 +871,19 @@ class EngineJobDispatcher:
         return run_worker_process(
             command,
             cwd=Path(__file__).resolve().parents[2],
-            environment=minimal_worker_environment(),
+            environment=minimal_worker_environment(
+                overrides={
+                    key: value
+                    for key in (
+                        "APPDATA",
+                        "CODEX_HOME",
+                        "HOME",
+                        "LOCALAPPDATA",
+                        "USERPROFILE",
+                    )
+                    if type(value := os.environ.get(key)) is str and value
+                }
+            ),
             timeout_seconds=WORKER_TIMEOUT_SECONDS,
             stdin_payload=launch.to_bytes(),
             check_running=check_running,

@@ -74,6 +74,9 @@ def test_default_worker_command_preserves_all_runtime_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for key in ("APPDATA", "CODEX_HOME", "HOME", "LOCALAPPDATA", "USERPROFILE"):
+        monkeypatch.setenv(key, str(tmp_path / key.lower()))
+    monkeypatch.setenv("ALLTONOTE_TEST_SECRET", "must-not-cross-worker-boundary")
     paths = RuntimePaths(
         config_dir=tmp_path / "config root" / "AllToNote",
         data_dir=tmp_path / "data root" / "AllToNote",
@@ -113,6 +116,10 @@ def test_default_worker_command_preserves_all_runtime_roots(
     assert EngineJobDispatcher(paths)._run_worker(launch, lambda: None) == 0
     command, options = observed[0]
     assert options["stdin_payload"] == launch.to_bytes()
+    environment = options["environment"]
+    for key in ("APPDATA", "CODEX_HOME", "HOME", "LOCALAPPDATA", "USERPROFILE"):
+        assert environment[key] == str(tmp_path / key.lower())
+    assert "ALLTONOTE_TEST_SECRET" not in environment
     for flag, expected in (
         ("--config-dir", paths.config_dir),
         ("--data-dir", paths.data_dir),

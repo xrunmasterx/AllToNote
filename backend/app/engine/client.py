@@ -408,6 +408,7 @@ class LocalEngineClient:
             if key.upper()
             in {
                 "APPDATA",
+                "CODEX_HOME",
                 "COMSPEC",
                 "HOME",
                 "LANG",
