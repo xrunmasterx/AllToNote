@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -124,6 +127,71 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, object], Path, Path]:
         ],
     }
     return lock, inputs, wheelhouse
+
+
+def _record_hash(content: bytes) -> str:
+    encoded = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=")
+    return f"sha256={encoded.decode('ascii')}"
+
+
+def _wheel_install_fixture(
+    tmp_path: Path,
+    *,
+    source_contains_installer: bool = False,
+) -> tuple[Path, Path, tuple[dict[str, object], ...]]:
+    wheelhouse = tmp_path / "wheelhouse"
+    site_packages = tmp_path / "site-packages"
+    wheelhouse.mkdir()
+    site_packages.mkdir()
+    dist_info = "example-1.0.dist-info"
+    source_files = {
+        "example/__init__.py": b"VALUE = 1\n",
+        f"{dist_info}/METADATA": b"Name: example\nVersion: 1.0\n",
+        f"{dist_info}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\n",
+    }
+    if source_contains_installer:
+        source_files[f"{dist_info}/INSTALLER"] = b"pip\n"
+    record_path = f"{dist_info}/RECORD"
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    for path, content in source_files.items():
+        writer.writerow((path, _record_hash(content), len(content)))
+    writer.writerow((record_path, "", ""))
+    record_bytes = output.getvalue().encode("utf-8")
+    wheel = wheelhouse / "example-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, content in source_files.items():
+            archive.writestr(path, content)
+        archive.writestr(record_path, record_bytes)
+
+    for path, content in source_files.items():
+        target = site_packages.joinpath(*path.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    generated = {
+        f"{dist_info}/INSTALLER": b"pip\n",
+        f"{dist_info}/REQUESTED": b"",
+    }
+    for path, content in generated.items():
+        site_packages.joinpath(*path.split("/")).write_bytes(content)
+    installed_record = io.StringIO(newline="")
+    installed_writer = csv.writer(installed_record, lineterminator="\n")
+    for path, content in {**source_files, **generated}.items():
+        installed_writer.writerow((path, _record_hash(content), len(content)))
+    installed_writer.writerow((record_path, "", ""))
+    site_packages.joinpath(*record_path.split("/")).write_text(
+        installed_record.getvalue(),
+        encoding="utf-8",
+        newline="",
+    )
+    wheels = (
+        {
+            "filename": wheel.name,
+            "byte_length": wheel.stat().st_size,
+            "sha256": _sha256(wheel),
+        },
+    )
+    return site_packages, wheelhouse, wheels
 
 
 def test_engine_lifecycle_gate_reconnects_and_stops_candidate(
@@ -255,6 +323,26 @@ def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     lock = _load_lock(LOCK)
 
     assert lock["runtime_source_commit"] == "54019ea58a280dea6b508044fc0dbe0558684203"
+    assert lock["builder"] == {
+        "implementation": "CPython",
+        "version": "3.14.0",
+        "platform": "win32",
+        "machine": "AMD64",
+        "pointer_bits": 64,
+        "python_executable_sha256": (
+            "467014615a5255aca450ae88100dd2caf887da87657f00e3c2171ec44a685aec"
+        ),
+        "python_runtime_dll_sha256": (
+            "f1722bd369d79fecbc85f3ed2790c30c330b9413fd74332f95b086e60dfacc2a"
+        ),
+        "pip_version": "25.2",
+        "pip_tree_sha256": (
+            "efe1bd4b245d602d84b97bf591d5d3aee4c91c0349996a9f0c5c73633f3e585b"
+        ),
+        "builder_tree_sha256": (
+            "931b2c04dad774969bb321c788ece6c9991750f7485baccac856a0c2c6cf7200"
+        ),
+    }
     assert lock["python"]["version"] == "3.14.6"
     assert lock["sqlite"] == {
         "version": "3.53.4",
@@ -492,6 +580,8 @@ def test_pip_install_uses_only_absolute_locked_wheels(tmp_path: Path) -> None:
     )
 
     assert "--isolated" in arguments
+    assert "-I" in arguments
+    assert "-B" in arguments
     assert "--no-index" in arguments
     assert "--no-deps" in arguments
     assert "--find-links" not in arguments
@@ -516,6 +606,158 @@ def test_pip_environment_discards_external_configuration() -> None:
     assert environment["PIP_NO_INDEX"] == "1"
     assert "PIP_FIND_LINKS" not in environment
     assert "PIP_CONSTRAINT" not in environment
+
+
+def test_builder_toolchain_gate_rejects_missing_lock_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = tmp_path / "builder" / "python.exe"
+    builder.parent.mkdir()
+    builder.write_bytes(b"python")
+    executed = False
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal executed
+        executed = True
+        raise AssertionError("builder must not execute")
+
+    monkeypatch.setattr(release_module, "_run", unexpected_run)
+
+    with pytest.raises(ReleaseError, match="Builder toolchain"):
+        release_module._verify_builder_toolchain({}, builder, {})
+
+    assert executed is False
+
+
+def test_builder_toolchain_attestation_is_locked_and_path_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Private Builder Root"
+    builder = root / "python.exe"
+    runtime_dll = root / "python314.dll"
+    pip_root = root / "Lib" / "site-packages" / "pip"
+    pip_dist = root / "Lib" / "site-packages" / "pip-25.2.dist-info"
+    pip_root.mkdir(parents=True)
+    pip_dist.mkdir()
+    builder.write_bytes(b"python")
+    runtime_dll.write_bytes(b"runtime")
+    (pip_root / "__init__.py").write_text("__version__ = '25.2'\n", encoding="utf-8")
+    (pip_dist / "METADATA").write_text("Name: pip\nVersion: 25.2\n", encoding="utf-8")
+    pip_tree_sha256 = release_module._builder_pip_tree_sha256(root, "25.2")
+    builder_tree_sha256 = release_module._builder_tree_sha256(root)
+    lock = {
+        "builder": {
+            "implementation": "CPython",
+            "version": "3.14.0",
+            "platform": "win32",
+            "machine": "AMD64",
+            "pointer_bits": 64,
+            "python_executable_sha256": _sha256(builder),
+            "python_runtime_dll_sha256": _sha256(runtime_dll),
+            "pip_version": "25.2",
+            "pip_tree_sha256": pip_tree_sha256,
+            "builder_tree_sha256": builder_tree_sha256,
+        }
+    }
+    monkeypatch.setattr(
+        release_module,
+        "_run",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "implementation": "CPython",
+                "version": "3.14.0",
+                "platform": "win32",
+                "machine": "AMD64",
+                "pointer_bits": 64,
+                "pip_version": "25.2",
+            }
+        ),
+    )
+
+    result = release_module._verify_builder_toolchain(lock, builder, {})
+
+    assert result == {"schema_version": 1, **lock["builder"]}
+    assert str(root) not in json.dumps(result)
+
+    runtime_dll.write_bytes(b"tampered")
+    with pytest.raises(ReleaseError, match="Builder toolchain"):
+        release_module._verify_builder_toolchain(lock, builder, {})
+
+
+def test_wheel_install_attestation_reconciles_archive_records(
+    tmp_path: Path,
+) -> None:
+    site_packages, wheelhouse, wheels = _wheel_install_fixture(tmp_path)
+
+    result = release_module._verify_wheel_install(
+        site_packages,
+        wheelhouse,
+        wheels,
+    )
+
+    assert result["schema_version"] == 1
+    assert result["wheel_count"] == 1
+    assert result["source_files_verified"] == 3
+    assert result["installed_files_verified"] == 6
+    assert result["generated_files"] == 2
+    assert str(tmp_path) not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "extra", "manifest_named_extra", "tampered"),
+)
+def test_wheel_install_attestation_rejects_unexplained_installed_files(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    site_packages, wheelhouse, wheels = _wheel_install_fixture(tmp_path)
+    payload = site_packages / "example" / "__init__.py"
+    if mutation == "missing":
+        payload.unlink()
+    elif mutation == "extra":
+        (site_packages / "injected.py").write_text("injected\n", encoding="utf-8")
+    elif mutation == "manifest_named_extra":
+        hidden = site_packages / "release" / "file-manifest.json"
+        hidden.parent.mkdir()
+        hidden.write_text("injected\n", encoding="utf-8")
+    else:
+        payload.write_text("TAMPERED = True\n", encoding="utf-8")
+
+    with pytest.raises(ReleaseError, match="wheel installation"):
+        release_module._verify_wheel_install(site_packages, wheelhouse, wheels)
+
+
+def test_wheel_install_attestation_rebinds_final_tree_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site_packages, wheelhouse, wheels = _wheel_install_fixture(tmp_path)
+    payload = site_packages / "example" / "__init__.py"
+    original_rows = release_module._candidate_file_rows
+
+    def mutate_then_scan(root: Path, **kwargs):
+        payload.write_text("TAMPERED_AFTER_RECORD_CHECK = True\n", encoding="utf-8")
+        return original_rows(root, **kwargs)
+
+    monkeypatch.setattr(release_module, "_candidate_file_rows", mutate_then_scan)
+
+    with pytest.raises(ReleaseError, match="wheel installation"):
+        release_module._verify_wheel_install(site_packages, wheelhouse, wheels)
+
+
+def test_wheel_install_attestation_rejects_generated_metadata_in_source_wheel(
+    tmp_path: Path,
+) -> None:
+    site_packages, wheelhouse, wheels = _wheel_install_fixture(
+        tmp_path,
+        source_contains_installer=True,
+    )
+
+    with pytest.raises(ReleaseError, match="wheel installation"):
+        release_module._verify_wheel_install(site_packages, wheelhouse, wheels)
 
 
 def test_direct_wheel_provenance_does_not_leak_the_builder_path(
@@ -733,8 +975,8 @@ def test_runtime_candidate_verifier_rejects_control_swap_after_tree_hash(
     acceptance = candidate / "release" / "acceptance.json"
     original_rows = release_module._candidate_file_rows
 
-    def rows_then_swap(root: Path):
-        rows = original_rows(root)
+    def rows_then_swap(root: Path, **kwargs):
+        rows = original_rows(root, **kwargs)
         payload = json.loads(acceptance.read_text(encoding="utf-8"))
         payload["note"] = "swapped after tree hash"
         acceptance.write_bytes(release_module._canonical_json(payload))
@@ -746,6 +988,112 @@ def test_runtime_candidate_verifier_rejects_control_swap_after_tree_hash(
         verify_runtime_candidate(
             candidate,
             expected_manifest_sha256=manifest_sha256,
+        )
+
+
+def test_runtime_candidate_verifier_binds_build_provenance_attestations(
+    tmp_path: Path,
+) -> None:
+    candidate, _manifest_sha256 = _runtime_candidate(tmp_path)
+    release = candidate / "release"
+    builder = release / "builder-toolchain.json"
+    wheel_install = release / "wheel-install-attestation.json"
+    wheelhouse = release / "wheelhouse-lock.json"
+    wheelhouse_payload = json.loads(wheelhouse.read_text(encoding="utf-8"))
+    wheelhouse_payload["wheels"] = [
+        {
+            "filename": "runtime.whl",
+            "byte_length": 7,
+            "sha256": "1" * 64,
+        }
+    ]
+    wheelhouse.write_bytes(release_module._canonical_json(wheelhouse_payload))
+    builder.write_bytes(
+        release_module._canonical_json(
+            {
+                "schema_version": 1,
+                "implementation": "CPython",
+                "version": "3.14.0",
+                "platform": "win32",
+                "machine": "AMD64",
+                "pointer_bits": 64,
+                "python_executable_sha256": "2" * 64,
+                "python_runtime_dll_sha256": "3" * 64,
+                "pip_version": "25.2",
+                "pip_tree_sha256": "4" * 64,
+                "builder_tree_sha256": "5" * 64,
+            }
+        )
+    )
+    wheel_install.write_bytes(
+        release_module._canonical_json(
+            {
+                "schema_version": 1,
+                "wheel_count": 1,
+                "source_files_verified": 3,
+                "installed_files_verified": 6,
+                "generated_files": 2,
+                "locked_wheels_sha256": hashlib.sha256(
+                    release_module._canonical_json(
+                        {"wheels": wheelhouse_payload["wheels"]}
+                    )
+                ).hexdigest(),
+                "installed_tree_sha256": "6" * 64,
+                "wheels": [
+                    {
+                        "filename": "runtime.whl",
+                        "archive_sha256": "1" * 64,
+                        "source_record_sha256": "7" * 64,
+                        "installed_record_sha256": "8" * 64,
+                        "source_files_verified": 3,
+                        "installed_files_verified": 6,
+                    }
+                ],
+            }
+        )
+    )
+    provenance = {
+        "builder_toolchain_sha256": _sha256(builder),
+        "wheel_install_attestation_sha256": _sha256(wheel_install),
+    }
+    for name in ("runtime-inputs.json", "acceptance.json"):
+        path = release / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["build_provenance"] = provenance
+        if name == "acceptance.json":
+            payload["checks"]["builder_toolchain"] = True
+            payload["checks"]["wheel_install_attestation"] = True
+        path.write_bytes(release_module._canonical_json(payload))
+    (release / "file-manifest.json").write_bytes(
+        release_module._canonical_json(_file_manifest(candidate))
+    )
+
+    result = verify_runtime_candidate(
+        candidate,
+        expected_manifest_sha256=_sha256(release / "file-manifest.json"),
+    )
+
+    assert result["file_count"] == 6
+
+    invalid_builder = json.loads(builder.read_text(encoding="utf-8"))
+    invalid_builder["implementation"] = "PyPy"
+    builder.write_bytes(release_module._canonical_json(invalid_builder))
+    invalid_builder_sha256 = _sha256(builder)
+    for name in ("runtime-inputs.json", "acceptance.json"):
+        path = release / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["build_provenance"][
+            "builder_toolchain_sha256"
+        ] = invalid_builder_sha256
+        path.write_bytes(release_module._canonical_json(payload))
+    (release / "file-manifest.json").write_bytes(
+        release_module._canonical_json(_file_manifest(candidate))
+    )
+
+    with pytest.raises(ReleaseError, match="build provenance"):
+        verify_runtime_candidate(
+            candidate,
+            expected_manifest_sha256=_sha256(release / "file-manifest.json"),
         )
 
 

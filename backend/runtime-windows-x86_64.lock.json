@@ -3,6 +3,18 @@
   "runtime_source_commit": "54019ea58a280dea6b508044fc0dbe0558684203",
   "runtime_version": "0.1.0",
   "platform": "windows-x86_64",
+  "builder": {
+    "implementation": "CPython",
+    "version": "3.14.0",
+    "platform": "win32",
+    "machine": "AMD64",
+    "pointer_bits": 64,
+    "python_executable_sha256": "467014615a5255aca450ae88100dd2caf887da87657f00e3c2171ec44a685aec",
+    "python_runtime_dll_sha256": "f1722bd369d79fecbc85f3ed2790c30c330b9413fd74332f95b086e60dfacc2a",
+    "pip_version": "25.2",
+    "pip_tree_sha256": "efe1bd4b245d602d84b97bf591d5d3aee4c91c0349996a9f0c5c73633f3e585b",
+    "builder_tree_sha256": "931b2c04dad774969bb321c788ece6c9991750f7485baccac856a0c2c6cf7200"
+  },
   "python": {
     "version": "3.14.6",
     "archive": "python-3.14.6-embed-amd64.zip",

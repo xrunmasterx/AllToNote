@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import io
@@ -56,6 +57,23 @@ _PIP_CONSOLE_SCRIPTS = {
     "iwiki.exe",
     "keyring.exe",
 }
+_BUILDER_PROBE = r"""
+import json
+import platform
+import struct
+import sys
+
+import pip
+
+print(json.dumps({
+    "implementation": platform.python_implementation(),
+    "version": platform.python_version(),
+    "platform": sys.platform,
+    "machine": platform.machine(),
+    "pointer_bits": struct.calcsize("P") * 8,
+    "pip_version": pip.__version__,
+}, sort_keys=True))
+"""
 _SQLITE_PROBE = r"""
 import ctypes
 import hashlib
@@ -513,6 +531,131 @@ def _clean_environment(base: Mapping[str, str]) -> dict[str, str]:
     return environment
 
 
+def _builder_pip_tree_sha256(builder_root: Path, pip_version: str) -> str:
+    root = _ordinary_directory(builder_root, "Builder root")
+    site_packages = _ordinary_directory(
+        root / "Lib" / "site-packages",
+        "Builder site-packages",
+    )
+    pip_root = _ordinary_directory(site_packages / "pip", "Builder pip package")
+    dist_name = f"pip-{pip_version}.dist-info"
+    pip_dist = _ordinary_directory(site_packages / dist_name, "Builder pip metadata")
+    try:
+        discovered = {
+            path.name
+            for path in site_packages.iterdir()
+            if path.name.casefold().startswith("pip-")
+            and path.name.casefold().endswith(".dist-info")
+        }
+    except OSError as error:
+        raise ReleaseError("Builder toolchain is unavailable") from error
+    if discovered != {dist_name}:
+        raise ReleaseError("Builder toolchain pip metadata is ambiguous")
+    rows: list[dict[str, Any]] = []
+    for prefix, directory in (("pip", pip_root), (dist_name, pip_dist)):
+        for row in _candidate_file_rows(directory):
+            rows.append({**row, "path": f"{prefix}/{row['path']}"})
+    rows.sort(key=lambda row: row["path"])
+    return hashlib.sha256(
+        _canonical_json({"schema_version": 1, "files": rows})
+    ).hexdigest()
+
+
+def _builder_tree_sha256(builder_root: Path) -> str:
+    root = _ordinary_directory(builder_root, "Builder root")
+    rows = _candidate_file_rows(root)
+    return hashlib.sha256(
+        _canonical_json({"schema_version": 1, "files": rows})
+    ).hexdigest()
+
+
+def _verify_builder_toolchain(
+    lock: Mapping[str, Any],
+    builder_python: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    builder = lock.get("builder")
+    expected_keys = {
+        "implementation",
+        "version",
+        "platform",
+        "machine",
+        "pointer_bits",
+        "python_executable_sha256",
+        "python_runtime_dll_sha256",
+        "pip_version",
+        "pip_tree_sha256",
+        "builder_tree_sha256",
+    }
+    if (
+        type(builder) is not dict
+        or set(builder) != expected_keys
+        or builder.get("implementation") != "CPython"
+        or type(builder.get("version")) is not str
+        or builder.get("platform") != "win32"
+        or builder.get("machine") != "AMD64"
+        or type(builder.get("pointer_bits")) is not int
+        or builder.get("pointer_bits") != 64
+        or type(builder.get("pip_version")) is not str
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", builder.get(name, "")) is None
+            for name in (
+                "python_executable_sha256",
+                "python_runtime_dll_sha256",
+                "pip_tree_sha256",
+                "builder_tree_sha256",
+            )
+        )
+    ):
+        raise ReleaseError("Builder toolchain is missing from the Runtime release lock")
+    python_executable = _ordinary_file(builder_python, "Builder Python")
+    runtime_dll = _ordinary_file(
+        python_executable.parent / "python314.dll",
+        "Builder Python runtime",
+    )
+    if (
+        _hash(python_executable) != builder["python_executable_sha256"]
+        or _hash(runtime_dll) != builder["python_runtime_dll_sha256"]
+        or _builder_pip_tree_sha256(
+            python_executable.parent,
+            builder["pip_version"],
+        )
+        != builder["pip_tree_sha256"]
+        or _builder_tree_sha256(python_executable.parent)
+        != builder["builder_tree_sha256"]
+    ):
+        raise ReleaseError("Builder toolchain does not match the Runtime release lock")
+    try:
+        output = _run(
+            (str(python_executable), "-I", "-B", "-c", _BUILDER_PROBE),
+            environment=environment,
+            timeout=30,
+        )
+    except ReleaseError as error:
+        raise ReleaseError("Builder toolchain probe failed") from error
+    try:
+        probe = json.loads(
+            output,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ReleaseError("Builder toolchain probe returned invalid JSON") from error
+    identity_keys = {
+        "implementation",
+        "version",
+        "platform",
+        "machine",
+        "pointer_bits",
+        "pip_version",
+    }
+    if type(probe) is not dict or set(probe) != identity_keys or any(
+        probe.get(name) != builder[name] for name in identity_keys
+    ):
+        raise ReleaseError("Builder toolchain identity does not match the Runtime release lock")
+    return {"schema_version": 1, **builder}
+
+
 def _locked_wheel_install_arguments(
     builder_python: Path,
     site_packages: Path,
@@ -521,6 +664,8 @@ def _locked_wheel_install_arguments(
 ) -> tuple[str, ...]:
     return (
         str(builder_python),
+        "-I",
+        "-B",
         "-m",
         "pip",
         "--isolated",
@@ -595,6 +740,189 @@ def _remove_pip_console_scripts(site_packages: Path) -> None:
         output = io.StringIO(newline="")
         csv.writer(output, lineterminator="\n").writerows(rows)
         record.write_text(output.getvalue(), encoding="utf-8", newline="")
+
+
+def _record_entries(
+    content: bytes,
+    record_path: str,
+) -> dict[str, tuple[str | None, int | None]]:
+    try:
+        rows = list(csv.reader(content.decode("utf-8").splitlines()))
+    except (UnicodeError, csv.Error) as error:
+        raise ReleaseError("Runtime wheel installation RECORD is invalid") from error
+    entries: dict[str, tuple[str | None, int | None]] = {}
+    for row in rows:
+        if len(row) != 3:
+            raise ReleaseError("Runtime wheel installation RECORD is invalid")
+        relative = _portable_candidate_path(row[0])
+        if relative in entries:
+            raise ReleaseError("Runtime wheel installation RECORD contains a duplicate path")
+        if relative == record_path:
+            if row[1:] != ["", ""]:
+                raise ReleaseError("Runtime wheel installation RECORD self-entry is invalid")
+            entries[relative] = (None, None)
+            continue
+        if not row[1].startswith("sha256=") or not row[2].isdigit():
+            raise ReleaseError("Runtime wheel installation RECORD entry is invalid")
+        encoded = row[1].removeprefix("sha256=")
+        try:
+            digest = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (ValueError, base64.binascii.Error) as error:
+            raise ReleaseError("Runtime wheel installation RECORD hash is invalid") from error
+        if len(digest) != hashlib.sha256().digest_size:
+            raise ReleaseError("Runtime wheel installation RECORD hash is invalid")
+        size = int(row[2])
+        if str(size) != row[2] or size > _MAX_CANDIDATE_FILE_BYTES:
+            raise ReleaseError("Runtime wheel installation RECORD size is invalid")
+        entries[relative] = (digest.hex(), size)
+    return entries
+
+
+def _verify_wheel_install(
+    site_packages: Path,
+    wheelhouse: Path,
+    wheels: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    installed_root = _ordinary_directory(site_packages, "Runtime site-packages")
+    wheelhouse = _ordinary_directory(wheelhouse, "Runtime wheelhouse")
+    expected_installed: set[str] = set()
+    expected_installed_rows: dict[str, dict[str, Any]] = {}
+    collision_keys: set[str] = set()
+    wheel_reports: list[dict[str, Any]] = []
+    source_files_verified = 0
+    generated_files = 0
+    try:
+        for wheel_lock in wheels:
+            filename = wheel_lock.get("filename")
+            if type(filename) is not str:
+                raise ReleaseError("Runtime wheel installation lock is invalid")
+            wheel = _ordinary_file(wheelhouse / filename, "Runtime wheel")
+            if (
+                type(wheel_lock.get("byte_length")) is not int
+                or wheel.stat().st_size != wheel_lock["byte_length"]
+                or _hash(wheel) != wheel_lock.get("sha256")
+            ):
+                raise ReleaseError("Runtime wheel installation source does not match the lock")
+            members = _archive_members(wheel)
+            file_members = {member.filename: member for member in members if not member.is_dir()}
+            record_paths = [
+                path
+                for path in file_members
+                if path.endswith(".dist-info/RECORD")
+                and path.count("/") == 1
+            ]
+            if len(record_paths) != 1 or any(".data/" in path for path in file_members):
+                raise ReleaseError("Runtime wheel installation layout is unsupported")
+            record_path = record_paths[0]
+            dist_info = record_path.removesuffix("/RECORD")
+            with zipfile.ZipFile(wheel) as archive:
+                source_record_bytes = archive.read(record_path)
+                source_record = _record_entries(source_record_bytes, record_path)
+                if set(source_record) != set(file_members):
+                    raise ReleaseError("Runtime wheel installation RECORD file set is invalid")
+                for relative, member in file_members.items():
+                    if relative == record_path:
+                        continue
+                    content = archive.read(member)
+                    digest, size = source_record[relative]
+                    if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+                        raise ReleaseError("Runtime wheel installation archive bytes are invalid")
+
+            generated = {
+                f"{dist_info}/INSTALLER": b"pip\n",
+                f"{dist_info}/REQUESTED": b"",
+            }
+            if set(generated) & set(source_record):
+                raise ReleaseError(
+                    "Runtime wheel installation source contains pip generated metadata"
+                )
+            installed_record_path = _ordinary_file(
+                installed_root.joinpath(*record_path.split("/")),
+                "installed wheel RECORD",
+            )
+            installed_record_bytes = installed_record_path.read_bytes()
+            installed_record = _record_entries(installed_record_bytes, record_path)
+            installed_paths = set(source_record) | set(generated)
+            if set(installed_record) != installed_paths:
+                raise ReleaseError("Runtime wheel installation contains unexplained RECORD entries")
+            for relative, expected in source_record.items():
+                if relative == record_path:
+                    continue
+                if installed_record[relative] != expected:
+                    raise ReleaseError("Runtime wheel installation changed a source RECORD entry")
+                row = _candidate_file_row(
+                    installed_root.joinpath(*relative.split("/")),
+                    relative,
+                )
+                digest, size = expected
+                if row["sha256"] != digest or row["byte_length"] != size:
+                    raise ReleaseError("Runtime wheel installation changed a locked file")
+                expected_installed_rows[relative] = row
+            for relative, expected_content in generated.items():
+                target = _ordinary_file(
+                    installed_root.joinpath(*relative.split("/")),
+                    "pip generated metadata",
+                )
+                if target.read_bytes() != expected_content:
+                    raise ReleaseError("Runtime wheel installation generated unexpected metadata")
+                row = _candidate_file_row(target, relative)
+                if installed_record[relative] != (row["sha256"], row["byte_length"]):
+                    raise ReleaseError("Runtime wheel installation RECORD does not bind metadata")
+                expected_installed_rows[relative] = row
+            expected_installed_rows[record_path] = {
+                "path": record_path,
+                "byte_length": len(installed_record_bytes),
+                "sha256": hashlib.sha256(installed_record_bytes).hexdigest(),
+            }
+            for relative in installed_paths:
+                folded = relative.casefold()
+                if folded in collision_keys:
+                    raise ReleaseError("Runtime wheel installation has colliding files")
+                collision_keys.add(folded)
+            expected_installed.update(installed_paths)
+            source_count = len(source_record) - 1
+            source_files_verified += source_count
+            generated_files += len(generated)
+            wheel_reports.append(
+                {
+                    "filename": filename,
+                    "archive_sha256": wheel_lock["sha256"],
+                    "source_record_sha256": hashlib.sha256(source_record_bytes).hexdigest(),
+                    "installed_record_sha256": hashlib.sha256(
+                        installed_record_bytes
+                    ).hexdigest(),
+                    "source_files_verified": source_count,
+                    "installed_files_verified": len(installed_paths),
+                }
+            )
+        actual_rows = _candidate_file_rows(installed_root)
+        if (
+            {row["path"] for row in actual_rows} != expected_installed
+            or {row["path"]: row for row in actual_rows} != expected_installed_rows
+        ):
+            raise ReleaseError("Runtime wheel installation contains unexplained files")
+    except ReleaseError as error:
+        raise ReleaseError("Runtime wheel installation could not be verified") from error
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+        raise ReleaseError("Runtime wheel installation could not be verified") from error
+    return {
+        "schema_version": 1,
+        "wheel_count": len(wheel_reports),
+        "source_files_verified": source_files_verified,
+        "installed_files_verified": len(expected_installed),
+        "generated_files": generated_files,
+        "locked_wheels_sha256": hashlib.sha256(
+            _canonical_json({"wheels": list(wheels)})
+        ).hexdigest(),
+        "installed_tree_sha256": hashlib.sha256(
+            _canonical_json({"files": actual_rows})
+        ).hexdigest(),
+        "wheels": wheel_reports,
+    }
 
 
 def _probe_runtime(root: Path, lock: Mapping[str, Any], environment: Mapping[str, str]) -> dict[str, Any]:
@@ -967,7 +1295,11 @@ def _candidate_file_row(path: Path, relative: str) -> dict[str, Any]:
     }
 
 
-def _candidate_file_rows(root: Path) -> list[dict[str, Any]]:
+def _candidate_file_rows(
+    root: Path,
+    *,
+    exclude_file_manifest: bool = False,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     total_bytes = 0
@@ -1004,7 +1336,7 @@ def _candidate_file_rows(root: Path) -> list[dict[str, Any]]:
                 if folded in seen:
                     raise OSError("path_collision")
                 seen.add(folded)
-                if relative == _FILE_MANIFEST_PATH:
+                if exclude_file_manifest and relative == _FILE_MANIFEST_PATH:
                     continue
                 row = _candidate_file_row(target, relative)
                 total_bytes += row["byte_length"]
@@ -1020,7 +1352,7 @@ def _candidate_file_rows(root: Path) -> list[dict[str, Any]]:
 
 
 def _file_manifest(root: Path) -> dict[str, Any]:
-    rows = _candidate_file_rows(root)
+    rows = _candidate_file_rows(root, exclude_file_manifest=True)
     return {
         "schema_version": 1,
         "hash_algorithm": "sha256",
@@ -1123,6 +1455,134 @@ def _manifest_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _valid_sha256(value: object) -> bool:
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _validate_candidate_build_attestations(
+    builder: Mapping[str, Any],
+    wheel_install: Mapping[str, Any],
+    wheelhouse: Mapping[str, Any],
+) -> None:
+    builder_keys = {
+        "schema_version",
+        "implementation",
+        "version",
+        "platform",
+        "machine",
+        "pointer_bits",
+        "python_executable_sha256",
+        "python_runtime_dll_sha256",
+        "pip_version",
+        "pip_tree_sha256",
+        "builder_tree_sha256",
+    }
+    if (
+        set(builder) != builder_keys
+        or type(builder.get("schema_version")) is not int
+        or builder.get("schema_version") != 1
+        or builder.get("implementation") != "CPython"
+        or type(builder.get("version")) is not str
+        or not builder["version"]
+        or builder.get("platform") != "win32"
+        or builder.get("machine") != "AMD64"
+        or type(builder.get("pointer_bits")) is not int
+        or builder.get("pointer_bits") != 64
+        or type(builder.get("pip_version")) is not str
+        or not builder["pip_version"]
+        or any(
+            not _valid_sha256(builder.get(name))
+            for name in (
+                "python_executable_sha256",
+                "python_runtime_dll_sha256",
+                "pip_tree_sha256",
+                "builder_tree_sha256",
+            )
+        )
+    ):
+        raise ReleaseError("Runtime candidate build provenance is invalid")
+
+    locked_wheels = wheelhouse.get("wheels")
+    if type(locked_wheels) is not list or any(
+        type(item) is not dict
+        or set(item) != {"filename", "byte_length", "sha256"}
+        or type(item.get("filename")) is not str
+        or PurePosixPath(item["filename"]).name != item["filename"]
+        or type(item.get("byte_length")) is not int
+        or item["byte_length"] < 0
+        or not _valid_sha256(item.get("sha256"))
+        for item in locked_wheels
+    ):
+        raise ReleaseError("Runtime candidate build provenance is invalid")
+    wheel_reports = wheel_install.get("wheels")
+    wheel_keys = {
+        "filename",
+        "archive_sha256",
+        "source_record_sha256",
+        "installed_record_sha256",
+        "source_files_verified",
+        "installed_files_verified",
+    }
+    if (
+        set(wheel_install)
+        != {
+            "schema_version",
+            "wheel_count",
+            "source_files_verified",
+            "installed_files_verified",
+            "generated_files",
+            "locked_wheels_sha256",
+            "installed_tree_sha256",
+            "wheels",
+        }
+        or type(wheel_install.get("schema_version")) is not int
+        or wheel_install.get("schema_version") != 1
+        or type(wheel_install.get("wheel_count")) is not int
+        or type(wheel_reports) is not list
+        or wheel_install["wheel_count"] != len(wheel_reports)
+        or wheel_install["wheel_count"] != len(locked_wheels)
+        or any(
+            type(wheel_install.get(name)) is not int
+            or wheel_install[name] < 0
+            for name in (
+                "source_files_verified",
+                "installed_files_verified",
+                "generated_files",
+            )
+        )
+        or not _valid_sha256(wheel_install.get("locked_wheels_sha256"))
+        or not _valid_sha256(wheel_install.get("installed_tree_sha256"))
+        or wheel_install["locked_wheels_sha256"]
+        != hashlib.sha256(
+            _canonical_json({"wheels": locked_wheels})
+        ).hexdigest()
+    ):
+        raise ReleaseError("Runtime candidate build provenance is invalid")
+    for report, locked in zip(wheel_reports, locked_wheels, strict=True):
+        if (
+            type(report) is not dict
+            or set(report) != wheel_keys
+            or report.get("filename") != locked["filename"]
+            or report.get("archive_sha256") != locked["sha256"]
+            or not _valid_sha256(report.get("source_record_sha256"))
+            or not _valid_sha256(report.get("installed_record_sha256"))
+            or type(report.get("source_files_verified")) is not int
+            or type(report.get("installed_files_verified")) is not int
+            or report["source_files_verified"] < 0
+            or report["installed_files_verified"]
+            != report["source_files_verified"] + 3
+        ):
+            raise ReleaseError("Runtime candidate build provenance is invalid")
+    if (
+        wheel_install["source_files_verified"]
+        != sum(report["source_files_verified"] for report in wheel_reports)
+        or wheel_install["installed_files_verified"]
+        != sum(report["installed_files_verified"] for report in wheel_reports)
+        or wheel_install["generated_files"] != len(wheel_reports) * 2
+    ):
+        raise ReleaseError("Runtime candidate build provenance is invalid")
+
+
 def verify_runtime_candidate(
     candidate: Path,
     *,
@@ -1145,7 +1605,7 @@ def verify_runtime_candidate(
     if manifest_sha256 != expected_manifest_sha256:
         raise ReleaseError("Runtime expected manifest hash does not match the candidate")
     expected_rows = _manifest_rows(manifest)
-    actual_rows = _candidate_file_rows(root)
+    actual_rows = _candidate_file_rows(root, exclude_file_manifest=True)
     if actual_rows != expected_rows:
         raise ReleaseError("Runtime candidate files do not match the manifest")
 
@@ -1174,6 +1634,52 @@ def verify_runtime_candidate(
             or row["sha256"] != hashlib.sha256(content).hexdigest()
         ):
             raise ReleaseError("Runtime candidate files changed during verification")
+    build_provenance = runtime_inputs.get("build_provenance")
+    acceptance_provenance = acceptance.get("build_provenance")
+    if build_provenance is not None or acceptance_provenance is not None:
+        provenance_keys = {
+            "builder_toolchain_sha256",
+            "wheel_install_attestation_sha256",
+        }
+        if (
+            type(build_provenance) is not dict
+            or set(build_provenance) != provenance_keys
+            or acceptance_provenance != build_provenance
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", build_provenance.get(name, ""))
+                is None
+                for name in provenance_keys
+            )
+        ):
+            raise ReleaseError("Runtime candidate build provenance is invalid")
+        attestation_payloads: dict[str, dict[str, Any]] = {}
+        for relative, key, label in (
+            (
+                "release/builder-toolchain.json",
+                "builder_toolchain_sha256",
+                "Builder toolchain attestation",
+            ),
+            (
+                "release/wheel-install-attestation.json",
+                "wheel_install_attestation_sha256",
+                "wheel install attestation",
+            ),
+        ):
+            payload, content = _read_candidate_control(root / relative, label)
+            attestation_payloads[key] = payload
+            row = actual_by_path.get(relative)
+            if (
+                row is None
+                or row["byte_length"] != len(content)
+                or row["sha256"] != hashlib.sha256(content).hexdigest()
+                or row["sha256"] != build_provenance[key]
+            ):
+                raise ReleaseError("Runtime candidate build provenance is invalid")
+        _validate_candidate_build_attestations(
+            attestation_payloads["builder_toolchain_sha256"],
+            attestation_payloads["wheel_install_attestation_sha256"],
+            wheelhouse,
+        )
     source_commit = runtime_inputs.get("runtime_source_commit")
     checks = acceptance.get("checks")
     wal_gate = acceptance.get("wal_gate")
@@ -1204,6 +1710,13 @@ def verify_runtime_candidate(
         or acceptance.get("runtime_source_commit") != source_commit
         or type(checks) is not dict
         or any(checks.get(name) is not True for name in _REQUIRED_ACCEPTANCE_CHECKS)
+        or (
+            build_provenance is not None
+            and (
+                checks.get("builder_toolchain") is not True
+                or checks.get("wheel_install_attestation") is not True
+            )
+        )
         or type(wal_gate) is not dict
         or wal_gate.get("scenarios_passed") is not True
         or wal_gate.get("parallel_job_execution_enabled") is not False
@@ -1260,13 +1773,18 @@ def assemble_runtime(
                 overlaps = False
         if overlaps:
             raise ReleaseError("Runtime output overlaps a release input")
+    environment = _clean_environment(os.environ)
+    builder_attestation = _verify_builder_toolchain(
+        lock,
+        builder_python,
+        environment,
+    )
     python_archive, python_spdx, sqlite_archive, wheels = _verify_inputs(
         lock, inputs, wheelhouse
     )
     stage = parent / f".{output.name}.staging-{uuid.uuid4().hex}"
     stage.mkdir(mode=0o700)
     published = False
-    environment = _clean_environment(os.environ)
     try:
         _extract_archive(python_archive, stage)
         sqlite_target = stage / "sqlite3.dll"
@@ -1286,6 +1804,11 @@ def assemble_runtime(
         )
         _remove_direct_url_metadata(site_packages, len(wheels))
         _remove_pip_console_scripts(site_packages)
+        wheel_install_attestation = _verify_wheel_install(
+            site_packages,
+            wheelhouse,
+            wheels,
+        )
         (stage / "python314._pth").write_text(
             "python314.zip\n.\nsite-packages\nimport site\n",
             encoding="ascii",
@@ -1304,6 +1827,15 @@ def assemble_runtime(
         release = stage / "release"
         release.mkdir()
         shutil.copyfile(python_spdx, release / "python-3.14.6.spdx.json")
+        _write_json(release / "builder-toolchain.json", builder_attestation)
+        _write_json(
+            release / "wheel-install-attestation.json",
+            wheel_install_attestation,
+        )
+        builder_attestation_sha256 = _hash(release / "builder-toolchain.json")
+        wheel_install_attestation_sha256 = _hash(
+            release / "wheel-install-attestation.json"
+        )
         probe = _probe_runtime(stage, lock, environment)
         with tempfile.TemporaryDirectory(prefix="alltonote-runtime-smoke-", dir=gate_root) as temporary:
             smoke = Path(temporary)
@@ -1360,6 +1892,12 @@ def assemble_runtime(
                 "python": lock["python"],
                 "sqlite": lock["sqlite"],
                 "legacy_jobstore_fixture": lock["legacy_jobstore_fixture"],
+                "build_provenance": {
+                    "builder_toolchain_sha256": builder_attestation_sha256,
+                    "wheel_install_attestation_sha256": (
+                        wheel_install_attestation_sha256
+                    ),
+                },
             },
         )
         _write_json(
@@ -1386,6 +1924,14 @@ def assemble_runtime(
                     "unicode_workspace_init": True,
                     "sqlite_wal_gate": True,
                     "legacy_jobstore_migration": True,
+                    "builder_toolchain": True,
+                    "wheel_install_attestation": True,
+                },
+                "build_provenance": {
+                    "builder_toolchain_sha256": builder_attestation_sha256,
+                    "wheel_install_attestation_sha256": (
+                        wheel_install_attestation_sha256
+                    ),
                 },
                 "wal_gate": {
                     "connection_counts": gate_data["connection_counts"],
