@@ -186,6 +186,15 @@ Stop condition：
 - 无法在 Windows 回收完整子进程树；
 - IPC 损坏会直接写入 Job 成功。
 
+容量 1 权限移交进度（2026-08-01）：
+
+- Engine dispatcher 在创建 Worker 前先获取全局 `produce:heavy:v1`，再创建一次性、限时、绑定目标 `ResourceOwner` 的 handoff，并以同一 process-instance owner 预 claim 既有 Job；资源繁忙或 spawn 失败都不会启动未准入 Worker；
+- 私有 `EngineWorkerLaunchV1` 通过有界 canonical JSON stdin 绑定 Workspace instance、Job、资源 handoff 与精确 Job generation；Worker 先原子 adopt 资源，再验证同 owner 的 Job claim 必须保持完全相同的 authority，之后才创建 Runtime；
+- supervisor 从预 claim 到 Worker 退出持续 heartbeat 精确 Job 与源/已 adopt 资源，轮询 durable cancel；权限丢失或取消宽限到期复用既有 process-tree kill，永久 pre-runtime failure 只使用 dispatcher 持有的 expected authority 收敛；
+- Video 与 Document Service 已支持“前台自行准入”或“Engine 已 adopt + expected authority”两个互斥模式；Engine 模式不再二次获取全局资源，checkpoint heartbeat 与最终 stale-safe release 继续复用既有路径；
+- 三种跨进程 detach 验收（fixture Video、local Video、Document）均证明提交者退出后独立 Worker 使用新 launch envelope 完成原 Job；完整后端回归为 `2586 passed, 3 skipped, 3 subtests passed`；
+- 这只是 Task 5/6 的 capacity-1 正确性地基，不宣称并发 Worker、资源池、排队可观测、workspace publish slot 或公开发布完成。dispatcher 仍只有一个 active Worker，`parallel_job_execution_enabled=false` 保持不变，因此 Task 5 与 Task 6 继续未完成。
+
 ## Task 6: [ ] 加入最小资源准入与 workspace publish 控制
 
 - 风险：高

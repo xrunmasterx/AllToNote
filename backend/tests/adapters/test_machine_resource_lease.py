@@ -16,6 +16,33 @@ EXPECTED_RESOURCE_LEASE_SCHEMA = """CREATE TABLE resource_leases (
     process_instance_id TEXT NOT NULL CHECK(length(process_instance_id) > 0),
     process_id INTEGER CHECK(process_id IS NULL OR process_id > 0),
     fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms >= 0),
+    handoff_workspace_identity TEXT,
+    handoff_process_instance_id TEXT,
+    handoff_process_id INTEGER,
+    handoff_nonce TEXT,
+    handoff_expires_at_ms INTEGER,
+    CHECK (
+        (handoff_workspace_identity IS NULL
+         AND handoff_process_instance_id IS NULL
+         AND handoff_process_id IS NULL
+         AND handoff_nonce IS NULL
+         AND handoff_expires_at_ms IS NULL)
+        OR
+        (length(handoff_workspace_identity) > 0
+         AND length(handoff_process_instance_id) > 0
+         AND (handoff_process_id IS NULL OR handoff_process_id > 0)
+         AND length(handoff_nonce) = 43
+         AND handoff_expires_at_ms >= 0)
+    )
+)"""
+
+V1_RESOURCE_LEASE_SCHEMA = """CREATE TABLE resource_leases (
+    resource_name TEXT PRIMARY KEY CHECK(length(resource_name) > 0),
+    workspace_identity TEXT NOT NULL CHECK(length(workspace_identity) > 0),
+    process_instance_id TEXT NOT NULL CHECK(length(process_instance_id) > 0),
+    process_id INTEGER CHECK(process_id IS NULL OR process_id > 0),
+    fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
     expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms >= 0)
 )"""
 
@@ -147,7 +174,7 @@ def test_machine_lease_owner_requires_workspace_and_process_instance_identity(
         ResourceOwner(*owner_args, process_id=123)
 
 
-def test_machine_lease_version_zero_empty_database_creates_exact_v1_schema(
+def test_machine_lease_version_zero_empty_database_creates_exact_v2_schema(
     tmp_path: Path,
 ) -> None:
     MachineResourceLeaseStore, _ = _task7_lease_api()
@@ -165,7 +192,7 @@ def test_machine_lease_version_zero_empty_database_creates_exact_v1_schema(
             """
         ).fetchall()
 
-    assert version == 1
+    assert version == 2
     assert journal_mode == "wal"
     assert synchronous == 2
     assert len(objects) == 1
@@ -183,7 +210,7 @@ def test_machine_lease_rejects_unsupported_schema_version(tmp_path: Path) -> Non
     machine_root = tmp_path / "machine"
     machine_root.mkdir()
     with sqlite3.connect(machine_root / "leases.sqlite") as connection:
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 3")
 
     with pytest.raises(
         DomainError, match="machine_lease_schema_unsupported"
@@ -212,7 +239,7 @@ def test_machine_lease_rejects_version_zero_nonempty_without_mutation(
     "mutation",
     ("missing", "extra", "wrong_primary_key", "wrong_constraint"),
 )
-def test_machine_lease_v1_rejects_non_exact_schema(
+def test_machine_lease_v2_rejects_non_exact_schema(
     tmp_path: Path,
     mutation: str,
 ) -> None:
@@ -255,6 +282,103 @@ def test_machine_lease_v1_rejects_non_exact_schema(
             )
 
     _assert_schema_invalid(machine_root)
+
+
+def test_machine_lease_migrates_exact_v1_and_preserves_active_lease(
+    tmp_path: Path,
+) -> None:
+    MachineResourceLeaseStore, ResourceOwner = _task7_lease_api()
+    machine_root = tmp_path / "v1"
+    machine_root.mkdir()
+    database_path = machine_root / "leases.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(V1_RESOURCE_LEASE_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO resource_leases (
+                resource_name, workspace_identity, process_instance_id,
+                process_id, fencing_token, expires_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("produce:heavy:v1", "workspace", "old-owner", 100, 7, 9_999_999),
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    store = MachineResourceLeaseStore.open(machine_root, clock=_Clock())
+
+    with sqlite3.connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        row = connection.execute(
+            "SELECT * FROM resource_leases WHERE resource_name = ?",
+            ("produce:heavy:v1",),
+        ).fetchone()
+    assert version == 2
+    assert row[:6] == (
+        "produce:heavy:v1",
+        "workspace",
+        "old-owner",
+        100,
+        7,
+        9_999_999,
+    )
+    assert row[6:] == (None, None, None, None, None)
+    with pytest.raises(DomainError, match="resource_busy"):
+        store.acquire(
+            "produce:heavy:v1",
+            ResourceOwner("workspace", "new-owner"),
+            ttl_seconds=30,
+        )
+
+
+def test_machine_lease_handoff_is_one_use_and_preserves_fencing(
+    tmp_path: Path,
+) -> None:
+    MachineResourceLeaseStore, ResourceOwner = _task7_lease_api()
+    clock = _Clock()
+    store = MachineResourceLeaseStore.open(tmp_path / "handoff", clock=clock)
+    supervisor = ResourceOwner("workspace", "engine-supervisor", process_id=10)
+    worker = ResourceOwner("workspace", "engine-worker")
+    source = store.acquire("produce:heavy:v1", supervisor, ttl_seconds=30)
+
+    handoff = store.handoff(source, worker, ttl_seconds=30)
+    adopted = store.adopt(handoff, ttl_seconds=30)
+
+    assert adopted.owner == worker
+    assert adopted.fencing_token == source.fencing_token
+    assert source.release() is False
+    with pytest.raises(DomainError, match="resource_handoff_invalid"):
+        store.adopt(handoff, ttl_seconds=30)
+    renewed = store.heartbeat_adopted(handoff, ttl_seconds=30)
+    assert renewed.owner == worker
+    assert renewed.fencing_token == adopted.fencing_token
+    assert store.release_adopted(handoff) is True
+    assert adopted.release() is False
+
+
+def test_machine_lease_handoff_expiry_and_wrong_target_fail_closed(
+    tmp_path: Path,
+) -> None:
+    MachineResourceLeaseStore, ResourceOwner = _task7_lease_api()
+    clock = _Clock()
+    store = MachineResourceLeaseStore.open(tmp_path / "handoff-expiry", clock=clock)
+    source = store.acquire(
+        "produce:heavy:v1",
+        ResourceOwner("workspace", "engine-supervisor"),
+        ttl_seconds=30,
+    )
+    handoff = store.handoff(
+        source,
+        ResourceOwner("workspace", "engine-worker"),
+        ttl_seconds=1,
+    )
+    clock.advance(1_001)
+
+    with pytest.raises(DomainError, match="resource_handoff_invalid"):
+        store.adopt(handoff, ttl_seconds=30)
+    with pytest.raises(DomainError, match="resource_lease_lost"):
+        store.heartbeat_adopted(handoff, ttl_seconds=30)
+    assert store.release_adopted(handoff) is False
+    assert source.release() is True
 
 
 def test_machine_lease_corrupt_database_and_runtime_sqlite_errors_are_sanitized(

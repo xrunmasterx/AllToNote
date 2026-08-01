@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import threading
 import time
@@ -8,7 +9,9 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.workspace_instance_registry import (
     WorkspaceInstance,
     WorkspaceInstanceRegistry,
@@ -23,7 +26,14 @@ from app.core.jobs.model import (
     JobExecutionOwner,
     JobState,
 )
-from app.engine.contracts import EngineJobReference
+from app.core.jobs.resource_lease import (
+    HEAVY_PRODUCTION_RESOURCE_NAME,
+    JobExecutionAuthority,
+    ResourceLease,
+    ResourceLeaseHandoff,
+    ResourceOwner,
+)
+from app.engine.contracts import EngineJobReference, EngineWorkerLaunchV1
 from app.engine.job_store import open_engine_job_store
 from app.runtime_paths import RuntimePaths
 
@@ -32,12 +42,97 @@ MAXIMUM_PENDING_JOBS = 256
 DISCOVERY_PAGE_SIZE = 100
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 30.0
 WORKER_TIMEOUT_SECONDS = 24 * 60 * 60
+WORKER_AUTHORITY_TTL_SECONDS = 300
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 30.0
+WORKER_CANCELLATION_POLL_SECONDS = 0.25
+WORKER_CANCELLATION_GRACE_SECONDS = 5.0
 
-WorkerRunner = Callable[[EngineJobReference, Callable[[], None]], int]
+WorkerRunner = Callable[[EngineWorkerLaunchV1, Callable[[], None]], int]
 
 
 class _DispatcherStopping(RuntimeError):
     pass
+
+
+class _WorkerCancellationRequested(RuntimeError):
+    pass
+
+
+@dataclass
+class _WorkerAdmission:
+    repository: object
+    resource_store: MachineResourceLeaseStore
+    source_lease: ResourceLease
+    launch: EngineWorkerLaunchV1
+    next_heartbeat: float = 0.0
+    next_cancel_poll: float = 0.0
+    cancellation_started: float | None = None
+
+    def check_running(self, check_engine: Callable[[], None]) -> None:
+        check_engine()
+        now = time.monotonic()
+        if now >= self.next_cancel_poll:
+            job = self.repository.get_job(self.launch.reference.job_id)
+            if job.state is JobState.CANCELLED:
+                raise _WorkerCancellationRequested
+            if job.state not in {JobState.QUEUED, JobState.RUNNING}:
+                return
+            if job.cancellation_requested:
+                if self.cancellation_started is None:
+                    self.cancellation_started = now
+                elif now - self.cancellation_started >= WORKER_CANCELLATION_GRACE_SECONDS:
+                    raise _WorkerCancellationRequested
+            else:
+                self.cancellation_started = None
+            self.next_cancel_poll = now + WORKER_CANCELLATION_POLL_SECONDS
+        if now < self.next_heartbeat:
+            return
+        self.repository.heartbeat_job_claim(
+            self.launch.job_authority,
+            ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+        )
+        try:
+            self.source_lease = self.source_lease.heartbeat(
+                ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS
+            )
+        except DomainError as error:
+            if error.code != "resource_lease_lost":
+                raise
+            self.resource_store.heartbeat_adopted(
+                self.launch.resource_handoff,
+                ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+            )
+        self.next_heartbeat = now + WORKER_HEARTBEAT_INTERVAL_SECONDS
+
+    def settle_cancellation(self) -> None:
+        try:
+            if not self.repository.is_cancellation_requested(
+                self.launch.reference.job_id
+            ):
+                return
+            claim = self.repository.claim_job(
+                self.launch.reference.job_id,
+                self.launch.job_authority.owner_id,
+                ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+            )
+            if claim.authority != self.launch.job_authority:
+                return
+        except (DomainError, OSError, RuntimeError, ValueError):
+            return
+
+    def release(self) -> None:
+        try:
+            self.repository.release_job_claim(self.launch.job_authority)
+        except Exception:
+            pass
+        try:
+            self.resource_store.release_adopted(self.launch.resource_handoff)
+        except Exception:
+            pass
+        try:
+            self.source_lease.release()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -333,17 +428,110 @@ class EngineJobDispatcher:
             if reference is None:
                 continue
             exit_code: int | None = None
+            admission: _WorkerAdmission | None = None
             try:
-                exit_code = self._worker_runner(reference, self._check_running)
-            except (_DispatcherStopping, OSError, RuntimeError, ValueError):
+                admission = self._admit_worker(reference)
+                if admission is None:
+                    exit_code = 0
+                else:
+                    exit_code = self._worker_runner(
+                        admission.launch,
+                        lambda: admission.check_running(self._check_running),
+                    )
+            except (
+                _DispatcherStopping,
+                _WorkerCancellationRequested,
+                DomainError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ):
                 pass
             finally:
+                if admission is not None:
+                    admission.settle_cancellation()
+                    admission.release()
                 with self._condition:
                     self._active = None
                     self._known.discard(reference)
                     self._condition.notify_all()
             if exit_code == 0:
                 next_reconcile = 0.0
+
+    def _admit_worker(
+        self,
+        reference: EngineJobReference,
+    ) -> _WorkerAdmission | None:
+        instance, repository = self._resolve_repository(reference)
+        job = repository.get_job(reference.job_id)
+        if (
+            job.execution_owner is not JobExecutionOwner.ENGINE
+            or job.principal != LOCAL_USER_PRINCIPAL
+        ):
+            raise DomainError(
+                "engine_job_authority_denied",
+                ErrorCategory.POLICY_DENIED,
+                "Engine is not authorized to execute this Job",
+            )
+        if job.state not in {JobState.QUEUED, JobState.RUNNING}:
+            return None
+        resource_store = MachineResourceLeaseStore.open(
+            self._paths.data_dir / "machine"
+        )
+        source_lease = resource_store.acquire(
+            HEAVY_PRODUCTION_RESOURCE_NAME,
+            ResourceOwner(
+                instance.workspace_identity,
+                f"engine-supervisor-{uuid4().hex}",
+                process_id=os.getpid(),
+            ),
+            ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+        )
+        handoff: ResourceLeaseHandoff | None = None
+        authority: JobExecutionAuthority | None = None
+        try:
+            worker_owner = ResourceOwner(
+                instance.workspace_identity,
+                f"engine-worker-{uuid4().hex}",
+            )
+            handoff = resource_store.handoff(
+                source_lease,
+                worker_owner,
+                ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+            )
+            claim = repository.claim_job(
+                reference.job_id,
+                worker_owner.process_instance_id,
+                ttl_seconds=WORKER_AUTHORITY_TTL_SECONDS,
+            )
+            authority = claim.authority
+            if claim.job.state not in {JobState.QUEUED, JobState.RUNNING}:
+                repository.release_job_claim(authority)
+                source_lease.release()
+                return None
+            launch = EngineWorkerLaunchV1(1, reference, handoff, authority)
+            return _WorkerAdmission(
+                repository=repository,
+                resource_store=resource_store,
+                source_lease=source_lease,
+                launch=launch,
+            )
+        except BaseException:
+            if authority is not None:
+                try:
+                    repository.release_job_claim(authority)
+                except Exception:
+                    pass
+            if handoff is not None:
+                try:
+                    resource_store.release_adopted(handoff)
+                except Exception:
+                    pass
+            try:
+                source_lease.release()
+            except Exception:
+                pass
+            raise
 
     def _next_reference(self, next_reconcile: float) -> EngineJobReference | None:
         with self._condition:
@@ -364,9 +552,10 @@ class EngineJobDispatcher:
 
     def _run_worker(
         self,
-        reference: EngineJobReference,
+        launch: EngineWorkerLaunchV1,
         check_running: Callable[[], None],
     ) -> int:
+        reference = launch.reference
         command = (
             str(Path(sys.executable).resolve()),
             "-I",
@@ -393,6 +582,7 @@ class EngineJobDispatcher:
             cwd=Path(__file__).resolve().parents[2],
             environment=minimal_worker_environment(),
             timeout_seconds=WORKER_TIMEOUT_SECONDS,
+            stdin_payload=launch.to_bytes(),
             check_running=check_running,
         )
 

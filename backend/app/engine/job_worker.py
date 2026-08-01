@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from uuid import RFC_4122, UUID, uuid4
@@ -10,6 +11,7 @@ from app.adapters.jobs.workspace_instance_registry import (
     WorkspaceInstance,
     WorkspaceInstanceRegistry,
 )
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
 from app.core.errors import DomainError, ErrorCategory, ErrorDetail
@@ -18,6 +20,15 @@ from app.core.jobs.model import (
     LOCAL_USER_PRINCIPAL,
     JobExecutionOwner,
     JobState,
+)
+from app.core.jobs.resource_lease import (
+    JobExecutionAuthority,
+    ResourceLease,
+)
+from app.engine.contracts import (
+    EngineProtocolError,
+    EngineWorkerLaunchV1,
+    MAX_WORKER_LAUNCH_BYTES,
 )
 from app.engine.job_store import open_engine_job_store
 from app.runtime_paths import RuntimePaths
@@ -50,6 +61,7 @@ _PERSISTENT_CONFLICT_CODES = frozenset(
         "execution_pack_snapshot_missing",
     }
 )
+_SUPERVISED_AUTHORITY_TTL_SECONDS = 300
 _RECOVERY_CLAIM_TTL_SECONDS = 30
 
 
@@ -60,6 +72,7 @@ def execute_engine_job(
     job_id: str,
     inspect_workspace: Callable[[Path], str] | None = None,
     runtime_factory: Callable[..., object] | None = None,
+    launch: EngineWorkerLaunchV1 | None = None,
 ) -> object:
     if not _is_typed_job_id(job_id):
         raise DomainError(
@@ -86,6 +99,27 @@ def execute_engine_job(
             ErrorCategory.INVALID_REQUEST,
             "Workspace instance does not exist",
         )
+    if launch is not None and (
+        launch.reference.workspace_instance_id != workspace_instance_id
+        or launch.reference.job_id != job_id
+        or launch.resource_handoff.owner.workspace_identity
+        != instance.workspace_identity
+    ):
+        raise DomainError(
+            "engine_worker_launch_invalid",
+            ErrorCategory.POLICY_DENIED,
+            "Engine Worker launch does not match the registered Job",
+        )
+    adopted_resource_lease: ResourceLease | None = None
+    expected_job_authority: JobExecutionAuthority | None = None
+    if launch is not None:
+        adopted_resource_lease = MachineResourceLeaseStore.open(
+            paths.data_dir / "machine"
+        ).adopt(
+            launch.resource_handoff,
+            ttl_seconds=_SUPERVISED_AUTHORITY_TTL_SECONDS,
+        )
+        expected_job_authority = launch.job_authority
     repository = open_engine_job_store(paths, instance)
     job = repository.get_job(job_id)
     if (
@@ -98,29 +132,66 @@ def execute_engine_job(
             "Engine is not authorized to execute this Job",
         )
     try:
+        if expected_job_authority is not None:
+            claim = repository.claim_job(
+                job_id,
+                expected_job_authority.owner_id,
+                ttl_seconds=_SUPERVISED_AUTHORITY_TTL_SECONDS,
+            )
+            if claim.authority != expected_job_authority:
+                raise DomainError(
+                    "job_claim_fenced",
+                    ErrorCategory.CONFLICT,
+                    "Engine Worker Job authority is expired or fenced",
+                )
         workspace_root = _validated_workspace(paths, instance, inspector)
         config_snapshot = _load_config_snapshot(repository, job_id)
         if runtime_factory is None:
             from app.job_runtime import create_job_runtime_for_workspace
 
             runtime_factory = create_job_runtime_for_workspace
-        runtime = runtime_factory(
-            workspace_root,
-            runtime_paths=paths,
-            current_config_snapshot=config_snapshot,
-            execution_owner=JobExecutionOwner.ENGINE,
-            require_existing_job_store=True,
-        )
+        runtime_options = {
+            "runtime_paths": paths,
+            "current_config_snapshot": config_snapshot,
+            "execution_owner": JobExecutionOwner.ENGINE,
+            "require_existing_job_store": True,
+        }
+        if adopted_resource_lease is not None:
+            runtime_options.update(
+                {
+                    "adopted_resource_lease": adopted_resource_lease,
+                    "expected_job_authority": expected_job_authority,
+                }
+            )
+        runtime = runtime_factory(workspace_root, **runtime_options)
         return runtime.wait_for_job(job_id)
     except DomainError as error:
-        _persist_permanent_failure(repository, job_id, error)
+        _persist_permanent_failure(
+            repository,
+            job_id,
+            error,
+            expected_authority=expected_job_authority,
+        )
         raise
+    finally:
+        if expected_job_authority is not None:
+            try:
+                repository.release_job_claim(expected_job_authority)
+            except Exception:
+                pass
+        if adopted_resource_lease is not None:
+            try:
+                adopted_resource_lease.release()
+            except Exception:
+                pass
 
 
 def _persist_permanent_failure(
     repository: SqliteJobRepository,
     job_id: str,
     error: DomainError,
+    *,
+    expected_authority: JobExecutionAuthority | None = None,
 ) -> None:
     if not (
         error.category in _PERSISTENT_FAILURE_CATEGORIES
@@ -138,9 +209,15 @@ def _persist_permanent_failure(
             return
         claim = repository.claim_job(
             job_id,
-            f"engine-recovery-{uuid4().hex}",
+            (
+                expected_authority.owner_id
+                if expected_authority is not None
+                else f"engine-recovery-{uuid4().hex}"
+            ),
             ttl_seconds=_RECOVERY_CLAIM_TTL_SECONDS,
         )
+        if expected_authority is not None and claim.authority != expected_authority:
+            return
         authority = claim.authority
         if claim.job.state in {
             JobState.SUCCEEDED,
@@ -289,7 +366,11 @@ def _is_typed_job_id(value: object) -> bool:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    stdin_payload: bytes | None = None,
+) -> int:
     parser = argparse.ArgumentParser(prog="alltonote-engine-job-worker-private")
     parser.add_argument("--config-dir", required=True, type=Path)
     parser.add_argument("--data-dir", required=True, type=Path)
@@ -300,6 +381,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--job-id", required=True)
     args = parser.parse_args(argv)
     try:
+        payload = (
+            stdin_payload
+            if stdin_payload is not None
+            else sys.stdin.buffer.read(MAX_WORKER_LAUNCH_BYTES + 1)
+        )
+        launch = EngineWorkerLaunchV1.from_bytes(payload)
+        if (
+            launch.reference.workspace_instance_id != args.workspace_instance_id
+            or launch.reference.job_id != args.job_id
+        ):
+            raise EngineProtocolError("engine_worker_launch_invalid")
         execute_engine_job(
             RuntimePaths(
                 config_dir=args.config_dir,
@@ -310,11 +402,14 @@ def main(argv: list[str] | None = None) -> int:
             ),
             workspace_instance_id=args.workspace_instance_id,
             job_id=args.job_id,
+            launch=launch,
         )
     except KeyboardInterrupt:
         return 130
     except DomainError as error:
         return _EXIT_CODES[error.category]
+    except EngineProtocolError:
+        return 2
     except Exception:
         return 70
     return 0

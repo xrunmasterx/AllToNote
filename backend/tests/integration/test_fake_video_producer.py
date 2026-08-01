@@ -2095,6 +2095,48 @@ def test_machine_admission_is_released_after_execution_abort(
     assert recovered.release()
 
 
+def test_video_worker_consumes_adopted_resource_and_exact_job_authority(
+    tmp_path: Path,
+    workspace_root: Path,
+) -> None:
+    runtime_module = importlib.import_module("app.runtime")
+    machine_root = tmp_path / "video-adopted-machine"
+    submitted_runtime = _create_fake_runtime(runtime_module, machine_root)
+    submitted = submitted_runtime.submit_video(
+        valid_request(workspace_root, client_request_id="video-adopted-authority")
+    )
+    store = MachineResourceLeaseStore.open(tmp_path / "video-adopted-resource")
+    supervisor = ResourceOwner("workspace-a", "engine-supervisor", process_id=101)
+    worker = ResourceOwner("workspace-a", "engine-worker", process_id=202)
+    source_lease = store.acquire("produce:heavy:v1", supervisor, ttl_seconds=300)
+    adopted = store.adopt(
+        store.handoff(source_lease, worker, ttl_seconds=300),
+        ttl_seconds=300,
+    )
+    authority = submitted_runtime.job_repository.claim_job(
+        submitted.job_id,
+        worker.process_instance_id,
+        ttl_seconds=300,
+    ).authority
+    calls = runtime_module.FakeCallCounts()
+    worker_runtime = _create_fake_runtime(
+        runtime_module,
+        machine_root,
+        calls=calls,
+        adopted_resource_lease=adopted,
+        expected_job_authority=authority,
+    )
+
+    assert worker_runtime.wait_job(submitted.job_id).state is JobState.SUCCEEDED
+    assert calls.download == calls.transcribe == calls.model == calls.commit == 1
+    next_lease = store.acquire(
+        "produce:heavy:v1",
+        ResourceOwner("workspace-b", "other-worker", process_id=303),
+        ttl_seconds=300,
+    )
+    assert next_lease.release()
+
+
 def test_video_runtime_rejects_partial_or_mismatched_machine_admission(
     tmp_path: Path,
 ) -> None:

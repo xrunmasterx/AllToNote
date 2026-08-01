@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+import app.engine.job_worker as job_worker_module
 from app.adapters.documents.document_basic_pack import PACK_VERSION
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.core.domain.ids import sha256_digest
 from app.core.errors import DomainError, ErrorCategory
@@ -15,6 +17,16 @@ from app.core.jobs.model import (
     JobExecutionBinding,
     JobExecutionOwner,
     JobState,
+)
+from app.core.jobs.resource_lease import (
+    HEAVY_PRODUCTION_RESOURCE_NAME,
+    JobExecutionAuthority,
+    ResourceLeaseHandoff,
+    ResourceOwner,
+)
+from app.engine.contracts import (
+    EngineJobReference,
+    EngineWorkerLaunchV1,
 )
 from app.engine.job_worker import execute_engine_job, main
 from app.job_runtime import LOCAL_CLI_PRINCIPAL
@@ -67,6 +79,192 @@ def _registered_job(
         execution_binding=binding,
     )
     return paths, workspace, instance, repository, job
+
+
+def _preclaimed_launch(paths, instance, repository, job):
+    store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+    supervisor = ResourceOwner(
+        WORKSPACE_ID,
+        "engine-supervisor",
+        process_id=100,
+    )
+    worker = ResourceOwner(WORKSPACE_ID, "engine-worker")
+    source = store.acquire(
+        HEAVY_PRODUCTION_RESOURCE_NAME,
+        supervisor,
+        ttl_seconds=30,
+    )
+    handoff = store.handoff(source, worker, ttl_seconds=30)
+    claim = repository.claim_job(job.job_id, worker.process_instance_id, ttl_seconds=30)
+    return (
+        EngineWorkerLaunchV1(
+            1,
+            EngineJobReference(instance.instance_id, job.job_id),
+            handoff,
+            claim.authority,
+        ),
+        store,
+        source,
+    )
+
+
+def _private_launch_payload(
+    workspace_instance_id: str,
+    job_id: str,
+) -> bytes:
+    owner = ResourceOwner("workspace", "engine-worker")
+    return EngineWorkerLaunchV1(
+        1,
+        EngineJobReference(workspace_instance_id, job_id),
+        ResourceLeaseHandoff(
+            1,
+            HEAVY_PRODUCTION_RESOURCE_NAME,
+            owner,
+            1,
+            30_000,
+            "a" * 43,
+        ),
+        JobExecutionAuthority(owner.process_instance_id, 1, job_id),
+    ).to_bytes()
+
+
+def _private_worker_arguments(
+    tmp_path: Path,
+    workspace_instance_id: str,
+    job_id: str,
+) -> list[str]:
+    return [
+        "--config-dir",
+        str(tmp_path / "config" / "AllToNote"),
+        "--data-dir",
+        str(tmp_path / "data" / "AllToNote"),
+        "--cache-dir",
+        str(tmp_path / "cache" / "AllToNote"),
+        "--state-dir",
+        str(tmp_path / "state" / "AllToNote"),
+        "--log-dir",
+        str(tmp_path / "log" / "AllToNote"),
+        "--workspace-instance-id",
+        workspace_instance_id,
+        "--job-id",
+        job_id,
+    ]
+
+
+def test_worker_adopts_launch_before_runtime_and_passes_exact_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, workspace, instance, repository, job = _registered_job(tmp_path)
+    launch, _store, source = _preclaimed_launch(
+        paths, instance, repository, job
+    )
+    observed: list[tuple[object, object]] = []
+    claim_ttls: list[int] = []
+    original_claim_job = repository.claim_job
+
+    def claim_job(job_id: str, owner_id: str, *, ttl_seconds: int):
+        claim_ttls.append(ttl_seconds)
+        return original_claim_job(job_id, owner_id, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(repository, "claim_job", claim_job)
+    monkeypatch.setattr(
+        job_worker_module,
+        "open_engine_job_store",
+        lambda _paths, _instance: repository,
+    )
+
+    class Runtime:
+        def wait_for_job(self, job_id: str):
+            assert job_id == job.job_id
+            return object()
+
+    def runtime_factory(
+        workspace_root: Path,
+        *,
+        adopted_resource_lease,
+        expected_job_authority,
+        **_kwargs,
+    ):
+        assert workspace_root == workspace.resolve()
+        observed.append((adopted_resource_lease, expected_job_authority))
+        return Runtime()
+
+    execute_engine_job(
+        paths,
+        workspace_instance_id=instance.instance_id,
+        job_id=job.job_id,
+        inspect_workspace=_inspect_workspace,
+        runtime_factory=runtime_factory,
+        launch=launch,
+    )
+
+    assert observed[0][0].owner == launch.resource_handoff.owner
+    assert (
+        observed[0][0].expires_at_ms
+        - launch.resource_handoff.expires_at_ms
+        >= 240_000
+    )
+    assert observed[0][1] == launch.job_authority
+    assert claim_ttls == [300]
+    assert source.release() is False
+
+
+def test_worker_launch_is_one_use_and_replay_never_reaches_runtime(
+    tmp_path: Path,
+) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+    launch, _store, _source = _preclaimed_launch(paths, instance, repository, job)
+
+    class Runtime:
+        def wait_for_job(self, _job_id: str):
+            return object()
+
+    execute_engine_job(
+        paths,
+        workspace_instance_id=instance.instance_id,
+        job_id=job.job_id,
+        inspect_workspace=_inspect_workspace,
+        runtime_factory=lambda *_args, **_kwargs: Runtime(),
+        launch=launch,
+    )
+    with pytest.raises(DomainError, match="resource_handoff_invalid"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: pytest.fail(
+                "replayed launch must fail before runtime"
+            ),
+            launch=launch,
+        )
+
+
+def test_worker_permanent_failure_uses_dispatcher_preclaim(
+    tmp_path: Path,
+) -> None:
+    paths, _workspace, instance, repository, job = _registered_job(tmp_path)
+    launch, _store, _source = _preclaimed_launch(paths, instance, repository, job)
+
+    with pytest.raises(DomainError, match="document_pack_unavailable"):
+        execute_engine_job(
+            paths,
+            workspace_instance_id=instance.instance_id,
+            job_id=job.job_id,
+            inspect_workspace=_inspect_workspace,
+            runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DomainError(
+                    "document_pack_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Install the compatible document Pack",
+                )
+            ),
+            launch=launch,
+        )
+
+    assert repository.get_job(job.job_id).state is JobState.FAILED
+    assert repository.get_job_error(job.job_id).code == "document_pack_unavailable"
 
 
 def test_worker_executes_existing_engine_job_using_registry_ids_only(
@@ -504,6 +702,8 @@ def test_private_worker_main_maps_domain_failure_without_output(
         ),
     )
 
+    workspace_instance_id = "1" * 32
+    job_id = "job_018f0000-0000-7000-8000-000000000001"
     exit_code = main(
         [
             "--config-dir",
@@ -517,14 +717,51 @@ def test_private_worker_main_maps_domain_failure_without_output(
             "--log-dir",
             str(tmp_path / "log" / "AllToNote"),
             "--workspace-instance-id",
-            "1" * 32,
+            workspace_instance_id,
             "--job-id",
-            "job_018f0000-0000-7000-8000-000000000001",
-        ]
+            job_id,
+        ],
+        stdin_payload=_private_launch_payload(workspace_instance_id, job_id),
     )
 
     assert exit_code == 30
     assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("payload", (b"", b"{}", b"x" * 4097))
+def test_private_worker_main_rejects_missing_malformed_or_oversized_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    monkeypatch.setattr(
+        "app.engine.job_worker.execute_engine_job",
+        lambda *_args, **_kwargs: pytest.fail("invalid launch executed"),
+    )
+    workspace_instance_id = "1" * 32
+    job_id = "job_018f0000-0000-7000-8000-000000000001"
+
+    assert main(
+        _private_worker_arguments(tmp_path, workspace_instance_id, job_id),
+        stdin_payload=payload,
+    ) == 2
+
+
+def test_private_worker_main_rejects_cli_and_launch_reference_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "app.engine.job_worker.execute_engine_job",
+        lambda *_args, **_kwargs: pytest.fail("mismatched launch executed"),
+    )
+    workspace_instance_id = "1" * 32
+    job_id = "job_018f0000-0000-7000-8000-000000000001"
+
+    assert main(
+        _private_worker_arguments(tmp_path, workspace_instance_id, job_id),
+        stdin_payload=_private_launch_payload("2" * 32, job_id),
+    ) == 2
 
 
 def test_private_worker_main_preserves_all_runtime_roots(
@@ -544,6 +781,8 @@ def test_private_worker_main_preserves_all_runtime_roots(
         lambda paths, **_kwargs: observed.append(paths),
     )
 
+    workspace_instance_id = "1" * 32
+    job_id = "job_018f0000-0000-7000-8000-000000000001"
     exit_code = main(
         [
             "--config-dir",
@@ -557,10 +796,11 @@ def test_private_worker_main_preserves_all_runtime_roots(
             "--log-dir",
             str(expected.log_dir),
             "--workspace-instance-id",
-            "1" * 32,
+            workspace_instance_id,
             "--job-id",
-            "job_018f0000-0000-7000-8000-000000000001",
-        ]
+            job_id,
+        ],
+        stdin_payload=_private_launch_payload(workspace_instance_id, job_id),
     )
 
     assert exit_code == 0

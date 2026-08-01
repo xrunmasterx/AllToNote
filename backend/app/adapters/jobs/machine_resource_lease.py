@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from secrets import token_urlsafe
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,14 +10,15 @@ from pathlib import Path
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.resource_lease import (
     ResourceLease,
+    ResourceLeaseHandoff,
     ResourceOwner,
     validate_lease_ttl,
 )
 
 
 _BUSY_TIMEOUT_MS = 5_000
-_SCHEMA_VERSION = 1
-_SCHEMA_STATEMENT = """
+_SCHEMA_VERSION = 2
+_SCHEMA_STATEMENT_V1 = """
 CREATE TABLE resource_leases (
     resource_name TEXT PRIMARY KEY CHECK(length(resource_name) > 0),
     workspace_identity TEXT NOT NULL CHECK(length(workspace_identity) > 0),
@@ -24,6 +26,34 @@ CREATE TABLE resource_leases (
     process_id INTEGER CHECK(process_id IS NULL OR process_id > 0),
     fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
     expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms >= 0)
+)
+"""
+_SCHEMA_STATEMENT = """
+CREATE TABLE resource_leases (
+    resource_name TEXT PRIMARY KEY CHECK(length(resource_name) > 0),
+    workspace_identity TEXT NOT NULL CHECK(length(workspace_identity) > 0),
+    process_instance_id TEXT NOT NULL CHECK(length(process_instance_id) > 0),
+    process_id INTEGER CHECK(process_id IS NULL OR process_id > 0),
+    fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms >= 0),
+    handoff_workspace_identity TEXT,
+    handoff_process_instance_id TEXT,
+    handoff_process_id INTEGER,
+    handoff_nonce TEXT,
+    handoff_expires_at_ms INTEGER,
+    CHECK (
+        (handoff_workspace_identity IS NULL
+         AND handoff_process_instance_id IS NULL
+         AND handoff_process_id IS NULL
+         AND handoff_nonce IS NULL
+         AND handoff_expires_at_ms IS NULL)
+        OR
+        (length(handoff_workspace_identity) > 0
+         AND length(handoff_process_instance_id) > 0
+         AND (handoff_process_id IS NULL OR handoff_process_id > 0)
+         AND length(handoff_nonce) = 43
+         AND handoff_expires_at_ms >= 0)
+    )
 )
 """
 
@@ -45,9 +75,9 @@ def _application_schema(
     return {(row[0], row[1]): _normalize_schema_sql(row[2]) for row in rows}
 
 
-def _expected_schema() -> dict[tuple[str, str], str]:
+def _expected_schema(statement: str = _SCHEMA_STATEMENT) -> dict[tuple[str, str], str]:
     with sqlite3.connect(":memory:") as connection:
-        connection.execute(_SCHEMA_STATEMENT)
+        connection.execute(statement)
         return _application_schema(connection)
 
 
@@ -55,7 +85,7 @@ def _raise_schema_invalid(error: BaseException | None = None) -> None:
     raise DomainError(
         "machine_lease_schema_invalid",
         ErrorCategory.WORKSPACE_INCOMPATIBLE,
-        "Machine resource lease schema does not match version 1",
+        "Machine resource lease schema does not match version 2",
     ) from error
 
 
@@ -139,7 +169,7 @@ class MachineResourceLeaseStore:
     def _initialize_schema(self) -> None:
         with self._transaction(schema_operation=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, _SCHEMA_VERSION):
+            if version not in (0, 1, _SCHEMA_VERSION):
                 raise DomainError(
                     "machine_lease_schema_unsupported",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
@@ -150,6 +180,27 @@ class MachineResourceLeaseStore:
                 if actual_schema:
                     _raise_schema_invalid()
                 connection.execute(_SCHEMA_STATEMENT)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
+            elif version == 1:
+                if actual_schema != _expected_schema(_SCHEMA_STATEMENT_V1):
+                    _raise_schema_invalid()
+                connection.execute(
+                    "ALTER TABLE resource_leases RENAME TO resource_leases_v1"
+                )
+                connection.execute(_SCHEMA_STATEMENT)
+                connection.execute(
+                    """
+                    INSERT INTO resource_leases (
+                        resource_name, workspace_identity, process_instance_id,
+                        process_id, fencing_token, expires_at_ms
+                    )
+                    SELECT resource_name, workspace_identity, process_instance_id,
+                           process_id, fencing_token, expires_at_ms
+                    FROM resource_leases_v1
+                    """
+                )
+                connection.execute("DROP TABLE resource_leases_v1")
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             if actual_schema != _expected_schema():
@@ -247,7 +298,11 @@ class MachineResourceLeaseStore:
                     """
                     UPDATE resource_leases
                     SET workspace_identity = ?, process_instance_id = ?,
-                        process_id = ?, fencing_token = ?, expires_at_ms = ?
+                        process_id = ?, fencing_token = ?, expires_at_ms = ?,
+                        handoff_workspace_identity = NULL,
+                        handoff_process_instance_id = NULL,
+                        handoff_process_id = NULL, handoff_nonce = NULL,
+                        handoff_expires_at_ms = NULL
                     WHERE resource_name = ?
                     """,
                     (
@@ -260,6 +315,145 @@ class MachineResourceLeaseStore:
                     ),
                 )
         return self._lease(resource_name, owner, fencing_token, expires_at_ms)
+
+    def handoff(
+        self,
+        lease: ResourceLease,
+        owner: ResourceOwner,
+        *,
+        ttl_seconds: int,
+    ) -> ResourceLeaseHandoff:
+        if not isinstance(lease, ResourceLease) or not isinstance(owner, ResourceOwner):
+            raise DomainError(
+                "resource_handoff_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Resource lease handoff is invalid",
+            )
+        if lease.owner.workspace_identity != owner.workspace_identity:
+            raise DomainError(
+                "resource_handoff_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Resource lease handoff must stay within one Workspace identity",
+            )
+        validate_lease_ttl(ttl_seconds)
+        now_ms = self._clock()
+        expires_at_ms = now_ms + ttl_seconds * 1_000
+        nonce = token_urlsafe(32)
+        with self._transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE resource_leases
+                SET handoff_workspace_identity = ?,
+                    handoff_process_instance_id = ?, handoff_process_id = ?,
+                    handoff_nonce = ?, handoff_expires_at_ms = ?
+                WHERE resource_name = ? AND workspace_identity = ?
+                  AND process_instance_id = ? AND fencing_token = ?
+                  AND expires_at_ms > ? AND handoff_nonce IS NULL
+                """,
+                (
+                    owner.workspace_identity,
+                    owner.process_instance_id,
+                    owner.process_id,
+                    nonce,
+                    expires_at_ms,
+                    lease.resource_name,
+                    lease.owner.workspace_identity,
+                    lease.owner.process_instance_id,
+                    lease.fencing_token,
+                    now_ms,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise DomainError(
+                    "resource_handoff_invalid",
+                    ErrorCategory.CONFLICT,
+                    "Resource lease is expired, fenced, or already handed off",
+                )
+        return ResourceLeaseHandoff(
+            handoff_version=1,
+            resource_name=lease.resource_name,
+            owner=owner,
+            fencing_token=lease.fencing_token,
+            expires_at_ms=expires_at_ms,
+            nonce=nonce,
+        )
+
+    def adopt(
+        self,
+        handoff: ResourceLeaseHandoff,
+        *,
+        ttl_seconds: int,
+    ) -> ResourceLease:
+        if not isinstance(handoff, ResourceLeaseHandoff):
+            raise DomainError(
+                "resource_handoff_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Resource lease handoff is invalid",
+            )
+        validate_lease_ttl(ttl_seconds)
+        now_ms = self._clock()
+        expires_at_ms = now_ms + ttl_seconds * 1_000
+        with self._transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE resource_leases
+                SET workspace_identity = ?, process_instance_id = ?, process_id = ?,
+                    expires_at_ms = ?, handoff_workspace_identity = NULL,
+                    handoff_process_instance_id = NULL, handoff_process_id = NULL,
+                    handoff_nonce = NULL, handoff_expires_at_ms = NULL
+                WHERE resource_name = ? AND fencing_token = ?
+                  AND expires_at_ms > ? AND handoff_expires_at_ms > ?
+                  AND handoff_workspace_identity = ?
+                  AND handoff_process_instance_id = ?
+                  AND handoff_process_id IS ? AND handoff_nonce = ?
+                """,
+                (
+                    handoff.owner.workspace_identity,
+                    handoff.owner.process_instance_id,
+                    handoff.owner.process_id,
+                    expires_at_ms,
+                    handoff.resource_name,
+                    handoff.fencing_token,
+                    now_ms,
+                    now_ms,
+                    handoff.owner.workspace_identity,
+                    handoff.owner.process_instance_id,
+                    handoff.owner.process_id,
+                    handoff.nonce,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise DomainError(
+                    "resource_handoff_invalid",
+                    ErrorCategory.CONFLICT,
+                    "Resource lease handoff is expired, consumed, or fenced",
+                )
+        return self._lease(
+            handoff.resource_name,
+            handoff.owner,
+            handoff.fencing_token,
+            expires_at_ms,
+        )
+
+    def heartbeat_adopted(
+        self,
+        handoff: ResourceLeaseHandoff,
+        *,
+        ttl_seconds: int,
+    ) -> ResourceLease:
+        return self._heartbeat(
+            handoff.resource_name,
+            handoff.owner,
+            handoff.fencing_token,
+            ttl_seconds,
+        )
+
+    def release_adopted(self, handoff: ResourceLeaseHandoff) -> bool:
+        return self._release(
+            handoff.resource_name,
+            handoff.owner,
+            handoff.fencing_token,
+        )
 
     def _heartbeat(
         self,
@@ -305,9 +499,14 @@ class MachineResourceLeaseStore:
         with self._transaction() as connection:
             updated = connection.execute(
                 """
-                UPDATE resource_leases SET expires_at_ms = 0
+                UPDATE resource_leases SET expires_at_ms = 0,
+                    handoff_workspace_identity = NULL,
+                    handoff_process_instance_id = NULL,
+                    handoff_process_id = NULL, handoff_nonce = NULL,
+                    handoff_expires_at_ms = NULL
                 WHERE resource_name = ? AND workspace_identity = ?
                   AND process_instance_id = ? AND fencing_token = ?
+                  AND expires_at_ms > 0
                 """,
                 (
                     resource_name,

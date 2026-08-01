@@ -384,6 +384,8 @@ def _create_runtime(
     screenshot_process_factory: _ScreenshotProcessFactory | None = None,
     workspace_instance_id: str | None = None,
     current_config_snapshot: JobConfigSnapshot | None = None,
+    adopted_resource_lease=None,
+    expected_job_authority=None,
 ) -> object:
     factory = getattr(runtime_module, "_create_local_video_runtime_components", None)
     assert callable(factory), "Task 16A.1 local runtime composition is missing"
@@ -413,6 +415,8 @@ def _create_runtime(
         model=model,
         owner_id=owner_id,
         current_config_snapshot=current_config_snapshot,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
         clock=(None if now_ms is None else lambda: now_ms),
         screenshot_adapter_factory=(
             None

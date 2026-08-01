@@ -9,6 +9,13 @@ from types import MappingProxyType
 from typing import Mapping
 from uuid import RFC_4122, UUID
 
+from app.core.errors import DomainError
+from app.core.jobs.resource_lease import (
+    JobExecutionAuthority,
+    ResourceLeaseHandoff,
+    ResourceOwner,
+)
+
 
 DESCRIPTOR_VERSION = 1
 ENGINE_PROTOCOL_VERSION = 2
@@ -16,6 +23,7 @@ RUNTIME_COMPATIBILITY_MAJOR = 0
 MAX_DESCRIPTOR_BYTES = 16 * 1024
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_JOB_NOTIFY_BYTES = 4 * 1024
+MAX_WORKER_LAUNCH_BYTES = 4 * 1024
 
 _DESCRIPTOR_KEYS = frozenset(
     {
@@ -47,6 +55,23 @@ _RESPONSE_KEYS = frozenset(
 _METHODS = frozenset({"hello", "health", "shutdown", "job.notify"})
 _LIFECYCLE_METHODS = frozenset({"hello", "health", "shutdown"})
 _JOB_REFERENCE_KEYS = frozenset({"workspace_instance_id", "job_id"})
+_WORKER_LAUNCH_KEYS = frozenset(
+    {"launch_version", "reference", "resource_handoff", "job_authority"}
+)
+_RESOURCE_HANDOFF_KEYS = frozenset(
+    {
+        "handoff_version",
+        "resource_name",
+        "owner",
+        "fencing_token",
+        "expires_at_ms",
+        "nonce",
+    }
+)
+_RESOURCE_OWNER_KEYS = frozenset(
+    {"workspace_identity", "process_instance_id", "process_id"}
+)
+_JOB_AUTHORITY_KEYS = frozenset({"job_id", "owner_id", "fencing_token"})
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 _INSTANCE_ID = re.compile(r"[0-9a-f]{32}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -227,6 +252,102 @@ class EngineJobReference:
 
 
 @dataclass(frozen=True)
+class EngineWorkerLaunchV1:
+    launch_version: int
+    reference: EngineJobReference
+    resource_handoff: ResourceLeaseHandoff
+    job_authority: JobExecutionAuthority
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.launch_version) is not int
+            or self.launch_version != 1
+            or not isinstance(self.reference, EngineJobReference)
+            or not isinstance(self.resource_handoff, ResourceLeaseHandoff)
+            or not isinstance(self.job_authority, JobExecutionAuthority)
+            or self.job_authority.job_id != self.reference.job_id
+            or self.job_authority.owner_id
+            != self.resource_handoff.owner.process_instance_id
+        ):
+            raise EngineProtocolError("engine_worker_launch_invalid")
+
+    def to_bytes(self) -> bytes:
+        payload = _canonical_bytes(
+            {
+                "launch_version": self.launch_version,
+                "reference": {
+                    "workspace_instance_id": self.reference.workspace_instance_id,
+                    "job_id": self.reference.job_id,
+                },
+                "resource_handoff": {
+                    "handoff_version": self.resource_handoff.handoff_version,
+                    "resource_name": self.resource_handoff.resource_name,
+                    "owner": {
+                        "workspace_identity": (
+                            self.resource_handoff.owner.workspace_identity
+                        ),
+                        "process_instance_id": (
+                            self.resource_handoff.owner.process_instance_id
+                        ),
+                        "process_id": self.resource_handoff.owner.process_id,
+                    },
+                    "fencing_token": self.resource_handoff.fencing_token,
+                    "expires_at_ms": self.resource_handoff.expires_at_ms,
+                    "nonce": self.resource_handoff.nonce,
+                },
+                "job_authority": {
+                    "job_id": self.job_authority.job_id,
+                    "owner_id": self.job_authority.owner_id,
+                    "fencing_token": self.job_authority.fencing_token,
+                },
+            },
+            newline=True,
+        )
+        if len(payload) > MAX_WORKER_LAUNCH_BYTES:
+            raise EngineProtocolError("engine_worker_launch_invalid")
+        return payload
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> EngineWorkerLaunchV1:
+        value = _decode_json(payload, maximum=MAX_WORKER_LAUNCH_BYTES)
+        if frozenset(value) != _WORKER_LAUNCH_KEYS:
+            raise EngineProtocolError("engine_worker_launch_invalid")
+        reference = value["reference"]
+        handoff = value["resource_handoff"]
+        authority = value["job_authority"]
+        if (
+            type(reference) is not dict
+            or frozenset(reference) != _JOB_REFERENCE_KEYS
+            or type(handoff) is not dict
+            or frozenset(handoff) != _RESOURCE_HANDOFF_KEYS
+            or type(authority) is not dict
+            or frozenset(authority) != _JOB_AUTHORITY_KEYS
+            or type(handoff["owner"]) is not dict
+            or frozenset(handoff["owner"]) != _RESOURCE_OWNER_KEYS
+        ):
+            raise EngineProtocolError("engine_worker_launch_invalid")
+        try:
+            launch = cls(
+                launch_version=value["launch_version"],
+                reference=EngineJobReference(**reference),
+                resource_handoff=ResourceLeaseHandoff(
+                    handoff_version=handoff["handoff_version"],
+                    resource_name=handoff["resource_name"],
+                    owner=ResourceOwner(**handoff["owner"]),
+                    fencing_token=handoff["fencing_token"],
+                    expires_at_ms=handoff["expires_at_ms"],
+                    nonce=handoff["nonce"],
+                ),
+                job_authority=JobExecutionAuthority(**authority),
+            )
+        except (DomainError, TypeError) as error:
+            raise EngineProtocolError("engine_worker_launch_invalid") from error
+        if launch.to_bytes() != payload:
+            raise EngineProtocolError("engine_worker_launch_invalid")
+        return launch
+
+
+@dataclass(frozen=True)
 class EngineRequest:
     engine_protocol_version: int
     request_id: str
@@ -375,9 +496,11 @@ __all__ = [
     "EngineJobReference",
     "EngineProtocolError",
     "EngineRequest",
+    "EngineWorkerLaunchV1",
     "MAX_DESCRIPTOR_BYTES",
     "MAX_FRAME_BYTES",
     "MAX_JOB_NOTIFY_BYTES",
+    "MAX_WORKER_LAUNCH_BYTES",
     "RUNTIME_COMPATIBILITY_MAJOR",
     "decode_request",
     "decode_response",

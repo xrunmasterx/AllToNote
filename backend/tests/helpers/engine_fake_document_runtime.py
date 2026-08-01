@@ -25,6 +25,7 @@ from app.core.domain.document import (
     DocumentPage,
     ParsedDocument,
 )
+from app.core.jobs.resource_lease import JobExecutionAuthority, ResourceLease
 from app.core.ports.model_executor import ModelExecutionBinding
 from app.core.packs.events import ExecutionPackIdentity, JobPackEnvironmentSnapshot
 from app.runtime_paths import RuntimePaths
@@ -186,6 +187,8 @@ def create_fake_document_runtime_for_workspace(
     paths: RuntimePaths,
     call_log: Path,
     require_existing_job_store: bool,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ):
     registry = WorkspaceInstanceRegistry(
         paths.workspace_registry_parent,
@@ -220,9 +223,10 @@ def create_fake_document_runtime_for_workspace(
         model_execution_binding=binding,
         model_execution_profile="default",
         pack_environment=_PACK_ENVIRONMENT,
-        owner_id=f"document-fixture-{os.getpid()}",
         local_instance_id=instance.instance_id,
         workspace_instance_id=instance.instance_id,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
         require_existing_job_store=require_existing_job_store,
     )
 

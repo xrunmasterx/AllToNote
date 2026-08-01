@@ -312,7 +312,7 @@ def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
         )
         instance = registry.resolve(workspace_root)
         repository = open_engine_job_store(paths, instance)
-        assert repository.get_job(job_id).state.value == "queued"
+        assert repository.get_job(job_id).state.value == "running"
         assert repository.list_attempts(job_id) == ()
 
         worker_release.write_text("continue", encoding="ascii")

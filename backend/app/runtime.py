@@ -135,7 +135,12 @@ from app.core.jobs.model import (
     JobExecutionBinding,
     JobExecutionOwner,
 )
-from app.core.jobs.resource_lease import ResourceLeaseStorePort, ResourceOwner
+from app.core.jobs.resource_lease import (
+    JobExecutionAuthority,
+    ResourceLease,
+    ResourceLeaseStorePort,
+    ResourceOwner,
+)
 from app.core.packs.events import (
     ExecutionPackIdentity,
     JobPackEnvironmentSnapshot,
@@ -1726,11 +1731,14 @@ def _read_checkpoint(
 def _resolve_execution_owner_id(
     owner_id: str | None,
     resource_owner: ResourceOwner | None,
+    adopted_resource_lease: ResourceLease | None = None,
 ) -> str:
     if owner_id is not None:
         return owner_id
     if resource_owner is not None:
         return resource_owner.process_instance_id
+    if adopted_resource_lease is not None:
+        return adopted_resource_lease.owner.process_instance_id
     return f"runtime-{uuid4().hex}"
 
 
@@ -1759,6 +1767,8 @@ def _create_platform_video_runtime_components(
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
     require_existing_job_store: bool = False,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve(
@@ -1837,7 +1847,9 @@ def _create_platform_video_runtime_components(
         portable,
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
+        owner_id=_resolve_execution_owner_id(
+            owner_id, resource_owner, adopted_resource_lease
+        ),
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
@@ -1852,6 +1864,8 @@ def _create_platform_video_runtime_components(
         source_identity_resolver=resolve_source_identity,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return (
         _create_video_runtime(
@@ -1882,6 +1896,8 @@ def create_platform_video_runtime(
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
     require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_platform_video_runtime_components(
@@ -1902,6 +1918,8 @@ def create_platform_video_runtime(
         clock=clock,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
         require_existing_job_store=require_existing_job_store,
     )
     return runtime
@@ -1924,6 +1942,8 @@ def create_document_runtime(
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
     require_existing_job_store: bool = False,
 ) -> AllToNoteRuntime:
     verifier_options = (
@@ -2026,7 +2046,9 @@ def create_document_runtime(
         portable,
         work_root=storage.root,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
+        owner_id=_resolve_execution_owner_id(
+            owner_id, resource_owner, adopted_resource_lease
+        ),
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         source_identity_resolver=resolve_source_identity,
@@ -2034,6 +2056,8 @@ def create_document_runtime(
         pack_environment=pack_environment,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return _create_document_runtime(
         service,
@@ -2145,6 +2169,8 @@ def create_document_runtime_for_workspace(
     requested_verifier_provider_profile: str | None = None,
     execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
     require_existing_job_store: bool = False,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> AllToNoteRuntime:
     if local_app_data is not None and runtime_paths is not None:
         raise ValueError("runtime_path_override_conflict")
@@ -2166,9 +2192,24 @@ def create_document_runtime_for_workspace(
         ).manifest.workspace_id,
     )
     instance = registry.resolve(workspace_root)
-    process_instance_id, resource_lease_store, resource_owner = (
-        _workspace_resource_admission(paths, instance)
-    )
+    if (adopted_resource_lease is None) != (expected_job_authority is None):
+        raise ValueError("resource_adoption_pair_required")
+    if adopted_resource_lease is None:
+        process_instance_id, resource_lease_store, resource_owner = (
+            _workspace_resource_admission(paths, instance)
+        )
+    else:
+        if (
+            adopted_resource_lease.owner.workspace_identity
+            != instance.workspace_identity
+            or expected_job_authority is None
+            or adopted_resource_lease.owner.process_instance_id
+            != expected_job_authority.owner_id
+        ):
+            raise ValueError("resource_adoption_owner_mismatch")
+        process_instance_id = adopted_resource_lease.owner.process_instance_id
+        resource_lease_store = None
+        resource_owner = None
     status = CodexAppServerStatusService.get_status()
     snapshot_values = (
         current_config_snapshot.values
@@ -2321,6 +2362,8 @@ def create_document_runtime_for_workspace(
         workspace_instance_id=instance.instance_id,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
         require_existing_job_store=require_existing_job_store,
     )
 
@@ -2344,6 +2387,8 @@ def _create_local_video_runtime_components(
     | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     resolved_machine_root = Path(machine_root).resolve()
     resolved_machine_root.mkdir(parents=True, exist_ok=True)
@@ -2383,7 +2428,9 @@ def _create_local_video_runtime_components(
         IWikiPortableGateway(),
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
+        owner_id=_resolve_execution_owner_id(
+            owner_id, resource_owner, adopted_resource_lease
+        ),
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
@@ -2392,6 +2439,8 @@ def _create_local_video_runtime_components(
         current_config_snapshot=current_config_snapshot,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return _create_video_runtime(service, repository), service
 
@@ -2415,6 +2464,8 @@ def create_local_video_runtime(
     | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_local_video_runtime_components(
         machine_root,
@@ -2431,6 +2482,8 @@ def create_local_video_runtime(
         screenshot_adapter_factory=screenshot_adapter_factory,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return runtime
 
@@ -2453,6 +2506,8 @@ def _create_fake_runtime_components(
     current_config_snapshot: JobConfigSnapshot | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> tuple[AllToNoteRuntime, VideoService]:
     call_counts = calls or FakeCallCounts()
     resolved_machine_root = Path(machine_root).resolve()
@@ -2484,13 +2539,17 @@ def _create_fake_runtime_components(
         IWikiPortableGateway(),
         operations,
         checkpoint_reader=lambda metadata: _read_checkpoint(storage, metadata),
-        owner_id=_resolve_execution_owner_id(owner_id, resource_owner),
+        owner_id=_resolve_execution_owner_id(
+            owner_id, resource_owner, adopted_resource_lease
+        ),
         work_root=storage.root,
         local_instance_id=local_instance_id
         or hashlib.sha256(str(resolved_machine_root).encode("utf-8")).hexdigest()[:32],
         current_config_snapshot=current_config_snapshot,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return (
         _create_video_runtime(
@@ -2520,6 +2579,8 @@ def create_fake_runtime(
     current_config_snapshot: JobConfigSnapshot | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> AllToNoteRuntime:
     runtime, _ = _create_fake_runtime_components(
         machine_root,
@@ -2538,6 +2599,8 @@ def create_fake_runtime(
         current_config_snapshot=current_config_snapshot,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return runtime
 
@@ -2601,6 +2664,8 @@ def create_codex_app_server_runtime_for_workspace(
     current_config_snapshot: JobConfigSnapshot | None = None,
     execution_pack_environment: JobPackEnvironmentSnapshot | None = None,
     require_existing_job_store: bool = False,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> AllToNoteRuntime:
     """Create the real URL producer using the locally authenticated Codex CLI."""
 
@@ -2770,9 +2835,24 @@ def create_codex_app_server_runtime_for_workspace(
             resolve_pack_ports(pack_environment)
         )
 
-    process_instance_id, resource_lease_store, resource_owner = (
-        _workspace_resource_admission(paths, instance)
-    )
+    if (adopted_resource_lease is None) != (expected_job_authority is None):
+        raise ValueError("resource_adoption_pair_required")
+    if adopted_resource_lease is None:
+        process_instance_id, resource_lease_store, resource_owner = (
+            _workspace_resource_admission(paths, instance)
+        )
+    else:
+        if (
+            adopted_resource_lease.owner.workspace_identity
+            != instance.workspace_identity
+            or expected_job_authority is None
+            or adopted_resource_lease.owner.process_instance_id
+            != expected_job_authority.owner_id
+        ):
+            raise ValueError("resource_adoption_owner_mismatch")
+        process_instance_id = adopted_resource_lease.owner.process_instance_id
+        resource_lease_store = None
+        resource_owner = None
     return create_platform_video_runtime(
         instance.machine_root,
         source=source,
@@ -2790,6 +2870,8 @@ def create_codex_app_server_runtime_for_workspace(
         pack_port_resolver=resolve_pack_ports,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
         require_existing_job_store=require_existing_job_store,
     )
 

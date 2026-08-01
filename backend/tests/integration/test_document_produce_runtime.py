@@ -68,7 +68,11 @@ from app.core.domain.video import RetryJobRequest, VideoProduceRequest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState, JobExecutionOwner, JobState
-from app.core.jobs.resource_lease import ResourceOwner
+from app.core.jobs.resource_lease import (
+    JobExecutionAuthority,
+    ResourceLease,
+    ResourceOwner,
+)
 from app.core.packs.events import ExecutionPackIdentity, JobPackEnvironmentSnapshot
 from app.core.ports.jobs import SourceIdentityBinding
 from app.core.ports.model_executor import ModelExecutionBinding
@@ -546,6 +550,8 @@ def _service(
     owner_id: str,
     resource_lease_store: MachineResourceLeaseStore | None = None,
     resource_owner: ResourceOwner | None = None,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
     knowledge_compiler: _KnowledgeCompiler | None = None,
     pack_environment: JobPackEnvironmentSnapshot | None = (
         _DOCUMENT_PACK_ENVIRONMENT
@@ -587,6 +593,8 @@ def _service(
         pack_environment=pack_environment,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
+        adopted_resource_lease=adopted_resource_lease,
+        expected_job_authority=expected_job_authority,
     )
     return service, repository
 
@@ -2245,6 +2253,101 @@ def test_machine_lease_store_busy_does_not_fail_document_job(
         router.wait_job(job_id)
 
     assert router.get_job(job_id).state is JobState.RUNNING
+    assert parser.calls == 0
+
+
+def test_document_worker_consumes_adopted_resource_and_exact_job_authority(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    machine_root = tmp_path / "document-adopted-machine"
+    first_service, repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="submitter",
+    )
+    job_id, _ = _submit(first_service, repository, workspace, source)
+    store = MachineResourceLeaseStore.open(tmp_path / "document-adopted-resource")
+    supervisor = ResourceOwner("document-workspace", "engine-supervisor", 101)
+    worker = ResourceOwner("document-workspace", "engine-worker", 202)
+    source_lease = store.acquire("produce:heavy:v1", supervisor, ttl_seconds=300)
+    handoff = store.handoff(source_lease, worker, ttl_seconds=300)
+    adopted = store.adopt(handoff, ttl_seconds=300)
+    authority = repository.claim_job(
+        job_id, worker.process_instance_id, ttl_seconds=300
+    ).authority
+    parser = _Parser()
+    service, reopened = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id=worker.process_instance_id,
+        adopted_resource_lease=adopted,
+        expected_job_authority=authority,
+    )
+    router = JobExecutionRouter(
+        reopened,
+        ((service.execution_binding, service),),
+    )
+
+    assert router.wait_job(job_id).state is JobState.SUCCEEDED
+    assert parser.calls == 1
+    next_lease = store.acquire(
+        "produce:heavy:v1",
+        ResourceOwner("other-workspace", "other-worker", 303),
+        ttl_seconds=300,
+    )
+    assert next_lease.release()
+
+
+def test_document_worker_rejects_mismatched_expected_job_authority_before_parse(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    machine_root = tmp_path / "document-fenced-machine"
+    first_service, repository = _service(
+        machine_root,
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="submitter",
+    )
+    job_id, _ = _submit(first_service, repository, workspace, source)
+    store = MachineResourceLeaseStore.open(tmp_path / "document-fenced-resource")
+    supervisor = ResourceOwner("document-workspace", "engine-supervisor", 101)
+    worker = ResourceOwner("document-workspace", "engine-worker", 202)
+    source_lease = store.acquire("produce:heavy:v1", supervisor, ttl_seconds=300)
+    adopted = store.adopt(
+        store.handoff(source_lease, worker, ttl_seconds=300),
+        ttl_seconds=300,
+    )
+    authority = repository.claim_job(
+        job_id, worker.process_instance_id, ttl_seconds=300
+    ).authority
+    parser = _Parser()
+    service, reopened = _service(
+        machine_root,
+        parser,
+        IWikiPortableGateway(),
+        owner_id=worker.process_instance_id,
+        adopted_resource_lease=adopted,
+        expected_job_authority=JobExecutionAuthority(
+            authority.owner_id,
+            authority.fencing_token + 1,
+            authority.job_id,
+        ),
+    )
+    router = JobExecutionRouter(
+        reopened,
+        ((service.execution_binding, service),),
+    )
+
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        router.wait_job(job_id)
     assert parser.calls == 0
 
 

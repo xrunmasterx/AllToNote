@@ -514,14 +514,28 @@ class VideoService:
         source_identity_resolver: SourceIdentityResolver | None = None,
         resource_lease_store: ResourceLeaseStorePort | None = None,
         resource_owner: ResourceOwner | None = None,
+        adopted_resource_lease: ResourceLease | None = None,
+        expected_job_authority: JobExecutionAuthority | None = None,
     ) -> None:
         if (resource_lease_store is None) != (resource_owner is None):
             raise ValueError("resource_admission_pair_required")
+        if (adopted_resource_lease is None) != (expected_job_authority is None):
+            raise ValueError("resource_adoption_pair_required")
+        if resource_owner is not None and adopted_resource_lease is not None:
+            raise ValueError("resource_admission_mode_conflict")
         if (
             resource_owner is not None
             and owner_id != resource_owner.process_instance_id
         ):
             raise ValueError("resource_admission_owner_mismatch")
+        if adopted_resource_lease is not None and (
+            adopted_resource_lease.resource_name
+            != HEAVY_PRODUCTION_RESOURCE_NAME
+            or owner_id != adopted_resource_lease.owner.process_instance_id
+            or expected_job_authority is None
+            or owner_id != expected_job_authority.owner_id
+        ):
+            raise ValueError("resource_adoption_owner_mismatch")
         self._repository = repository
         self._job_service = JobService(repository)
         self._attempt_storage = attempt_storage
@@ -545,6 +559,8 @@ class VideoService:
         self._source_identity_resolver = source_identity_resolver
         self._resource_lease_store = resource_lease_store
         self._resource_owner = resource_owner
+        self._adopted_resource_lease = adopted_resource_lease
+        self._expected_job_authority = expected_job_authority
         self._active_resource_lease: ResourceLease | None = None
         self._submitted_config_snapshots: dict[str, JobConfigSnapshot] = {}
         self._execution_lock = threading.Lock()
@@ -674,6 +690,7 @@ class VideoService:
         self._assert_pack_environment_compatible(job_id)
         self._assert_config_compatible(job_id)
         request = self._load_request(job_id)
+        self._assert_expected_job_authority(job_id)
         self._acquire_resource_lease()
         try:
             try:
@@ -696,6 +713,15 @@ class VideoService:
                 raise
             authority = claim.authority
             try:
+                if (
+                    self._expected_job_authority is not None
+                    and authority != self._expected_job_authority
+                ):
+                    raise DomainError(
+                        "job_claim_fenced",
+                        ErrorCategory.CONFLICT,
+                        "Job execution authority is expired or fenced",
+                    )
                 snapshot = self._snapshot(job_id)
                 if snapshot.state in {
                     JobState.SUCCEEDED,
@@ -758,6 +784,17 @@ class VideoService:
             self._release_resource_lease()
 
     def _acquire_resource_lease(self) -> None:
+        if self._adopted_resource_lease is not None:
+            self._active_resource_lease = self._adopted_resource_lease
+            self._adopted_resource_lease = None
+            self._heartbeat_resource_lease()
+            return
+        if self._expected_job_authority is not None:
+            raise DomainError(
+                "resource_lease_lost",
+                ErrorCategory.CONFLICT,
+                "Machine resource lease is expired or fenced",
+            )
         if self._resource_lease_store is None or self._resource_owner is None:
             return
         self._active_resource_lease = self._resource_lease_store.acquire(
@@ -765,6 +802,17 @@ class VideoService:
             self._resource_owner,
             ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
         )
+
+    def _assert_expected_job_authority(self, job_id: str) -> None:
+        if (
+            self._expected_job_authority is not None
+            and self._expected_job_authority.job_id != job_id
+        ):
+            raise DomainError(
+                "job_claim_fenced",
+                ErrorCategory.CONFLICT,
+                "Job execution authority is expired or fenced",
+            )
 
     def _heartbeat_resource_lease(self) -> None:
         if self._active_resource_lease is None:

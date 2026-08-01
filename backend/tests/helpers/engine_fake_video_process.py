@@ -16,6 +16,11 @@ from iwiki.workspace import open_workspace
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.adapters.worker_process import minimal_worker_environment, run_worker_process
 from app.core.jobs.model import JobExecutionOwner
+from app.core.jobs.resource_lease import JobExecutionAuthority, ResourceLease
+from app.engine.contracts import (
+    MAX_WORKER_LAUNCH_BYTES,
+    EngineWorkerLaunchV1,
+)
 from app.engine.host import run_engine_host
 from app.engine.job_dispatcher import EngineJobDispatcher
 from app.engine.job_worker import execute_engine_job
@@ -47,6 +52,14 @@ def _wait_for_file(path: Path) -> None:
 
 def _run_worker(args: argparse.Namespace) -> int:
     paths = _runtime_paths(args)
+    launch = EngineWorkerLaunchV1.from_bytes(
+        sys.stdin.buffer.read(MAX_WORKER_LAUNCH_BYTES + 1)
+    )
+    if (
+        launch.reference.workspace_instance_id != args.workspace_instance_id
+        or launch.reference.job_id != args.job_id
+    ):
+        raise RuntimeError("engine_worker_launch_mismatch")
     args.worker_started.write_text(str(os.getpid()), encoding="ascii")
     _wait_for_file(args.worker_release)
 
@@ -57,6 +70,8 @@ def _run_worker(args: argparse.Namespace) -> int:
         current_config_snapshot,
         execution_owner: JobExecutionOwner,
         require_existing_job_store: bool,
+        adopted_resource_lease: ResourceLease,
+        expected_job_authority: JobExecutionAuthority,
     ) -> JobRuntime:
         if not require_existing_job_store:
             raise RuntimeError("existing_job_store_required")
@@ -81,6 +96,8 @@ def _run_worker(args: argparse.Namespace) -> int:
                 paths=runtime_paths,
                 call_log=args.call_log,
                 require_existing_job_store=True,
+                adopted_resource_lease=adopted_resource_lease,
+                expected_job_authority=expected_job_authority,
             )
         elif args.recipe_kind == "video-local":
             from tests.integration.test_local_media_golden_path import _create_runtime
@@ -88,9 +105,10 @@ def _run_worker(args: argparse.Namespace) -> int:
             runtime = _create_runtime(
                 instance.machine_root,
                 call_log=args.call_log,
-                owner_id="engine-local-video-worker",
                 workspace_instance_id=instance.instance_id,
                 current_config_snapshot=current_config_snapshot,
+                adopted_resource_lease=adopted_resource_lease,
+                expected_job_authority=expected_job_authority,
             )
         else:
             from app.runtime import create_fake_runtime
@@ -100,6 +118,8 @@ def _run_worker(args: argparse.Namespace) -> int:
                 workspace_instance_id=instance.instance_id,
                 current_config_snapshot=current_config_snapshot,
                 call_log_path=args.call_log,
+                adopted_resource_lease=adopted_resource_lease,
+                expected_job_authority=expected_job_authority,
             )
         return JobRuntime(
             runtime.job_repository,
@@ -114,6 +134,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             workspace_instance_id=args.workspace_instance_id,
             job_id=args.job_id,
             runtime_factory=runtime_factory,
+            launch=launch,
         )
     finally:
         args.worker_finished.write_text(str(os.getpid()), encoding="ascii")
@@ -129,7 +150,8 @@ def _run_host(args: argparse.Namespace) -> int:
 
         signal.signal(signal.SIGTERM, terminate_host)
 
-    def worker_runner(reference, check_running) -> int:
+    def worker_runner(launch: EngineWorkerLaunchV1, check_running) -> int:
+        reference = launch.reference
         command = (
             str(Path(sys.executable).resolve()),
             "-I",
@@ -158,6 +180,7 @@ def _run_host(args: argparse.Namespace) -> int:
             environment=minimal_worker_environment(),
             timeout_seconds=_PROCESS_TIMEOUT_SECONDS,
             check_running=check_running,
+            stdin_payload=launch.to_bytes(),
         )
 
     import app.engine.host as host_module

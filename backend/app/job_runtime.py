@@ -36,6 +36,7 @@ from app.core.jobs.model import (
     JobExecutionOwner,
     LOCAL_USER_PRINCIPAL,
 )
+from app.core.jobs.resource_lease import JobExecutionAuthority, ResourceLease
 from app.core.jobs.state_machine import TERMINAL_JOB_STATES
 from app.core.packs.events import (
     JOB_PACK_ENVIRONMENT_EVENT,
@@ -455,11 +456,15 @@ def create_job_runtime_for_workspace(
     current_config_snapshot: JobConfigSnapshot | None,
     execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
     require_existing_job_store: bool = False,
+    adopted_resource_lease: ResourceLease | None = None,
+    expected_job_authority: JobExecutionAuthority | None = None,
 ) -> JobRuntime:
     from iwiki.workspace import open_workspace
 
     if local_app_data is not None and runtime_paths is not None:
         raise ValueError("runtime_path_override_conflict")
+    if (adopted_resource_lease is None) != (expected_job_authority is None):
+        raise ValueError("resource_adoption_pair_required")
     paths = runtime_paths or resolve_runtime_paths(
         local_data_parent=local_app_data
     )
@@ -490,6 +495,14 @@ def create_job_runtime_for_workspace(
 
     def execute(job_id: str) -> JobSnapshot:
         binding = _require_supported_execution_binding(repository, job_id)
+        execution_authority_options = (
+            {
+                "adopted_resource_lease": adopted_resource_lease,
+                "expected_job_authority": expected_job_authority,
+            }
+            if adopted_resource_lease is not None
+            else {}
+        )
         if binding == _DOCUMENT_EXECUTION_BINDING:
             from app.runtime import create_document_runtime_for_workspace
 
@@ -551,6 +564,7 @@ def create_job_runtime_for_workspace(
                 ),
                 execution_pack_environment=execution_pack_environment,
                 require_existing_job_store=require_existing_job_store,
+                **execution_authority_options,
             )
         else:
             from app.runtime import create_codex_app_server_runtime_for_workspace
@@ -565,6 +579,7 @@ def create_job_runtime_for_workspace(
                     binding,
                 ),
                 require_existing_job_store=require_existing_job_store,
+                **execution_authority_options,
             )
         return runtime.wait_job(job_id)
 

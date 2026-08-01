@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -11,6 +13,7 @@ from app.core.jobs.model import Attempt, Job, JobExecutionBinding
 MIN_LEASE_TTL_SECONDS = 1
 MAX_LEASE_TTL_SECONDS = 300
 HEAVY_PRODUCTION_RESOURCE_NAME = "produce:heavy:v1"
+_HANDOFF_NONCE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
 def validate_lease_ttl(ttl_seconds: int) -> None:
@@ -92,6 +95,50 @@ class ResourceOwner:
 
 
 @dataclass(frozen=True)
+class ResourceLeaseHandoff:
+    handoff_version: int
+    resource_name: str
+    owner: ResourceOwner
+    fencing_token: int
+    expires_at_ms: int
+    nonce: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.handoff_version) is not int
+            or self.handoff_version != 1
+            or type(self.resource_name) is not str
+            or not self.resource_name.strip()
+            or not isinstance(self.owner, ResourceOwner)
+            or type(self.fencing_token) is not int
+            or self.fencing_token < 1
+            or type(self.expires_at_ms) is not int
+            or self.expires_at_ms < 0
+            or type(self.nonce) is not str
+            or _HANDOFF_NONCE.fullmatch(self.nonce) is None
+        ):
+            raise DomainError(
+                "resource_handoff_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Resource lease handoff is invalid",
+            )
+        try:
+            decoded = base64.urlsafe_b64decode(self.nonce + "=")
+        except ValueError as error:
+            raise DomainError(
+                "resource_handoff_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Resource lease handoff is invalid",
+            ) from error
+        if len(decoded) != 32:
+            raise DomainError(
+                "resource_handoff_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Resource lease handoff is invalid",
+            )
+
+
+@dataclass(frozen=True)
 class ResourceLease:
     resource_name: str
     owner: ResourceOwner
@@ -118,6 +165,21 @@ class ResourceLeaseStorePort(Protocol):
         ttl_seconds: int,
     ) -> ResourceLease: ...
 
+    def handoff(
+        self,
+        lease: ResourceLease,
+        owner: ResourceOwner,
+        *,
+        ttl_seconds: int,
+    ) -> ResourceLeaseHandoff: ...
+
+    def adopt(
+        self,
+        handoff: ResourceLeaseHandoff,
+        *,
+        ttl_seconds: int,
+    ) -> ResourceLease: ...
+
 
 __all__ = [
     "ExecutionAuthority",
@@ -127,6 +189,7 @@ __all__ = [
     "MIN_LEASE_TTL_SECONDS",
     "PersistedJobClaim",
     "ResourceLease",
+    "ResourceLeaseHandoff",
     "ResourceLeaseStorePort",
     "ResourceOwner",
     "validate_lease_ttl",

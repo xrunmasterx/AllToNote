@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app.adapters.jobs.machine_resource_lease import MachineResourceLeaseStore
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
 from app.core.errors import DomainError, ErrorCategory
@@ -14,7 +15,11 @@ from app.core.jobs.model import (
     JobExecutionOwner,
     JobState,
 )
-from app.engine.contracts import EngineJobReference
+from app.core.jobs.resource_lease import (
+    HEAVY_PRODUCTION_RESOURCE_NAME,
+    ResourceOwner,
+)
+from app.engine.contracts import EngineJobReference, EngineWorkerLaunchV1
 from app.engine.job_dispatcher import EngineJobDispatcher
 from app.runtime_paths import RuntimePaths, resolve_runtime_paths
 
@@ -40,18 +45,38 @@ def test_default_worker_command_preserves_all_runtime_roots(
         state_dir=tmp_path / "state root" / "AllToNote",
         log_dir=tmp_path / "log root" / "AllToNote",
     )
-    observed: list[tuple[str, ...]] = []
+    observed: list[tuple[tuple[str, ...], dict[str, object]]] = []
     monkeypatch.setattr(
         "app.engine.job_dispatcher.run_worker_process",
-        lambda command, **_kwargs: observed.append(command) or 0,
+        lambda command, **kwargs: observed.append((command, kwargs)) or 0,
     )
     reference = EngineJobReference(
         "1" * 32,
         "job_018f0000-0000-7000-8000-000000000001",
     )
+    owner = ResourceOwner("workspace", "engine-worker")
+    from app.core.jobs.resource_lease import (
+        JobExecutionAuthority,
+        ResourceLeaseHandoff,
+    )
 
-    assert EngineJobDispatcher(paths)._run_worker(reference, lambda: None) == 0
-    command = observed[0]
+    launch = EngineWorkerLaunchV1(
+        1,
+        reference,
+        ResourceLeaseHandoff(
+            1,
+            HEAVY_PRODUCTION_RESOURCE_NAME,
+            owner,
+            1,
+            30_000,
+            "a" * 43,
+        ),
+        JobExecutionAuthority(owner.process_instance_id, 1, reference.job_id),
+    )
+
+    assert EngineJobDispatcher(paths)._run_worker(launch, lambda: None) == 0
+    command, options = observed[0]
+    assert options["stdin_payload"] == launch.to_bytes()
     for flag, expected in (
         ("--config-dir", paths.config_dir),
         ("--data-dir", paths.data_dir),
@@ -60,6 +85,120 @@ def test_default_worker_command_preserves_all_runtime_roots(
         ("--log-dir", paths.log_dir),
     ):
         assert command[command.index(flag) + 1] == str(expected)
+
+
+def test_dispatcher_admits_resource_and_exact_job_authority_before_worker(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, reference = _registered_job(
+        tmp_path,
+        client_request_id="pre-admission",
+    )
+    observed = threading.Event()
+
+    def run_worker(launch: EngineWorkerLaunchV1, check_running) -> int:
+        assert launch.reference == reference
+        store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+        adopted = store.adopt(launch.resource_handoff, ttl_seconds=30)
+        assert adopted.owner.process_instance_id == launch.job_authority.owner_id
+        claim = repository.claim_job(
+            job.job_id,
+            adopted.owner.process_instance_id,
+            ttl_seconds=30,
+        )
+        assert claim.authority == launch.job_authority
+        check_running()
+        repository.cancel_job(job.job_id)
+        observed.set()
+        return 0
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        dispatcher.start()
+        assert observed.wait(timeout=5)
+        for _index in range(500):
+            if repository.get_job(job.job_id).state is JobState.CANCELLED:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        dispatcher.close(force=True)
+
+    assert repository.get_job(job.job_id).state is JobState.CANCELLED
+
+
+def test_dispatcher_resource_busy_starts_no_worker_and_keeps_job_durable(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, reference = _registered_job(
+        tmp_path,
+        client_request_id="resource-busy",
+    )
+    store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+    competing = store.acquire(
+        HEAVY_PRODUCTION_RESOURCE_NAME,
+        ResourceOwner("another-workspace", "another-runtime"),
+        ttl_seconds=30,
+    )
+    called = threading.Event()
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=lambda _launch, _check: called.set() or 0,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        dispatcher.start()
+        dispatcher.notify(reference)
+        threading.Event().wait(0.2)
+    finally:
+        dispatcher.close(force=True)
+        competing.release()
+
+    assert called.is_set() is False
+    assert repository.get_job(job.job_id).state is JobState.QUEUED
+
+
+def test_dispatcher_spawn_failure_releases_both_preclaims(
+    tmp_path: Path,
+) -> None:
+    paths, repository, job, reference = _registered_job(
+        tmp_path,
+        client_request_id="spawn-failure",
+    )
+    attempted = threading.Event()
+
+    def fail_spawn(_launch: EngineWorkerLaunchV1, _check_running) -> int:
+        attempted.set()
+        raise OSError("spawn failed")
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=fail_spawn,
+        reconcile_interval_seconds=60,
+    )
+    try:
+        dispatcher.start()
+        assert attempted.wait(timeout=5)
+        for _index in range(500):
+            if not dispatcher.has_work:
+                break
+            threading.Event().wait(0.01)
+    finally:
+        dispatcher.close(force=True)
+
+    store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+    resource = store.acquire(
+        HEAVY_PRODUCTION_RESOURCE_NAME,
+        ResourceOwner("identity-spawn-failure", "replacement-worker"),
+        ttl_seconds=30,
+    )
+    claim = repository.claim_job(job.job_id, "replacement-worker", ttl_seconds=30)
+    assert claim.authority.owner_id == "replacement-worker"
+    repository.release_job_claim(claim.authority)
+    resource.release()
 
 
 def _registered_job(
@@ -105,8 +244,8 @@ def test_startup_reconcile_dispatches_persisted_engine_job_without_notify(
     observed = threading.Event()
     calls: list[EngineJobReference] = []
 
-    def run_worker(candidate: EngineJobReference, _check_running) -> int:
-        calls.append(candidate)
+    def run_worker(launch: EngineWorkerLaunchV1, _check_running) -> int:
+        calls.append(launch.reference)
         repository.cancel_job(job.job_id)
         observed.set()
         return 0
@@ -255,7 +394,8 @@ def test_failed_oldest_job_does_not_starve_lost_notification_job(
     healthy_observed = threading.Event()
     calls: list[EngineJobReference] = []
 
-    def run_worker(candidate: EngineJobReference, _check_running) -> int:
+    def run_worker(launch: EngineWorkerLaunchV1, _check_running) -> int:
+        candidate = launch.reference
         calls.append(candidate)
         if candidate == poison and calls.count(poison) == 1:
             return 1
@@ -324,7 +464,7 @@ def test_graceful_close_refuses_active_worker(tmp_path: Path) -> None:
     started = threading.Event()
     release = threading.Event()
 
-    def run_worker(_candidate: EngineJobReference, _check_running) -> int:
+    def run_worker(_launch: EngineWorkerLaunchV1, _check_running) -> int:
         started.set()
         assert release.wait(timeout=5)
         repository.cancel_job(job.job_id)
@@ -345,6 +485,49 @@ def test_graceful_close_refuses_active_worker(tmp_path: Path) -> None:
         dispatcher.close(force=True)
 
 
+def test_worker_watchdog_settles_durable_cancellation_and_releases_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, job, reference = _registered_job(
+        tmp_path,
+        client_request_id="watchdog-cancellation",
+    )
+    monkeypatch.setattr(
+        "app.engine.job_dispatcher.WORKER_CANCELLATION_GRACE_SECONDS",
+        0.0,
+    )
+
+    def run_worker(_launch: EngineWorkerLaunchV1, check_running) -> int:
+        repository.cancel_job(job.job_id)
+        check_running()
+        pytest.fail("cancelled worker was not stopped")
+
+    dispatcher = EngineJobDispatcher(
+        paths,
+        worker_runner=run_worker,
+        reconcile_interval_seconds=60,
+    )
+    dispatcher.start()
+    try:
+        dispatcher.notify(reference)
+        for _index in range(500):
+            if not dispatcher.has_work:
+                break
+            threading.Event().wait(0.01)
+        assert dispatcher.has_work is False
+        assert repository.get_job(job.job_id).state is JobState.CANCELLED
+        resource_store = MachineResourceLeaseStore.open(paths.data_dir / "machine")
+        lease = resource_store.acquire(
+            HEAVY_PRODUCTION_RESOURCE_NAME,
+            ResourceOwner("other-workspace", "other-worker", process_id=303),
+            ttl_seconds=300,
+        )
+        assert lease.release()
+    finally:
+        dispatcher.close(force=True)
+
+
 def test_graceful_shutdown_waits_for_active_worker_without_killing_it(
     tmp_path: Path,
 ) -> None:
@@ -355,7 +538,7 @@ def test_graceful_shutdown_waits_for_active_worker_without_killing_it(
     started = threading.Event()
     release = threading.Event()
 
-    def run_worker(_candidate: EngineJobReference, check_running) -> int:
+    def run_worker(_launch: EngineWorkerLaunchV1, check_running) -> int:
         started.set()
         assert release.wait(timeout=5)
         check_running()
