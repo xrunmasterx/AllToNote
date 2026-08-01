@@ -549,35 +549,6 @@ def test_wait_and_detach_are_mutually_exclusive(
     assert envelope["error"]["code"] == "cli_usage_invalid"
 
 
-def test_document_detach_is_rejected_before_submission_or_notification(
-    workspace_root: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    runtime = _GenericCaptureRuntime()
-    client = _EngineNotifySpy()
-
-    code = main(
-        [
-            "produce",
-            str(workspace_root / "document.pdf"),
-            "--recipe",
-            "alltonote.document-note@1",
-            "--workspace",
-            str(workspace_root),
-            "--detach",
-            "--json",
-        ],
-        runtime=runtime,
-        engine_client=client,
-    )
-    envelope = json.loads(capsys.readouterr().out)
-
-    assert code == 2
-    assert envelope["error"]["code"] == "detach_recipe_unsupported"
-    assert runtime.requests == []
-    assert client.references == []
-
-
 class _UnregisteredDetachRuntime:
     workspace_instance_id = None
 

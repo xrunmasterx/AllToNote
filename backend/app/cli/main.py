@@ -829,12 +829,6 @@ def _produce_generic(
 
     if args.request is not None:
         request = load_produce_request(args.request)
-        if not args.wait and request.recipe_key == _DOCUMENT_NOTE_V1:
-            raise DomainError(
-                "detach_recipe_unsupported",
-                ErrorCategory.INVALID_REQUEST,
-                "Detached execution is supported only for Video Recipes",
-            )
         workspace_root = Path(request.workspace_ref).resolve()
         if request.recipe_key == _DOCUMENT_NOTE_V1:
             request = replace(request, workspace_ref=str(workspace_root))
@@ -894,12 +888,6 @@ def _produce_generic(
             )
     else:
         key = parse_recipe_selector(args.recipe)
-        if not args.wait and key == _DOCUMENT_NOTE_V1:
-            raise DomainError(
-                "detach_recipe_unsupported",
-                ErrorCategory.INVALID_REQUEST,
-                "Detached execution is supported only for Video Recipes",
-            )
         requested_outputs = ("knowledge-note",)
         if key == _DOCUMENT_NOTE_V1:
             effective_args = argparse.Namespace(

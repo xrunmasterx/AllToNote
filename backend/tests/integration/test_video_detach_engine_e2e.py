@@ -11,6 +11,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from multiprocessing import get_context
 from pathlib import Path
 
+import pytest
 from iwiki.workspace import open_workspace
 
 from app.adapters.jobs.workspace_instance_registry import WorkspaceInstanceRegistry
@@ -40,29 +41,55 @@ def _wait_for_file(path: Path, *, timeout_seconds: float) -> None:
 def _run_detached_submit(
     workspace_root: Path,
     local_data_parent: Path,
+    recipe_kind: str,
+    input_value: str,
+    call_log: Path,
     results,
 ) -> None:
-    from app.runtime import create_fake_runtime_for_workspace
-
     paths = resolve_runtime_paths(local_data_parent=local_data_parent)
-    runtime = create_fake_runtime_for_workspace(
-        workspace_root,
-        local_app_data=local_data_parent,
-    )
+    if recipe_kind == "document":
+        from tests.helpers.engine_fake_document_runtime import (
+            create_fake_document_runtime_for_workspace,
+        )
+
+        runtime = create_fake_document_runtime_for_workspace(
+            workspace_root,
+            paths=paths,
+            call_log=call_log,
+            require_existing_job_store=False,
+        )
+        arguments = [
+            "produce",
+            input_value,
+            "--recipe",
+            "alltonote.document-note@1",
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ]
+    else:
+        from app.runtime import create_fake_runtime_for_workspace
+
+        runtime = create_fake_runtime_for_workspace(
+            workspace_root,
+            local_app_data=local_data_parent,
+        )
+        arguments = [
+            "produce",
+            "video",
+            "--input",
+            input_value,
+            "--workspace",
+            str(workspace_root),
+            "--detach",
+            "--json",
+        ]
     stdout = io.StringIO()
     stderr = io.StringIO()
     with redirect_stdout(stdout), redirect_stderr(stderr):
         exit_code = main(
-            [
-                "produce",
-                "video",
-                "--input",
-                "fixture://detached-cross-process",
-                "--workspace",
-                str(workspace_root),
-                "--detach",
-                "--json",
-            ],
+            arguments,
             runtime=runtime,
             config_service=RuntimeConfigService(paths=paths, environ={}),
             engine_client=LocalEngineClient(paths),
@@ -97,8 +124,24 @@ def _run_job_wait(
     results.put((exit_code, stdout.getvalue(), stderr.getvalue(), os.getpid()))
 
 
-def test_detached_video_survives_submitter_exit_and_finishes_in_engine_worker(
+@pytest.mark.parametrize(
+    ("recipe_kind", "expected_operations"),
+    (
+        ("video", ("download", "transcribe", "model", "portable_commit")),
+        (
+            "document",
+            (
+                "parse_document",
+                "document-knowledge-compose",
+                "document-knowledge-verify",
+            ),
+        ),
+    ),
+)
+def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
     tmp_path: Path,
+    recipe_kind: str,
+    expected_operations: tuple[str, ...],
 ) -> None:
     workspace_root = tmp_path / "Workspace 有空格"
     shutil.copytree(FIXTURE_ROOT, workspace_root)
@@ -109,6 +152,12 @@ def test_detached_video_survives_submitter_exit_and_finishes_in_engine_worker(
     worker_release = tmp_path / "worker-release"
     worker_finished = tmp_path / "worker-finished"
     call_log = tmp_path / "worker-calls.jsonl"
+    if recipe_kind == "document":
+        source = tmp_path / "detached document.pdf"
+        source.write_bytes(b"%PDF-1.7\nfixture\n")
+        input_value = str(source)
+    else:
+        input_value = "fixture://detached-cross-process"
     context = get_context("spawn")
     host = subprocess.Popen(
         (
@@ -135,6 +184,8 @@ def test_detached_video_survives_submitter_exit_and_finishes_in_engine_worker(
             str(worker_finished),
             "--call-log",
             str(call_log),
+            "--recipe-kind",
+            recipe_kind,
         ),
         cwd=Path(__file__).parents[2],
         env=minimal_worker_environment(),
@@ -165,7 +216,14 @@ def test_detached_video_survives_submitter_exit_and_finishes_in_engine_worker(
 
         submitter = context.Process(
             target=_run_detached_submit,
-            args=(workspace_root, local_data_parent, submit_results),
+            args=(
+                workspace_root,
+                local_data_parent,
+                recipe_kind,
+                input_value,
+                call_log,
+                submit_results,
+            ),
         )
         submitter.start()
         submitter.join(timeout=_PROCESS_TIMEOUT_SECONDS)
@@ -252,10 +310,8 @@ def test_detached_video_survives_submitter_exit_and_finishes_in_engine_worker(
             json.loads(line)["operation"]
             for line in call_log.read_text(encoding="utf-8").splitlines()
         )
-        assert operations.count("download") == 1
-        assert operations.count("transcribe") == 1
-        assert operations.count("model") == 1
-        assert operations.count("portable_commit") == 1
+        assert tuple(operations) == expected_operations
+        assert len(tuple(workspace_root.rglob("commit.json"))) == 1
 
         _wait_for_file(worker_finished, timeout_seconds=_PROCESS_TIMEOUT_SECONDS)
         assert int(worker_finished.read_text(encoding="ascii")) == worker_pid

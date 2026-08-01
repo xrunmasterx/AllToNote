@@ -9,8 +9,10 @@ from app.cli.commands.jobs import _result_refs
 from app.cli.main import main
 from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import JobSnapshot, JobState
+from app.core.jobs.model import JobExecutionOwner
 from app.core.recipes.contracts import ProduceRequest, ProduceSubmission
 from app.core.domain.ids import new_typed_id
+from app.engine.contracts import EngineJobReference
 
 
 def _document_result(job_id: str) -> RecipeProduceResult:
@@ -43,8 +45,10 @@ def _document_result(job_id: str) -> RecipeProduceResult:
 
 class _DocumentRuntime:
     def __init__(self) -> None:
+        self.workspace_instance_id = "d" * 32
         self.job_id = new_typed_id("job")
         self.requests: list[ProduceRequest] = []
+        self.execution_owners: list[JobExecutionOwner] = []
         self.wait_calls: list[str] = []
         self.completed = JobSnapshot(
             job_id=self.job_id,
@@ -67,8 +71,14 @@ class _DocumentRuntime:
             error=None,
         )
 
-    def submit(self, request: ProduceRequest) -> ProduceSubmission:
+    def submit(
+        self,
+        request: ProduceRequest,
+        *,
+        execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+    ) -> ProduceSubmission:
         self.requests.append(request)
+        self.execution_owners.append(execution_owner)
         return ProduceSubmission(self.job_id, request.recipe_key, JobState.QUEUED)
 
     def get_job(self, job_id: str) -> JobSnapshot:
@@ -84,6 +94,21 @@ class _DocumentRuntime:
     def cancel_job(self, job_id: str) -> JobSnapshot:
         assert job_id == self.job_id
         return self.queued
+
+
+class _EngineNotifySpy:
+    def __init__(self) -> None:
+        self.references: list[EngineJobReference] = []
+
+    def notify_job(self, reference: EngineJobReference) -> dict[str, object]:
+        self.references.append(reference)
+        return {
+            "engine_id": "engine_test",
+            "workspace_instance_id": reference.workspace_instance_id,
+            "job_id": reference.job_id,
+            "state": "queued",
+            "scheduled": True,
+        }
 
 
 def test_generic_document_produce_uses_file_contract_and_projects_result(
@@ -144,6 +169,108 @@ def test_generic_document_produce_uses_file_contract_and_projects_result(
     assert {item["role"] for item in envelope["artifacts"]} == set(
         runtime.completed.result.artifacts
     )
+
+
+def test_generic_document_detach_persists_engine_owned_job_and_notifies_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    runtime = _DocumentRuntime()
+    client = _EngineNotifySpy()
+
+    exit_code = main(
+        [
+            "produce",
+            str(source),
+            "--recipe",
+            "alltonote.document-note@1",
+            "--workspace",
+            str(workspace),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert envelope["ok"] is True
+    assert envelope["command"] == "produce"
+    assert envelope["data"] == {
+        "job_id": runtime.job_id,
+        "state": "queued",
+    }
+    assert runtime.execution_owners == [JobExecutionOwner.ENGINE]
+    assert runtime.wait_calls == []
+    assert client.references == [
+        EngineJobReference(runtime.workspace_instance_id, runtime.job_id)
+    ]
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+
+
+def test_document_request_file_detach_uses_the_same_engine_submission_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    request_path = tmp_path / "document request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "contract_version": 1,
+                "recipe_key": {
+                    "recipe_id": "alltonote.document-note",
+                    "recipe_version": 1,
+                },
+                "input": {"kind": "file", "value": str(source)},
+                "workspace_ref": str(workspace),
+                "requested_outputs": ["knowledge-note"],
+                "parameters": {
+                    "provider_profile": "composer",
+                    "model_override": "fixture/composer-v1",
+                    "output_language": "zh-CN",
+                },
+                "client_request_id": "document-detach-request",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = _DocumentRuntime()
+    client = _EngineNotifySpy()
+
+    exit_code = main(
+        [
+            "produce",
+            "--request",
+            str(request_path),
+            "--detach",
+            "--json",
+        ],
+        runtime=runtime,
+        engine_client=client,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert envelope["data"] == {
+        "job_id": runtime.job_id,
+        "state": "queued",
+    }
+    assert runtime.execution_owners == [JobExecutionOwner.ENGINE]
+    assert runtime.wait_calls == []
+    assert client.references == [
+        EngineJobReference(runtime.workspace_instance_id, runtime.job_id)
+    ]
 
 
 def test_generic_document_produce_hands_off_to_clean_draft(

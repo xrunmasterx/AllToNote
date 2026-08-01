@@ -74,6 +74,8 @@ Knowledge Note + deterministic Quality；来源语言/中文；section-aware inp
 
 当前增量（2026-07-31）：Compiler 已生成结构化 Knowledge Note 与独立 Knowledge Map；第二个可恢复的结构化 stage 会逐 claim、仅基于其引用 block 给出 model review，并绑定 compiled/source/parser、block 声明 hash 与实际文本 hash。产品 Runtime 支持可选 `default_verifier_provider_profile`：未配置时保持 schema v2 同模型 advisory，固定为 `same-model-review-not-independent`、`quality.overall=fail`、`publish_eligible=false`；配置不同 frozen model identity 时生成 schema v3，分别持久化并重连 composer/verifier profile 与 model，只有独立 review 和既有 extraction/coverage Gate 全部通过才恢复自动发布资格。当前“独立”只证明 model identity 不同，不扩大为供应商或统计独立；CLI Automation Protocol 仍为 v1。Windows `spawn` 集成回归已证明在 compose/verify 两条成功调用落盘后进程退出，SQLite reopen 与新 fencing Attempt 会复用原 operation/result/checkpoint，禁止调用的 executor 为零调用并最终只提交一次 Portable Bundle；该结果证明本地零重放，不替代外部供应商可用性验收。验证边界见 [`Document Knowledge Note 语义质量边界`](../../acceptance/2026-07-31-document-semantic-quality-boundary.md)。
 
+当前增量（2026-08-01）：统一 `produce` CLI 已允许 `alltonote.document-note@1` 使用 `--detach`；Job 先以 `execution_owner=engine` 持久化，再用 Registry 的 `workspace_instance_id` 通知现有 Engine，直接参数和 request-file 两条入口共用同一提交路径。Document Workspace Runtime 现在显式携带该 machine-local instance identity；没有新增 Document 专用 Engine、JobStore 或协议。Windows `spawn` E2E 已让提交 CLI 在 Worker 放行前退出，并使用真实 `LocalEngineClient`、Host、Dispatcher、独立 Worker、Document Runtime、SQLite JobStore 与 Portable commit 完成同一 Job；Parser/Model 是受控外部 fixture。该结果与既有 Document 真重启零重放 Gate 共同关闭本地 detach 语义，但仍不等于带真实 Docling Pack、真实模型和正式签名 Runtime 的 clean-user 发布验收。
+
 ## 9. Task DOC-07：局部 OCR Pack
 
 manifest/probe/languages；只处理 classified pages/regions；render DPI/rotation/deskew；text+bbox+confidence；与 native去重；per-page checkpoint；OCR低置信/语言错误；不覆盖原PDF。

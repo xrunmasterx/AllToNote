@@ -277,6 +277,7 @@ def _dual_model_runtime(
     clock: Callable[[], int],
     composer_bridge: object,
     verifier_bridge: object,
+    workspace_instance_id: str | None = None,
 ) -> runtime_module.AllToNoteRuntime:
     composer_identity = "fixture/composer-v1"
     verifier_identity = "fixture/reviewer-v1"
@@ -291,6 +292,7 @@ def _dual_model_runtime(
         verifier_model_execution_profile="reviewer",
         owner_id=owner_id,
         local_instance_id="document-test",
+        workspace_instance_id=workspace_instance_id,
         clock=clock,
     )
 
@@ -318,6 +320,34 @@ def _terminate_after_document_model_success(
     )
     runtime.wait_job(job_id)
     os._exit(24)
+
+
+def test_document_runtime_exposes_registered_workspace_instance_for_engine_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance_id = "d" * 32
+    monkeypatch.setattr(
+        runtime_module,
+        "DoclingWorkerParser",
+        lambda _config: _RuntimeParser(),
+    )
+    runtime = _dual_model_runtime(
+        tmp_path / "machine-instance",
+        owner_id="document-process",
+        clock=lambda: 1_000,
+        composer_bridge=_RoutingStageBridge(
+            "fixture/composer-v1",
+            {"document-knowledge-compose": _compiled_stage_response()},
+        ),
+        verifier_bridge=_RoutingStageBridge(
+            "fixture/reviewer-v1",
+            {"document-knowledge-verify": _verification_stage_response()},
+        ),
+        workspace_instance_id=instance_id,
+    )
+
+    assert runtime.workspace_instance_id == instance_id
 
 
 def _document_operation_rows(

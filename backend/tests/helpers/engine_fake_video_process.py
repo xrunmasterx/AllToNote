@@ -71,14 +71,26 @@ def _run_worker(args: argparse.Namespace) -> int:
         instance = registry.get(args.workspace_instance_id)
         if instance is None or instance.canonical_root != workspace_root:
             raise RuntimeError("workspace_instance_mismatch")
-        from app.runtime import create_fake_runtime
+        if args.recipe_kind == "document":
+            from tests.helpers.engine_fake_document_runtime import (
+                create_fake_document_runtime_for_workspace,
+            )
 
-        runtime = create_fake_runtime(
-            instance.machine_root,
-            workspace_instance_id=instance.instance_id,
-            current_config_snapshot=current_config_snapshot,
-            call_log_path=args.call_log,
-        )
+            runtime = create_fake_document_runtime_for_workspace(
+                workspace_root,
+                paths=runtime_paths,
+                call_log=args.call_log,
+                require_existing_job_store=True,
+            )
+        else:
+            from app.runtime import create_fake_runtime
+
+            runtime = create_fake_runtime(
+                instance.machine_root,
+                workspace_instance_id=instance.instance_id,
+                current_config_snapshot=current_config_snapshot,
+                call_log_path=args.call_log,
+            )
         return JobRuntime(
             runtime.job_repository,
             wait_job=lambda requested_job_id: runtime.wait_job(requested_job_id),
@@ -119,6 +131,8 @@ def _run_host(args: argparse.Namespace) -> int:
             reference.workspace_instance_id,
             "--job-id",
             reference.job_id,
+            "--recipe-kind",
+            args.recipe_kind,
             "--worker-started",
             str(args.worker_started),
             "--worker-release",
@@ -175,6 +189,11 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--worker-release", required=True, type=Path)
         child.add_argument("--worker-finished", required=True, type=Path)
         child.add_argument("--call-log", required=True, type=Path)
+        child.add_argument(
+            "--recipe-kind",
+            choices=("video", "document"),
+            required=True,
+        )
         if mode == "worker":
             child.add_argument("--workspace-instance-id", required=True)
             child.add_argument("--job-id", required=True)

@@ -434,6 +434,7 @@ def test_document_workspace_factory_reuses_process_identity_and_frozen_model(
 
     assert created is sentinel
     assert captured["local_instance_id"] == instance["instance_id"]
+    assert captured["workspace_instance_id"] == instance["instance_id"]
     assert captured["owner_id"] == resource_owner.process_instance_id
     assert captured["model"].model_identity == "fixture/frozen-model"
     assert (

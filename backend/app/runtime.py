@@ -1663,6 +1663,8 @@ def _create_video_runtime(
 def _create_document_runtime(
     service: DocumentService,
     repository: SqliteJobRepository,
+    *,
+    workspace_instance_id: str | None = None,
 ) -> AllToNoteRuntime:
     registry = RecipeRegistry(
         ((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(service)),)
@@ -1678,6 +1680,7 @@ def _create_document_runtime(
             adapt_video_produce_request,
         ),
         repository,
+        workspace_instance_id=workspace_instance_id,
     )
 
 
@@ -1913,6 +1916,7 @@ def create_document_runtime(
     verifier_model_execution_profile: str | None = None,
     owner_id: str | None = None,
     local_instance_id: str | None = None,
+    workspace_instance_id: str | None = None,
     clock: Callable[[], int] | None = None,
     resource_lease_store: ResourceLeaseStorePort | None = None,
     resource_owner: ResourceOwner | None = None,
@@ -2026,7 +2030,11 @@ def create_document_runtime(
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
     )
-    return _create_document_runtime(service, repository)
+    return _create_document_runtime(
+        service,
+        repository,
+        workspace_instance_id=workspace_instance_id,
+    )
 
 
 def _resolve_document_worker_config(
@@ -2249,6 +2257,7 @@ def create_document_runtime_for_workspace(
         ),
         owner_id=process_instance_id,
         local_instance_id=instance.instance_id,
+        workspace_instance_id=instance.instance_id,
         resource_lease_store=resource_lease_store,
         resource_owner=resource_owner,
         require_existing_job_store=require_existing_job_store,
