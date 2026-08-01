@@ -87,6 +87,7 @@ def _build_parser(
     *,
     include_job_commands: bool = True,
     include_artifact_commands: bool = True,
+    include_review_commands: bool = True,
 ) -> argparse.ArgumentParser:
     parser = _CliArgumentParser(prog="alltonote")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -195,6 +196,10 @@ def _build_parser(
         from app.cli.commands.artifacts import add_artifact_parsers
 
         add_artifact_parsers(subparsers)
+    if include_review_commands:
+        from app.cli.commands.reviews import add_review_parsers
+
+        add_review_parsers(subparsers)
     recipe_parser = subparsers.add_parser("recipe")
     recipe_subparsers = recipe_parser.add_subparsers(
         dest="recipe_command", required=True
@@ -302,10 +307,14 @@ def main(
         not arguments
         or arguments[0] in {"artifact", "draft", "-h", "--help"}
     )
+    include_review_commands = (
+        not arguments or arguments[0] in {"review", "-h", "--help"}
+    )
     try:
         args = _build_parser(
             include_job_commands=include_job_commands,
             include_artifact_commands=include_artifact_commands,
+            include_review_commands=include_review_commands,
         ).parse_args(parse_arguments)
         if (
             args.command == "produce"
@@ -671,6 +680,45 @@ def main(
                 args,
                 correlation_id,
                 service=(artifact_query_service or ArtifactQueryService()),
+                workspace_root=workspace_root,
+                versions=_versions(),
+            )
+            exit_code = ExitCode.SUCCESS
+        except DomainError as error:
+            mapped = map_domain_error(error)
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        except Exception:
+            mapped = internal_error()
+            result = _failure_result(
+                command=command,
+                correlation_id=correlation_id,
+                mapped=mapped,
+            )
+            exit_code = mapped.exit_code
+        render_result(result, json_mode=args.json)
+        return int(exit_code)
+
+    if args.command == "review":
+        command = f"review {args.review_command}"
+        try:
+            from app.cli.commands.reviews import execute_review_command
+            from app.core.application.review_candidate_service import (
+                ReviewCandidateService,
+            )
+
+            workspace_root = _artifact_workspace_for_args(
+                args,
+                config_service=config_service,
+            )
+            result = execute_review_command(
+                args,
+                correlation_id,
+                service=ReviewCandidateService(),
                 workspace_root=workspace_root,
                 versions=_versions(),
             )
@@ -1917,6 +1965,8 @@ def _command_from_arguments(arguments: Sequence[str]) -> str:
         return f"job {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] in {"artifact", "draft"}:
         return f"{arguments[0]} {arguments[1]}"
+    if len(arguments) >= 2 and arguments[0] == "review":
+        return f"review {arguments[1]}"
     if len(arguments) >= 2 and arguments[0] == "recipe":
         return f"recipe {arguments[1]}"
     if arguments and arguments[0] == "produce":

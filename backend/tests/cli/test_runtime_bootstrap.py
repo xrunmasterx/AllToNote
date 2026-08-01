@@ -94,6 +94,8 @@ def test_cli_version_does_not_import_web_or_video_modules():
         "torch",
         "faster_whisper",
         "app.workspace_initializer",
+        "app.core.application.review_candidate_service",
+        "app.adapters.iwiki.portable_gateway",
         "app.services.note",
     } & set(report["imported_modules"])
 

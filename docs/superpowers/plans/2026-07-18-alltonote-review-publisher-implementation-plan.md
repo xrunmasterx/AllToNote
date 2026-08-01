@@ -8,8 +8,8 @@ upstream:
   - ../specs/2026-07-18-alltonote-review-publisher-design.md
   - ../specs/2026-07-14-alltonote-portable-artifact-source-bundle-design.md
   - ../specs/2026-07-13-alltonote-cli-first-vault-workspace-design.md
-implementation_status: not-started
-last_verified_at: 2026-07-18
+implementation_status: in-progress
+last_verified_at: 2026-08-01
 ```
 
 ## 1. 前置 Gate
@@ -69,6 +69,10 @@ Gate：每个 Publisher 操作有已发布 API；否则停止实施该操作。
 实现纯领域对象，不读文件/数据库/iwiki。
 
 ## 5. Task RP-02：ReviewCandidate Query Service
+
+状态（2026-08-01）：P0 单 Candidate 只读切片已完成。`alltonote review show <draft-id>` 从已提交 Portable Bundle 重建 Candidate，默认返回 Source 与完整 Quality checks/messages；`--evidence-id` 按需展开一个 Video time-range/transcript excerpt，`--note-item-id` 按需展开一个 Document semantic claim 及其 page/bbox/source blocks。所有投影均绑定 Draft hash、source revision 与 artifact parent lineage，保持有界、只读、无模型调用且不保存第二份正文。
+
+本切片基于最小必要面没有提前创建 `review_store.py` 或 ReviewRecord 领域对象；它们仍属于 RP-01/RP-03 的 decision/approval 阶段。RP-02 尚未完成 list/filter/cursor，也未包含审批、发布或 Desktop UI。
 
 目标文件：
 
