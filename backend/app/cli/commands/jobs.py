@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.cli.contracts import ApplicationResult
 from app.cli.errors import ExitCode, map_domain_error, map_error_detail
 from app.core.application.job_query_service import JobEventPage, JobView
+from app.core.jobs.model import JobEvent
 from app.core.domain.production import RecipeProduceResult
 from app.core.domain.video import JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
@@ -30,10 +31,7 @@ _RETRY_REQUEST_KEYS = frozenset(
 class JobCommandExecution:
     result: ApplicationResult
     exit_code: ExitCode
-    jsonl_records: tuple[Mapping[str, object], ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "jsonl_records", tuple(self.jsonl_records))
+    jsonl_records: Iterable[Mapping[str, object]] = ()
 
 
 def add_job_parsers(subparsers: argparse._SubParsersAction) -> None:
@@ -67,6 +65,7 @@ def add_job_parsers(subparsers: argparse._SubParsersAction) -> None:
     events_format = events_parser.add_mutually_exclusive_group()
     events_format.add_argument("--json", action="store_true")
     events_format.add_argument("--jsonl", action="store_true")
+    events_parser.add_argument("--follow", action="store_true")
     events_parser.add_argument("--workspace", type=Path)
     events_parser.add_argument("--config-profile")
 
@@ -123,6 +122,29 @@ def execute_job_command(
             exit_code=ExitCode.SUCCESS,
         )
     if args.job_command == "events":
+        if args.follow and not args.jsonl:
+            raise DomainError(
+                "cli_usage_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Command arguments are invalid",
+            )
+        if args.follow:
+            return JobCommandExecution(
+                result=ApplicationResult(
+                    command=command,
+                    correlation_id=correlation_id,
+                    ok=True,
+                    data={"events": [], "next_after_sequence": None},
+                    versions=versions,
+                ),
+                exit_code=ExitCode.SUCCESS,
+                jsonl_records=_follow_event_records(
+                    runtime,
+                    args.job_id,
+                    after_sequence=args.after_sequence,
+                    limit=args.limit,
+                ),
+            )
         page = runtime.get_job_events(
             args.job_id,
             after_sequence=args.after_sequence,
@@ -359,28 +381,42 @@ def _result_refs(result: object) -> dict[str, object] | None:
 
 
 def _event_records(page: JobEventPage) -> tuple[dict[str, object], ...]:
-    records: list[dict[str, object]] = []
-    for event in page.events:
-        try:
-            payload = json.loads(event.payload_json)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            raise DomainError(
-                "job_event_invalid",
-                ErrorCategory.INTERNAL,
-                "Stored Job event is invalid",
-            ) from None
-        records.append(
-            {
-                "event_schema_version": 1,
-                "event_id": event.event_id,
-                "job_id": event.job_id,
-                "sequence": event.sequence,
-                "recorded_at": event.created_at,
-                "type": event.event_type,
-                "data": payload,
-            }
-        )
-    return tuple(records)
+    return tuple(_event_record(event) for event in page.events)
+
+
+def _follow_event_records(
+    runtime: JobRuntime,
+    job_id: str,
+    *,
+    after_sequence: int,
+    limit: int,
+) -> Iterator[dict[str, object]]:
+    for event in runtime.stream_job_events(
+        job_id,
+        after_sequence=after_sequence,
+        limit=limit,
+    ):
+        yield _event_record(event)
+
+
+def _event_record(event: JobEvent) -> dict[str, object]:
+    try:
+        payload = json.loads(event.payload_json)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise DomainError(
+            "job_event_invalid",
+            ErrorCategory.INTERNAL,
+            "Stored Job event is invalid",
+        ) from None
+    return {
+        "event_schema_version": 1,
+        "event_id": event.event_id,
+        "job_id": event.job_id,
+        "sequence": event.sequence,
+        "recorded_at": event.created_at,
+        "type": event.event_type,
+        "data": payload,
+    }
 
 
 def _retry_request(path: Path) -> RetryJobRequest:

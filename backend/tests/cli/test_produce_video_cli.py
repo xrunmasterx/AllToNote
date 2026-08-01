@@ -1007,7 +1007,10 @@ def test_request_file_binds_current_config_snapshot_and_reopens(
     events = runtime.job_repository.list_events(job_id)
 
     assert wait_calls == [job_id]
-    assert [event.event_type for event in events] == ["configuration.snapshot.v1"]
+    assert [event.event_type for event in events] == [
+        "configuration.snapshot.v1",
+        "job.state.v1",
+    ]
     assert json.loads(events[0].payload_json)["digest"] == effective.digest
 
     changed_config = replace(

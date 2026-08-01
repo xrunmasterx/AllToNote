@@ -459,7 +459,8 @@ def test_generic_and_legacy_v2_submission_share_durable_identity(tmp_path: Path)
                 "snapshot_version": config_snapshot.snapshot_version,
                 "values": dict(config_snapshot.values),
             },
-        )
+        ),
+        ("job.state.v1", {"state": "queued"}),
     ]
     assert repository.get_job(generic_submission.job_id).request_hash == repository.get_job(
         legacy_submission.job_id

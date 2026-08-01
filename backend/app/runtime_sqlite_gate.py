@@ -442,7 +442,7 @@ def _database_invariants_pass(invariants: Mapping[str, object]) -> bool:
         "checkpoint_busy": 0,
         "wal_frames_remaining": 0,
         "journal_mode": "wal",
-        "user_version": 4,
+        "user_version": 5,
     }
 
 
@@ -941,9 +941,10 @@ def _run_crash_recovery(
             acknowledged_binding_present = bool(
                 repository.get_job_execution_binding(acknowledged_job_id)
             )
-            acknowledged_event_present = (
-                len(repository.list_events(acknowledged_job_id)) == 1
-            )
+            acknowledged_event_present = [
+                event.event_type
+                for event in repository.list_events(acknowledged_job_id)
+            ] == ["gate.acknowledged", "job.state.v1"]
         except DomainError:
             acknowledged_present = False
     repository.create_job(

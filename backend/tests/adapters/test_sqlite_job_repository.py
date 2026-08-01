@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from multiprocessing import get_context
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -258,7 +259,7 @@ def test_initial_job_event_is_atomic_with_job_creation(
     with monkeypatch.context() as patch:
         patch.setattr(
             repo,
-            "_insert_event",
+            "_insert_job_state_event",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 sqlite3.IntegrityError("injected event failure")
             ),
@@ -279,9 +280,12 @@ def test_initial_job_event_is_atomic_with_job_creation(
         client_request_id="atomic-initial-event",
         initial_events=(("configuration.snapshot.v1", "{}"),),
     )
-    assert [event.event_type for event in repo.list_events(created.job_id)] == [
-        "configuration.snapshot.v1"
+    events = repo.list_events(created.job_id)
+    assert [event.event_type for event in events] == [
+        "configuration.snapshot.v1",
+        "job.state.v1",
     ]
+    assert events[1].payload_json == '{"state":"queued"}'
 
 
 def test_idempotent_job_replay_rejects_changed_initial_snapshot(
@@ -307,9 +311,128 @@ def test_idempotent_job_replay_rejects_changed_initial_snapshot(
             ),
         )
 
-    assert [event.payload_json for event in repo.list_events(created.job_id)] == [
-        '{"digest":"first"}'
+    events = repo.list_events(created.job_id)
+    assert [event.event_type for event in events] == [
+        "configuration.snapshot.v1",
+        "job.state.v1",
     ]
+    assert [event.payload_json for event in events] == [
+        '{"digest":"first"}',
+        '{"state":"queued"}',
+    ]
+
+
+def test_job_state_events_are_atomic_monotonic_and_terminal_last(
+    repo: SqliteJobRepository,
+) -> None:
+    job, _binding = _claim_fixture_job(
+        repo,
+        client_request_id="state-events",
+    )
+
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    repo.fail_job_atomic(
+        job.job_id,
+        ErrorDetail(
+            code="fixture_failure",
+            category=ErrorCategory.INTERNAL,
+            message="Fixture failure",
+        ),
+    )
+
+    events = repo.list_events(job.job_id)
+    assert [event.sequence for event in events] == [1, 2, 3]
+    assert [event.event_type for event in events] == [
+        "job.state.v1",
+        "job.state.v1",
+        "job.state.v1",
+    ]
+    assert [event.payload_json for event in events] == [
+        '{"state":"queued"}',
+        '{"state":"running"}',
+        '{"state":"failed"}',
+    ]
+
+    with pytest.raises(DomainError, match="job_event_terminal"):
+        repo.append_event(job.job_id, "stage.progress", '{"completed":1}')
+
+
+def test_job_state_event_failure_rolls_back_state_transition(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, _binding = _claim_fixture_job(
+        repo,
+        client_request_id="state-event-rollback",
+    )
+    original_events = repo.list_events(job.job_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            repo,
+            "_insert_job_state_event",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.IntegrityError("injected state event failure")
+            ),
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="injected state event failure",
+        ):
+            repo.transition_job(job.job_id, JobState.RUNNING)
+
+    assert repo.get_job(job.job_id).state is JobState.QUEUED
+    assert repo.list_events(job.job_id) == original_events
+
+
+def test_append_racing_terminal_transition_is_before_terminal_or_rejected(
+    repo: SqliteJobRepository,
+) -> None:
+    job, _binding = _claim_fixture_job(
+        repo,
+        client_request_id="terminal-append-race",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    competing = SqliteJobRepository.open(repo.machine_root)
+    barrier = Barrier(2)
+
+    def append_progress() -> str:
+        barrier.wait()
+        try:
+            competing.append_event(
+                job.job_id,
+                "stage.progress",
+                '{"completed":1,"stage":"publish","total":1}',
+            )
+        except DomainError as error:
+            return error.code
+        return "appended"
+
+    def fail_job() -> str:
+        barrier.wait()
+        repo.fail_job_atomic(
+            job.job_id,
+            ErrorDetail(
+                code="fixture_failure",
+                category=ErrorCategory.INTERNAL,
+                message="Fixture failure",
+            ),
+        )
+        return "failed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        append_result = executor.submit(append_progress)
+        fail_result = executor.submit(fail_job)
+        outcomes = {append_result.result(), fail_result.result()}
+
+    events = repo.list_events(job.job_id)
+    assert outcomes in (
+        {"appended", "failed"},
+        {"job_event_terminal", "failed"},
+    )
+    assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+    assert events[-1].event_type == "job.state.v1"
+    assert events[-1].payload_json == '{"state":"failed"}'
 
 
 def test_initial_job_event_rejects_sensitive_fields_before_creation(
@@ -498,7 +621,7 @@ def test_corrupt_database_is_rejected_without_overwrite(tmp_path: Path) -> None:
     assert database_path.read_bytes() == corrupt_bytes
 
 
-def test_open_creates_version_four_database_with_exact_schema_and_pragmas(
+def test_open_creates_version_five_database_with_exact_schema_and_pragmas(
     repo: SqliteJobRepository,
 ) -> None:
     assert repo.database_path == repo.machine_root / "jobs.sqlite"
@@ -511,6 +634,12 @@ def test_open_creates_version_four_database_with_exact_schema_and_pragmas(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        triggers = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
@@ -521,12 +650,173 @@ def test_open_creates_version_four_database_with_exact_schema_and_pragmas(
         ).fetchall()
 
     assert tables == EXPECTED_TABLES
+    assert set(repository_module._WRITER_PROTOCOL_TABLES) == tables
+    assert triggers == {
+        f"writer_protocol_{table}_{operation}"
+        for table in repository_module._WRITER_PROTOCOL_TABLES
+        for operation in ("insert", "update", "delete")
+    }
     assert foreign_keys == 1
     assert journal_mode == "wal"
     assert synchronous == 2
     assert busy_timeout == 5_000
-    assert user_version == 4
+    assert user_version == 5
     assert foreign_key_violations == []
+
+
+def _create_version_four_lifecycle_store(database_path: Path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        for statement in repository_module._SCHEMA_STATEMENTS_V4:
+            connection.execute(statement)
+        for job_id, state in (
+            ("job_v4_running", "running"),
+            ("job_v4_succeeded", "succeeded"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, request_hash, request_json, principal,
+                    client_request_id, state, cancellation_requested,
+                    retry_of_job_id, result_json, error_json, created_at,
+                    updated_at, execution_owner
+                ) VALUES (?, ?, NULL, 'local', ?, ?, 0,
+                          NULL, NULL, NULL, '1', '1', 'foreground')
+                """,
+                (job_id, HASH_A, job_id, state),
+            )
+            connection.execute(
+                """
+                INSERT INTO job_execution_bindings (
+                    job_id, recipe_id, recipe_version, executor_id,
+                    executor_version, pack_id, pack_version
+                ) VALUES (?, 'alltonote.video-course-note', 1,
+                          'alltonote.video', 1, 'media-basic', 'builtin-v1')
+                """,
+                (job_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, job_id, sequence, event_type,
+                    payload_json, created_at
+                ) VALUES (?, ?, 1, 'configuration.snapshot.v1', '{}', '1')
+                """,
+                (f"evt_{job_id}", job_id),
+            )
+        connection.execute("PRAGMA user_version = 4")
+
+
+def test_version_four_lifecycle_migration_backfills_current_state_once(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v4-events")
+    _create_version_four_lifecycle_store(database_path)
+
+    migrated = SqliteJobRepository.open(machine_root, clock=lambda: 2)
+
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    for job_id, state in (
+        ("job_v4_running", "running"),
+        ("job_v4_succeeded", "succeeded"),
+    ):
+        events = migrated.list_events(job_id)
+        assert [event.sequence for event in events] == [1, 2]
+        assert events[0].event_type == "configuration.snapshot.v1"
+        assert events[-1].event_type == "job.state.v1"
+        assert events[-1].payload_json == f'{{"state":"{state}"}}'
+
+    reopened = SqliteJobRepository.open(machine_root, clock=lambda: 3)
+    assert [
+        len(reopened.list_events(job_id))
+        for job_id in ("job_v4_running", "job_v4_succeeded")
+    ] == [2, 2]
+
+
+def test_version_four_lifecycle_migration_failure_rolls_back_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v4-rollback")
+    _create_version_four_lifecycle_store(database_path)
+    repository = SqliteJobRepository(machine_root.resolve(), clock=lambda: 2)
+    original_insert = repository._insert_job_state_event
+    insert_calls = 0
+
+    def fail_second_backfill(*args: object, **kwargs: object) -> None:
+        nonlocal insert_calls
+        insert_calls += 1
+        if insert_calls == 2:
+            raise RuntimeError("injected lifecycle migration failure")
+        original_insert(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(repository, "_insert_job_state_event", fail_second_backfill)
+        with pytest.raises(RuntimeError, match="lifecycle migration failure"):
+            repository._initialize_schema()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+
+    migrated = SqliteJobRepository.open(machine_root, clock=lambda: 3)
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 4
+
+
+def test_version_five_migration_fences_preexisting_version_four_writer(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v4-writer-fence")
+    _create_version_four_lifecycle_store(database_path)
+    stale_writer = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        migrated = SqliteJobRepository.open(machine_root, clock=lambda: 2)
+
+        for statement, parameters in (
+            (
+                "UPDATE jobs SET state = 'running' WHERE job_id = ?",
+                ("job_v4_succeeded",),
+            ),
+            (
+                "UPDATE jobs SET cancellation_requested = 1 WHERE job_id = ?",
+                ("job_v4_running",),
+            ),
+            (
+                """
+                INSERT INTO events (
+                    event_id, job_id, sequence, event_type,
+                    payload_json, created_at
+                ) VALUES ('evt_stale_writer', ?, 3, 'legacy.event.v1', '{}', '3')
+                """,
+                ("job_v4_running",),
+            ),
+        ):
+            with pytest.raises(sqlite3.OperationalError, match="no such function"):
+                stale_writer.execute(statement, parameters)
+
+        migrated.transition_job("job_v4_running", JobState.FAILED)
+        with pytest.raises(sqlite3.OperationalError, match="no such function"):
+            stale_writer.execute(
+                """
+                INSERT INTO events (
+                    event_id, job_id, sequence, event_type,
+                    payload_json, created_at
+                ) VALUES ('evt_after_terminal', ?, 4, 'legacy.event.v1', '{}', '4')
+                """,
+                ("job_v4_running",),
+            )
+
+        events = migrated.list_events("job_v4_running")
+        assert [event.event_type for event in events] == [
+            "configuration.snapshot.v1",
+            "job.state.v1",
+            "job.state.v1",
+        ]
+        assert events[-1].payload_json == '{"state":"failed"}'
+    finally:
+        stale_writer.close()
 
 
 def test_job_store_fails_closed_when_wal_is_unavailable(
@@ -539,6 +829,9 @@ def test_job_store_fails_closed_when_wal_is_unavailable(
 
     class FakeConnection:
         row_factory = None
+
+        def create_function(self, *args: object, **kwargs: object) -> None:
+            pass
 
         def execute(self, statement: str):
             if statement in {"PRAGMA foreign_keys = ON"} or statement.startswith(
@@ -743,7 +1036,7 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
         pack_version="legacy-v1",
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -789,7 +1082,7 @@ def test_version_two_database_migrates_jobs_to_foreground_owner(
         JobExecutionOwner.FOREGROUND
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -829,7 +1122,7 @@ def test_version_two_migration_failure_rolls_back_and_retry_succeeds(
 
     migrated = SqliteJobRepository.open(machine_root)
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def _create_version_three_store(
@@ -881,7 +1174,7 @@ def test_version_three_expired_bound_lease_migrates_to_job_generation(
     migrated = SqliteJobRepository.open_existing(machine_root, clock=lambda: 1_000)
 
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT 1 FROM leases").fetchone() is None
         lease = connection.execute(
             "SELECT owner, generation, expires_at FROM job_execution_leases "
@@ -3401,7 +3694,7 @@ def test_cancel_waiting_job_cancels_pending_challenge(
     assert persisted[0] == "cancelled"
     assert repo.get_job_details(job.job_id)[2] is None
 
-    with sqlite3.connect(repo.database_path) as connection:
+    with repo._connect() as connection:
         connection.execute(
             "UPDATE challenges SET state = 'pending' WHERE challenge_id = ?",
             (challenge.challenge_id,),
@@ -3430,6 +3723,10 @@ def test_running_job_cancellation_is_durable_across_real_repository_reopen(
     attempt = writer.start_attempt(attempt.attempt_id, authority)
     requested = writer.cancel_job(job.job_id)
     assert requested.state is JobState.RUNNING
+    assert writer.cancel_job(job.job_id).state is JobState.RUNNING
+    assert [
+        event.event_type for event in writer.list_events(job.job_id)
+    ].count("job.cancel-requested.v1") == 1
 
     reopened = SqliteJobRepository.open(machine_root)
     token = CancellationToken(reopened, job.job_id)
@@ -3446,6 +3743,11 @@ def test_running_job_cancellation_is_durable_across_real_repository_reopen(
         authority=authority,
     )
     assert reopened.get_job(job.job_id).state is JobState.CANCELLED
+    terminal_events = reopened.list_events(job.job_id)
+    assert terminal_events[-1].event_type == "job.state.v1"
+    assert terminal_events[-1].payload_json == '{"state":"cancelled"}'
+    assert reopened.cancel_job(job.job_id).state is JobState.CANCELLED
+    assert reopened.list_events(job.job_id) == terminal_events
 
 
 def test_create_challenge_atomically_waits_for_input(

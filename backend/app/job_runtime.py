@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -24,6 +24,7 @@ from app.core.config.model import JobConfigSnapshot
 from app.core.domain.video import JobSnapshot, JobState, RetryJobRequest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import (
+    JobEvent,
     JobExecutionBinding,
     JobExecutionOwner,
     LOCAL_USER_PRINCIPAL,
@@ -125,6 +126,41 @@ class JobRuntime:
             after_sequence=after_sequence,
             limit=limit,
         )
+
+    def stream_job_events(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> Iterator[JobEvent]:
+        cursor = after_sequence
+        idle_delay_seconds = 0.1
+        while True:
+            page = self.get_job_events(
+                job_id,
+                after_sequence=cursor,
+                limit=limit,
+            )
+            if page.events:
+                yield from page.events
+                cursor = page.events[-1].sequence
+                idle_delay_seconds = 0.1
+                continue
+            current = self.get_job(job_id)
+            if _is_wait_boundary(current.snapshot.state):
+                final_page = self.get_job_events(
+                    job_id,
+                    after_sequence=cursor,
+                    limit=limit,
+                )
+                if final_page.events:
+                    yield from final_page.events
+                    cursor = final_page.events[-1].sequence
+                    continue
+                return
+            self._sleep(idle_delay_seconds)
+            idle_delay_seconds = min(idle_delay_seconds * 2, 1.0)
 
     def wait_for_job(
         self,

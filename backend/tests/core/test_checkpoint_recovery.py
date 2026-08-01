@@ -264,9 +264,11 @@ def test_checkpoint_and_event_projection_use_job_scoped_layout(
     )
     assert (storage.root / metadata.relative_path).read_bytes() == record.payload
     projection = storage.root / "jobs" / record.job_id / "events.jsonl"
-    assert json.loads(projection.read_text(encoding="utf-8"))[
-        "event_id"
-    ] == event.event_id
+    records = tuple(
+        json.loads(line)
+        for line in projection.read_text(encoding="utf-8").splitlines()
+    )
+    assert records[-1]["event_id"] == event.event_id
 
 
 def test_validate_checkpoint_rejects_another_jobs_checkpoint_path(
@@ -566,11 +568,11 @@ def test_event_sequences_are_strictly_monotonic_per_job_across_connections(
         events = tuple(pool.map(append, range(12)))
     other = repository.append_event(other_job.job_id, "job.started", "{}")
 
-    assert sorted(event.sequence for event in events) == list(range(1, 13))
+    assert sorted(event.sequence for event in events) == list(range(3, 15))
     assert [event.sequence for event in repository.list_events(job.job_id)] == list(
-        range(1, 13)
+        range(1, 15)
     )
-    assert other.sequence == 1
+    assert other.sequence == 3
     assert repository.list_events(job.job_id, after_sequence=10) == tuple(
         repository.list_events(job.job_id)[10:]
     )
@@ -625,15 +627,15 @@ def test_stale_event_projection_writer_publishes_until_caught_up(
         json.loads(line)
         for line in projection.read_text(encoding="utf-8").splitlines()
     )
-    assert [record["sequence"] for record in projected] == [1, 2]
-    assert [record["event_id"] for record in projected] == [
-        first.event_id,
-        second.event_id,
+    expected = repository.list_events(job.job_id)
+    assert [record["sequence"] for record in projected] == [
+        event.sequence for event in expected
     ]
-    assert normal_storage.reconcile_event_projection(job.job_id) == (
-        first,
-        second,
-    )
+    assert [record["event_id"] for record in projected] == [
+        event.event_id for event in expected
+    ]
+    assert expected[-2:] == (first, second)
+    assert normal_storage.reconcile_event_projection(job.job_id) == expected
 
 
 def test_append_event_commits_sqlite_before_projection_and_reconcile_backfills(
@@ -650,13 +652,13 @@ def test_append_event_commits_sqlite_before_projection_and_reconcile_backfills(
         storage.append_event(job.job_id, "checkpoint.saved", '{"step":"draft"}')
 
     committed = repository.list_events(job.job_id)
-    assert len(committed) == 1
+    assert len(committed) == 3
     job_directory.unlink()
     reconciled = storage.reconcile_event_projection(job.job_id)
     assert reconciled == committed
     projection = _projection_path(storage.root, job.job_id)
     assert projection.read_bytes().endswith(b"\n")
-    assert len(projection.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(projection.read_text(encoding="utf-8").splitlines()) == 3
 
 
 def test_append_event_commits_sqlite_but_preserves_malformed_projection(
@@ -673,7 +675,7 @@ def test_append_event_commits_sqlite_but_preserves_malformed_projection(
     with pytest.raises(DomainError, match="event_projection_invalid"):
         storage.append_event(job.job_id, "job.started", "{}")
 
-    assert len(repository.list_events(job.job_id)) == 1
+    assert len(repository.list_events(job.job_id)) == 3
     assert projection.read_bytes() == original
 
 
@@ -700,8 +702,9 @@ def test_reconcile_uses_only_sqlite_and_discards_valid_file_only_rows(
     storage.reconcile_event_projection(job.job_id)
 
     lines = projection.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
-    assert json.loads(lines[0])["event_id"] == committed.event_id
+    expected = repository.list_events(job.job_id)
+    assert len(lines) == len(expected)
+    assert json.loads(lines[-1])["event_id"] == committed.event_id
     assert "evt_file_only" not in projection.read_text(encoding="utf-8")
 
 
@@ -716,7 +719,9 @@ def test_reconcile_tolerates_only_truncated_unterminated_final_line(
     with projection.open("ab") as handle:
         handle.write(b'{"event_id":"truncated"')
 
-    assert storage.reconcile_event_projection(job.job_id) == (committed,)
+    expected = repository.list_events(job.job_id)
+    assert expected[-1] == committed
+    assert storage.reconcile_event_projection(job.job_id) == expected
     assert projection.read_bytes().endswith(b"\n")
     assert b"truncated" not in projection.read_bytes()
 

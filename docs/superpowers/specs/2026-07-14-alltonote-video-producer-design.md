@@ -984,6 +984,8 @@ alltonote job retry <job-id> --request <retry-request.json> --json
 alltonote job respond <job-id> --challenge <id> --response <response.json> --json
 ```
 
+`job events --follow` 以 SQLite JobStore 为权威源，`--after-sequence` 是排他游标，`--limit` 是单次分页上限而非总输出上限；积压必须跨页排空后才进入等待。事件按 Job 内 sequence 递增，每行立即 flush。`succeeded`、`failed`、`cancelled` 的 durable `job.state.v1` 必须是流的最后记录；schema v5 通过覆盖全部可写表的 writer-protocol triggers 阻止迁移前存活的旧 Runtime 在迁移后继续写入并破坏该语义。`waiting_for_input` 不是 Job 终态，但作为非交互观察调用的成功停止边界，调用方读取 challenge 后通过独立 `job respond` 恢复。Ctrl+C 只停止观察并以 Automation Protocol v1 错误对象结束 JSONL，不取消或改写 Job。
+
 可以增加 `job list` 和安全的 `job clean --dry-run` 作为本机管理命令，但不能改变终态/retry 语义，也不能删除 Workspace Bundle。
 
 ### 11.4 JSON Envelope

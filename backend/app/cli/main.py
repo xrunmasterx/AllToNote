@@ -317,6 +317,13 @@ def main(
         ):
             raise _CliUsageError
         if (
+            args.command == "job"
+            and args.job_command == "events"
+            and args.follow
+            and not args.jsonl
+        ):
+            raise _CliUsageError
+        if (
             args.command == "produce"
             and args.produce_kind == "_generic"
             and (
@@ -601,6 +608,9 @@ def main(
             )
             result = execution.result
             exit_code = execution.exit_code
+            if getattr(args, "jsonl", False):
+                render_json_lines(execution.jsonl_records)
+                return int(exit_code)
         except DomainError as error:
             mapped = map_domain_error(error)
             result = _failure_result(
@@ -634,13 +644,10 @@ def main(
             )
             exit_code = mapped.exit_code
             execution = None
-        if getattr(args, "jsonl", False) and execution is not None:
-            render_json_lines(execution.jsonl_records)
-        else:
-            render_result(
-                result,
-                json_mode=(getattr(args, "json", False) or json_requested),
-            )
+        render_result(
+            result,
+            json_mode=(getattr(args, "json", False) or json_requested),
+        )
         return int(exit_code)
 
     if args.command in {"artifact", "draft"}:

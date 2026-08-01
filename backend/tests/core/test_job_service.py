@@ -539,7 +539,8 @@ def test_retry_persists_config_snapshot_atomically_and_replay_checks_it(
     assert replay.job_id == retried.job_id
     events = repo.list_events(retried.job_id)
     assert [event.event_type for event in events] == [
-        "configuration.snapshot.v1"
+        "configuration.snapshot.v1",
+        "job.state.v1",
     ]
     with pytest.raises(DomainError, match="idempotency_conflict"):
         service.retry(
@@ -555,7 +556,7 @@ def test_retry_persists_config_snapshot_atomically_and_replay_checks_it(
                 ),
             ),
         )
-    assert len(repo.list_events(retried.job_id)) == 1
+    assert len(repo.list_events(retried.job_id)) == 2
 
 
 @pytest.mark.parametrize(

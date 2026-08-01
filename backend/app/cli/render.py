@@ -4,7 +4,7 @@ import json
 import math
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import TextIO
 
@@ -177,6 +177,7 @@ def render_result(
                 allow_nan=False,
             ),
             file=output,
+            flush=True,
         )
         return
 
@@ -203,7 +204,7 @@ def render_result(
 
 
 def render_json_lines(
-    records: Sequence[Mapping[str, object]],
+    records: Iterable[Mapping[str, object]],
     *,
     stdout: TextIO | None = None,
 ) -> None:
@@ -217,6 +218,7 @@ def render_json_lines(
                 allow_nan=False,
             ),
             file=output,
+            flush=True,
         )
 
 

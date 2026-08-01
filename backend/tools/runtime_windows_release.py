@@ -864,7 +864,7 @@ def _run_legacy_jobstore_migration(
     }
     if payload != {
         "schema_before": 1,
-        "schema_after": 4,
+        "schema_after": 5,
         "integrity": "ok",
         "foreign_key_errors": 0,
         "job_id": "job_legacy_release_fixture",
@@ -872,7 +872,7 @@ def _run_legacy_jobstore_migration(
         "result_bundle_id": "bnd_018cc251-f400-7000-8000-000000000005",
         "result_quality": "pass",
         "attempt_states": ["succeeded"],
-        "event_types": ["portable.commit.completed.v1"],
+        "event_types": ["portable.commit.completed.v1", "job.state.v1"],
         "checkpoint_id": "chk_legacy_release_fixture",
         "source_identity_preserved": True,
         "binding": expected_binding,

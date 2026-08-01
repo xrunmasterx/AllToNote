@@ -54,9 +54,15 @@ from app.core.ports.job_queries import JobListRecord, JobQueryRecord
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
+_WRITER_PROTOCOL_FUNCTION = "alltonote_jobstore_writer_protocol"
 _BUSY_TIMEOUT_MS = 5_000
 _RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
+_JOB_STATE_EVENT_TYPE = "job.state.v1"
+_JOB_CANCEL_REQUESTED_EVENT_TYPE = "job.cancel-requested.v1"
+_INTERNAL_JOB_EVENT_TYPES = frozenset(
+    {_JOB_STATE_EVENT_TYPE, _JOB_CANCEL_REQUESTED_EVENT_TYPE}
+)
 _JOBS_SCHEMA_V1 = """
     CREATE TABLE jobs (
         job_id TEXT PRIMARY KEY,
@@ -245,7 +251,7 @@ _JOB_EXECUTION_LEASE_SCHEMA = """
         heartbeat_at TEXT NOT NULL
     )
     """
-_SCHEMA_STATEMENTS = (
+_SCHEMA_STATEMENTS_V4 = (
     _JOBS_SCHEMA_V3,
     *_SCHEMA_STATEMENTS_V1[1:7],
     _SCHEDULER_LEASE_SCHEMA_V4,
@@ -253,6 +259,34 @@ _SCHEMA_STATEMENTS = (
     _EXECUTION_BINDING_SCHEMA,
     _JOB_EXECUTION_LEASE_SCHEMA,
 )
+_WRITER_PROTOCOL_TABLES = (
+    "jobs",
+    "steps",
+    "attempts",
+    "events",
+    "challenges",
+    "external_operations",
+    "checkpoints",
+    "leases",
+    "source_identities",
+    "job_execution_bindings",
+    "job_execution_leases",
+)
+_WRITER_PROTOCOL_TRIGGERS = tuple(
+    f"""
+    CREATE TRIGGER writer_protocol_{table}_{operation.casefold()}
+    BEFORE {operation} ON {table}
+    BEGIN
+        SELECT CASE
+            WHEN {_WRITER_PROTOCOL_FUNCTION}() != {_SCHEMA_VERSION}
+            THEN RAISE(ABORT, 'job_store_writer_protocol_mismatch')
+        END;
+    END
+    """
+    for table in _WRITER_PROTOCOL_TABLES
+    for operation in ("INSERT", "UPDATE", "DELETE")
+)
+_SCHEMA_STATEMENTS = (*_SCHEMA_STATEMENTS_V4, *_WRITER_PROTOCOL_TRIGGERS)
 _DEFAULT_EXECUTION_BINDING = JobExecutionBinding(
     recipe_id="alltonote.legacy",
     recipe_version=1,
@@ -320,6 +354,12 @@ def _raise_if_job_store_busy(error: sqlite3.DatabaseError) -> None:
 
 
 def _configure_connection(connection: sqlite3.Connection) -> None:
+    connection.create_function(
+        _WRITER_PROTOCOL_FUNCTION,
+        0,
+        lambda: _SCHEMA_VERSION,
+        deterministic=True,
+    )
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
     journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
@@ -399,7 +439,7 @@ class SqliteJobRepository:
             raise
         except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
             _raise_schema_invalid(error)
-        if version not in (1, 2, 3, _SCHEMA_VERSION):
+        if version not in (1, 2, 3, 4, _SCHEMA_VERSION):
             _raise_schema_invalid()
         repository = cls(
             resolved_root,
@@ -469,7 +509,7 @@ class SqliteJobRepository:
     def _initialize_schema(self) -> None:
         with self._transaction(immediate=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3, _SCHEMA_VERSION):
+            if version not in (0, 1, 2, 3, 4, _SCHEMA_VERSION):
                 raise DomainError(
                     "job_store_schema_unsupported",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
@@ -489,6 +529,7 @@ class SqliteJobRepository:
                 self._migrate_v1_to_v2(connection)
                 self._migrate_v2_to_v3(connection)
                 self._migrate_v3_to_v4(connection)
+                self._migrate_v4_to_v5(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             elif version == 2:
@@ -496,12 +537,20 @@ class SqliteJobRepository:
                     _raise_schema_invalid()
                 self._migrate_v2_to_v3(connection)
                 self._migrate_v3_to_v4(connection)
+                self._migrate_v4_to_v5(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             elif version == 3:
                 if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V3):
                     _raise_schema_invalid()
                 self._migrate_v3_to_v4(connection)
+                self._migrate_v4_to_v5(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
+            elif version == 4:
+                if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V4):
+                    _raise_schema_invalid()
+                self._migrate_v4_to_v5(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             if actual_schema != _expected_schema():
@@ -564,6 +613,46 @@ class SqliteJobRepository:
                     ),
                 )
         connection.execute("DROP TABLE leases_v3")
+
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT job_id, state FROM jobs ORDER BY job_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                state = JobState(row["state"])
+            except ValueError:
+                _raise_schema_invalid()
+            canonical_payload = json.dumps(
+                {"state": state.value},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            latest_state = connection.execute(
+                """
+                SELECT sequence, payload_json FROM events
+                WHERE job_id = ? AND event_type = ?
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (row["job_id"], _JOB_STATE_EVENT_TYPE),
+            ).fetchone()
+            if (
+                latest_state is not None
+                and latest_state["payload_json"] == canonical_payload
+            ):
+                if state not in TERMINAL_JOB_STATES:
+                    continue
+                latest_sequence = connection.execute(
+                    "SELECT MAX(sequence) FROM events WHERE job_id = ?",
+                    (row["job_id"],),
+                ).fetchone()[0]
+                if latest_sequence == latest_state["sequence"]:
+                    continue
+            self._insert_job_state_event(connection, row["job_id"], state)
+        for statement in _WRITER_PROTOCOL_TRIGGERS:
+            connection.execute(statement)
 
     @staticmethod
     def _legacy_execution_binding(request_json: str | None) -> JobExecutionBinding:
@@ -631,6 +720,11 @@ class SqliteJobRepository:
                         event_type,
                         payload_json,
                     )
+                self._insert_job_state_event(
+                    connection,
+                    job.job_id,
+                    JobState.QUEUED,
+                )
             else:
                 if job.execution_owner is not execution_owner:
                     raise DomainError(
@@ -648,9 +742,14 @@ class SqliteJobRepository:
                 stored = connection.execute(
                     """
                     SELECT event_type, payload_json FROM events
-                    WHERE job_id = ? ORDER BY sequence LIMIT ?
+                    WHERE job_id = ? AND event_type != ?
+                    ORDER BY sequence LIMIT ?
                     """,
-                    (job.job_id, len(initial_events)),
+                    (
+                        job.job_id,
+                        _JOB_STATE_EVENT_TYPE,
+                        len(initial_events),
+                    ),
                 ).fetchall()
                 if tuple(
                     (row["event_type"], row["payload_json"]) for row in stored
@@ -1086,6 +1185,11 @@ class SqliteJobRepository:
                     "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                     (JobState.RUNNING.value, now, job_id),
                 )
+                self._insert_job_state_event(
+                    connection,
+                    job_id,
+                    JobState.RUNNING,
+                )
                 job = self._get_job(connection, job_id)
             active_attempt = connection.execute(
                 """
@@ -1409,13 +1513,20 @@ class SqliteJobRepository:
                     )
                 return job
             now = utc_now_millis()
-            connection.execute(
-                """
-                UPDATE jobs SET cancellation_requested = 1, updated_at = ?
-                WHERE job_id = ?
-                """,
-                (now, job_id),
-            )
+            if not job.cancellation_requested:
+                connection.execute(
+                    """
+                    UPDATE jobs SET cancellation_requested = 1, updated_at = ?
+                    WHERE job_id = ? AND cancellation_requested = 0
+                    """,
+                    (now, job_id),
+                )
+                self._insert_event(
+                    connection,
+                    job_id,
+                    _JOB_CANCEL_REQUESTED_EVENT_TYPE,
+                    '{"requested":true}',
+                )
             connection.execute(
                 """
                 UPDATE attempts SET state = ?, updated_at = ?
@@ -1507,6 +1618,7 @@ class SqliteJobRepository:
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (next_state.value, now, job_id),
             )
+            self._insert_job_state_event(connection, job_id, next_state)
             return self._get_challenge(connection, challenge_id)
 
     def pause_for_external_outcome_atomic(
@@ -1598,6 +1710,11 @@ class SqliteJobRepository:
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (JobState.WAITING_FOR_INPUT.value, now, job_id),
             )
+            self._insert_job_state_event(
+                connection,
+                job_id,
+                JobState.WAITING_FOR_INPUT,
+            )
             return self._get_challenge(connection, challenge_id)
 
     def respond_challenge_atomic(
@@ -1665,6 +1782,7 @@ class SqliteJobRepository:
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (next_state.value, now, job_id),
             )
+            self._insert_job_state_event(connection, job_id, next_state)
             return self._get_job(connection, job_id), response_attempt
 
     def create_retry_job_atomic(
@@ -1744,13 +1862,23 @@ class SqliteJobRepository:
                         event_type,
                         payload_json,
                     )
+                self._insert_job_state_event(
+                    connection,
+                    job.job_id,
+                    JobState.QUEUED,
+                )
             elif initial_events:
                 stored = connection.execute(
                     """
                     SELECT event_type, payload_json FROM events
-                    WHERE job_id = ? ORDER BY sequence LIMIT ?
+                    WHERE job_id = ? AND event_type != ?
+                    ORDER BY sequence LIMIT ?
                     """,
-                    (job.job_id, len(initial_events)),
+                    (
+                        job.job_id,
+                        _JOB_STATE_EVENT_TYPE,
+                        len(initial_events),
+                    ),
                 ).fetchall()
                 if tuple(
                     (row["event_type"], row["payload_json"]) for row in stored
@@ -2376,7 +2504,13 @@ class SqliteJobRepository:
     ) -> JobEvent:
         self._validate_initial_events(((event_type, payload_json),))
         with self._transaction(immediate=True) as connection:
-            self._get_job(connection, job_id)
+            job = self._get_job(connection, job_id)
+            if job.state in TERMINAL_JOB_STATES:
+                raise DomainError(
+                    "job_event_terminal",
+                    ErrorCategory.CONFLICT,
+                    "Terminal Job event stream is closed",
+                )
             return self._insert_event(
                 connection,
                 job_id,
@@ -2429,6 +2563,25 @@ class SqliteJobRepository:
             created_at=created_at,
         )
 
+    @staticmethod
+    def _insert_job_state_event(
+        connection: sqlite3.Connection,
+        job_id: str,
+        state: JobState,
+    ) -> JobEvent:
+        return SqliteJobRepository._insert_event(
+            connection,
+            job_id,
+            _JOB_STATE_EVENT_TYPE,
+            json.dumps(
+                {"state": state.value},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+        )
+
     def transition_job(
         self,
         job_id: str,
@@ -2455,6 +2608,7 @@ class SqliteJobRepository:
                 "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
                 (next_state.value, utc_now_millis(), job_id),
             )
+            self._insert_job_state_event(connection, job_id, next_state)
             return self._get_job(connection, job_id)
 
     def transition_attempt(
@@ -2689,6 +2843,11 @@ class SqliteJobRepository:
                 """,
                 (JobState.FAILED.value, error_json, now, job_id),
             )
+            self._insert_job_state_event(
+                connection,
+                job_id,
+                JobState.FAILED,
+            )
             return self._get_job(connection, job_id)
 
     def _assert_commit_guard(
@@ -2764,6 +2923,11 @@ class SqliteJobRepository:
                 ErrorCategory.CONFLICT,
                 "Portable commit authority changed before success",
             )
+        self._insert_job_state_event(
+            connection,
+            job_id,
+            JobState.SUCCEEDED,
+        )
 
     @classmethod
     def _validate_result_plan(cls, plan: VideoResultPlan) -> None:
@@ -3245,6 +3409,7 @@ class SqliteJobRepository:
                 type(event) is not tuple
                 or len(event) != 2
                 or type(event[0]) is not str
+                or event[0] in _INTERNAL_JOB_EVENT_TYPES
                 or re.fullmatch(
                     r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*",
                     event[0],
@@ -3691,6 +3856,11 @@ class SqliteJobRepository:
         connection.execute(
             "UPDATE jobs SET state = ?, updated_at = ? WHERE job_id = ?",
             (next_state.value, now, job_id),
+        )
+        SqliteJobRepository._insert_job_state_event(
+            connection,
+            job_id,
+            next_state,
         )
 
     @staticmethod

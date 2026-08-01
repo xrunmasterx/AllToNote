@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import shutil
 import sqlite3
@@ -10,6 +11,9 @@ import pytest
 
 from app.cli.errors import map_error
 from app.cli.main import main
+from app.cli.contracts import ApplicationResult, CliError
+from app.cli.render import render_json_lines, render_result
+from app.core.application.job_query_service import JobEventPage
 from app.core.domain.video import JobState, VideoProduceRequest
 from app.core.errors import ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
@@ -255,7 +259,7 @@ def test_job_events_jsonl_is_versioned_bounded_and_redacted(
             "--workspace",
             str(workspace_root),
             "--after-sequence",
-            "0",
+            "1",
             "--limit",
             "1",
             "--jsonl",
@@ -270,7 +274,7 @@ def test_job_events_jsonl_is_versioned_bounded_and_redacted(
     event = json.loads(lines[0])
     assert event["event_schema_version"] == 1
     assert event["job_id"] == submitted.job_id
-    assert event["sequence"] == 1
+    assert event["sequence"] == 2
     assert event["type"] == "step.finished"
     assert str(workspace_root) not in captured.out
     assert captured.err == ""
@@ -283,14 +287,455 @@ def test_job_events_jsonl_is_versioned_bounded_and_redacted(
             "--workspace",
             str(workspace_root),
             "--after-sequence",
-            "1",
+            "2",
             "--json",
         ],
         runtime=runtime,
     )
     page = json.loads(capsys.readouterr().out)
     assert code == 0
-    assert [item["sequence"] for item in page["data"]["events"]] == [2]
+    assert [item["sequence"] for item in page["data"]["events"]] == [3]
+
+
+def test_job_events_follow_jsonl_catches_up_resumes_and_ends_with_terminal_state(
+    runtime: object,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(_request(workspace_root, "events-follow"))
+    repository = runtime.job_repository
+    repository.append_event(
+        submitted.job_id,
+        "stage.progress",
+        '{"completed":1,"stage":"prepare","total":2}',
+    )
+    repository.append_event(
+        submitted.job_id,
+        "stage.progress",
+        '{"completed":2,"stage":"prepare","total":2}',
+    )
+    sleep_calls = 0
+
+    def finish_during_follow(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        repository.append_event(
+            submitted.job_id,
+            "stage.progress",
+            '{"completed":1,"stage":"publish","total":1}',
+        )
+        repository.cancel_job(submitted.job_id)
+
+    observer = JobRuntime(
+        repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        sleep=finish_during_follow,
+    )
+    code = main(
+        [
+            "job",
+            "events",
+            submitted.job_id,
+            "--workspace",
+            str(workspace_root),
+            "--after-sequence",
+            "1",
+            "--limit",
+            "2",
+            "--jsonl",
+            "--follow",
+        ],
+        runtime=runtime,
+        job_runtime=observer,
+    )
+    captured = capsys.readouterr()
+    records = [json.loads(line) for line in captured.out.splitlines()]
+
+    assert code == 0
+    assert sleep_calls == 1
+    assert [record["sequence"] for record in records] == [2, 3, 4, 5, 6]
+    assert [record["type"] for record in records[:3]] == [
+        "stage.progress",
+        "stage.progress",
+        "stage.progress",
+    ]
+    assert records[-2]["type"] == "job.cancel-requested.v1"
+    assert records[-2]["data"] == {"requested": True}
+    assert records[-1]["type"] == "job.state.v1"
+    assert records[-1]["data"] == {"state": "cancelled"}
+    assert captured.err == ""
+
+    code = main(
+        [
+            "job",
+            "events",
+            submitted.job_id,
+            "--workspace",
+            str(workspace_root),
+            "--after-sequence",
+            str(records[-1]["sequence"]),
+            "--limit",
+            "1",
+            "--jsonl",
+            "--follow",
+        ],
+        runtime=runtime,
+        job_runtime=observer,
+    )
+    resumed = capsys.readouterr()
+
+    assert code == 0
+    assert resumed.out == ""
+    assert resumed.err == ""
+
+
+def test_job_events_follow_requires_jsonl(
+    runtime: object,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    submitted = runtime.submit_video(
+        _request(workspace_root, "events-follow-format")
+    )
+
+    code = main(
+        [
+            "job",
+            "events",
+            submitted.job_id,
+            "--workspace",
+            str(workspace_root),
+            "--follow",
+            "--json",
+        ],
+        runtime=runtime,
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert envelope["command"] == "job events"
+    assert envelope["error"]["code"] == "cli_usage_invalid"
+
+
+def test_job_events_follow_format_is_rejected_before_runtime_bootstrap(
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli_main = importlib.import_module("app.cli.main")
+    bootstrap_calls = 0
+
+    def fail_bootstrap(*_args: object, **_kwargs: object) -> object:
+        nonlocal bootstrap_calls
+        bootstrap_calls += 1
+        raise AssertionError("invalid follow format must not bootstrap a JobRuntime")
+
+    monkeypatch.setattr(cli_main, "_job_runtime_for_args", fail_bootstrap)
+    code = main(
+        [
+            "job",
+            "events",
+            "job_invalid_follow",
+            "--workspace",
+            str(workspace_root),
+            "--follow",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+
+    assert code == 2
+    assert bootstrap_calls == 0
+    assert envelope["command"] == "job events"
+    assert envelope["error"]["code"] == "cli_usage_invalid"
+    assert captured.err == ""
+
+    code = main(
+        [
+            "job",
+            "events",
+            "job_invalid_follow",
+            "--workspace",
+            str(workspace_root),
+            "--follow",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert bootstrap_calls == 0
+    assert captured.out == ""
+    assert "Error [cli_usage_invalid]" in captured.err
+
+
+def test_job_events_follow_stops_at_waiting_for_input_boundary(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "events-follow-waiting")
+    )
+    repository = runtime.job_repository
+    repository.transition_job(submitted.job_id, JobState.RUNNING)
+    authority = repository.claim_job(
+        submitted.job_id,
+        "follow-waiting-owner",
+        ttl_seconds=300,
+    ).authority
+    attempt = repository.start_attempt(
+        repository.create_attempt(
+            submitted.job_id,
+            "acquire",
+            authority=authority,
+        ).attempt_id,
+        authority,
+    )
+    repository.transition_attempt(
+        attempt.attempt_id,
+        AttemptState.NEEDS_INPUT,
+        authority=authority,
+    )
+    repository.create_challenge(
+        submitted.job_id,
+        attempt.attempt_id,
+        '{"kind":"credential_profile"}',
+    )
+    repository.release_job_claim(authority)
+    observer = JobRuntime(
+        repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        sleep=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("waiting_for_input must close this observation call")
+        ),
+    )
+
+    events = tuple(observer.stream_job_events(submitted.job_id, limit=1))
+
+    assert events[-1].event_type == "job.state.v1"
+    assert events[-1].payload_json == '{"state":"waiting_for_input"}'
+    assert repository.get_job(submitted.job_id).state is JobState.WAITING_FOR_INPUT
+
+
+def test_job_events_follow_drains_multiple_pages_before_sleep(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "events-follow-multiple-pages")
+    )
+    repository = runtime.job_repository
+    for completed in range(5):
+        repository.append_event(
+            submitted.job_id,
+            "stage.progress",
+            json.dumps(
+                {"completed": completed + 1, "stage": "prepare", "total": 5},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    sleep_calls = 0
+
+    def finish_after_backlog(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        repository.cancel_job(submitted.job_id)
+
+    observer = JobRuntime(
+        repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        sleep=finish_after_backlog,
+    )
+
+    events = tuple(observer.stream_job_events(submitted.job_id, limit=2))
+
+    assert sleep_calls == 1
+    assert [event.sequence for event in events] == list(
+        range(1, events[-1].sequence + 1)
+    )
+    assert [event.event_type for event in events[1:6]] == ["stage.progress"] * 5
+    assert events[-1].event_type == "job.state.v1"
+    assert events[-1].payload_json == '{"state":"cancelled"}'
+
+
+def test_job_events_follow_uses_bounded_adaptive_idle_backoff(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "events-follow-backoff")
+    )
+    delays: list[float] = []
+
+    def settle_after_backoff(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) == 5:
+            runtime.job_repository.cancel_job(submitted.job_id)
+
+    observer = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        sleep=settle_after_backoff,
+    )
+
+    events = tuple(observer.stream_job_events(submitted.job_id, limit=1))
+
+    assert delays == [0.1, 0.2, 0.4, 0.8, 1.0]
+    assert events[-1].event_type == "job.state.v1"
+    assert events[-1].payload_json == '{"state":"cancelled"}'
+
+
+def test_job_events_follow_interrupt_emits_final_protocol_error_without_cancelling(
+    runtime: object,
+    workspace_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "events-follow-interrupt")
+    )
+
+    def interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    observer = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        sleep=interrupt,
+    )
+    code = main(
+        [
+            "job",
+            "events",
+            submitted.job_id,
+            "--workspace",
+            str(workspace_root),
+            "--jsonl",
+            "--follow",
+        ],
+        runtime=runtime,
+        job_runtime=observer,
+    )
+    captured = capsys.readouterr()
+    records = [json.loads(line) for line in captured.out.splitlines()]
+
+    assert code == 130
+    assert records[0]["type"] == "job.state.v1"
+    assert records[-1]["alltonote_cli_protocol_version"] == 1
+    assert records[-1]["ok"] is False
+    assert records[-1]["command"] == "job events"
+    assert records[-1]["error"]["code"] == "interrupted"
+    assert runtime.get_job(submitted.job_id).state is JobState.QUEUED
+    assert captured.err == ""
+
+
+def test_job_event_stream_rechecks_after_observing_terminal_state(
+    runtime: object,
+    workspace_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    submitted = runtime.submit_video(
+        _request(workspace_root, "events-terminal-race")
+    )
+    runtime.job_repository.cancel_job(submitted.job_id)
+    observer = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        sleep=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("terminal stream must not sleep")
+        ),
+    )
+    read_events = observer.get_job_events
+    calls = 0
+
+    def miss_first_committed_page(*args: object, **kwargs: object) -> JobEventPage:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return JobEventPage(events=(), next_after_sequence=None)
+        return read_events(*args, **kwargs)
+
+    monkeypatch.setattr(observer, "get_job_events", miss_first_committed_page)
+
+    events = tuple(observer.stream_job_events(submitted.job_id, limit=1))
+
+    assert calls >= 3
+    assert [event.sequence for event in events] == [1, 2, 3]
+    assert events[-1].event_type == "job.state.v1"
+    assert events[-1].payload_json == '{"state":"cancelled"}'
+
+
+def test_jsonl_renderer_flushes_each_incremental_record() -> None:
+    class FlushCountingStream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flush_count = 0
+
+        def flush(self) -> None:
+            self.flush_count += 1
+            super().flush()
+
+    output = FlushCountingStream()
+    render_json_lines(
+        ({"sequence": sequence} for sequence in (1, 2, 3)),
+        stdout=output,
+    )
+
+    assert output.flush_count == 3
+    assert output.getvalue().splitlines() == [
+        '{"sequence":1}',
+        '{"sequence":2}',
+        '{"sequence":3}',
+    ]
+
+
+def test_json_error_renderer_flushes_final_protocol_record() -> None:
+    class FlushCountingStream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flush_count = 0
+
+        def flush(self) -> None:
+            self.flush_count += 1
+            super().flush()
+
+    output = FlushCountingStream()
+    render_result(
+        ApplicationResult(
+            command="job events",
+            correlation_id="corr_test",
+            ok=False,
+            error=CliError(
+                code="interrupted",
+                category="cancelled",
+                message="Command was interrupted",
+                retryable=False,
+            ),
+        ),
+        json_mode=True,
+        stdout=output,
+    )
+
+    assert output.flush_count == 1
+    assert json.loads(output.getvalue())["error"]["code"] == "interrupted"
 
 
 def test_job_wait_executes_without_timeout_and_failed_wait_is_nonzero(
@@ -527,6 +972,7 @@ def test_job_cancel_then_retry_creates_new_job_with_frozen_snapshots(
     assert [event.event_type for event in events] == [
         "configuration.snapshot.v1",
         JOB_PACK_ENVIRONMENT_EVENT,
+        "job.state.v1",
     ]
     inherited = parse_job_pack_environment_payload(events[1].payload_json)
     assert inherited.pack("media-basic").manifest_sha256 == "sha256:" + "a" * 64
@@ -776,7 +1222,7 @@ def test_job_cancel_repairs_legacy_cancelled_pending_challenge(
     )
     repo.release_job_claim(authority)
     repo.cancel_job(job.job_id)
-    with sqlite3.connect(repo.database_path) as connection:
+    with repo._connect() as connection:
         connection.execute(
             "UPDATE challenges SET state = 'pending' WHERE challenge_id = ?",
             (challenge.challenge_id,),

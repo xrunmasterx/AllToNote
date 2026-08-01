@@ -307,14 +307,16 @@ def test_legacy_jobstore_fixture_migrates_and_reopens(tmp_path: Path) -> None:
     assert result.quality_overall.value == "pass"
     assert [attempt.state.value for attempt in attempts] == ["succeeded"]
     assert [event.event_type for event in events] == [
-        "portable.commit.completed.v1"
+        "portable.commit.completed.v1",
+        "job.state.v1",
     ]
+    assert events[-1].payload_json == '{"state":"succeeded"}'
     assert checkpoint is not None
     assert checkpoint.checkpoint_id == "chk_legacy_release_fixture"
     assert source_identity is not None
     assert source_identity.source_id == "src_018cc251-f400-7000-8000-000000000006"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -337,7 +339,7 @@ def test_release_gate_accepts_only_current_jobstore_migration_schema(
 ) -> None:
     payload = {
         "schema_before": 1,
-        "schema_after": 4,
+        "schema_after": 5,
         "integrity": "ok",
         "foreign_key_errors": 0,
         "job_id": "job_legacy_release_fixture",
@@ -345,7 +347,7 @@ def test_release_gate_accepts_only_current_jobstore_migration_schema(
         "result_bundle_id": "bnd_018cc251-f400-7000-8000-000000000005",
         "result_quality": "pass",
         "attempt_states": ["succeeded"],
-        "event_types": ["portable.commit.completed.v1"],
+        "event_types": ["portable.commit.completed.v1", "job.state.v1"],
         "checkpoint_id": "chk_legacy_release_fixture",
         "source_identity_preserved": True,
         "binding": {

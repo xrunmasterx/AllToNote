@@ -150,8 +150,8 @@ Stop condition：
 
 完成记录（2026-08-01）：
 
-- JobStore schema v4 将 scheduler leadership 保留在 `leases`，并新增按 `job_id` 唯一的 `job_execution_leases`，持久化 owner、generation、heartbeat 与 expiry；两个不同 Job 可独立 claim，同一 Job 的有效 owner 仍唯一；
-- v1/v2/v3 均在一个 `BEGIN IMMEDIATE` 事务内迁移到 v4。v3 存在未过期旧 lease 时以 retryable `job_store_migration_busy` fail closed 且不改 schema；过期的 bound lease 保留 generation 后迁移，失败可完整回滚；
+- JobStore schema v4 将 scheduler leadership 保留在 `leases`，并新增按 `job_id` 唯一的 `job_execution_leases`，持久化 owner、generation、heartbeat 与 expiry；schema v5 不改表字段，只冻结 durable `job.state.v1` 生命周期事件语义，并为全部可写表安装 writer-protocol triggers；
+- v1/v2/v3 先在一个 `BEGIN IMMEDIATE` 事务内完成 v4 结构迁移，再与已有 v4 一起升级到 v5；升级会为每个旧 Job 追加一次当前状态快照，使旧终态 Job 的事件流也以终态记录收尾，并在提交前安装数据库级 writer fence，使迁移前已打开的 v4 连接在迁移后无法继续写入。v3 存在未过期旧 lease 时以 retryable `job_store_migration_busy` fail closed 且不改 schema；任何结构、事件回填或 trigger 安装失败都完整回滚；
 - 新 claim 的 generation 高于该 Job 已存在 Attempt 的最大 fencing token，避免旧 scheduler token 与新 Job generation 的命名空间碰撞；release 仅将 expiry 置零，takeover 严格递增；
 - Video、Document、Checkpoint heartbeat 与 Engine failure convergence 已改用 Job-scoped heartbeat/release；scheduler API 拒绝 Job authority，防止两个 authority 域被误混用；
 - 迁移、32 路同 Job 争用、跨进程唯一领取、不同 Job 独立领取、stale generation 全写面 fencing、candidate 按 Job 排除、Video/Document outcome-unknown/recovery 与 Runtime release migration Gate 均有回归测试；
@@ -236,13 +236,13 @@ Stop condition：
 
 验收：
 
-- [ ] detach 返回前 Job 已 durable；
-- [ ] 关闭 CLI 后任务继续；
+- [x] detach 返回前 Job 已 durable；
+- [x] 关闭 CLI 后任务继续；
 - [ ] batch 每项为独立 Job；
 - [ ] max-parallel 只是上限，仍服从资源容量；
 - [ ] 单项失败不阻塞其他项；
-- [ ] Job 可独立 retry/cancel；
-- [ ] CLI 重连可继续 wait/events；
+- [x] Job 可独立 retry/cancel；
+- [x] CLI 重连可继续 wait/events；
 - [ ] Desktop 与 CLI 观察同一状态和事件；
 - [ ] Desktop 不解析人类 CLI stdout；
 - [ ] 普通单任务命令不要求理解 Engine；
@@ -253,6 +253,14 @@ Stop condition：
 - batch 被实现为一个无法局部恢复的大事务；
 - Desktop 建立第二套状态机；
 - 为 GUI 方便绕过 ProduceService/JobStore。
+
+当前进展（2026-08-01，Task 7 尚未完成）：
+
+- Video 与 Document 的 `produce --detach` 已复用同一 durable Job/Engine handoff，提交进程退出后 Worker 继续执行；
+- `alltonote job events JOB --jsonl --follow` 已提供 SQLite 权威的单 Job 增量事件流：`after_sequence` 为排他游标，`limit` 为分页上限，积压跨页完整排空；每行立即 flush，Ctrl+C 只终止观察并输出最终协议错误行，不取消 Job；
+- Job 状态变化与 `job.state.v1` 在同一事务提交，终态后禁止追加事件；v5 迁移为旧 Job 回填当前状态。`waiting_for_input` 是本次观察调用的成功停止边界，调用方随后使用独立 respond 命令恢复；
+- 空闲跟随采用 0.1、0.2、0.4、0.8、1.0 秒有界退避，避免固定 50 ms 高频读取；CLI 参数关系在 Workspace/JobStore bootstrap 前校验；
+- batch request manifest、`max-parallel`、资源准入队列和 typed Desktop bridge 仍未实现，因此 Task 7 保持未完成，`parallel_job_execution_enabled` 继续为 false。
 
 ## Task 8: [ ] 实现完整本地 AgentExecutor
 
