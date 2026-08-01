@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,19 @@ def _attempt_state(repository, attempt_id: str) -> AttemptState:
     return AttemptState(row["state"])
 
 
+def _stage_states(
+    repository: SqliteJobRepository,
+    job_id: str,
+    stage: str,
+) -> list[str]:
+    return [
+        payload["state"]
+        for event in repository.list_events(job_id)
+        if event.event_type == "stage.changed.v1"
+        and (payload := json.loads(event.payload_json))["stage"] == stage
+    ]
+
+
 def test_valid_checkpoint_is_reused_and_resumed_attempt_converges(
     tmp_path: Path,
 ) -> None:
@@ -113,6 +127,14 @@ def test_valid_checkpoint_is_reused_and_resumed_attempt_converges(
     assert first == second == "durable result"
     assert calls == 1
     assert _attempt_state(repository, resumed.attempt_id) is AttemptState.SUCCEEDED
+    assert _stage_states(repository, job.job_id, "knowledge-map") == [
+        "pending",
+        "running",
+        "succeeded",
+        "pending",
+        "running",
+        "succeeded",
+    ]
 
 
 def test_fenced_runner_cannot_publish_checkpoint(tmp_path: Path) -> None:
@@ -175,6 +197,14 @@ def test_external_outcome_unknown_pauses_job_atomically(tmp_path: Path) -> None:
     assert _attempt_state(repository, attempt_ids[0]) is AttemptState.NEEDS_INPUT
     assert challenge is not None
     assert repository.latest_checkpoint(job.job_id, "knowledge-map") is None
+    assert _stage_states(repository, job.job_id, "knowledge-map") == [
+        "pending",
+        "running",
+        "needs_input",
+    ]
+    assert repository.list_events(job.job_id)[-1].payload_json == (
+        '{"state":"waiting_for_input"}'
+    )
 
 
 def test_cancelled_action_settles_attempt_as_cancelled(tmp_path: Path) -> None:
@@ -202,3 +232,11 @@ def test_cancelled_action_settles_attempt_as_cancelled(tmp_path: Path) -> None:
     assert _attempt_state(repository, attempt_ids[0]) is AttemptState.CANCELLED
     assert repository.get_job_details(job.job_id)[0].state is JobState.CANCELLED
     assert repository.latest_checkpoint(job.job_id, "parse-document") is None
+    assert _stage_states(repository, job.job_id, "parse-document") == [
+        "pending",
+        "running",
+        "cancelled",
+    ]
+    assert repository.list_events(job.job_id)[-1].payload_json == (
+        '{"state":"cancelled"}'
+    )

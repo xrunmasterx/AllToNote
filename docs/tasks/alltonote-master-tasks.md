@@ -126,7 +126,7 @@ git diff --check
 | AgentExecutor | `design complete; implementation pending` | Codebase/UE5 所需受控 AgentExecutor/ExecutionGrant 尚未实现 |
 | Thin Desktop | `design complete; implementation pending` | Desktop API、Runtime Resolver、Vault UI 与发布 Gate 均待实现；旧 BiliNote UI 不等于目标架构 |
 | Knowledge MCP | `design complete; implementation pending` | 与 Production MCP 分离；默认 published-only stdio server |
-| Engine/Production MCP | `partially admitted; single-active detached Engine implemented` | 按用户授权完成 Engine 生命周期、Video/Document detach、两类本地输入 pre-Job 快照、SQLite Job authority、跨进程恢复与事件重连；仍保持单 active Worker，资源准入、worker pool、batch/max-parallel 与 Production MCP 未 admission |
+| Engine/Production MCP | `partially admitted; single-active detached Engine implemented` | 按用户授权完成 Engine 生命周期、Video/Document detach、两类本地输入 pre-Job 快照、SQLite Job authority、跨进程恢复、事件重连与事务型 durable stage events；仍保持单 active Worker，资源准入、worker pool、batch/max-parallel 与 Production MCP 未 admission |
 | Article/Wiki/PDF/PPT Recipe | `design complete; two PDF samples implemented` | 英文双栏与中文表格密集 PDF 均通过正式纵切；Windows 中文路径、TableFormer 结构和 Document 默认 Evidence 呈现已关闭；Article/Wiki/PPT/OCR/完整 Document MVP 仍 pending |
 | UE5/Codebase/Personal Recipe | `design complete; implementation pending/deferred by gates` | Code prototype等待 Recipe 合同验证；Personal manual MVP 可先做，scheduler 等 Engine |
 | 网站账号/邀请/下载/设备/公共知识 | `design complete; implementation deferred` | 网站不保存个人 Markdown，等待本地产品和合规 Gate |
@@ -530,7 +530,7 @@ alltonote vault index-status
 
 ### ENGINE-01：按需 Engine 与 Production MCP
 
-- 状态：`deferred; product re-admission and technical gates required`
+- 状态：`partially implemented; single-active Engine and durable events admitted`
 - 优先级：P3
 - 依赖：Video 可信复用后出现被测用户的真实多 Job、detach 或后台执行瓶颈；同时完成模型 turn 隔离、SQLite 版本/并发策略、per-job authority、恢复和零重复副作用 Gate。Engine 不得提前成为 foreground CLI 或 Recipe 的依赖
 - 设计：[`ENGINE-001`](../superpowers/specs/2026-07-18-alltonote-engine-production-mcp-design.md)、[`ADR-0001`](../decisions/ADR-0001-machine-state-outside-vault.md)
@@ -548,6 +548,8 @@ alltonote vault index-status
 - Runtime/Pack 活动版本保护
 
 完成 Gate：杀死 Desktop、CLI、Worker 或 Engine 后不产生半提交 Artifact，Job 状态可确定恢复。
+
+当前实现（2026-08-01）：按需单实例 Engine、Video/Document detach、Job-scoped generation、跨进程恢复、控制面事件跟随和 `stage.changed.v1` 已闭环。阶段事件只由 JobStore 根据持久化后的 Attempt 行在同一事务生成，覆盖 pending、running、接管、暂停、取消、失败与成功；终态 Job 事件保持最后。当前仍是单 active Worker，未开放资源感知并行、batch/max-parallel 或 Production MCP，因此本任务保持 partial。
 
 ### RECIPE-WEB-01：Article/Wiki Recipe
 

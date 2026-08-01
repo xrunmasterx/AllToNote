@@ -60,8 +60,13 @@ _BUSY_TIMEOUT_MS = 5_000
 _RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
 _JOB_STATE_EVENT_TYPE = "job.state.v1"
 _JOB_CANCEL_REQUESTED_EVENT_TYPE = "job.cancel-requested.v1"
+_STAGE_CHANGED_EVENT_TYPE = "stage.changed.v1"
 _INTERNAL_JOB_EVENT_TYPES = frozenset(
-    {_JOB_STATE_EVENT_TYPE, _JOB_CANCEL_REQUESTED_EVENT_TYPE}
+    {
+        _JOB_STATE_EVENT_TYPE,
+        _JOB_CANCEL_REQUESTED_EVENT_TYPE,
+        _STAGE_CHANGED_EVENT_TYPE,
+    }
 )
 _JOBS_SCHEMA_V1 = """
     CREATE TABLE jobs (
@@ -1225,6 +1230,10 @@ class SqliteJobRepository:
                     "SELECT * FROM attempts WHERE attempt_id = ?",
                     (active_attempt["attempt_id"],),
                 ).fetchone()
+                self._insert_stage_changed_event(
+                    connection,
+                    self._attempt_from_row(active_attempt),
+                )
             return PersistedJobClaim(
                 job=job,
                 binding=binding,
@@ -1439,7 +1448,9 @@ class SqliteJobRepository:
                     attempt_id,
                 ),
             )
-            return self._get_attempt(connection, attempt_id)
+            started = self._get_attempt(connection, attempt_id)
+            self._insert_stage_changed_event(connection, started)
+            return started
 
     def take_over_running_attempt(
         self,
@@ -1475,6 +1486,8 @@ class SqliteJobRepository:
                 "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
                 (AttemptState.INTERRUPTED.value, now, attempt_id),
             )
+            interrupted = self._get_attempt(connection, attempt_id)
+            self._insert_stage_changed_event(connection, interrupted)
             replacement = self._create_attempt(
                 connection, job_id, attempt.step_id
             )
@@ -1491,7 +1504,9 @@ class SqliteJobRepository:
                     AttemptState.PENDING.value,
                 ),
             )
-            return self._get_attempt(connection, replacement.attempt_id)
+            running = self._get_attempt(connection, replacement.attempt_id)
+            self._insert_stage_changed_event(connection, running)
+            return running
 
     def cancel_job(self, job_id: str) -> Job:
         with self._transaction(immediate=True) as connection:
@@ -1527,17 +1542,11 @@ class SqliteJobRepository:
                     _JOB_CANCEL_REQUESTED_EVENT_TYPE,
                     '{"requested":true}',
                 )
-            connection.execute(
-                """
-                UPDATE attempts SET state = ?, updated_at = ?
-                WHERE job_id = ? AND state = ?
-                """,
-                (
-                    AttemptState.CANCELLED.value,
-                    now,
-                    job_id,
-                    AttemptState.PENDING.value,
-                ),
+            self._transition_attempts_to_cancelled(
+                connection,
+                job_id,
+                now,
+                states=(AttemptState.PENDING,),
             )
             connection.execute(
                 """
@@ -1687,6 +1696,8 @@ class SqliteJobRepository:
                 "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
                 (AttemptState.NEEDS_INPUT.value, now, attempt_id),
             )
+            paused = self._get_attempt(connection, attempt_id)
+            self._insert_stage_changed_event(connection, paused)
             challenge_id = new_typed_id("chl")
             connection.execute(
                 """
@@ -2582,6 +2593,30 @@ class SqliteJobRepository:
             ),
         )
 
+    @staticmethod
+    def _insert_stage_changed_event(
+        connection: sqlite3.Connection,
+        attempt: Attempt,
+    ) -> JobEvent:
+        return SqliteJobRepository._insert_event(
+            connection,
+            attempt.job_id,
+            _STAGE_CHANGED_EVENT_TYPE,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "stage": attempt.step_id,
+                    "state": attempt.state.value,
+                    "attempt_id": attempt.attempt_id,
+                    "generation": attempt.fencing_token,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+        )
+
     def transition_job(
         self,
         job_id: str,
@@ -2650,8 +2685,10 @@ class SqliteJobRepository:
                 "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
                 (next_state.value, now, attempt_id),
             )
+            transitioned = self._get_attempt(connection, attempt_id)
+            self._insert_stage_changed_event(connection, transitioned)
             self._settle_cancelled_job_if_idle(connection, attempt.job_id, now)
-            return self._get_attempt(connection, attempt_id)
+            return transitioned
 
     @contextmanager
     def commit_guard(
@@ -2835,6 +2872,8 @@ class SqliteJobRepository:
                     "UPDATE attempts SET state = ?, updated_at = ? WHERE attempt_id = ?",
                     (AttemptState.FAILED.value, now, attempt_id),
                 )
+                failed_attempt = self._get_attempt(connection, attempt_id)
+                self._insert_stage_changed_event(connection, failed_attempt)
             self._ensure_attempts_settled(connection, job_id)
             connection.execute(
                 """
@@ -2904,6 +2943,8 @@ class SqliteJobRepository:
                 ErrorCategory.CONFLICT,
                 "Attempt authority changed before success",
             )
+        succeeded_attempt = self._get_attempt(connection, attempt_id)
+        self._insert_stage_changed_event(connection, succeeded_attempt)
         self._ensure_attempts_settled(connection, job_id)
         updated = connection.execute(
             """
@@ -3702,7 +3743,9 @@ class SqliteJobRepository:
                 now,
             ),
         )
-        return self._get_attempt(connection, attempt_id)
+        attempt = self._get_attempt(connection, attempt_id)
+        self._insert_stage_changed_event(connection, attempt)
+        return attempt
 
     def _assert_job_authority(
         self,
@@ -3790,8 +3833,42 @@ class SqliteJobRepository:
                 "Scheduler owner must identify a process instance, not only a PID",
             )
 
-    @staticmethod
+    def _transition_attempts_to_cancelled(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        now: str,
+        *,
+        states: tuple[AttemptState, ...],
+    ) -> None:
+        placeholders = ", ".join("?" for _state in states)
+        rows = connection.execute(
+            f"""
+            SELECT * FROM attempts
+            WHERE job_id = ? AND state IN ({placeholders})
+            ORDER BY created_at, attempt_id
+            """,
+            (job_id, *(state.value for state in states)),
+        ).fetchall()
+        for row in rows:
+            updated = connection.execute(
+                """
+                UPDATE attempts SET state = ?, updated_at = ?
+                WHERE attempt_id = ? AND state = ?
+                """,
+                (
+                    AttemptState.CANCELLED.value,
+                    now,
+                    row["attempt_id"],
+                    row["state"],
+                ),
+            )
+            if updated.rowcount == 1:
+                attempt = self._get_attempt(connection, row["attempt_id"])
+                self._insert_stage_changed_event(connection, attempt)
+
     def _settle_claimed_cancellation(
+        self,
         connection: sqlite3.Connection,
         job_id: str,
         now: str,
@@ -3809,18 +3886,11 @@ class SqliteJobRepository:
                 ExternalOutcome.STARTED.value,
             ),
         )
-        connection.execute(
-            """
-            UPDATE attempts SET state = ?, updated_at = ?
-            WHERE job_id = ? AND state IN (?, ?)
-            """,
-            (
-                AttemptState.CANCELLED.value,
-                now,
-                job_id,
-                AttemptState.PENDING.value,
-                AttemptState.RUNNING.value,
-            ),
+        self._transition_attempts_to_cancelled(
+            connection,
+            job_id,
+            now,
+            states=(AttemptState.PENDING, AttemptState.RUNNING),
         )
         SqliteJobRepository._settle_cancelled_job_if_idle(
             connection,

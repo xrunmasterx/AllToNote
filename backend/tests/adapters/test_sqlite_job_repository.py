@@ -385,6 +385,240 @@ def test_job_state_event_failure_rolls_back_state_transition(
     assert repo.list_events(job.job_id) == original_events
 
 
+def test_attempt_lifecycle_emits_exact_durable_stage_events(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="stage-events",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo, job.job_id)
+
+    pending = repo.create_attempt(
+        job.job_id,
+        "generate_draft",
+        authority=authority,
+    )
+    running = repo.start_attempt(pending.attempt_id, authority)
+    succeeded = repo.transition_attempt(
+        running.attempt_id,
+        AttemptState.SUCCEEDED,
+        authority=authority,
+    )
+
+    stage_events = tuple(
+        event
+        for event in repo.list_events(job.job_id)
+        if event.event_type == "stage.changed.v1"
+    )
+    assert [event.payload_json for event in stage_events] == [
+        json.dumps(
+            {
+                "attempt_id": pending.attempt_id,
+                "generation": 0,
+                "schema_version": 1,
+                "stage": "generate_draft",
+                "state": "pending",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {
+                "attempt_id": running.attempt_id,
+                "generation": authority.fencing_token,
+                "schema_version": 1,
+                "stage": "generate_draft",
+                "state": "running",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {
+                "attempt_id": succeeded.attempt_id,
+                "generation": authority.fencing_token,
+                "schema_version": 1,
+                "stage": "generate_draft",
+                "state": "succeeded",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    ]
+
+    with pytest.raises(DomainError, match="job_event_invalid"):
+        repo.append_event(
+            job.job_id,
+            "stage.changed.v1",
+            stage_events[-1].payload_json,
+        )
+
+
+def test_stage_event_failure_rolls_back_attempt_creation(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="stage-event-rollback",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo, job.job_id)
+    original_events = repo.list_events(job.job_id)
+
+    monkeypatch.setattr(
+        repo,
+        "_insert_stage_changed_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.IntegrityError("injected stage event failure")
+        ),
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected stage event failure",
+    ):
+        repo.create_attempt(job.job_id, "resolve", authority=authority)
+
+    assert repo.list_attempts(job.job_id) == ()
+    assert repo.list_events(job.job_id) == original_events
+
+
+def test_stage_event_failure_rolls_back_attempt_transition(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="stage-transition-rollback",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo, job.job_id)
+    pending = repo.create_attempt(job.job_id, "resolve", authority=authority)
+    original_events = repo.list_events(job.job_id)
+
+    monkeypatch.setattr(
+        repo,
+        "_insert_stage_changed_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.IntegrityError("injected stage event failure")
+        ),
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected stage event failure",
+    ):
+        repo.start_attempt(pending.attempt_id, authority)
+
+    assert repo.list_attempts(job.job_id) == (pending,)
+    assert repo.list_events(job.job_id) == original_events
+
+
+def test_takeover_emits_old_and_replacement_stage_history_in_order(
+    tmp_path: Path,
+) -> None:
+    now = {"value": 10_000}
+    repo = SqliteJobRepository.open(
+        tmp_path / "stage-takeover-store",
+        clock=lambda: now["value"],
+    )
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="stage-takeover",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    old_authority = repo.claim_job(
+        job.job_id,
+        "old-owner",
+        ttl_seconds=1,
+    ).authority
+    old_attempt = repo.start_attempt(
+        repo.create_attempt(
+            job.job_id,
+            "transcribe",
+            authority=old_authority,
+        ).attempt_id,
+        old_authority,
+    )
+    now["value"] = 11_001
+    new_authority = repo.claim_job(
+        job.job_id,
+        "new-owner",
+        ttl_seconds=30,
+    ).authority
+
+    replacement = repo.take_over_running_attempt(
+        job.job_id,
+        old_attempt.attempt_id,
+        new_authority,
+    )
+
+    stage_payloads = [
+        json.loads(event.payload_json)
+        for event in repo.list_events(job.job_id)
+        if event.event_type == "stage.changed.v1"
+    ]
+    assert [payload["state"] for payload in stage_payloads] == [
+        "pending",
+        "running",
+        "interrupted",
+        "pending",
+        "running",
+    ]
+    assert [payload["attempt_id"] for payload in stage_payloads] == [
+        old_attempt.attempt_id,
+        old_attempt.attempt_id,
+        old_attempt.attempt_id,
+        replacement.attempt_id,
+        replacement.attempt_id,
+    ]
+    assert [payload["generation"] for payload in stage_payloads] == [
+        0,
+        old_authority.fencing_token,
+        old_authority.fencing_token,
+        0,
+        new_authority.fencing_token,
+    ]
+
+
+def test_terminal_attempt_event_precedes_terminal_job_event(
+    repo: SqliteJobRepository,
+) -> None:
+    job = repo.create_job(
+        request_hash=HASH_A,
+        principal="local",
+        client_request_id="stage-terminal-order",
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = _authority(repo, job.job_id)
+    attempt = repo.start_attempt(
+        repo.create_attempt(
+            job.job_id,
+            "publish",
+            authority=authority,
+        ).attempt_id,
+        authority,
+    )
+
+    with repo.commit_guard(job.job_id, attempt.attempt_id, authority):
+        pass
+
+    events = repo.list_events(job.job_id)
+    assert [event.event_type for event in events[-2:]] == [
+        "stage.changed.v1",
+        "job.state.v1",
+    ]
+    assert json.loads(events[-2].payload_json)["state"] == "succeeded"
+    assert events[-1].payload_json == '{"state":"succeeded"}'
+
+
 def test_append_racing_terminal_transition_is_before_terminal_or_rejected(
     repo: SqliteJobRepository,
 ) -> None:
@@ -3249,6 +3483,13 @@ def test_failed_error_round_trips_after_repository_reopen(tmp_path: Path) -> Non
 
     assert failed.state is JobState.FAILED
     assert reader.get_job_error(job.job_id) == error
+    events = reader.list_events(job.job_id)
+    assert [event.event_type for event in events[-2:]] == [
+        "stage.changed.v1",
+        "job.state.v1",
+    ]
+    assert json.loads(events[-2].payload_json)["state"] == "failed"
+    assert events[-1].payload_json == '{"state":"failed"}'
 
 
 def test_atomic_failure_rejects_secret_details_without_mutation(
@@ -3400,6 +3641,13 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
             "SELECT state FROM attempts WHERE attempt_id = ?", (replacement.attempt_id,)
         ).fetchone()[0]
     assert state == AttemptState.NEEDS_INPUT.value
+    events = repo.list_events(job.job_id)
+    assert [event.event_type for event in events[-2:]] == [
+        "stage.changed.v1",
+        "job.state.v1",
+    ]
+    assert json.loads(events[-2].payload_json)["state"] == "needs_input"
+    assert events[-1].payload_json == '{"state":"waiting_for_input"}'
 
 
 def test_cancel_between_reconcile_and_pause_wins_without_challenge(
@@ -3670,6 +3918,13 @@ def test_cancel_cancels_pending_attempt_and_persists_request(
 
     assert cancelled.state is JobState.CANCELLED
     assert cancelled.cancellation_requested is True
+    events = repo.list_events(job.job_id)
+    assert [event.event_type for event in events[-2:]] == [
+        "stage.changed.v1",
+        "job.state.v1",
+    ]
+    assert json.loads(events[-2].payload_json)["state"] == "cancelled"
+    assert events[-1].payload_json == '{"state":"cancelled"}'
     with pytest.raises(DomainError, match="attempt_terminal"):
         repo.start_attempt(
             pending.attempt_id,
@@ -3744,6 +3999,8 @@ def test_running_job_cancellation_is_durable_across_real_repository_reopen(
     )
     assert reopened.get_job(job.job_id).state is JobState.CANCELLED
     terminal_events = reopened.list_events(job.job_id)
+    assert terminal_events[-2].event_type == "stage.changed.v1"
+    assert json.loads(terminal_events[-2].payload_json)["state"] == "cancelled"
     assert terminal_events[-1].event_type == "job.state.v1"
     assert terminal_events[-1].payload_json == '{"state":"cancelled"}'
     assert reopened.cancel_job(job.job_id).state is JobState.CANCELLED

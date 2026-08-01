@@ -345,6 +345,34 @@ def test_detached_recipe_survives_submitter_exit_and_finishes_in_engine_worker(
         assert persisted.state.value == "succeeded"
         attempts = repository.list_attempts(job_id)
         assert len({attempt.step_id for attempt in attempts}) == len(attempts)
+        stage_payloads = tuple(
+            json.loads(event.payload_json)
+            for event in repository.list_events(job_id)
+            if event.event_type == "stage.changed.v1"
+        )
+        assert len(stage_payloads) == len(attempts) * 3
+        for attempt in attempts:
+            payloads = tuple(
+                payload
+                for payload in stage_payloads
+                if payload["attempt_id"] == attempt.attempt_id
+            )
+            assert [payload["state"] for payload in payloads] == [
+                "pending",
+                "running",
+                "succeeded",
+            ]
+            assert {payload["stage"] for payload in payloads} == {
+                attempt.step_id
+            }
+            assert [payload["generation"] for payload in payloads] == [
+                0,
+                attempt.fencing_token,
+                attempt.fencing_token,
+            ]
+        assert repository.list_events(job_id)[-1].payload_json == (
+            '{"state":"succeeded"}'
+        )
 
         operations = tuple(
             json.loads(line)["operation"]

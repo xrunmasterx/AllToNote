@@ -215,7 +215,7 @@ flowchart TD
 | Review/Publisher | `pending` | 设计/计划已完成 |
 | AgentExecutor | `pending` | 受控 AgentExecutor/ExecutionGrant 尚未实现 |
 | Knowledge MCP | `not implemented` | 设计/计划已完成 |
-| Engine/Production MCP | `partial; single-active Engine implemented` | Engine 生命周期、detach、SQLite/per-job authority 与跨进程恢复已落地；并行 worker、资源准入、batch/max-parallel 与 Production MCP 尚未实现 |
+| Engine/Production MCP | `partial; single-active Engine + durable stage events implemented` | Engine 生命周期、detach、SQLite/per-job authority、跨进程恢复和 Video/Document 共用的事务型 `stage.changed.v1` 已落地；并行 worker、资源准入、batch/max-parallel 与 Production MCP 尚未实现 |
 | Web/Document/Code/Personal Recipe | `not implemented` | 设计/计划已完成 |
 | 网站/公共知识 | `not implemented` | 设计/计划已完成，等待本地稳定 |
 | Windows/macOS正式分发 | `not completed` | 设计/计划已完成，签名/安装/更新/E2E待做 |

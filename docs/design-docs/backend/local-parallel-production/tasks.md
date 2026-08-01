@@ -260,7 +260,8 @@ Stop condition：
 - Engine-owned Document 在 Job 创建前持久化 machine-state 内容快照；Job 事件只绑定 schema、摘要与字节数，不暴露路径。相同 PDF 的并发提交复用一个快照，retry 继承绑定，旧无绑定 Job 不按摘要路径猜测权威；
 - Engine-owned 本地 Video 现已采用同一产品语义：Job 创建前完成内容寻址快照，事件只绑定摘要与字节数，独立 Worker 可在原视频删除后继续执行；retry 显式继承，历史无绑定 Job 不猜测快照。验收见 [`Video detach 本地输入快照`](../../../acceptance/2026-08-01-video-detached-input-snapshot.md)；
 - `alltonote job events JOB --jsonl --follow` 已提供 SQLite 权威的单 Job 增量事件流：`after_sequence` 为排他游标，`limit` 为分页上限，积压跨页完整排空；每行立即 flush，Ctrl+C 只终止观察并输出最终协议错误行，不取消 Job；
-- Job 状态变化与 `job.state.v1` 在同一事务提交，终态后禁止追加事件；v5 迁移为旧 Job 回填当前状态。`waiting_for_input` 是本次观察调用的成功停止边界，调用方随后使用独立 respond 命令恢复；
+- Job 状态变化与 `job.state.v1` 在同一事务提交，终态后禁止追加事件；v5 迁移为旧 Job 回填当前状态。Attempt 创建和每次权威状态转换现在同事务追加 `stage.changed.v1`，固定携带 schema、stage、state、attempt_id 和 Job fencing generation；Video 与 Document 共用该路径，不生成伪精确百分比，也不从事件反推 Job 状态。验收见 [`durable stage events`](../../../acceptance/2026-08-01-durable-stage-events.md)；
+- `waiting_for_input` 是本次观察调用的成功停止边界，调用方随后使用独立 respond 命令恢复；终态 Attempt 事件始终先于终态 `job.state.v1`，因此 follow 仍可用终态 Job 事件作为稳定收尾；
 - 控制面执行 `job retry` 或 `job respond` 后，若目标 Job 为 Engine-owned，会在 durable mutation 成功后复用 `LocalEngineClient.notify_job()` 完成原子 ensure+notify；通知失败保留 queued Job，并返回可见 Job ID 与明确恢复动作。Engine 内部恢复和 foreground Job 不触发这条控制面唤醒；
 - 空闲跟随采用 0.1、0.2、0.4、0.8、1.0 秒有界退避，避免固定 50 ms 高频读取；CLI 参数关系在 Workspace/JobStore bootstrap 前校验；
 - batch request manifest、`max-parallel`、资源准入队列和 typed Desktop bridge 仍未实现，因此 Task 7 保持未完成，`parallel_job_execution_enabled` 继续为 false。

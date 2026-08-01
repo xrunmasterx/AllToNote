@@ -555,6 +555,8 @@ def test_event_sequences_are_strictly_monotonic_per_job_across_connections(
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     job, _ = _job_attempt(repository)
     other_job, _ = _job_attempt(repository)
+    initial = repository.list_events(job.job_id)
+    other_initial = repository.list_events(other_job.job_id)
 
     def append(index: int):
         independent = SqliteJobRepository.open(repository.machine_root)
@@ -568,13 +570,16 @@ def test_event_sequences_are_strictly_monotonic_per_job_across_connections(
         events = tuple(pool.map(append, range(12)))
     other = repository.append_event(other_job.job_id, "job.started", "{}")
 
-    assert sorted(event.sequence for event in events) == list(range(3, 15))
-    assert [event.sequence for event in repository.list_events(job.job_id)] == list(
-        range(1, 15)
+    assert sorted(event.sequence for event in events) == list(
+        range(len(initial) + 1, len(initial) + 13)
     )
-    assert other.sequence == 3
+    all_events = repository.list_events(job.job_id)
+    assert [event.sequence for event in all_events] == list(
+        range(1, len(all_events) + 1)
+    )
+    assert other.sequence == len(other_initial) + 1
     assert repository.list_events(job.job_id, after_sequence=10) == tuple(
-        repository.list_events(job.job_id)[10:]
+        all_events[10:]
     )
 
 
@@ -643,6 +648,7 @@ def test_append_event_commits_sqlite_before_projection_and_reconcile_backfills(
 ) -> None:
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     job, _ = _job_attempt(repository)
+    initial_event_count = len(repository.list_events(job.job_id))
     storage = _storage(tmp_path, repository)
     job_directory = storage.root / "jobs" / job.job_id
     job_directory.parent.mkdir(parents=True, exist_ok=True)
@@ -652,13 +658,13 @@ def test_append_event_commits_sqlite_before_projection_and_reconcile_backfills(
         storage.append_event(job.job_id, "checkpoint.saved", '{"step":"draft"}')
 
     committed = repository.list_events(job.job_id)
-    assert len(committed) == 3
+    assert len(committed) == initial_event_count + 1
     job_directory.unlink()
     reconciled = storage.reconcile_event_projection(job.job_id)
     assert reconciled == committed
     projection = _projection_path(storage.root, job.job_id)
     assert projection.read_bytes().endswith(b"\n")
-    assert len(projection.read_text(encoding="utf-8").splitlines()) == 3
+    assert len(projection.read_text(encoding="utf-8").splitlines()) == len(committed)
 
 
 def test_append_event_commits_sqlite_but_preserves_malformed_projection(
@@ -666,6 +672,7 @@ def test_append_event_commits_sqlite_but_preserves_malformed_projection(
 ) -> None:
     repository = SqliteJobRepository.open(tmp_path / "machine-root")
     job, _ = _job_attempt(repository)
+    initial_event_count = len(repository.list_events(job.job_id))
     storage = _storage(tmp_path, repository)
     projection = _projection_path(storage.root, job.job_id)
     projection.parent.mkdir(parents=True, exist_ok=True)
@@ -675,7 +682,7 @@ def test_append_event_commits_sqlite_but_preserves_malformed_projection(
     with pytest.raises(DomainError, match="event_projection_invalid"):
         storage.append_event(job.job_id, "job.started", "{}")
 
-    assert len(repository.list_events(job.job_id)) == 3
+    assert len(repository.list_events(job.job_id)) == initial_event_count + 1
     assert projection.read_bytes() == original
 
 
