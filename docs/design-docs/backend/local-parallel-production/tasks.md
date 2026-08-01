@@ -260,6 +260,7 @@ Stop condition：
 - Engine-owned Document 在 Job 创建前持久化 machine-state 内容快照；Job 事件只绑定 schema、摘要与字节数，不暴露路径。相同 PDF 的并发提交复用一个快照，retry 继承绑定，旧无绑定 Job 不按摘要路径猜测权威；
 - `alltonote job events JOB --jsonl --follow` 已提供 SQLite 权威的单 Job 增量事件流：`after_sequence` 为排他游标，`limit` 为分页上限，积压跨页完整排空；每行立即 flush，Ctrl+C 只终止观察并输出最终协议错误行，不取消 Job；
 - Job 状态变化与 `job.state.v1` 在同一事务提交，终态后禁止追加事件；v5 迁移为旧 Job 回填当前状态。`waiting_for_input` 是本次观察调用的成功停止边界，调用方随后使用独立 respond 命令恢复；
+- 控制面执行 `job retry` 或 `job respond` 后，若目标 Job 为 Engine-owned，会在 durable mutation 成功后复用 `LocalEngineClient.notify_job()` 完成原子 ensure+notify；通知失败保留 queued Job，并返回可见 Job ID 与明确恢复动作。Engine 内部恢复和 foreground Job 不触发这条控制面唤醒；
 - 空闲跟随采用 0.1、0.2、0.4、0.8、1.0 秒有界退避，避免固定 50 ms 高频读取；CLI 参数关系在 Workspace/JobStore bootstrap 前校验；
 - batch request manifest、`max-parallel`、资源准入队列和 typed Desktop bridge 仍未实现，因此 Task 7 保持未完成，`parallel_job_execution_enabled` 继续为 false。
 

@@ -84,6 +84,7 @@ class JobRuntime:
         current_config_snapshot: JobConfigSnapshot | None,
         principal: str = LOCAL_CLI_PRINCIPAL,
         execution_owner: JobExecutionOwner = JobExecutionOwner.FOREGROUND,
+        notify_engine_job: Callable[[str], None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -94,6 +95,7 @@ class JobRuntime:
         self._current_config_snapshot = current_config_snapshot
         self._principal = principal
         self._execution_owner = execution_owner
+        self._notify_engine_job = notify_engine_job
         self._monotonic = monotonic
         self._sleep = sleep
 
@@ -241,7 +243,9 @@ class JobRuntime:
                 "Challenge response must be a JSON object",
             )
         self._jobs.respond(job_id, challenge_id, response)
-        return self.get_job(job_id)
+        resumed = self.get_job(job_id)
+        self._reactivate_engine_job(resumed)
+        return resumed
 
     def require_respondable(
         self,
@@ -352,7 +356,54 @@ class JobRuntime:
             request,
             initial_events=tuple(initial_events),
         )
-        return self.get_job(retried.job_id)
+        child = self.get_job(retried.job_id)
+        self._reactivate_engine_job(child)
+        return child
+
+    def _reactivate_engine_job(self, view: JobView) -> None:
+        if self._execution_owner is JobExecutionOwner.ENGINE:
+            return
+        job = self._repository.get_job(view.snapshot.job_id)
+        if (
+            job.execution_owner is not JobExecutionOwner.ENGINE
+            or job.state not in {JobState.QUEUED, JobState.RUNNING}
+        ):
+            return
+        if self._notify_engine_job is None:
+            raise DomainError(
+                "engine_job_reactivation_failed",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                f"Job {job.job_id} is durable but Engine activation failed",
+                {
+                    "job_id": job.job_id,
+                    "state": job.state.value,
+                    "engine_error_code": "engine_notifier_unavailable",
+                },
+            )
+        cause: BaseException | None = None
+        try:
+            self._notify_engine_job(job.job_id)
+        except DomainError as error:
+            engine_error_code = error.code
+            cause = error
+        except KeyboardInterrupt as error:
+            engine_error_code = "interrupted"
+            cause = error
+        except Exception as error:
+            engine_error_code = "internal_error"
+            cause = error
+        else:
+            return
+        raise DomainError(
+            "engine_job_reactivation_failed",
+            ErrorCategory.RETRYABLE_RUNTIME,
+            f"Job {job.job_id} is durable but Engine activation failed",
+            {
+                "job_id": job.job_id,
+                "state": job.state.value,
+                "engine_error_code": engine_error_code,
+            },
+        ) from cause
 
 
 def create_job_runtime_for_execution_runtime(
@@ -399,6 +450,14 @@ def create_job_runtime_for_workspace(
         else SqliteJobRepository.open
     )
     repository = repository_factory(instance.machine_root / "job-store")
+
+    def notify_engine_job(job_id: str) -> None:
+        from app.engine.client import LocalEngineClient
+        from app.engine.contracts import EngineJobReference
+
+        LocalEngineClient(paths).notify_job(
+            EngineJobReference(instance.instance_id, job_id)
+        )
 
     def execute(job_id: str) -> JobSnapshot:
         binding = _require_supported_execution_binding(repository, job_id)
@@ -479,6 +538,7 @@ def create_job_runtime_for_workspace(
         wait_job=execute,
         current_config_snapshot=current_config_snapshot,
         execution_owner=execution_owner,
+        notify_engine_job=notify_engine_job,
     )
 
 

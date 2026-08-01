@@ -113,6 +113,10 @@ def map_error(
         next_actions = (
             "Run the Gate from a Runtime with an explicitly admitted SQLite build",
         )
+    elif code == "engine_job_reactivation_failed":
+        next_actions = (
+            "Run alltonote engine ensure, then wait for the durable Job by ID",
+        )
     elif code == "pack_trust_unconfigured":
         next_actions = ("Install a Runtime release with official Pack trust roots",)
     elif code == "pack_install_busy":

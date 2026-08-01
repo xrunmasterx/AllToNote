@@ -104,7 +104,7 @@ flowchart TD
 | `VAL-VIDEO-REUSE-001` | [Video 可信复用验证](../design-docs/video-trusted-reuse-validation/spec.md) | 保留、延迟检索与真实复用 Gate | [观察任务](../design-docs/video-trusted-reuse-validation/tasks.md) + [观察日志](../design-docs/video-trusted-reuse-validation/observation-log.md) | active | `PASS by explicit user override`；用户提前结束观察并授权继续，逐项指标不伪造 |
 | `REVIEW-001` | [Review / Publisher](../superpowers/specs/2026-07-18-alltonote-review-publisher-design.md) | 审阅/正式写入 | [实施计划](../superpowers/plans/2026-07-18-alltonote-review-publisher-implementation-plan.md) | active | 未实现 |
 | `MCP-READ-001` | [Knowledge Access MCP](../superpowers/specs/2026-07-18-alltonote-knowledge-access-mcp-design.md) | 本地/公共只读知识 | [实施计划](../superpowers/plans/2026-07-18-alltonote-knowledge-access-mcp-implementation-plan.md) | active | 未实现 |
-| `ENGINE-001` | [Engine / Production MCP](../superpowers/specs/2026-07-18-alltonote-engine-production-mcp-design.md) | 后台执行/生产 Agent 接口 | [实施计划](../superpowers/plans/2026-07-18-alltonote-engine-production-mcp-implementation-plan.md) | active | 设计保留；当前实现 deferred，等待可信复用后的真实多 Job/后台瓶颈与技术 re-admission |
+| `ENGINE-001` | [Engine / Production MCP](../superpowers/specs/2026-07-18-alltonote-engine-production-mcp-design.md) | 后台执行/生产 Agent 接口 | [实施计划](../superpowers/plans/2026-07-18-alltonote-engine-production-mcp-implementation-plan.md) | active | 已部分 admission：单实例生命周期、单 active detached Job、per-job authority 与恢复已实现；多 Worker、资源准入、batch/max-parallel 与 Production MCP 仍 deferred |
 | `REC-WEB-001` | [Article / Wiki Recipe](../superpowers/specs/2026-07-18-alltonote-article-wiki-recipe-design.md) | Web/Wiki | [实施计划](../superpowers/plans/2026-07-18-alltonote-article-wiki-recipe-implementation-plan.md) | active | 未实现 |
 | `REC-DOC-001` | [PDF / PPT / OCR Recipe](../superpowers/specs/2026-07-18-alltonote-document-recipe-design.md) | Document | [实施计划](../superpowers/plans/2026-07-18-alltonote-document-recipe-implementation-plan.md) | active; first slice passed | 一个真实 born-digital PDF 纵切已通过；扫描件、OCR、PPTX、URL、长文档和完整 MVP 未实现 |
 | `REC-CODE-001` | [Codebase / UE5 Recipe](../superpowers/specs/2026-07-18-alltonote-codebase-ue5-recipe-design.md) | Code/UE5 | [实施计划](../superpowers/plans/2026-07-18-alltonote-codebase-ue5-recipe-implementation-plan.md) | active | 未实现 |
@@ -140,7 +140,7 @@ flowchart TD
 | Phase 3A Compiler contract | `DATA-001`、`RUNTIME-001`、`REC-CONTRACT-001` | 既有 + 新计划 | 基础 partial |
 | Phase 3B Video | Video + Long + `VAL-VIDEO-001` + `VAL-VIDEO-REUSE-001` | Video release plan + Pilot/reuse tasks | core mostly complete；三样本 Pilot closed；可信复用由用户提前判定 PASS；广泛验证仍未完成 |
 | Phase 3C Review/Publisher | `REVIEW-001` | Review plan | pending |
-| Phase 4 Engine/Production MCP | `ENGINE-001` | Engine plan | deferred；等待可信复用后的真实多 Job/后台瓶颈与技术 re-admission |
+| Phase 4 Engine/Production MCP | `ENGINE-001` | Engine plan | partial；单 active detached Engine 已实现，多 Worker/资源准入/Production MCP 仍等待后续 admission |
 | Phase 5 Article/Wiki | `REC-WEB-001` | Web plan | pending |
 | Phase 6 PPT/PDF | `REC-DOC-001` | Document plan | one born-digital PDF slice complete; remainder pending |
 | Phase 7 UE5/Codebase | `REC-CODE-001` | Code plan | pending |
@@ -215,7 +215,7 @@ flowchart TD
 | Review/Publisher | `pending` | 设计/计划已完成 |
 | AgentExecutor | `pending` | 受控 AgentExecutor/ExecutionGrant 尚未实现 |
 | Knowledge MCP | `not implemented` | 设计/计划已完成 |
-| Engine/Production MCP | `deferred; re-admission required` | 当前单 Job Dogfood 不需要；等待可信复用后的真实多 Job/后台瓶颈和模型 turn、SQLite、per-job authority 技术 Gate |
+| Engine/Production MCP | `partial; single-active Engine implemented` | Engine 生命周期、detach、SQLite/per-job authority 与跨进程恢复已落地；并行 worker、资源准入、batch/max-parallel 与 Production MCP 尚未实现 |
 | Web/Document/Code/Personal Recipe | `not implemented` | 设计/计划已完成 |
 | 网站/公共知识 | `not implemented` | 设计/计划已完成，等待本地稳定 |
 | Windows/macOS正式分发 | `not completed` | 设计/计划已完成，签名/安装/更新/E2E待做 |

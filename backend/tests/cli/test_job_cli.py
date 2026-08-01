@@ -14,8 +14,12 @@ from app.cli.main import main
 from app.cli.contracts import ApplicationResult, CliError
 from app.cli.render import render_json_lines, render_result
 from app.core.application.job_query_service import JobEventPage
-from app.core.domain.video import JobState, VideoProduceRequest
-from app.core.errors import ErrorCategory
+from app.core.domain.video import (
+    JobState,
+    RetryJobRequest,
+    VideoProduceRequest,
+)
+from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import AttemptState, JobExecutionOwner
 from app.core.packs.events import (
@@ -178,6 +182,35 @@ def test_attempt_storage_capacity_failure_has_machine_state_recovery_action() ->
     assert mapped.error.next_actions == (
         "Free space in the AllToNote machine-state location and retry",
     )
+
+
+def test_engine_job_reactivation_failure_has_durable_recovery_action(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "job_01910000-0000-7000-8000-000000000001"
+    mapped = map_error(
+        code="engine_job_reactivation_failed",
+        category=ErrorCategory.RETRYABLE_RUNTIME,
+        message=f"Job {job_id} is durable but Engine activation failed",
+        details={"job_id": job_id},
+    )
+
+    assert mapped.error.retryable is True
+    assert mapped.error.next_actions == (
+        "Run alltonote engine ensure, then wait for the durable Job by ID",
+    )
+    render_result(
+        ApplicationResult(
+            command="job retry",
+            correlation_id="corr_engine_reactivation",
+            ok=False,
+            error=mapped.error,
+        ),
+        json_mode=False,
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert job_id in captured.err
 
 
 def test_job_list_is_bounded_cursor_paginated_and_state_filtered(
@@ -859,6 +892,176 @@ def test_engine_authorized_job_runtime_executes_engine_owned_job(
     assert execution_calls == [submitted.job_id]
 
 
+def test_engine_owned_retry_notifies_after_the_child_job_is_durable(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    original = runtime.submit_video(
+        _request(workspace_root, "engine-retry-original"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    runtime.cancel_job(original.job_id)
+    notifications: list[str] = []
+
+    def notify(job_id: str) -> None:
+        assert runtime.job_repository.get_job(job_id).state is JobState.QUEUED
+        notifications.append(job_id)
+
+    job_runtime = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        notify_engine_job=notify,
+    )
+
+    retried = job_runtime.retry_job(
+        original.job_id,
+        RetryJobRequest(
+            retry_request_schema_version=1,
+            client_request_id="engine-retry-child",
+            expected_original_job_state=JobState.CANCELLED,
+            confirmed_unknown_operation_ids=(),
+        ),
+    )
+
+    assert retried.snapshot.state is JobState.QUEUED
+    assert retried.snapshot.retry_of_job_id == original.job_id
+    assert notifications == [retried.snapshot.job_id]
+    assert runtime.job_repository.get_job(
+        retried.snapshot.job_id
+    ).execution_owner is JobExecutionOwner.ENGINE
+
+
+def test_foreground_retry_does_not_start_the_engine(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    original = runtime.submit_video(
+        _request(workspace_root, "foreground-retry-original")
+    )
+    runtime.cancel_job(original.job_id)
+    notifications: list[str] = []
+    job_runtime = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        notify_engine_job=notifications.append,
+    )
+
+    retried = job_runtime.retry_job(
+        original.job_id,
+        RetryJobRequest(
+            retry_request_schema_version=1,
+            client_request_id="foreground-retry-child",
+            expected_original_job_state=JobState.CANCELLED,
+            confirmed_unknown_operation_ids=(),
+        ),
+    )
+
+    assert retried.snapshot.state is JobState.QUEUED
+    assert notifications == []
+
+
+def test_engine_authorized_retry_does_not_require_control_plane_notification(
+    runtime: object,
+    workspace_root: Path,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    original = runtime.submit_video(
+        _request(workspace_root, "engine-authorized-retry-original"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    runtime.cancel_job(original.job_id)
+    job_runtime = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+
+    retried = job_runtime.retry_job(
+        original.job_id,
+        RetryJobRequest(
+            retry_request_schema_version=1,
+            client_request_id="engine-authorized-retry-child",
+            expected_original_job_state=JobState.CANCELLED,
+            confirmed_unknown_operation_ids=(),
+        ),
+    )
+
+    assert retried.snapshot.state is JobState.QUEUED
+
+
+@pytest.mark.parametrize(
+    ("notification_error", "expected_engine_error_code"),
+    (
+        (
+            DomainError(
+                "engine_start_busy",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "Engine startup is busy",
+            ),
+            "engine_start_busy",
+        ),
+        (KeyboardInterrupt(), "interrupted"),
+        (RuntimeError("private notifier failure"), "internal_error"),
+    ),
+)
+def test_engine_retry_notification_failure_preserves_the_durable_child(
+    runtime: object,
+    workspace_root: Path,
+    notification_error: BaseException,
+    expected_engine_error_code: str,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    original = runtime.submit_video(
+        _request(workspace_root, "engine-retry-notify-failure"),
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    runtime.cancel_job(original.job_id)
+
+    def fail_notification(_job_id: str) -> None:
+        raise notification_error
+
+    job_runtime = JobRuntime(
+        runtime.job_repository,
+        wait_job=None,
+        current_config_snapshot=None,
+        notify_engine_job=fail_notification,
+    )
+
+    with pytest.raises(DomainError) as caught:
+        job_runtime.retry_job(
+            original.job_id,
+            RetryJobRequest(
+                retry_request_schema_version=1,
+                client_request_id="engine-retry-notify-failure-child",
+                expected_original_job_state=JobState.CANCELLED,
+                confirmed_unknown_operation_ids=(),
+            ),
+        )
+
+    assert caught.value.code == "engine_job_reactivation_failed"
+    assert caught.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    child_job_id = caught.value.details["job_id"]
+    assert (
+        caught.value.details["engine_error_code"]
+        == expected_engine_error_code
+    )
+    assert child_job_id in caught.value.message
+    assert "private notifier failure" not in caught.value.message
+    assert "private notifier failure" not in repr(dict(caught.value.details))
+    child = runtime.job_repository.get_job(child_job_id)
+    assert child.state is JobState.QUEUED
+    assert child.retry_of_job_id == original.job_id
+
+
 @pytest.mark.parametrize("timeout", ("0", "-1", "nan", "inf"))
 def test_job_wait_rejects_invalid_timeout_without_mutation(
     timeout: str,
@@ -1126,6 +1329,66 @@ def test_job_respond_requires_matching_explicit_waiting_challenge(
     assert resumed["data"]["job"]["state"] == "queued"
     assert resumed["data"]["job"]["challenge_id"] is None
     assert resumed["data"]["job"]["active_attempt_id"] is not None
+
+
+def test_engine_owned_respond_notifies_after_the_job_returns_to_queued(
+    runtime: object,
+) -> None:
+    from app.job_runtime import JobRuntime
+
+    repo = runtime.job_repository
+    job = repo.create_job(
+        request_hash="sha256:" + "2" * 64,
+        principal="local-user",
+        client_request_id="engine-respond",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    repo.transition_job(job.job_id, JobState.RUNNING)
+    authority = repo.claim_job(
+        job.job_id,
+        "engine-respond-owner",
+        ttl_seconds=300,
+    ).authority
+    attempt = repo.start_attempt(
+        repo.create_attempt(
+            job.job_id,
+            "acquire",
+            authority=authority,
+        ).attempt_id,
+        authority,
+    )
+    repo.transition_attempt(
+        attempt.attempt_id,
+        AttemptState.NEEDS_INPUT,
+        authority=authority,
+    )
+    challenge = repo.create_challenge(
+        job.job_id,
+        attempt.attempt_id,
+        '{"kind":"credential_profile"}',
+    )
+    repo.release_job_claim(authority)
+    notifications: list[str] = []
+
+    def notify(job_id: str) -> None:
+        assert repo.get_job(job_id).state is JobState.QUEUED
+        notifications.append(job_id)
+
+    job_runtime = JobRuntime(
+        repo,
+        wait_job=None,
+        current_config_snapshot=None,
+        notify_engine_job=notify,
+    )
+
+    resumed = job_runtime.respond_job(
+        job.job_id,
+        challenge.challenge_id,
+        {"credential_profile": "profile-a"},
+    )
+
+    assert resumed.snapshot.state is JobState.QUEUED
+    assert notifications == [job.job_id]
 
 
 def test_job_respond_rejects_external_unknown_without_consuming_challenge(

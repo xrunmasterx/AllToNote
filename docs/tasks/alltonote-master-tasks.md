@@ -126,7 +126,7 @@ git diff --check
 | AgentExecutor | `design complete; implementation pending` | Codebase/UE5 所需受控 AgentExecutor/ExecutionGrant 尚未实现 |
 | Thin Desktop | `design complete; implementation pending` | Desktop API、Runtime Resolver、Vault UI 与发布 Gate 均待实现；旧 BiliNote UI 不等于目标架构 |
 | Knowledge MCP | `design complete; implementation pending` | 与 Production MCP 分离；默认 published-only stdio server |
-| Engine/Production MCP | `deferred; re-admission requires product and technical evidence` | 设计保留；当前单 Job Dogfood 不需要 Engine。只有可信复用后出现真实多 Job/后台瓶颈，且模型 turn、SQLite 与 per-job authority Gate 可证明时才重新 admission |
+| Engine/Production MCP | `partially admitted; single-active detached Engine implemented` | 按用户授权完成 Engine 生命周期、Video/Document detach、SQLite Job authority、跨进程恢复与事件重连；仍保持单 active Worker，资源准入、worker pool、batch/max-parallel 与 Production MCP 未 admission |
 | Article/Wiki/PDF/PPT Recipe | `design complete; two PDF samples implemented` | 英文双栏与中文表格密集 PDF 均通过正式纵切；Windows 中文路径、TableFormer 结构和 Document 默认 Evidence 呈现已关闭；Article/Wiki/PPT/OCR/完整 Document MVP 仍 pending |
 | UE5/Codebase/Personal Recipe | `design complete; implementation pending/deferred by gates` | Code prototype等待 Recipe 合同验证；Personal manual MVP 可先做，scheduler 等 Engine |
 | 网站账号/邀请/下载/设备/公共知识 | `design complete; implementation deferred` | 网站不保存个人 Markdown，等待本地产品和合规 Gate |
