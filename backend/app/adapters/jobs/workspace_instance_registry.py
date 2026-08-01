@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -97,6 +98,33 @@ class WorkspaceInstanceRegistry:
 
         return resolved_instance
 
+    def get(self, instance_id: str) -> WorkspaceInstance | None:
+        if (
+            type(instance_id) is not str
+            or _INSTANCE_ID_PATTERN.fullmatch(instance_id) is None
+        ):
+            raise ValueError("workspace_instance_id_invalid")
+        for instance in self.list():
+            if instance.instance_id == instance_id:
+                return instance
+        return None
+
+    def list(self) -> tuple[WorkspaceInstance, ...]:
+        registry = self._read_registry()
+        instances = registry["instances"]
+        if not instances:
+            return ()
+        try:
+            machine_parent = (self._app_root / "workspaces").resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as error:
+            self._raise_root_unsafe(error)
+        if not machine_parent.is_relative_to(self._trusted_local_root):
+            self._raise_root_unsafe()
+        return tuple(
+            self._to_workspace_instance(instance, machine_parent)
+            for instance in instances
+        )
+
     def _ensure_contained_directory(self, path: Path) -> Path:
         try:
             before = path.resolve(strict=False)
@@ -126,6 +154,7 @@ class WorkspaceInstanceRegistry:
         ) from error
 
     def _read_registry(self) -> dict[str, object]:
+        self._validate_read_only_paths()
         try:
             with self._registry_path.open("r", encoding="utf-8") as registry_file:
                 registry = json.load(registry_file)
@@ -135,6 +164,41 @@ class WorkspaceInstanceRegistry:
             raise ValueError("workspace_instance_registry_invalid") from error
         self._validate_registry(registry)
         return registry
+
+    def _validate_read_only_paths(self) -> None:
+        controlled_paths = (
+            (self._app_root, "directory"),
+            (self._app_root / "workspaces", "directory"),
+            (self._registry_path, "file"),
+        )
+        for path, expected_kind in controlled_paths:
+            try:
+                resolved = path.resolve(strict=False)
+            except (OSError, RuntimeError, ValueError) as error:
+                self._raise_root_unsafe(error)
+            if resolved != path or not resolved.is_relative_to(
+                self._trusted_local_root
+            ):
+                self._raise_root_unsafe()
+            if not os.path.lexists(path):
+                continue
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                self._raise_root_unsafe(error)
+            is_reparse = bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            if is_reparse:
+                self._raise_root_unsafe()
+            if expected_kind == "directory":
+                if not stat.S_ISDIR(metadata.st_mode):
+                    self._raise_root_unsafe()
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("workspace_instance_registry_invalid")
+            elif metadata.st_nlink != 1:
+                self._raise_root_unsafe()
 
     @staticmethod
     def _validate_registry(registry: object) -> None:

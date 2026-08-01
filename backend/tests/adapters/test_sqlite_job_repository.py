@@ -1522,6 +1522,184 @@ def test_new_job_persists_explicit_execution_owner(
     assert repo.get_job(engine.job_id).execution_owner is JobExecutionOwner.ENGINE
 
 
+def test_list_engine_execution_candidates_excludes_foreground_and_wait_boundaries(
+    repo: SqliteJobRepository,
+) -> None:
+    foreground = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="foreground-candidate",
+    )
+    queued = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="engine-queued",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    running = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="engine-running",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    waiting = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="engine-waiting",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    failed = repo.create_job(
+        request_hash=HASH_A,
+        principal="agent",
+        client_request_id="engine-failed",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    repo.transition_job(running.job_id, JobState.RUNNING)
+    repo.transition_job(waiting.job_id, JobState.RUNNING)
+    repo.transition_job(waiting.job_id, JobState.WAITING_FOR_INPUT)
+    repo.transition_job(failed.job_id, JobState.RUNNING)
+    repo.transition_job(failed.job_id, JobState.FAILED)
+
+    candidates = repo.list_engine_execution_candidates(
+        after_created_at=None,
+        after_job_id=None,
+        limit=10,
+    )
+
+    assert [candidate.job_id for candidate in candidates] == [
+        job.job_id
+        for job in sorted(
+            (queued, running), key=lambda job: (job.created_at, job.job_id)
+        )
+    ]
+    assert foreground.job_id not in {candidate.job_id for candidate in candidates}
+    assert waiting.job_id not in {candidate.job_id for candidate in candidates}
+    assert failed.job_id not in {candidate.job_id for candidate in candidates}
+    assert all(
+        candidate.execution_owner is JobExecutionOwner.ENGINE
+        for candidate in candidates
+    )
+
+
+def test_list_engine_execution_candidates_has_stable_forward_pagination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_values = iter((1000, 1000, 1001))
+    monkeypatch.setattr(
+        repository_module,
+        "utc_now_millis",
+        lambda _now=None: "2026-08-01T00:00:00.000Z",
+    )
+    repository = SqliteJobRepository.open(
+        tmp_path / "candidate-pagination",
+        clock=lambda: next(clock_values),
+    )
+    created = tuple(
+        repository.create_job(
+            request_hash=HASH_A,
+            principal="agent",
+            client_request_id=f"candidate-{index}",
+            execution_owner=JobExecutionOwner.ENGINE,
+        )
+        for index in range(3)
+    )
+
+    first_page = repository.list_engine_execution_candidates(
+        after_created_at=None,
+        after_job_id=None,
+        limit=2,
+    )
+    second_page = repository.list_engine_execution_candidates(
+        after_created_at=first_page[-1].created_at,
+        after_job_id=first_page[-1].job_id,
+        limit=2,
+    )
+
+    assert first_page + second_page == tuple(
+        sorted(created, key=lambda job: (job.created_at, job.job_id))
+    )
+    assert len({job.created_at for job in created}) == 1
+
+
+def test_list_engine_execution_candidates_does_not_read_payload_columns(
+    repo: SqliteJobRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = repo.create_job(
+        request_hash=sha256_digest("{}"),
+        request_json="{}",
+        principal="agent",
+        client_request_id="metadata-only-candidate",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
+    original_connect = repo._connect
+
+    def guarded_connect() -> sqlite3.Connection:
+        connection = original_connect()
+
+        def authorize(
+            action: int,
+            table: str | None,
+            column: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if (
+                action == sqlite3.SQLITE_READ
+                and table == "jobs"
+                and column in {"request_json", "result_json", "error_json"}
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(authorize)
+        return connection
+
+    monkeypatch.setattr(repo, "_connect", guarded_connect)
+
+    candidates = repo.list_engine_execution_candidates(
+        after_created_at=None,
+        after_job_id=None,
+        limit=10,
+    )
+
+    assert [candidate.job_id for candidate in candidates] == [created.job_id]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        {"after_created_at": None, "after_job_id": "job"},
+        {"after_created_at": "time", "after_job_id": None},
+        {
+            "after_created_at": "2026-08-01T00:00:00Z",
+            "after_job_id": new_typed_id(
+                "job", now_ms=1, randomness=b"\x01" * 10
+            ),
+        },
+        {
+            "after_created_at": "2026-08-01T00:00:00.000Z",
+            "after_job_id": "not-a-job-id",
+        },
+        {"after_created_at": None, "after_job_id": None, "limit": 0},
+        {"after_created_at": None, "after_job_id": None, "limit": True},
+    ),
+)
+def test_list_engine_execution_candidates_rejects_invalid_cursor(
+    repo: SqliteJobRepository,
+    arguments: dict[str, object],
+) -> None:
+    query = {
+        "after_created_at": None,
+        "after_job_id": None,
+        "limit": 10,
+        **arguments,
+    }
+    with pytest.raises(DomainError, match="engine_job_query_invalid"):
+        repo.list_engine_execution_candidates(**query)
+
+
 def test_idempotency_key_cannot_change_execution_owner(
     repo: SqliteJobRepository,
 ) -> None:

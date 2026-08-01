@@ -183,6 +183,118 @@ def test_registry_and_machine_state_are_never_written_inside_portable_workspace(
     assert not _registry_path(local_app_data).is_relative_to(workspace_root)
 
 
+def test_list_is_read_only_when_registry_is_absent(local_app_data: Path) -> None:
+    registry = WorkspaceInstanceRegistry(
+        local_app_data,
+        inspect_workspace=lambda _root: (_ for _ in ()).throw(
+            AssertionError("read-only discovery must not inspect a Workspace")
+        ),
+    )
+
+    assert registry.list() == ()
+    assert list(local_app_data.iterdir()) == []
+
+
+def test_get_reads_registered_instance_without_mutating_or_inspecting_workspace(
+    local_app_data: Path,
+    tmp_path: Path,
+) -> None:
+    stored_root = tmp_path / "stored Workspace"
+    entry = _valid_entry(stored_root)
+    _write_registry(local_app_data, {"version": 1, "instances": [entry]})
+    before = _registry_path(local_app_data).read_bytes()
+    registry = WorkspaceInstanceRegistry(
+        local_app_data,
+        inspect_workspace=lambda _root: (_ for _ in ()).throw(
+            AssertionError("read-only discovery must not inspect a Workspace")
+        ),
+    )
+
+    instance = registry.get(VALID_INSTANCE_ID)
+
+    assert instance is not None
+    assert instance.instance_id == VALID_INSTANCE_ID
+    assert instance.workspace_identity == "stored-workspace"
+    assert instance.canonical_root == Path(entry["canonical_root"])
+    assert instance.machine_root == (
+        local_app_data / "AllToNote" / "workspaces" / VALID_INSTANCE_ID
+    )
+    assert registry.get("2" * 32) is None
+    assert _registry_path(local_app_data).read_bytes() == before
+    assert not (local_app_data / "AllToNote" / "workspaces").exists()
+    assert not (local_app_data / "AllToNote" / "workspace-instances.json.lock").exists()
+    assert not list((local_app_data / "AllToNote").glob("*.tmp"))
+
+
+@pytest.mark.parametrize("instance_id", ("", "A" * 32, "../escape", True))
+def test_get_rejects_invalid_instance_id_before_registry_access(
+    local_app_data: Path,
+    instance_id: object,
+) -> None:
+    registry = WorkspaceInstanceRegistry(
+        local_app_data,
+        inspect_workspace=lambda _root: "unused",
+    )
+
+    with pytest.raises(ValueError, match="^workspace_instance_id_invalid$"):
+        registry.get(instance_id)  # type: ignore[arg-type]
+
+    assert list(local_app_data.iterdir()) == []
+
+
+def test_list_rejects_app_root_reparse_before_external_registry_read(
+    local_app_data: Path,
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-registry"
+    outside.mkdir()
+    outside_registry = outside / "workspace-instances.json"
+    outside_registry.write_text("{not-json", encoding="utf-8")
+    app_root = local_app_data / "AllToNote"
+    _create_directory_link(app_root, outside)
+    before = outside_registry.read_bytes()
+    try:
+        registry = WorkspaceInstanceRegistry(
+            local_app_data,
+            inspect_workspace=lambda _root: "unused",
+        )
+
+        with pytest.raises(DomainError, match="workspace_instance_root_unsafe"):
+            registry.list()
+
+        assert outside_registry.read_bytes() == before
+        assert sorted(path.name for path in outside.iterdir()) == [
+            "workspace-instances.json"
+        ]
+    finally:
+        _remove_directory_link(app_root)
+
+
+def test_list_rejects_linked_registry_file_before_external_read(
+    local_app_data: Path,
+    tmp_path: Path,
+) -> None:
+    app_root = local_app_data / "AllToNote"
+    app_root.mkdir()
+    outside_registry = tmp_path / "outside-registry.json"
+    outside_registry.write_text("{not-json", encoding="utf-8")
+    linked_registry = app_root / "workspace-instances.json"
+    try:
+        linked_registry.symlink_to(outside_registry)
+    except OSError as error:
+        pytest.skip(f"file symlink creation unavailable: {error}")
+    before = outside_registry.read_bytes()
+    registry = WorkspaceInstanceRegistry(
+        local_app_data,
+        inspect_workspace=lambda _root: "unused",
+    )
+
+    with pytest.raises(DomainError, match="workspace_instance_root_unsafe"):
+        registry.list()
+
+    assert outside_registry.read_bytes() == before
+
+
 @pytest.mark.parametrize("escape_component", ("AllToNote", "workspaces"))
 def test_registry_rejects_physical_root_escape_before_writing_artifacts(
     workspace_root: Path,

@@ -6,6 +6,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from uuid import RFC_4122, UUID
 
@@ -661,6 +662,64 @@ class SqliteJobRepository:
                     ),
                 )
                 for row in rows
+            )
+
+    def list_engine_execution_candidates(
+        self,
+        *,
+        after_created_at: str | None,
+        after_job_id: str | None,
+        limit: int,
+    ) -> tuple[Job, ...]:
+        cursor_valid = after_created_at is None and after_job_id is None
+        if (
+            type(after_created_at) is str
+            and len(after_created_at) == 24
+            and type(after_job_id) is str
+            and self._is_typed_uuid7(after_job_id, "job")
+        ):
+            try:
+                parsed_cursor = datetime.fromisoformat(
+                    after_created_at.replace("Z", "+00:00")
+                )
+                cursor_valid = utc_now_millis(parsed_cursor) == after_created_at
+            except ValueError:
+                cursor_valid = False
+        if (
+            not cursor_valid
+            or type(limit) is not int
+            or limit < 1
+            or limit > 1000
+        ):
+            raise DomainError(
+                "engine_job_query_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Engine Job query is invalid",
+            )
+        clauses = [
+            "execution_owner = ?",
+            "state IN (?, ?)",
+        ]
+        parameters: list[object] = [
+            JobExecutionOwner.ENGINE.value,
+            JobState.QUEUED.value,
+            JobState.RUNNING.value,
+        ]
+        if after_created_at is not None and after_job_id is not None:
+            clauses.append("(created_at > ? OR (created_at = ? AND job_id > ?))")
+            parameters.extend((after_created_at, after_created_at, after_job_id))
+        parameters.append(limit)
+        statement = (
+            "SELECT job_id, request_hash, principal, client_request_id, "
+            "execution_owner, state, cancellation_requested, retry_of_job_id, "
+            "created_at, updated_at FROM jobs WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at ASC, job_id ASC LIMIT ?"
+        )
+        with self._transaction(immediate=False) as connection:
+            return tuple(
+                self._job_from_row(row)
+                for row in connection.execute(statement, parameters).fetchall()
             )
 
     def query_job_events(
