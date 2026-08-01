@@ -155,11 +155,14 @@ def test_human_mode_uses_the_same_result_without_json_protocol_noise(
     lines = captured.out.splitlines()
 
     assert code == 0
-    assert len(lines) == 4
+    assert len(lines) == 6
     assert lines[0].startswith("Job: job_")
     assert lines[1] == "State: succeeded"
     assert lines[2].startswith("Bundle: bnd_")
     assert lines[3].startswith("Draft: art_")
+    draft_id = lines[3].removeprefix("Draft: ")
+    assert lines[4] == f"Read: alltonote draft show {draft_id}"
+    assert lines[5] == f"Review: alltonote review show {draft_id}"
     assert "{" not in captured.out
     assert captured.err == ""
     assert calls.commit == 1

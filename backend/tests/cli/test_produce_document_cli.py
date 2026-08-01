@@ -298,6 +298,7 @@ def test_generic_document_produce_hands_off_to_clean_draft(
 
     draft_id = runtime.completed.result.artifacts["primary_draft"]
     assert f"Read: alltonote draft show {draft_id}\n" in captured.out
+    assert f"Review: alltonote review show {draft_id}\n" in captured.out
     assert "Document page" not in captured.out
     assert "[^ev_" not in captured.out
     assert captured.err == ""

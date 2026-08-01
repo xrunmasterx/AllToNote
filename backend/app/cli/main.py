@@ -1467,6 +1467,7 @@ def _video_snapshot_result(
         if primary_draft is not None:
             human_lines.append(f"Draft: {primary_draft}")
             human_lines.append(f"Read: alltonote draft show {primary_draft}")
+            human_lines.append(f"Review: alltonote review show {primary_draft}")
     elif produced is not None:
         data.update(
             {
@@ -1501,6 +1502,14 @@ def _video_snapshot_result(
             (
                 f"Bundle: {produced.bundle_id}",
                 f"Draft: {produced.primary_draft_artifact_id}",
+                (
+                    "Read: alltonote draft show "
+                    f"{produced.primary_draft_artifact_id}"
+                ),
+                (
+                    "Review: alltonote review show "
+                    f"{produced.primary_draft_artifact_id}"
+                ),
             )
         )
     return (
