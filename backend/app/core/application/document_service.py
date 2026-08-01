@@ -337,7 +337,7 @@ class DocumentService:
                     return self.get_job(job_id)
             finally:
                 try:
-                    self._repository.release_scheduler_lease(authority)
+                    self._repository.release_job_claim(authority)
                 except Exception:
                     pass
         finally:

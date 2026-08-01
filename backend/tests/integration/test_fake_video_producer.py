@@ -1465,7 +1465,7 @@ def test_blocking_checkpoint_action_renews_scheduler_lease_in_background(
     service = runtime.video_service
     service._heartbeat_interval_seconds = 0.01
     repository = runtime.job_repository
-    original_heartbeat = repository.heartbeat_scheduler_lease
+    original_heartbeat = repository.heartbeat_job_claim
 
     def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
         renewed = original_heartbeat(authority, ttl_seconds=ttl_seconds)
@@ -1473,7 +1473,7 @@ def test_blocking_checkpoint_action_renews_scheduler_lease_in_background(
             background_heartbeat.set()
         return renewed
 
-    repository.heartbeat_scheduler_lease = observe_heartbeat
+    repository.heartbeat_job_claim = observe_heartbeat
 
     snapshot = runtime.wait_job(
         runtime.submit_video(
@@ -1509,7 +1509,7 @@ def test_checkpoint_heartbeat_worker_stops_when_action_raises(
     service = runtime.video_service
     service._heartbeat_interval_seconds = 0.01
     repository = runtime.job_repository
-    original_heartbeat = repository.heartbeat_scheduler_lease
+    original_heartbeat = repository.heartbeat_job_claim
 
     def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
         renewed = original_heartbeat(authority, ttl_seconds=ttl_seconds)
@@ -1517,7 +1517,7 @@ def test_checkpoint_heartbeat_worker_stops_when_action_raises(
             background_heartbeat.set()
         return renewed
 
-    repository.heartbeat_scheduler_lease = observe_heartbeat
+    repository.heartbeat_job_claim = observe_heartbeat
     submitted = runtime.submit_video(
         valid_request(
             workspace_root,
@@ -1543,7 +1543,11 @@ def test_fenced_background_heartbeat_prevents_checkpoint_and_commit(
 
     def fence_during_model(_heartbeat: Callable[[], None]) -> None:
         now_ms[0] = 302_000
-        repository.acquire_scheduler_lease("replacement-owner", ttl_seconds=300)
+        repository.claim_job(
+            submitted.job_id,
+            "replacement-owner",
+            ttl_seconds=300,
+        )
         assert heartbeat_failed.wait(timeout=2)
         if action_failure is not None:
             raise action_failure("control flow interrupted")
@@ -1559,7 +1563,7 @@ def test_fenced_background_heartbeat_prevents_checkpoint_and_commit(
     service = runtime.video_service
     service._heartbeat_interval_seconds = 0.01
     repository = runtime.job_repository
-    original_heartbeat = repository.heartbeat_scheduler_lease
+    original_heartbeat = repository.heartbeat_job_claim
 
     def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
         try:
@@ -1569,13 +1573,13 @@ def test_fenced_background_heartbeat_prevents_checkpoint_and_commit(
                 heartbeat_failed.set()
             raise
 
-    repository.heartbeat_scheduler_lease = observe_heartbeat
+    repository.heartbeat_job_claim = observe_heartbeat
     submitted = runtime.submit_video(
         valid_request(workspace_root, client_request_id="fenced-heartbeat")
     )
 
     if action_failure is None:
-        with pytest.raises(DomainError, match="scheduler_lease_lost"):
+        with pytest.raises(DomainError, match="job_claim_fenced"):
             runtime.wait_job(submitted.job_id)
     else:
         with pytest.raises(action_failure, match="control flow interrupted"):
@@ -1602,10 +1606,17 @@ def test_takeover_of_running_generate_draft_leaves_no_running_replacement(
         valid_request(workspace_root, client_request_id="takeover-model")
     )
     repository = first.job_repository
-    repository.transition_job(submitted.job_id, JobState.RUNNING)
-    old_authority = repository.acquire_scheduler_lease("process-a", ttl_seconds=300)
+    old_authority = repository.claim_job(
+        submitted.job_id,
+        "process-a",
+        ttl_seconds=300,
+    ).authority
     abandoned = repository.start_attempt(
-        repository.create_attempt(submitted.job_id, "generate_draft").attempt_id,
+        repository.create_attempt(
+            submitted.job_id,
+            "generate_draft",
+            authority=old_authority,
+        ).attempt_id,
         old_authority,
     )
 
@@ -1854,7 +1865,7 @@ def test_machine_admission_keeps_competing_video_job_queued(
     assert second_calls.commit == 1
 
 
-def test_scheduler_busy_keeps_new_video_job_queued(
+def test_live_job_claim_keeps_new_video_job_queued(
     tmp_path: Path,
     workspace_root: Path,
 ) -> None:
@@ -1867,17 +1878,18 @@ def test_scheduler_busy_keeps_new_video_job_queued(
     submitted = runtime.submit_video(
         valid_request(workspace_root, client_request_id="scheduler-busy-queued")
     )
-    authority = runtime.job_repository.acquire_scheduler_lease(
+    authority = runtime.job_repository.claim_job(
+        submitted.job_id,
         "blocking-process",
         ttl_seconds=300,
-    )
+    ).authority
 
     try:
         with pytest.raises(DomainError, match="scheduler_busy"):
             runtime.wait_job(submitted.job_id)
-        assert runtime.get_job(submitted.job_id).state is JobState.QUEUED
+        assert runtime.get_job(submitted.job_id).state is JobState.RUNNING
     finally:
-        runtime.job_repository.release_scheduler_lease(authority)
+        runtime.job_repository.release_job_claim(authority)
 
 
 def test_machine_admission_heartbeat_fences_takeover_before_checkpoint(

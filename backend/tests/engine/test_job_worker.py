@@ -304,7 +304,7 @@ def test_worker_failure_settlement_never_overrides_live_claim(
         assert repository.get_job(job.job_id).state is JobState.RUNNING
         assert repository.get_job_error(job.job_id) is None
     finally:
-        repository.release_scheduler_lease(live.authority)
+        repository.release_job_claim(live.authority)
 
 
 def test_worker_failure_settlement_takes_over_expired_attempt(
@@ -318,7 +318,7 @@ def test_worker_failure_settlement_takes_over_expired_attempt(
         authority=previous.authority,
     )
     repository.start_attempt(attempt.attempt_id, previous.authority)
-    repository.release_scheduler_lease(previous.authority)
+    repository.release_job_claim(previous.authority)
 
     with pytest.raises(DomainError, match="job_request_invalid"):
         execute_engine_job(

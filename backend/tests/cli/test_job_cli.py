@@ -541,9 +541,17 @@ def test_job_retry_requires_exact_unknown_operation_confirmation(
     original = runtime.submit_video(_request(workspace_root, "unknown-retry"))
     repo = runtime.job_repository
     repo.transition_job(original.job_id, JobState.RUNNING)
-    authority = repo.acquire_scheduler_lease("unknown-retry-owner", ttl_seconds=300)
+    authority = repo.claim_job(
+        original.job_id,
+        "unknown-retry-owner",
+        ttl_seconds=300,
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(original.job_id, "generate_draft").attempt_id,
+        repo.create_attempt(
+            original.job_id,
+            "generate_draft",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     guard = ExternalOperationGuard(repo, authority)
@@ -563,7 +571,7 @@ def test_job_retry_requires_exact_unknown_operation_confirmation(
         AttemptState.CANCELLED,
         authority=authority,
     )
-    repo.release_scheduler_lease(authority)
+    repo.release_job_claim(authority)
 
     code = _job_json(runtime, workspace_root, "get", original.job_id)
     status = json.loads(capsys.readouterr().out)
@@ -627,9 +635,17 @@ def test_job_respond_requires_matching_explicit_waiting_challenge(
         client_request_id="respond",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = repo.acquire_scheduler_lease("respond-owner", ttl_seconds=300)
+    authority = repo.claim_job(
+        job.job_id,
+        "respond-owner",
+        ttl_seconds=300,
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "acquire").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "acquire",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     repo.transition_attempt(
@@ -642,7 +658,7 @@ def test_job_respond_requires_matching_explicit_waiting_challenge(
         attempt.attempt_id,
         '{"kind":"credential_profile"}',
     )
-    repo.release_scheduler_lease(authority)
+    repo.release_job_claim(authority)
     response_path = tmp_path / "response.json"
     response_path.write_text(
         '{"credential_profile":"profile-a"}', encoding="utf-8"
@@ -679,9 +695,17 @@ def test_job_respond_rejects_external_unknown_without_consuming_challenge(
         client_request_id="unknown-respond",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = repo.acquire_scheduler_lease("unknown-owner", ttl_seconds=300)
+    authority = repo.claim_job(
+        job.job_id,
+        "unknown-owner",
+        ttl_seconds=300,
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "generate_draft",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     repo.transition_attempt(
@@ -694,7 +718,7 @@ def test_job_respond_rejects_external_unknown_without_consuming_challenge(
         attempt.attempt_id,
         '{"code":"external_outcome_unknown","operation_ids":["op_fixture"]}',
     )
-    repo.release_scheduler_lease(authority)
+    repo.release_job_claim(authority)
     response_path = tmp_path / "must-not-be-read.json"
 
     code = _job_json(
@@ -727,9 +751,17 @@ def test_job_cancel_repairs_legacy_cancelled_pending_challenge(
         client_request_id="legacy-cancelled-challenge",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = repo.acquire_scheduler_lease("legacy-cancel-owner", ttl_seconds=300)
+    authority = repo.claim_job(
+        job.job_id,
+        "legacy-cancel-owner",
+        ttl_seconds=300,
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "generate_draft",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     repo.transition_attempt(
@@ -742,7 +774,7 @@ def test_job_cancel_repairs_legacy_cancelled_pending_challenge(
         attempt.attempt_id,
         '{"code":"external_outcome_unknown"}',
     )
-    repo.release_scheduler_lease(authority)
+    repo.release_job_claim(authority)
     repo.cancel_job(job.job_id)
     with sqlite3.connect(repo.database_path) as connection:
         connection.execute(

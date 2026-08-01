@@ -60,15 +60,27 @@ def _job_attempt(
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
     authority = _authority(repository)
-    pending = repository.create_attempt(job.job_id, step_id)
+    pending = repository.create_attempt(
+        job.job_id,
+        step_id,
+        authority=authority,
+    )
     attempt = repository.start_attempt(pending.attempt_id, authority)
     return job, attempt
 
 
 def _authority(repository: SqliteJobRepository):
-    return repository.acquire_scheduler_lease(
-        "test-workspace:test-process", ttl_seconds=300
-    )
+    with repository._connect() as connection:
+        row = connection.execute(
+            "SELECT job_id FROM jobs WHERE state = 'running' "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None
+    return repository.claim_job(
+        row["job_id"],
+        "test-workspace:test-process",
+        ttl_seconds=300,
+    ).authority
 
 
 def _record(

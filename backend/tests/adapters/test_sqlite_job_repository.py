@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from multiprocessing import get_context
 from pathlib import Path
@@ -65,6 +66,7 @@ EXPECTED_TABLES = {
     "external_operations",
     "jobs",
     "job_execution_bindings",
+    "job_execution_leases",
     "leases",
     "source_identities",
     "steps",
@@ -327,10 +329,15 @@ def test_initial_job_event_rejects_sensitive_fields_before_creation(
         )
 
 
-def _authority(repo: SqliteJobRepository):
-    return repo.acquire_scheduler_lease(
-        "test-workspace:test-process", ttl_seconds=300
-    )
+def _authority(
+    repo: SqliteJobRepository,
+    job_id: str,
+) -> JobExecutionAuthority:
+    return repo.claim_job(
+        job_id,
+        "test-workspace:test-process",
+        ttl_seconds=300,
+    ).authority
 
 
 def _terminalize_job(
@@ -343,11 +350,12 @@ def _terminalize_job(
     repo.transition_job(job_id, JobState.RUNNING)
     if terminal_state is JobState.FAILED:
         return repo.transition_job(job_id, terminal_state)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job_id, "terminal-setup")
+    authority = _authority(repo, job_id)
+    attempt = repo.create_attempt(job_id, "terminal-setup", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
     with repo.commit_guard(job_id, attempt.attempt_id, authority):
         pass
+    repo.release_job_claim(authority)
     return repo.get_job(job_id)
 
 
@@ -490,7 +498,7 @@ def test_corrupt_database_is_rejected_without_overwrite(tmp_path: Path) -> None:
     assert database_path.read_bytes() == corrupt_bytes
 
 
-def test_open_creates_version_three_database_with_exact_schema_and_pragmas(
+def test_open_creates_version_four_database_with_exact_schema_and_pragmas(
     repo: SqliteJobRepository,
 ) -> None:
     assert repo.database_path == repo.machine_root / "jobs.sqlite"
@@ -517,7 +525,7 @@ def test_open_creates_version_three_database_with_exact_schema_and_pragmas(
     assert journal_mode == "wal"
     assert synchronous == 2
     assert busy_timeout == 5_000
-    assert user_version == 3
+    assert user_version == 4
     assert foreign_key_violations == []
 
 
@@ -662,7 +670,11 @@ def test_authorize_attempt_storage_maps_busy_statement(
     monkeypatch.setattr(repo, "_assert_execution_authority", fail_authority)
 
     with pytest.raises(DomainError) as raised:
-        repo.authorize_attempt_storage("job", "attempt", _authority(repo))
+        repo.authorize_attempt_storage(
+            "job",
+            "attempt",
+            JobExecutionAuthority("test-owner", 1, "job"),
+        )
 
     assert raised.value.code == "job_store_busy"
     assert raised.value.category is ErrorCategory.RETRYABLE_RUNTIME
@@ -731,7 +743,7 @@ def test_version_one_database_migrates_execution_binding_and_reopens(
         pack_version="legacy-v1",
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -777,7 +789,7 @@ def test_version_two_database_migrates_jobs_to_foreground_owner(
         JobExecutionOwner.FOREGROUND
     )
     with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -817,7 +829,88 @@ def test_version_two_migration_failure_rolls_back_and_retry_succeeds(
 
     migrated = SqliteJobRepository.open(machine_root)
     with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+
+
+def _create_version_three_store(
+    database_path: Path,
+    *,
+    lease_expires_at: int,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        for statement in repository_module._SCHEMA_STATEMENTS_V3:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_id, request_hash, request_json, principal,
+                client_request_id, state, cancellation_requested,
+                retry_of_job_id, result_json, error_json, created_at, updated_at,
+                execution_owner
+            ) VALUES ('job_v3', ?, NULL, 'local', 'v3', 'queued', 0,
+                      NULL, NULL, NULL, '1', '1', 'engine')
+            """,
+            (HASH_A,),
+        )
+        connection.execute(
+            """
+            INSERT INTO job_execution_bindings (
+                job_id, recipe_id, recipe_version, executor_id,
+                executor_version, pack_id, pack_version
+            ) VALUES ('job_v3', 'alltonote.video-course-note', 1,
+                      'alltonote.video', 1, 'media-basic', 'builtin-v1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO leases (
+                lease_name, job_id, owner, fencing_token, expires_at, heartbeat_at
+            ) VALUES ('scheduler', 'job_v3', 'legacy-owner', 7, ?, '900')
+            """,
+            (str(lease_expires_at),),
+        )
+        connection.execute("PRAGMA user_version = 3")
+
+
+def test_version_three_expired_bound_lease_migrates_to_job_generation(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v3-expired")
+    _create_version_three_store(database_path, lease_expires_at=999)
+
+    migrated = SqliteJobRepository.open_existing(machine_root, clock=lambda: 1_000)
+
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("SELECT 1 FROM leases").fetchone() is None
+        lease = connection.execute(
+            "SELECT owner, generation, expires_at FROM job_execution_leases "
+            "WHERE job_id = 'job_v3'"
+        ).fetchone()
+    assert tuple(lease) == ("legacy-owner", 7, "999")
+    claim = migrated.claim_job("job_v3", "new-owner", ttl_seconds=30)
+    assert claim.authority.fencing_token == 8
+
+
+def test_version_three_live_bound_lease_blocks_migration_without_mutation(
+    tmp_path: Path,
+) -> None:
+    machine_root, database_path = _database_path(tmp_path, "migrate-v3-live")
+    _create_version_three_store(database_path, lease_expires_at=1_001)
+
+    with pytest.raises(DomainError) as caught:
+        SqliteJobRepository.open_existing(machine_root, clock=lambda: 1_000)
+
+    assert caught.value.code == "job_store_migration_busy"
+    assert caught.value.category is ErrorCategory.RETRYABLE_RUNTIME
+    with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT job_id, owner, fencing_token FROM leases"
+        ).fetchone() == ("job_v3", "legacy-owner", 7)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'job_execution_leases'"
+        ).fetchone() is None
 
 
 def test_version_one_migration_failure_rolls_back_and_retry_succeeds(
@@ -922,7 +1015,7 @@ def _claim_fixture_job(
     return job, binding
 
 
-def test_claim_job_atomically_binds_scheduler_and_transitions_same_job(
+def test_claim_job_atomically_binds_job_generation_and_transitions_same_job(
     tmp_path: Path,
 ) -> None:
     now_ms = 10_000
@@ -942,13 +1035,14 @@ def test_claim_job_atomically_binds_scheduler_and_transitions_same_job(
     assert claim.authority.fencing_token == 1
     with repo._connect() as connection:
         lease = connection.execute(
-            "SELECT job_id, owner, fencing_token, expires_at FROM leases "
-            "WHERE lease_name = 'scheduler'"
+            "SELECT job_id, owner, generation, expires_at "
+            "FROM job_execution_leases WHERE job_id = ?",
+            (job.job_id,),
         ).fetchone()
     assert tuple(lease) == (job.job_id, "engine-owner-a", 1, "40000")
 
 
-def test_claim_job_is_idempotent_for_same_owner_and_busy_for_other_work(
+def test_claim_job_is_idempotent_per_job_and_distinct_jobs_are_independent(
     tmp_path: Path,
 ) -> None:
     now_ms = 20_000
@@ -965,9 +1059,48 @@ def test_claim_job_is_idempotent_for_same_owner_and_busy_for_other_work(
     assert repeated.authority == original.authority
     with pytest.raises(DomainError, match="scheduler_busy"):
         repo.claim_job(first.job_id, "engine-owner-b", ttl_seconds=30)
-    with pytest.raises(DomainError, match="scheduler_busy"):
-        repo.claim_job(second.job_id, "engine-owner-a", ttl_seconds=30)
-    assert repo.get_job_details(second.job_id)[0].state is JobState.QUEUED
+    independent = repo.claim_job(second.job_id, "engine-owner-b", ttl_seconds=30)
+    assert independent.authority.job_id == second.job_id
+    assert independent.authority.fencing_token == 1
+    assert repo.get_job_details(second.job_id)[0].state is JobState.RUNNING
+
+
+def test_scheduler_leadership_and_job_execution_claims_are_independent(
+    tmp_path: Path,
+) -> None:
+    repo = SqliteJobRepository.open(
+        tmp_path / "scheduler-job-separation",
+        clock=lambda: 25_000,
+    )
+    job, _ = _claim_fixture_job(repo, client_request_id="separate-authority")
+
+    scheduler = repo.acquire_scheduler_lease("scheduler-owner", ttl_seconds=30)
+    claim = repo.claim_job(job.job_id, "job-owner", ttl_seconds=30)
+    attempt = repo.create_attempt(
+        job.job_id,
+        "authority-boundary",
+        authority=claim.authority,
+    )
+
+    assert scheduler.fencing_token == claim.authority.fencing_token == 1
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.start_attempt(attempt.attempt_id, scheduler)
+    attempt = repo.start_attempt(attempt.attempt_id, claim.authority)
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.authorize_attempt_storage(job.job_id, attempt.attempt_id, scheduler)
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        with repo.commit_guard(job.job_id, attempt.attempt_id, scheduler):
+            pass
+
+    with pytest.raises(DomainError, match="scheduler_authority_invalid"):
+        repo.heartbeat_scheduler_lease(claim.authority, ttl_seconds=60)
+    with pytest.raises(DomainError, match="scheduler_authority_invalid"):
+        repo.release_scheduler_lease(claim.authority)
+    assert repo.heartbeat_scheduler_lease(scheduler, ttl_seconds=60) == scheduler
+    assert repo.heartbeat_job_claim(claim.authority, ttl_seconds=60) == claim.authority
+    assert repo.release_scheduler_lease(scheduler) is True
+    assert repo.heartbeat_job_claim(claim.authority, ttl_seconds=60) == claim.authority
+    assert repo.release_job_claim(claim.authority) is True
 
 
 def test_expired_job_claim_is_taken_over_with_a_new_fencing_token(
@@ -986,10 +1119,10 @@ def test_expired_job_claim_is_taken_over_with_a_new_fencing_token(
 
     assert second.authority.job_id == job.job_id
     assert second.authority.fencing_token == first.authority.fencing_token + 1
-    assert repo.release_scheduler_lease(first.authority) is False
-    with pytest.raises(DomainError, match="scheduler_lease_lost"):
-        repo.heartbeat_scheduler_lease(first.authority, ttl_seconds=30)
-    assert repo.heartbeat_scheduler_lease(second.authority, ttl_seconds=60) == (
+    assert repo.release_job_claim(first.authority) is False
+    with pytest.raises(DomainError, match="job_claim_fenced"):
+        repo.heartbeat_job_claim(first.authority, ttl_seconds=30)
+    assert repo.heartbeat_job_claim(second.authority, ttl_seconds=60) == (
         second.authority
     )
 
@@ -1082,7 +1215,7 @@ def test_claim_after_crash_between_create_and_start_reuses_single_pending_attemp
     assert len(repo.list_attempts(job.job_id)) == 1
 
 
-def test_legacy_acquire_during_live_job_claim_returns_usable_bound_authority(
+def test_scheduler_acquire_during_live_job_claim_returns_scheduler_authority(
     tmp_path: Path,
 ) -> None:
     repo = SqliteJobRepository.open(
@@ -1092,15 +1225,16 @@ def test_legacy_acquire_during_live_job_claim_returns_usable_bound_authority(
     job, _ = _claim_fixture_job(repo, client_request_id="claim-legacy")
     claim = repo.claim_job(job.job_id, "engine-owner-a", ttl_seconds=30)
 
-    renewed = repo.acquire_scheduler_lease(
+    scheduler = repo.acquire_scheduler_lease(
         "engine-owner-a",
         ttl_seconds=60,
     )
 
-    assert isinstance(renewed, JobExecutionAuthority)
-    assert renewed == claim.authority
-    assert repo.heartbeat_scheduler_lease(renewed, ttl_seconds=60) == renewed
-    assert repo.release_scheduler_lease(renewed) is True
+    assert not isinstance(scheduler, JobExecutionAuthority)
+    assert repo.heartbeat_scheduler_lease(scheduler, ttl_seconds=60) == scheduler
+    assert repo.heartbeat_job_claim(claim.authority, ttl_seconds=60) == claim.authority
+    assert repo.release_scheduler_lease(scheduler) is True
+    assert repo.release_job_claim(claim.authority) is True
 
 
 def test_claim_job_failure_rolls_back_lease_binding_and_running_transition(
@@ -1128,7 +1262,7 @@ def test_claim_job_failure_rolls_back_lease_binding_and_running_transition(
     reopened = SqliteJobRepository.open(machine_root)
     assert reopened.get_job_details(job.job_id)[0].state is JobState.QUEUED
     with reopened._connect() as connection:
-        assert connection.execute("SELECT 1 FROM leases").fetchone() is None
+        assert connection.execute("SELECT 1 FROM job_execution_leases").fetchone() is None
 
 
 def test_stale_job_claim_cannot_transition_or_create_attempt(
@@ -1306,10 +1440,96 @@ def test_two_processes_claim_the_same_persisted_job_exactly_once(
     assert reopened.list_attempts(job.job_id) == ()
     with reopened._connect() as connection:
         lease = connection.execute(
-            "SELECT job_id, owner, fencing_token FROM leases "
-            "WHERE lease_name = 'scheduler'"
+            "SELECT job_id, owner, generation FROM job_execution_leases "
+            "WHERE job_id = ?",
+            (job.job_id,),
         ).fetchone()
     assert tuple(lease) == (job.job_id, claimed[1], claimed[2])
+
+
+def test_two_processes_claim_distinct_jobs_independently(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "multiprocess-distinct-claim-store"
+    repo = SqliteJobRepository.open(machine_root)
+    first, _ = _claim_fixture_job(repo, client_request_id="claim-process-first")
+    second, _ = _claim_fixture_job(repo, client_request_id="claim-process-second")
+    jobs = (first, second)
+    context = get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = tuple(
+        context.Process(
+            target=_claim_job_in_process,
+            args=(
+                str(machine_root),
+                job.job_id,
+                f"engine-owner-{index}",
+                barrier,
+                results,
+            ),
+        )
+        for index, job in enumerate(jobs)
+    )
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    outcomes = tuple(results.get(timeout=2) for _process in processes)
+    assert sorted(outcome[0] for outcome in outcomes) == ["claimed", "claimed"]
+    assert {outcome[2] for outcome in outcomes} == {1}
+    with repo._connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT job_id, generation FROM job_execution_leases
+            ORDER BY job_id
+            """
+        ).fetchall()
+    assert [tuple(row) for row in rows] == sorted(
+        (job.job_id, 1) for job in jobs
+    )
+
+
+def test_thirty_two_same_job_claimers_produce_one_live_generation(
+    tmp_path: Path,
+) -> None:
+    machine_root = tmp_path / "threaded-claim-store"
+    repo = SqliteJobRepository.open(machine_root)
+    job, _ = _claim_fixture_job(repo, client_request_id="claim-32")
+
+    def claim(index: int) -> tuple[str, str, int | None]:
+        repository = SqliteJobRepository.open(machine_root)
+        try:
+            result = repository.claim_job(
+                job.job_id,
+                f"engine-owner-{index}",
+                ttl_seconds=30,
+            )
+        except DomainError as error:
+            return ("error", error.code, None)
+        return (
+            "claimed",
+            result.authority.owner_id,
+            result.authority.fencing_token,
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        outcomes = tuple(executor.map(claim, range(32)))
+
+    claimed = tuple(item for item in outcomes if item[0] == "claimed")
+    assert len(claimed) == 1
+    assert {item[1] for item in outcomes if item[0] == "error"} == {
+        "scheduler_busy"
+    }
+    with repo._connect() as connection:
+        rows = connection.execute(
+            "SELECT owner, generation FROM job_execution_leases WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [(claimed[0][1], 1)]
 
 
 def test_json_columns_are_utf8_text_and_schema_has_no_secret_columns(
@@ -1368,9 +1588,8 @@ def test_schema_rejects_non_boolean_cancellation_and_non_scheduler_lease(
             connection.execute(
                 """
                 INSERT INTO leases (
-                    lease_name, job_id, owner, fencing_token,
-                    expires_at, heartbeat_at
-                ) VALUES ('not-scheduler', NULL, 'owner', 1, '1', '0')
+                    lease_name, owner, fencing_token, expires_at, heartbeat_at
+                ) VALUES ('not-scheduler', 'owner', 1, '1', '0')
                 """
             )
 
@@ -1631,7 +1850,7 @@ def test_list_engine_execution_candidates_excludes_foreground_and_wait_boundarie
     )
 
 
-def test_list_engine_execution_candidates_waits_for_live_scheduler_lease(
+def test_list_engine_execution_candidates_excludes_only_live_claimed_job(
     tmp_path: Path,
 ) -> None:
     now_ms = [1_000]
@@ -1639,14 +1858,20 @@ def test_list_engine_execution_candidates_waits_for_live_scheduler_lease(
         tmp_path / "candidate-live-lease",
         clock=lambda: now_ms[0],
     )
-    running = repository.create_job(
+    claimed = repository.create_job(
         request_hash=HASH_A,
         principal="agent",
         client_request_id="engine-live-lease",
         execution_owner=JobExecutionOwner.ENGINE,
     )
+    available = repository.create_job(
+        request_hash=HASH_B,
+        principal="agent",
+        client_request_id="engine-independent-candidate",
+        execution_owner=JobExecutionOwner.ENGINE,
+    )
     repository.claim_job(
-        running.job_id,
+        claimed.job_id,
         "engine-owner",
         ttl_seconds=10,
     )
@@ -1656,16 +1881,23 @@ def test_list_engine_execution_candidates_waits_for_live_scheduler_lease(
         after_created_at=None,
         after_job_id=None,
         limit=10,
-    ) == ()
+    ) == (available,)
 
     now_ms[0] = 11_001
 
-    assert repository.list_engine_execution_candidates(
+    candidates = repository.list_engine_execution_candidates(
         principal="agent",
         after_created_at=None,
         after_job_id=None,
         limit=10,
-    ) == (repository.get_job(running.job_id),)
+    )
+    assert [candidate.job_id for candidate in candidates] == [
+        job.job_id
+        for job in sorted(
+            (repository.get_job(claimed.job_id), available),
+            key=lambda job: (job.created_at, job.job_id),
+        )
+    ]
 
 
 def test_list_engine_execution_candidates_has_stable_forward_pagination(
@@ -1882,7 +2114,12 @@ def test_create_attempt_rejects_terminal_job_without_inserting_rows(
             "SELECT COUNT(*) FROM attempts WHERE job_id = ?", (job.job_id,)
         ).fetchone()[0]
 
-    with pytest.raises(DomainError, match="job_terminal"):
+    expected_error = (
+        "job_claim_fenced"
+        if terminal_state is JobState.SUCCEEDED
+        else "job_terminal"
+    )
+    with pytest.raises(DomainError, match=expected_error):
         repo.create_attempt(job.job_id, "must-not-exist")
 
     with repo._connect() as connection:
@@ -1967,12 +2204,17 @@ def test_job_cannot_be_terminal_while_an_attempt_is_unsettled(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    attempt = repo.create_attempt(job.job_id, "resolve")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "resolve", authority=authority)
     if attempt_state is AttemptState.RUNNING:
-        repo.start_attempt(attempt.attempt_id, _authority(repo))
+        repo.start_attempt(attempt.attempt_id, authority)
 
     with pytest.raises(DomainError, match="attempt_not_settled"):
-        repo.transition_job(job.job_id, JobState.FAILED)
+        repo.transition_job(
+            job.job_id,
+            JobState.FAILED,
+            authority=authority,
+        )
 
 
 def test_commit_guard_can_succeed_job_after_all_attempts_are_settled(
@@ -1984,8 +2226,8 @@ def test_commit_guard_can_succeed_job_after_all_attempts_are_settled(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    attempt = repo.create_attempt(job.job_id, "resolve")
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "resolve", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
 
     with repo.commit_guard(job.job_id, attempt.attempt_id, authority):
@@ -2006,9 +2248,11 @@ def test_commit_guard_maps_busy_before_portable_commit(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "commit").attempt_id,
+        repo.create_attempt(
+            job.job_id, "commit", authority=authority
+        ).attempt_id,
         authority,
     )
     holder = sqlite3.connect(repo.database_path, isolation_level=None)
@@ -2038,9 +2282,11 @@ def test_commit_guard_maps_busy_commit_without_replaying_callback(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "commit").attempt_id,
+        repo.create_attempt(
+            job.job_id, "commit", authority=authority
+        ).attempt_id,
         authority,
     )
     original_connect = repo._connect
@@ -2112,7 +2358,7 @@ def test_commit_guard_rejects_non_running_job(repo: SqliteJobRepository) -> None
         client_request_id=None,
     )
     attempt = repo.create_attempt(job.job_id, "resolve")
-    authority = _authority(repo)
+    authority = JobExecutionAuthority("test-owner", 1, job.job_id)
 
     with pytest.raises(DomainError, match="commit_guard_not_running"):
         with repo.commit_guard(job.job_id, attempt.attempt_id, authority):
@@ -2128,8 +2374,8 @@ def test_commit_guard_rolls_back_when_guarded_work_fails(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    pending = repo.create_attempt(job.job_id, "commit")
+    authority = _authority(repo, job.job_id)
+    pending = repo.create_attempt(job.job_id, "commit", authority=authority)
     attempt = repo.start_attempt(pending.attempt_id, authority)
 
     with pytest.raises(RuntimeError, match="portable commit failed"):
@@ -2155,8 +2401,8 @@ def test_commit_video_result_atomic_persists_result_identity_and_success(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job.job_id, "commit")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "commit", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
     plan, binding, receipt = _video_commit_inputs(job.job_id)
 
@@ -2192,9 +2438,11 @@ def test_commit_video_result_round_trips_v2_documents(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "commit").attempt_id,
+        repo.create_attempt(
+            job.job_id, "commit", authority=authority
+        ).attempt_id,
         authority,
     )
     plan, binding, receipt = _video_commit_inputs(job.job_id)
@@ -2237,8 +2485,8 @@ def test_commit_video_result_atomic_rolls_back_when_callback_fails(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job.job_id, "commit")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "commit", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
 
     plan, binding, _ = _video_commit_inputs(job.job_id)
@@ -2269,8 +2517,12 @@ def test_commit_video_result_atomic_rolls_back_on_source_identity_conflict(
         client_request_id=None,
     )
     repo.transition_job(first.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    first_attempt = repo.create_attempt(first.job_id, "commit")
+    authority = _authority(repo, first.job_id)
+    first_attempt = repo.create_attempt(
+        first.job_id,
+        "commit",
+        authority=authority,
+    )
     first_attempt = repo.start_attempt(first_attempt.attempt_id, authority)
     first_plan, first_binding, first_receipt = _video_commit_inputs(first.job_id)
     repo.commit_video_result_atomic(
@@ -2288,8 +2540,16 @@ def test_commit_video_result_atomic_rolls_back_on_source_identity_conflict(
         client_request_id=None,
     )
     repo.transition_job(second.job_id, JobState.RUNNING)
-    second_attempt = repo.create_attempt(second.job_id, "commit")
-    second_attempt = repo.start_attempt(second_attempt.attempt_id, authority)
+    second_authority = _authority(repo, second.job_id)
+    second_attempt = repo.create_attempt(
+        second.job_id,
+        "commit",
+        authority=second_authority,
+    )
+    second_attempt = repo.start_attempt(
+        second_attempt.attempt_id,
+        second_authority,
+    )
 
     plan, binding, receipt = _video_commit_inputs(
         second.job_id,
@@ -2307,7 +2567,7 @@ def test_commit_video_result_atomic_rolls_back_on_source_identity_conflict(
         repo.commit_video_result_atomic(
             second.job_id,
             second_attempt.attempt_id,
-            authority,
+            second_authority,
             result_plan=plan,
             source_identity=binding,
             commit=commit,
@@ -2325,9 +2585,14 @@ def test_commit_video_result_atomic_advances_same_source_binding(
         request_hash=HASH_A, principal="local", client_request_id=None
     )
     repo.transition_job(first.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, first.job_id)
     first_attempt = repo.start_attempt(
-        repo.create_attempt(first.job_id, "commit").attempt_id, authority
+        repo.create_attempt(
+            first.job_id,
+            "commit",
+            authority=authority,
+        ).attempt_id,
+        authority,
     )
     plan, binding, receipt = _video_commit_inputs(first.job_id)
     repo.commit_video_result_atomic(
@@ -2343,8 +2608,14 @@ def test_commit_video_result_atomic_advances_same_source_binding(
         request_hash=HASH_B, principal="local", client_request_id=None
     )
     repo.transition_job(second.job_id, JobState.RUNNING)
+    second_authority = _authority(repo, second.job_id)
     second_attempt = repo.start_attempt(
-        repo.create_attempt(second.job_id, "commit").attempt_id, authority
+        repo.create_attempt(
+            second.job_id,
+            "commit",
+            authority=second_authority,
+        ).attempt_id,
+        second_authority,
     )
     next_plan, next_binding, next_receipt = _video_commit_inputs(
         second.job_id, bundle_id=NEXT_BUNDLE_ID
@@ -2353,7 +2624,7 @@ def test_commit_video_result_atomic_advances_same_source_binding(
     repo.commit_video_result_atomic(
         second.job_id,
         second_attempt.attempt_id,
-        authority,
+        second_authority,
         result_plan=next_plan,
         source_identity=next_binding,
         commit=lambda: next_receipt,
@@ -2372,9 +2643,14 @@ def test_commit_video_result_atomic_rejects_plan_before_callback(
         request_hash=HASH_A, principal="local", client_request_id=None
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "commit").attempt_id, authority
+        repo.create_attempt(
+            job.job_id,
+            "commit",
+            authority=authority,
+        ).attempt_id,
+        authority,
     )
     plan, binding, receipt = _video_commit_inputs(job.job_id)
     if failure == "mismatch":
@@ -2443,9 +2719,14 @@ def test_commit_video_result_atomic_rejects_malformed_semantics_before_callback(
         request_hash=HASH_A, principal="local", client_request_id=None
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "commit").attempt_id, authority
+        repo.create_attempt(
+            job.job_id,
+            "commit",
+            authority=authority,
+        ).attempt_id,
+        authority,
     )
     plan, binding, receipt = _video_commit_inputs(job.job_id)
     wrong_uuid = "00000000-0000-4000-8000-000000000000"
@@ -2649,9 +2930,14 @@ def test_failed_error_round_trips_after_repository_reopen(tmp_path: Path) -> Non
         request_hash=HASH_A, principal="local", client_request_id=None
     )
     writer.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(writer)
+    authority = _authority(writer, job.job_id)
     attempt = writer.start_attempt(
-        writer.create_attempt(job.job_id, "preflight").attempt_id, authority
+        writer.create_attempt(
+            job.job_id,
+            "preflight",
+            authority=authority,
+        ).attempt_id,
+        authority,
     )
     error = ErrorDetail(
         "preflight_workspace_failed",
@@ -2707,20 +2993,29 @@ def test_take_over_running_attempt_requires_new_expired_lease_fence(
         request_hash=HASH_A, principal="local", client_request_id=None
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    old_authority = repo.acquire_scheduler_lease("old-owner", ttl_seconds=1)
+    old_authority = repo.claim_job(
+        job.job_id, "old-owner", ttl_seconds=1
+    ).authority
     old_attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "commit").attempt_id, old_authority
+        repo.create_attempt(
+            job.job_id,
+            "commit",
+            authority=old_authority,
+        ).attempt_id,
+        old_authority,
     )
 
     with pytest.raises(DomainError, match="scheduler_busy"):
-        repo.acquire_scheduler_lease("new-owner", ttl_seconds=1)
+        repo.claim_job(job.job_id, "new-owner", ttl_seconds=1)
     with pytest.raises(DomainError, match="attempt_takeover_not_fenced"):
         repo.take_over_running_attempt(
             job.job_id, old_attempt.attempt_id, old_authority
         )
 
     now_ms = 2_001
-    new_authority = repo.acquire_scheduler_lease("new-owner", ttl_seconds=1)
+    new_authority = repo.claim_job(
+        job.job_id, "new-owner", ttl_seconds=1
+    ).authority
     replacement = repo.take_over_running_attempt(
         job.job_id, old_attempt.attempt_id, new_authority
     )
@@ -2748,9 +3043,15 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
     repo = SqliteJobRepository.open(tmp_path / "pause-store", clock=lambda: now_ms)
     job = repo.create_job(request_hash=HASH_A, principal="local", client_request_id=None)
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = repo.acquire_scheduler_lease("current-owner", ttl_seconds=1)
+    authority = repo.claim_job(
+        job.job_id, "current-owner", ttl_seconds=1
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "generate_draft",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     operation = repo.prepare_external_operation(
@@ -2771,7 +3072,9 @@ def test_pause_for_external_outcome_is_atomic_and_fenced(tmp_path: Path) -> None
     )
 
     now_ms = 2_001
-    current_authority = repo.acquire_scheduler_lease("next-owner", ttl_seconds=1)
+    current_authority = repo.claim_job(
+        job.job_id, "next-owner", ttl_seconds=1
+    ).authority
     replacement = repo.take_over_running_attempt(
         job.job_id, attempt.attempt_id, current_authority
     )
@@ -2872,9 +3175,13 @@ def test_pause_for_external_outcome_rolls_back_without_unknown_operation(
     repo = SqliteJobRepository.open(tmp_path / "pause-rollback-store")
     job = repo.create_job(request_hash=HASH_A, principal="local", client_request_id=None)
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
+    authority = _authority(repo, job.job_id)
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "generate_draft").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "generate_draft",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
 
@@ -2898,8 +3205,8 @@ def _create_needs_input_attempt(repo: SqliteJobRepository):
         client_request_id="challenge-original",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job.job_id, "acquire")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "acquire", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
     attempt = repo.transition_attempt(
         attempt.attempt_id,
@@ -2944,8 +3251,8 @@ def _create_failed_job_with_unknown_operations(
         execution_owner=execution_owner,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job.job_id, "model")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "model", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
     for operation_id in operation_ids:
         _record_unknown_operation(
@@ -2958,7 +3265,14 @@ def _create_failed_job_with_unknown_operations(
     repo.transition_attempt(
         attempt.attempt_id, AttemptState.FAILED, authority=authority
     )
-    return repo.transition_job(job.job_id, JobState.FAILED), attempt
+    return (
+        repo.transition_job(
+            job.job_id,
+            JobState.FAILED,
+            authority=authority,
+        ),
+        attempt,
+    )
 
 
 def test_schema_v1_persists_challenge_response_hash_and_attempt_binding(
@@ -3064,7 +3378,10 @@ def test_cancel_cancels_pending_attempt_and_persists_request(
     assert cancelled.state is JobState.CANCELLED
     assert cancelled.cancellation_requested is True
     with pytest.raises(DomainError, match="attempt_terminal"):
-        repo.start_attempt(pending.attempt_id, _authority(repo))
+        repo.start_attempt(
+            pending.attempt_id,
+            JobExecutionAuthority("test-owner", 1, pending.job_id),
+        )
 
 
 def test_cancel_waiting_job_cancels_pending_challenge(
@@ -3104,8 +3421,12 @@ def test_running_job_cancellation_is_durable_across_real_repository_reopen(
         client_request_id=None,
     )
     writer.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(writer)
-    attempt = writer.create_attempt(job.job_id, "running-step")
+    authority = _authority(writer, job.job_id)
+    attempt = writer.create_attempt(
+        job.job_id,
+        "running-step",
+        authority=authority,
+    )
     attempt = writer.start_attempt(attempt.attempt_id, authority)
     requested = writer.cancel_job(job.job_id)
     assert requested.state is JobState.RUNNING

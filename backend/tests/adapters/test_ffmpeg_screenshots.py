@@ -747,9 +747,18 @@ def test_real_storage_cleans_partial_after_concrete_post_exit_scheduler_loss(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease("real-owner", ttl_seconds=300)
+    authority = repository.claim_job(
+        job.job_id,
+        "real-owner",
+        ttl_seconds=300,
+    ).authority
     acquire_attempt = repository.start_attempt(
-        repository.create_attempt(job.job_id, "acquire").attempt_id, authority
+        repository.create_attempt(
+            job.job_id,
+            "acquire",
+            authority=authority,
+        ).attempt_id,
+        authority,
     )
     source = tmp_path / "private-source.mp4"
     source.write_bytes(b"media")
@@ -771,7 +780,11 @@ def test_real_storage_cleans_partial_after_concrete_post_exit_scheduler_loss(
         acquire_attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
     )
     screenshot_attempt = repository.start_attempt(
-        repository.create_attempt(job.job_id, "optional_screenshots").attempt_id,
+        repository.create_attempt(
+            job.job_id,
+            "optional_screenshots",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     transcript = _transcript()
@@ -795,7 +808,7 @@ def test_real_storage_cleans_partial_after_concrete_post_exit_scheduler_loss(
         heartbeat_calls += 1
         if heartbeat_calls == 2:
             now[0] = 302_001
-        repository.heartbeat_scheduler_lease(authority, ttl_seconds=300)
+        repository.heartbeat_job_claim(authority, ttl_seconds=300)
 
     adapter = _adapter_type()(
         storage,
@@ -825,7 +838,7 @@ def test_real_storage_cleans_partial_after_concrete_post_exit_scheduler_loss(
             execution=execution,
         )
 
-    assert caught.value.code == "scheduler_lease_lost"
+    assert caught.value.code == "job_claim_fenced"
     assert caught.value.category is ErrorCategory.CONFLICT
     assert process_reaped(process)
     assert not tuple(storage.root.rglob("*.partial.webp"))

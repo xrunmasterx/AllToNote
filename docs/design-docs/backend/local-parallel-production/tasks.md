@@ -78,7 +78,7 @@ Stop condition：
 - Task 2 仍待：clean non-admin VM/Defender/中文用户 Gate、稳定 launcher/installer、签名/SBOM/license，以及从同一正式 artifact 完成 Video/Document E2E；在这些结束前不打开并行 Job。
 - 2026-08-01 的 `runtime-portable-sqlite-v9` 已把最新的 JobStore/MachineLease WAL+FULL fail-closed、`machine_lease_store_busy` 可重试分类和 `parallel_job_execution_enabled=false` 明确报告带入同一 Windows 候选；候选自身及发布后复跑均通过 1/4/8/16 connection WAL Gate，且 v1 JobStore 在候选解释器中迁移、重开、结果与子记录保持一致。公开发行和真正多 Job 执行仍未因此解锁。
 
-## Task 3: [ ] 实现按需 Engine 单实例生命周期
+## Task 3: [x] 实现按需 Engine 单实例生命周期
 
 - 风险：高
 - 目标：提供轻量、空闲退出的本地 scheduler leader，不复制 Recipe 业务。
@@ -91,15 +91,15 @@ Stop condition：
 验收：
 
 - [x] foreground 单次 wait 在无 Engine 时仍可直接执行；
-- [ ] detach、batch 或 Desktop 原子 ensure Engine；
+- [x] detach、batch 或 Desktop 原子 ensure Engine；
 - [x] 并发 ensure 最终只有一个 leader；
-- [ ] 已有 Engine 时 CLI 提交并观察同一 Job，不抢 leadership；
-- [ ] Job 在返回前 durable；
+- [x] 已有 Engine 时 CLI 提交并观察同一 Job，不抢 leadership；
+- [x] Job 在返回前 durable；
 - [x] Engine 不 eager load Recipe、Whisper、Torch、Agent 或模型；
 - [x] Engine 冷启动 p95 小于 2 秒；
 - [x] idle 内存目标小于 100 MB；
 - [x] idle grace 后退出；
-- [ ] Engine 被杀后可重新 ensure 和 reconcile；
+- [x] Engine 被杀后可重新 ensure 和 reconcile；
 - [x] 不监听 LAN/Internet。
 
 Stop condition：
@@ -108,14 +108,16 @@ Stop condition：
 - 出现第二套 ProduceService、JobStore 或 Recipe Runner；
 - 单实例只能靠不可靠的进程名扫描实现。
 
-当前进展（2026-08-01，Task 3 仍未完成）：
+完成记录（2026-08-01）：
 
 - 已交付显式 `engine start|ensure|status|stop` 生命周期控制面；按用户身份、canonical state-root 与 Runtime major 派生 scope，使用稳定 launch/lifetime lock、PID 创建身份和仅本机 IPC，不依赖进程名扫描；
 - Windows V10 真实候选使用 20 次冷启动、32 路并发 ensure、强杀恢复、idle 退出和最终清理完成 Gate：冷启动 p95 `559.301 ms`，最大 idle RSS `38,539,264 bytes`，单实例、父进程退出后重连、强杀后新 identity 与 descriptor 清理均通过；
 - 候选绑定源码提交 `54019ea58a280dea6b508044fc0dbe0558684203`，完整证据见 [`Runtime Windows V10 Engine 生命周期验收`](../../../acceptance/2026-08-01-runtime-v10-engine-lifecycle.md)；
-- `runtime info` 明确保持 `parallel_job_execution_enabled=false`；没有接入 Job 执行、detach、batch、Desktop、scheduler、reconcile 或 worker，因此“已有 Engine 时提交并观察同一 Job”“Job durable-before-return”“被杀后 reconcile”等验收项仍未完成，Task 3 不得勾选完成。
+- 后续实现已接通 `produce video --detach` 与 Document `produce --detach`：提交先持久化同一 Job，再原子 ensure Engine；已有 Engine 只接收持久 Job 通知，不复制 ProduceService；
+- Video 与 Document 的跨进程 E2E 均证明调用者退出后独立 Worker 可以恢复同一 Job、完成 commit，并由新 CLI 进程继续 `job wait`；Engine 启动时扫描并 reconcile 遗留的 Engine-owned queued/running Job；
+- Task 3 的完成只代表按需单实例生命周期和 durable handoff 已闭环。dispatcher 仍保持单 active Worker，`runtime info` 仍明确报告 `parallel_job_execution_enabled=false`；batch、Desktop、容量并发和正式发布证据分别属于 Task 5–7 与 Release Gate。
 
-## Task 4: [ ] 分离 scheduler leadership 与 Job-scoped generation authority
+## Task 4: [x] 分离 scheduler leadership 与 Job-scoped generation authority
 
 - 风险：极高
 - 目标：一个 leader 可以安全管理多个并行 Job，每个 Job 有独立 authority。
@@ -127,24 +129,33 @@ Stop condition：
 
 验收：
 
-- [ ] migration 有明确 schema version、事务和回滚策略；
-- [ ] 旧 schema v1 JobStore 可升级且历史 Job 可查询/恢复；
-- [ ] scheduler leadership 与 Job execution authority 分表或分语义；
-- [ ] 每个 authority 包含 job、owner/worker、generation、heartbeat、expiry；
-- [ ] generation 单调递增；release 不重置 generation；takeover 严格递增；
-- [ ] 一个 Job generation 下可以顺序创建多个 Step Attempt，每个 Attempt 记录继承的 generation；
-- [ ] 一个 Job release 不影响其他 Job；
-- [ ] stale generation 无法 start Attempt，也无法写 external operation、checkpoint、Artifact、result 或 terminal state；
-- [ ] cancel、finish、fail、takeover 有确定线性化点；
-- [ ] 同 Job 不能被两个有效 worker 同时执行；
-- [ ] 32 个并发 claim 无重复领取；
-- [ ] zero-replay 和 outcome unknown 语义保持。
+- [x] migration 有明确 schema version、事务和回滚策略；
+- [x] 旧 schema v1 JobStore 可升级且历史 Job 可查询/恢复；
+- [x] scheduler leadership 与 Job execution authority 分表或分语义；
+- [x] 每个 authority 包含 job、owner/worker、generation、heartbeat、expiry；
+- [x] generation 单调递增；release 不重置 generation；takeover 严格递增；
+- [x] 一个 Job generation 下可以顺序创建多个 Step Attempt，每个 Attempt 记录继承的 generation；
+- [x] 一个 Job release 不影响其他 Job；
+- [x] stale generation 无法 start Attempt，也无法写 external operation、checkpoint、Artifact、result 或 terminal state；
+- [x] cancel、finish、fail、takeover 有确定线性化点；
+- [x] 同 Job 不能被两个有效 worker 同时执行；
+- [x] 32 个并发 claim 无重复领取；
+- [x] zero-replay 和 outcome unknown 语义保持。
 
 Stop condition：
 
 - 只能通过删除 fencing 或原子 CAS 获得并发；
 - migration 不能安全回滚或无法识别旧 schema；
 - 需要改变 legacy Video request/result wire。
+
+完成记录（2026-08-01）：
+
+- JobStore schema v4 将 scheduler leadership 保留在 `leases`，并新增按 `job_id` 唯一的 `job_execution_leases`，持久化 owner、generation、heartbeat 与 expiry；两个不同 Job 可独立 claim，同一 Job 的有效 owner 仍唯一；
+- v1/v2/v3 均在一个 `BEGIN IMMEDIATE` 事务内迁移到 v4。v3 存在未过期旧 lease 时以 retryable `job_store_migration_busy` fail closed 且不改 schema；过期的 bound lease 保留 generation 后迁移，失败可完整回滚；
+- 新 claim 的 generation 高于该 Job 已存在 Attempt 的最大 fencing token，避免旧 scheduler token 与新 Job generation 的命名空间碰撞；release 仅将 expiry 置零，takeover 严格递增；
+- Video、Document、Checkpoint heartbeat 与 Engine failure convergence 已改用 Job-scoped heartbeat/release；scheduler API 拒绝 Job authority，防止两个 authority 域被误混用；
+- 迁移、32 路同 Job 争用、跨进程唯一领取、不同 Job 独立领取、stale generation 全写面 fencing、candidate 按 Job 排除、Video/Document outcome-unknown/recovery 与 Runtime release migration Gate 均有回归测试；
+- Task 4 完成不等于已开放并行生产：Engine dispatcher 仍单 active Worker，全局 `produce:heavy:v1` 准入仍串行化重任务，`parallel_job_execution_enabled` 保持 false，直到 Task 5/6 和发布验收完成。
 
 ## Task 5: [ ] 实现隔离 Worker 与进程监督
 

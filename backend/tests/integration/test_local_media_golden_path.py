@@ -41,7 +41,7 @@ from app.core.domain.video import (
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
-from app.core.jobs.resource_lease import ExecutionAuthority
+from app.core.jobs.resource_lease import JobExecutionAuthority
 from app.core.portable.bundle_assembler import DisplayAssetInput
 from app.core.portable.quality import evaluate_video_draft
 from app.core.ports.transcript import MediaInput
@@ -149,7 +149,11 @@ class _SemanticErrorTranscript:
             assert attempt is not None
             guard = ExternalOperationGuard(
                 self.repository,
-                ExecutionAuthority(self.owner_id, attempt.fencing_token),
+                JobExecutionAuthority(
+                    self.owner_id,
+                    attempt.fencing_token,
+                    job_id,
+                ),
             )
             operation = guard.prepare(
                 job_id=job_id,

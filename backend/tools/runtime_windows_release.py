@@ -864,7 +864,7 @@ def _run_legacy_jobstore_migration(
     }
     if payload != {
         "schema_before": 1,
-        "schema_after": 3,
+        "schema_after": 4,
         "integrity": "ok",
         "foreign_key_errors": 0,
         "job_id": "job_legacy_release_fixture",

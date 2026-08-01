@@ -43,8 +43,16 @@ def _running_attempt(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease(owner, ttl_seconds=ttl_seconds)
-    pending = repository.create_attempt(job.job_id, "acquire")
+    authority = repository.claim_job(
+        job.job_id,
+        owner,
+        ttl_seconds=ttl_seconds,
+    ).authority
+    pending = repository.create_attempt(
+        job.job_id,
+        "acquire",
+        authority=authority,
+    )
     attempt = repository.start_attempt(pending.attempt_id, authority)
     return job, attempt, authority
 
@@ -61,7 +69,11 @@ def _running_screenshot_attempt(
         acquire_attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
     )
     attempt = repository.start_attempt(
-        repository.create_attempt(job.job_id, "optional_screenshots").attempt_id,
+        repository.create_attempt(
+            job.job_id,
+            "optional_screenshots",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     return job, attempt, authority
@@ -77,7 +89,7 @@ def test_snapshot_asset_requires_live_authority_and_binds_owner(tmp_path: Path) 
         repository, owner="old-owner", ttl_seconds=1
     )
     now[0] = 2_001
-    repository.acquire_scheduler_lease("new-owner", ttl_seconds=300)
+    repository.claim_job(job.job_id, "new-owner", ttl_seconds=300)
     _, role_type = _asset_api()
 
     with pytest.raises(DomainError) as caught:
@@ -91,7 +103,7 @@ def test_snapshot_asset_requires_live_authority_and_binds_owner(tmp_path: Path) 
             token=_Token(),
         )
 
-    assert caught.value.code == "attempt_fenced"
+    assert caught.value.code == "job_claim_fenced"
     assert not tuple(storage.root.rglob("source_media.*"))
 
 
@@ -104,7 +116,11 @@ def test_screenshot_output_is_allocated_and_read_only_for_live_attempt(
     repository.transition_attempt(
         acquire_attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
     )
-    pending = repository.create_attempt(job.job_id, "optional_screenshots")
+    pending = repository.create_attempt(
+        job.job_id,
+        "optional_screenshots",
+        authority=authority,
+    )
     screenshot_attempt = repository.start_attempt(pending.attempt_id, authority)
     artifact_id = "art_018cc251-f400-7000-8000-000000000003"
 
@@ -142,9 +158,18 @@ def test_screenshot_output_rejects_live_non_screenshot_attempts(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease("storage-owner", ttl_seconds=300)
+    authority = repository.claim_job(
+        job.job_id,
+        "storage-owner",
+        ttl_seconds=300,
+    ).authority
     attempt = repository.start_attempt(
-        repository.create_attempt(job.job_id, step_id).attempt_id, authority
+        repository.create_attempt(
+            job.job_id,
+            step_id,
+            authority=authority,
+        ).attempt_id,
+        authority,
     )
 
     with pytest.raises(DomainError) as caught:
@@ -167,7 +192,11 @@ def test_screenshot_cleanup_rejects_leaf_substitution(tmp_path: Path) -> None:
         acquire_attempt.attempt_id, AttemptState.SUCCEEDED, authority=authority
     )
     attempt = repository.start_attempt(
-        repository.create_attempt(job.job_id, "optional_screenshots").attempt_id,
+        repository.create_attempt(
+            job.job_id,
+            "optional_screenshots",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     output = storage.allocate_screenshot_output(
@@ -204,9 +233,11 @@ def test_screenshot_cleanup_after_lease_loss_removes_only_old_capability(
     old_path = storage.root / old_output.relative_locator
     old_path.write_bytes(b"old-partial")
     now[0] = 302_001
-    new_authority = repository.acquire_scheduler_lease(
-        "replacement-storage-owner", ttl_seconds=300
-    )
+    new_authority = repository.claim_job(
+        job.job_id,
+        "replacement-storage-owner",
+        ttl_seconds=300,
+    ).authority
     replacement = repository.take_over_running_attempt(
         job.job_id, attempt.attempt_id, new_authority
     )
@@ -214,7 +245,11 @@ def test_screenshot_cleanup_after_lease_loss_removes_only_old_capability(
         replacement.attempt_id, AttemptState.SUCCEEDED, authority=new_authority
     )
     successor = repository.start_attempt(
-        repository.create_attempt(job.job_id, "optional_screenshots").attempt_id,
+        repository.create_attempt(
+            job.job_id,
+            "optional_screenshots",
+            authority=new_authority,
+        ).attempt_id,
         new_authority,
     )
     successor_output = storage.allocate_screenshot_output(
@@ -252,9 +287,11 @@ def test_screenshot_cleanup_rejects_successor_authority_without_deleting_old_lea
     )
     output_path = storage.root / output.relative_locator
     now[0] = 302_001
-    new_authority = repository.acquire_scheduler_lease(
-        "replacement-storage-owner", ttl_seconds=300
-    )
+    new_authority = repository.claim_job(
+        job.job_id,
+        "replacement-storage-owner",
+        ttl_seconds=300,
+    ).authority
 
     with pytest.raises(DomainError):
         storage.cleanup_screenshot_output(output, authority=new_authority)
@@ -275,7 +312,11 @@ def test_screenshot_cleanup_rejects_cross_attempt_capability_binding(
         authority=authority,
     )
     output_path = storage.root / output.relative_locator
-    other_attempt = repository.create_attempt(job.job_id, "optional_screenshots")
+    other_attempt = repository.create_attempt(
+        job.job_id,
+        "optional_screenshots",
+        authority=authority,
+    )
     forged = replace(output, attempt_id=other_attempt.attempt_id)
 
     with pytest.raises(DomainError):

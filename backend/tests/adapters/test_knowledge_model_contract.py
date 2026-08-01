@@ -615,11 +615,16 @@ def _sqlite_model_execution(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease(
+    authority = repository.claim_job(
+        job.job_id,
         "workspace:process-a",
         ttl_seconds=30,
+    ).authority
+    pending = repository.create_attempt(
+        job.job_id,
+        "generate-draft",
+        authority=authority,
     )
-    pending = repository.create_attempt(job.job_id, "generate-draft")
     attempt = repository.start_attempt(pending.attempt_id, authority)
     binding = ModelExecutionBinding(
         guard=ExternalOperationGuard(repository, authority),
@@ -1213,13 +1218,14 @@ def test_sqlite_reopen_resumes_three_chunks_without_reissuing_completed_chunk(
             request,
             _Token(cancel_when=lambda: len(bridge.prompts) == 1),
         )
-    assert repository.release_scheduler_lease(authority)  # type: ignore[arg-type]
+    assert repository.release_job_claim(authority)  # type: ignore[arg-type]
 
     reopened = SqliteJobRepository.open(tmp_path / "machine-root")
-    new_authority = reopened.acquire_scheduler_lease(
+    new_authority = reopened.claim_job(
+        job.job_id,  # type: ignore[attr-defined]
         "workspace:process-b",
         ttl_seconds=30,
-    )
+    ).authority
     replacement = reopened.take_over_running_attempt(
         job.job_id,  # type: ignore[attr-defined]
         attempt.attempt_id,  # type: ignore[attr-defined]

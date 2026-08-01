@@ -624,7 +624,7 @@ class VideoService:
                     return self._snapshot(job_id)
             finally:
                 try:
-                    self._repository.release_scheduler_lease(authority)
+                    self._repository.release_job_claim(authority)
                 except Exception:
                     # The lease has a bounded TTL; cleanup must not replace the Job result
                     # or the primary execution error.

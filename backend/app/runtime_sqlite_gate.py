@@ -442,7 +442,7 @@ def _database_invariants_pass(invariants: Mapping[str, object]) -> bool:
         "checkpoint_busy": 0,
         "wal_frames_remaining": 0,
         "journal_mode": "wal",
-        "user_version": 3,
+        "user_version": 4,
     }
 
 
@@ -797,11 +797,16 @@ def _portable_commit_writer_lock(
         client_request_id="portable-commit-writer-lock",
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease(
+    authority = repository.claim_job(
+        job.job_id,
         "sqlite-wal-gate:portable-commit",
         ttl_seconds=300,
+    ).authority
+    attempt = repository.create_attempt(
+        job.job_id,
+        "portable-commit",
+        authority=authority,
     )
-    attempt = repository.create_attempt(job.job_id, "portable-commit")
     attempt = repository.start_attempt(attempt.attempt_id, authority)
 
     transaction_started = time.perf_counter()

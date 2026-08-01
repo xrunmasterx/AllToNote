@@ -159,9 +159,15 @@ def _model_harness(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease("fixture", ttl_seconds=60)
+    authority = repository.claim_job(
+        job.job_id, "fixture", ttl_seconds=60
+    ).authority
     attempt = repository.start_attempt(
-        repository.create_attempt(job.job_id, "compile_document_note").attempt_id,
+        repository.create_attempt(
+            job.job_id,
+            "compile_document_note",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     coordinator = ModelCallCoordinator(
@@ -177,7 +183,7 @@ def _model_harness(
                 step_id=attempt.step_id,
                 attempt_id=attempt.attempt_id,
                 authority=authority,
-                heartbeat=lambda: repository.heartbeat_scheduler_lease(
+                heartbeat=lambda: repository.heartbeat_job_claim(
                     authority, ttl_seconds=60
                 ),
             ),

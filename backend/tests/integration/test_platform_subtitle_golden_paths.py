@@ -1571,11 +1571,17 @@ def test_reopen_with_started_model_operation_pauses_before_provider_resend(
     submitted = first_runtime.submit_video(request("bilibili", workspace_root))
     repository = first_runtime.job_repository
     repository.transition_job(submitted.job_id, JobState.RUNNING)
-    old_authority = repository.acquire_scheduler_lease(
-        "lost-process", ttl_seconds=1
-    )
+    old_authority = repository.claim_job(
+        submitted.job_id,
+        "lost-process",
+        ttl_seconds=1,
+    ).authority
     old_attempt = repository.start_attempt(
-        repository.create_attempt(submitted.job_id, "generate_draft").attempt_id,
+        repository.create_attempt(
+            submitted.job_id,
+            "generate_draft",
+            authority=old_authority,
+        ).attempt_id,
         old_authority,
     )
     operation = repository.prepare_external_operation(

@@ -753,7 +753,8 @@ def test_document_fenced_heartbeat_preserves_authority_loss_error(
             cancellation_token,
         ) -> ParsedDocument:
             repository._clock = lambda: 302_000
-            repository.acquire_scheduler_lease(
+            repository.claim_job(
+                job_id,
                 "replacement-owner",
                 ttl_seconds=300,
             )
@@ -772,7 +773,7 @@ def test_document_fenced_heartbeat_preserves_authority_loss_error(
     )
     repository._clock = lambda: 1_000
     service._checkpoint_runner.heartbeat_interval_seconds = 0.01
-    original_heartbeat = repository.heartbeat_scheduler_lease
+    original_heartbeat = repository.heartbeat_job_claim
 
     def observe_heartbeat(authority: object, *, ttl_seconds: int) -> object:
         try:
@@ -782,10 +783,10 @@ def test_document_fenced_heartbeat_preserves_authority_loss_error(
                 heartbeat_failed.set()
             raise
 
-    repository.heartbeat_scheduler_lease = observe_heartbeat  # type: ignore[method-assign]
+    repository.heartbeat_job_claim = observe_heartbeat  # type: ignore[method-assign]
     job_id, router = _submit(service, repository, workspace, source)
 
-    with pytest.raises(DomainError, match="scheduler_lease_lost"):
+    with pytest.raises(DomainError, match="job_claim_fenced"):
         router.wait_job(job_id)
 
     assert repository.latest_checkpoint(job_id, "parse") is None
@@ -1512,15 +1513,16 @@ def test_document_v2_process_loss_pauses_unknown_model_operation(
         knowledge_compiler=compiler,
     )
     snapshot = service.submit_document(_knowledge_request(workspace, source))
-    repository.transition_job(snapshot.job_id, JobState.RUNNING)
-    old_authority = repository.acquire_scheduler_lease(
+    old_authority = repository.claim_job(
+        snapshot.job_id,
         "old-process",
         ttl_seconds=60,
-    )
+    ).authority
     attempt = repository.start_attempt(
         repository.create_attempt(
             snapshot.job_id,
             "assemble_candidate_bundle",
+            authority=old_authority,
         ).attempt_id,
         old_authority,
     )
@@ -1534,7 +1536,7 @@ def test_document_v2_process_loss_pauses_unknown_model_operation(
         summary_json="{}",
     )
     guard.start(operation.operation_id)
-    repository.release_scheduler_lease(old_authority)
+    repository.release_job_claim(old_authority)
 
     paused = service.wait_job(snapshot.job_id)
 
@@ -1786,7 +1788,7 @@ def test_video_blocks_document_in_another_workspace_without_starting_parser(
     assert parser.calls == 1
 
 
-def test_scheduler_busy_keeps_new_document_job_queued(tmp_path: Path) -> None:
+def test_live_job_claim_keeps_new_document_job_queued(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"%PDF-1.7\nfixture\n")
@@ -1798,18 +1800,19 @@ def test_scheduler_busy_keeps_new_document_job_queued(tmp_path: Path) -> None:
         owner_id="waiting-document-process",
     )
     job_id, router = _submit(service, repository, workspace, source)
-    authority = repository.acquire_scheduler_lease(
+    authority = repository.claim_job(
+        job_id,
         "blocking-document-process",
         ttl_seconds=300,
-    )
+    ).authority
 
     try:
         with pytest.raises(DomainError, match="scheduler_busy"):
             router.wait_job(job_id)
-        assert router.get_job(job_id).state is JobState.QUEUED
+        assert router.get_job(job_id).state is JobState.RUNNING
         assert parser.calls == 0
     finally:
-        repository.release_scheduler_lease(authority)
+        repository.release_job_claim(authority)
 
 
 def test_blocking_document_parser_renews_machine_admission_beyond_ttl(

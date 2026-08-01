@@ -168,7 +168,7 @@ class JobRepositoryPort(Protocol):
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
         *,
         result_plan: VideoResultPlan,
         source_identity: SourceIdentityBinding,
@@ -179,7 +179,7 @@ class JobRepositoryPort(Protocol):
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
         *,
         result_plan: RecipeResultPlan,
         source_identity: SourceIdentityBinding,
@@ -192,7 +192,7 @@ class JobRepositoryPort(Protocol):
         error: ErrorDetail,
         *,
         attempt_id: str | None = None,
-        authority: ExecutionAuthority | None = None,
+        authority: JobExecutionAuthority | None = None,
     ) -> Job: ...
 
     def cancel_job(self, job_id: str) -> Job: ...
@@ -249,7 +249,7 @@ class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
     ) -> bool: ...
 
     def start_attempt(
-        self, attempt_id: str, authority: ExecutionAuthority
+        self, attempt_id: str, authority: JobExecutionAuthority
     ) -> Attempt: ...
 
     def transition_attempt(
@@ -257,7 +257,7 @@ class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
         attempt_id: str,
         state: AttemptState,
         *,
-        authority: ExecutionAuthority | None = None,
+        authority: JobExecutionAuthority | None = None,
     ) -> Attempt: ...
 
     def latest_checkpoint(
@@ -268,20 +268,20 @@ class JobExecutionRepositoryPort(JobRepositoryPort, Protocol):
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> Attempt: ...
 
     def reconcile_external_operations_after_process_loss(
         self,
         job_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> tuple[ExternalOperation, ...]: ...
 
     def pause_for_external_outcome_atomic(
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> Challenge | None: ...
 
 
@@ -295,6 +295,12 @@ class JobClaimRepositoryPort(Protocol):
         *,
         ttl_seconds: int,
     ) -> PersistedJobClaim: ...
+
+    def heartbeat_job_claim(
+        self, authority: JobExecutionAuthority, *, ttl_seconds: int
+    ) -> JobExecutionAuthority: ...
+
+    def release_job_claim(self, authority: JobExecutionAuthority) -> bool: ...
 
 
 VideoExecutionRepositoryPort = JobExecutionRepositoryPort

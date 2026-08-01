@@ -187,7 +187,7 @@ def _persist_permanent_failure(
     finally:
         if authority is not None:
             try:
-                repository.release_scheduler_lease(authority)
+                repository.release_job_claim(authority)
             except Exception:
                 pass
 

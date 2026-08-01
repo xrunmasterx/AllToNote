@@ -395,7 +395,11 @@ class FFmpegScreenshotAdapter:
     def _raise_execution_error(error: DomainError) -> None:
         if error.category is ErrorCategory.CANCELLED:
             raise _error(error.code, error.category, "Screenshot extraction was cancelled") from None
-        if error.code in {"attempt_fenced", "scheduler_lease_lost"}:
+        if error.code in {
+            "attempt_fenced",
+            "job_claim_fenced",
+            "scheduler_lease_lost",
+        }:
             raise _error(
                 error.code,
                 ErrorCategory.CONFLICT,
@@ -455,7 +459,11 @@ class FFmpegScreenshotAdapter:
 
     @staticmethod
     def _raise_storage_error(error: DomainError) -> None:
-        if error.code in {"attempt_fenced", "scheduler_lease_lost"}:
+        if error.code in {
+            "attempt_fenced",
+            "job_claim_fenced",
+            "scheduler_lease_lost",
+        }:
             raise _error(
                 error.code,
                 ErrorCategory.CONFLICT,

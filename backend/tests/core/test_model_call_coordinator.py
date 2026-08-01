@@ -16,7 +16,6 @@ from app.core.domain.video import JobState
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.cancellation import CancellationToken
 from app.core.jobs.external_operation import ExternalOperationGuard, ExternalOutcome
-from app.core.jobs.resource_lease import ExecutionAuthority
 from app.core.ports.model_executor import (
     ModelExecutionBinding,
     ModelExecutionRequest,
@@ -115,9 +114,17 @@ def _running_execution(
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = repo.acquire_scheduler_lease("process-one", ttl_seconds=30)
+    authority = repo.claim_job(
+        job.job_id,
+        "process-one",
+        ttl_seconds=30,
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "compile-knowledge-map").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "compile-knowledge-map",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     execution = ModelCallExecution(
@@ -125,7 +132,7 @@ def _running_execution(
         step_id=attempt.step_id,
         attempt_id=attempt.attempt_id,
         authority=authority,
-        heartbeat=lambda: repo.heartbeat_scheduler_lease(
+        heartbeat=lambda: repo.heartbeat_job_claim(
             authority, ttl_seconds=30
         ),
     )
@@ -188,7 +195,7 @@ def test_success_is_recovered_after_repository_reopen_without_provider_call(
     reopened = SqliteJobRepository.open(tmp_path / "machine", clock=lambda: 1_000)
     recovered_execution = replace(
         execution,
-        heartbeat=lambda: reopened.heartbeat_scheduler_lease(
+        heartbeat=lambda: reopened.heartbeat_job_claim(
             execution.authority, ttl_seconds=30
         ),
     )
@@ -431,9 +438,17 @@ def test_stale_guard_cannot_finish_or_mark_unknown_after_takeover(tmp_path: Path
         client_request_id=None,
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    old_authority = repo.acquire_scheduler_lease("old-process", ttl_seconds=1)
+    old_authority = repo.claim_job(
+        job.job_id,
+        "old-process",
+        ttl_seconds=1,
+    ).authority
     attempt = repo.start_attempt(
-        repo.create_attempt(job.job_id, "compile").attempt_id,
+        repo.create_attempt(
+            job.job_id,
+            "compile",
+            authority=old_authority,
+        ).attempt_id,
         old_authority,
     )
     old_guard = ExternalOperationGuard(repo, old_authority)
@@ -448,7 +463,11 @@ def test_stale_guard_cannot_finish_or_mark_unknown_after_takeover(tmp_path: Path
     old_guard.start(operation.operation_id)
 
     now_ms = 2_001
-    new_authority = repo.acquire_scheduler_lease("new-process", ttl_seconds=1)
+    new_authority = repo.claim_job(
+        job.job_id,
+        "new-process",
+        ttl_seconds=1,
+    ).authority
     repo.take_over_running_attempt(job.job_id, attempt.attempt_id, new_authority)
 
     for action in (

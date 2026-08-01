@@ -509,8 +509,16 @@ def test_sqlite_reopen_replays_succeeded_remote_transcript_without_reissue(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease("workspace:process-a", ttl_seconds=30)
-    pending = repository.create_attempt(job.job_id, "normalize_transcript")
+    authority = repository.claim_job(
+        job.job_id,
+        "workspace:process-a",
+        ttl_seconds=30,
+    ).authority
+    pending = repository.create_attempt(
+        job.job_id,
+        "normalize_transcript",
+        authority=authority,
+    )
     attempt = repository.start_attempt(pending.attempt_id, authority)
     request_hash = sha256_digest(b"remote transcript request")
     result_root = tmp_path / "attempt" / "operation-results"
@@ -532,13 +540,14 @@ def test_sqlite_reopen_replays_succeeded_remote_transcript_without_reissue(
         factories={"groq": lambda: transcriber},
         remote_binding=first_binding,
     ).transcribe(MediaInput(media_path=media), _Token())
-    assert repository.release_scheduler_lease(authority)
+    assert repository.release_job_claim(authority)
 
     reopened = SqliteJobRepository.open(machine_root)
-    new_authority = reopened.acquire_scheduler_lease(
+    new_authority = reopened.claim_job(
+        job.job_id,
         "workspace:process-b",
         ttl_seconds=30,
-    )
+    ).authority
     replay_binding = RemoteTranscriptionBinding(
         guard=ExternalOperationGuard(reopened, new_authority),
         result_store=RemoteTranscriptResultStore(result_root),

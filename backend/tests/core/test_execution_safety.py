@@ -11,6 +11,7 @@ from app.core.domain.ids import sha256_digest
 from app.core.domain.video import JobState
 from app.core.errors import DomainError
 from app.core.jobs.model import AttemptState, CheckpointRecord
+from app.core.jobs.resource_lease import JobExecutionAuthority
 
 
 TRANSCRIPT_SCHEMA = "evidence.transcript.v1"
@@ -55,8 +56,16 @@ def _running_attempt(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease(owner_id, ttl_seconds=30)
-    pending = repository.create_attempt(job.job_id, "normalize_transcript")
+    authority = repository.claim_job(
+        job.job_id,
+        owner_id,
+        ttl_seconds=30,
+    ).authority
+    pending = repository.create_attempt(
+        job.job_id,
+        "normalize_transcript",
+        authority=authority,
+    )
     assert pending.fencing_token == 0
     running = repository.start_attempt(pending.attempt_id, authority)
     assert running.state is AttemptState.RUNNING
@@ -91,7 +100,11 @@ def test_cancellation_token_reads_durable_store_and_running_attempt_settles_job(
     assert requested.state is JobState.RUNNING
     assert requested.cancellation_requested is True
     with pytest.raises(DomainError, match="job_cancelled"):
-        repository.create_attempt(job.job_id, "late-step")
+        repository.create_attempt(
+            job.job_id,
+            "late-step",
+            authority=authority,
+        )
     with pytest.raises(DomainError, match="job_cancelled"):
         token.raise_if_cancelled()
 
@@ -123,8 +136,10 @@ def test_cancel_cancels_pending_attempts_and_finishes_without_running_attempt(
     with pytest.raises(DomainError, match="attempt_terminal"):
         repository.start_attempt(
             pending.attempt_id,
-            repository.acquire_scheduler_lease(
-                "workspace-a:process-a", ttl_seconds=30
+            JobExecutionAuthority(
+                "workspace-a:process-a",
+                1,
+                job.job_id,
             ),
         )
 
@@ -139,16 +154,23 @@ def test_generic_attempt_transition_cannot_bypass_fenced_start(
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    pending = repository.create_attempt(job.job_id, "resolve")
+    authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-a",
+        ttl_seconds=30,
+    ).authority
+    pending = repository.create_attempt(
+        job.job_id,
+        "resolve",
+        authority=authority,
+    )
 
     with pytest.raises(DomainError, match="attempt_start_required"):
         repository.transition_attempt(pending.attempt_id, AttemptState.RUNNING)
 
     started = repository.start_attempt(
         pending.attempt_id,
-        repository.acquire_scheduler_lease(
-            "workspace-a:process-a", ttl_seconds=30
-        ),
+        authority,
     )
     assert started.state is AttemptState.RUNNING
     assert started.fencing_token > 0
@@ -161,9 +183,11 @@ def test_expired_scheduler_owner_cannot_restart_or_checkpoint_old_attempt(
     repository = _repository(tmp_path, clock)
     job, old_attempt, old_authority = _running_attempt(repository)
     clock.advance(31_000)
-    new_authority = repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
-    )
+    new_authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
+    ).authority
     assert new_authority.fencing_token == old_authority.fencing_token + 1
 
     with pytest.raises(DomainError, match="attempt_fenced"):
@@ -174,7 +198,7 @@ def test_expired_scheduler_owner_cannot_restart_or_checkpoint_old_attempt(
         repository,
         validators={TRANSCRIPT_SCHEMA: lambda payload: payload == TRANSCRIPT_PAYLOAD},
     )
-    with pytest.raises(DomainError, match="attempt_fenced"):
+    with pytest.raises(DomainError, match="job_claim_fenced"):
         storage.save_checkpoint(
             _checkpoint_record(job.job_id, old_attempt.attempt_id), old_authority
         )
@@ -266,10 +290,16 @@ def test_commit_guard_rejects_success_while_fenced_old_attempt_is_running(
     repository = _repository(tmp_path, clock)
     job, _, _ = _running_attempt(repository)
     clock.advance(31_000)
-    authority = repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
+    authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
+    ).authority
+    pending = repository.create_attempt(
+        job.job_id,
+        "replacement",
+        authority=authority,
     )
-    pending = repository.create_attempt(job.job_id, "replacement")
     replacement = repository.start_attempt(pending.attempt_id, authority)
 
     with pytest.raises(DomainError, match="attempt_not_settled"):
@@ -288,7 +318,11 @@ def test_commit_guard_rejects_other_unsettled_attempt_before_marker_runs(
 ) -> None:
     repository = _repository(tmp_path, _Clock())
     job, attempt, authority = _running_attempt(repository)
-    other = repository.create_attempt(job.job_id, "other-step")
+    other = repository.create_attempt(
+        job.job_id,
+        "other-step",
+        authority=authority,
+    )
     if other_state is AttemptState.RUNNING:
         other = repository.start_attempt(other.attempt_id, authority)
     marker: list[str] = []
@@ -331,9 +365,11 @@ def test_started_external_operation_becomes_unknown_and_cannot_restart(
     started = guard.start(prepared.operation_id)
     assert started.outcome is ExternalOutcome.STARTED
     clock.advance(31_000)
-    new_authority = repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
-    )
+    new_authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
+    ).authority
     reconciler = ExternalOperationGuard(repository, new_authority)
     reconciled = reconciler.reconcile_after_process_loss(job.job_id)
     assert len(reconciled) == 1
@@ -471,10 +507,16 @@ def test_prepared_binding_rebinds_same_operation_to_current_fenced_attempt(
         ).fetchone()[0]
 
     clock.advance(31_000)
-    authority = repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
+    authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
+    ).authority
+    current_attempt = repository.create_attempt(
+        job.job_id,
+        old_attempt.step_id,
+        authority=authority,
     )
-    current_attempt = repository.create_attempt(job.job_id, old_attempt.step_id)
     current_attempt = repository.start_attempt(current_attempt.attempt_id, authority)
     guard = ExternalOperationGuard(repository, authority)
     replay = guard.prepare(
@@ -502,7 +544,11 @@ def test_prepared_binding_cannot_move_between_attempts_with_same_token(
     _, ExternalOperationGuard, ExternalOutcome, _ = _task7_api()
     repository = _repository(tmp_path, _Clock())
     job, first_attempt, authority = _running_attempt(repository)
-    second_attempt = repository.create_attempt(job.job_id, first_attempt.step_id)
+    second_attempt = repository.create_attempt(
+        job.job_id,
+        first_attempt.step_id,
+        authority=authority,
+    )
     second_attempt = repository.start_attempt(second_attempt.attempt_id, authority)
     guard = ExternalOperationGuard(repository, authority)
     request_hash = sha256_digest(b"same token concurrent attempts")
@@ -541,7 +587,11 @@ def test_prepared_binding_with_future_attempt_token_fails_closed(
     _, ExternalOperationGuard, _, _ = _task7_api()
     repository = _repository(tmp_path, _Clock())
     job, existing_attempt, authority = _running_attempt(repository)
-    current_attempt = repository.create_attempt(job.job_id, existing_attempt.step_id)
+    current_attempt = repository.create_attempt(
+        job.job_id,
+        existing_attempt.step_id,
+        authority=authority,
+    )
     current_attempt = repository.start_attempt(current_attempt.attempt_id, authority)
     guard = ExternalOperationGuard(repository, authority)
     request_hash = sha256_digest(b"future attempt token")
@@ -605,10 +655,12 @@ def test_prepare_rejects_stale_authority_before_reuse_or_insert(
         ).fetchall()
 
     clock.advance(31_000)
-    repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
+    repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
     )
-    with pytest.raises(DomainError, match="attempt_fenced"):
+    with pytest.raises(DomainError, match="job_claim_fenced"):
         old_guard.prepare(
             job_id=job.job_id,
             step_id=attempt.step_id,
@@ -733,7 +785,11 @@ def test_prepare_rejects_attempt_from_another_step_before_insert(
     _, ExternalOperationGuard, _, _ = _task7_api()
     repository = _repository(tmp_path, _Clock())
     job, attempt, authority = _running_attempt(repository)
-    other = repository.create_attempt(job.job_id, "other-step")
+    other = repository.create_attempt(
+        job.job_id,
+        "other-step",
+        authority=authority,
+    )
     other = repository.start_attempt(other.attempt_id, authority)
 
     with pytest.raises(DomainError, match="attempt_fenced"):
@@ -770,9 +826,11 @@ def test_unknown_binding_blocks_prepare_and_defensive_start_but_not_new_job(
     )
     old_guard.start(operation.operation_id)
     clock.advance(31_000)
-    authority = repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
-    )
+    authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
+    ).authority
     guard = ExternalOperationGuard(repository, authority)
     assert guard.reconcile_after_process_loss(job.job_id)[0].outcome is ExternalOutcome.UNKNOWN
 
@@ -825,9 +883,18 @@ def test_unknown_binding_blocks_prepare_and_defensive_start_but_not_new_job(
         client_request_id=None,
     )
     repository.transition_job(new_job.job_id, JobState.RUNNING)
-    new_attempt = repository.create_attempt(new_job.job_id, attempt.step_id)
-    new_attempt = repository.start_attempt(new_attempt.attempt_id, authority)
-    allowed = guard.prepare(
+    new_authority = repository.claim_job(
+        new_job.job_id,
+        "workspace-a:process-new-job",
+        ttl_seconds=30,
+    ).authority
+    new_attempt = repository.create_attempt(
+        new_job.job_id,
+        attempt.step_id,
+        authority=new_authority,
+    )
+    new_attempt = repository.start_attempt(new_attempt.attempt_id, new_authority)
+    allowed = ExternalOperationGuard(repository, new_authority).prepare(
         job_id=new_job.job_id,
         step_id=new_attempt.step_id,
         attempt_id=new_attempt.attempt_id,
@@ -857,10 +924,16 @@ def test_reconcile_requires_current_authority_and_only_marks_older_tokens_unknow
     old_guard.start(old_operation.operation_id)
 
     clock.advance(31_000)
-    authority = repository.acquire_scheduler_lease(
-        "workspace-a:process-b", ttl_seconds=30
+    authority = repository.claim_job(
+        job.job_id,
+        "workspace-a:process-b",
+        ttl_seconds=30,
+    ).authority
+    current_attempt = repository.create_attempt(
+        job.job_id,
+        "current-step",
+        authority=authority,
     )
-    current_attempt = repository.create_attempt(job.job_id, "current-step")
     current_attempt = repository.start_attempt(current_attempt.attempt_id, authority)
     current_guard = ExternalOperationGuard(repository, authority)
     current_operation = current_guard.prepare(
@@ -873,7 +946,7 @@ def test_reconcile_requires_current_authority_and_only_marks_older_tokens_unknow
     )
     current_guard.start(current_operation.operation_id)
 
-    with pytest.raises(DomainError, match="attempt_fenced"):
+    with pytest.raises(DomainError, match="job_claim_fenced"):
         old_guard.reconcile_after_process_loss(job.job_id)
     assert old_guard.get(old_operation.operation_id).outcome is ExternalOutcome.STARTED
     assert current_guard.get(current_operation.operation_id).outcome is ExternalOutcome.STARTED

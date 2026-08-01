@@ -58,10 +58,12 @@ def _new_service(repo: SqliteJobRepository):
     return module.JobService(repo)
 
 
-def _authority(repo: SqliteJobRepository):
-    return repo.acquire_scheduler_lease(
-        "test-workspace:test-process", ttl_seconds=300
-    )
+def _authority(repo: SqliteJobRepository, job_id: str):
+    return repo.claim_job(
+        job_id,
+        "test-workspace:test-process",
+        ttl_seconds=300,
+    ).authority
 
 
 def _request(
@@ -91,8 +93,8 @@ def _failed_job(
         client_request_id="original",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job.job_id, "model")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "model", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
     with repo._transaction(immediate=True) as connection:
         for operation_id in operation_ids:
@@ -117,7 +119,11 @@ def _failed_job(
     repo.transition_attempt(
         attempt.attempt_id, AttemptState.FAILED, authority=authority
     )
-    return repo.transition_job(job.job_id, JobState.FAILED)
+    return repo.transition_job(
+        job.job_id,
+        JobState.FAILED,
+        authority=authority,
+    )
 
 
 def _waiting_job(repo: SqliteJobRepository):
@@ -127,8 +133,8 @@ def _waiting_job(repo: SqliteJobRepository):
         client_request_id="waiting",
     )
     repo.transition_job(job.job_id, JobState.RUNNING)
-    authority = _authority(repo)
-    attempt = repo.create_attempt(job.job_id, "acquire")
+    authority = _authority(repo, job.job_id)
+    attempt = repo.create_attempt(job.job_id, "acquire", authority=authority)
     attempt = repo.start_attempt(attempt.attempt_id, authority)
     attempt = repo.transition_attempt(
         attempt.attempt_id, AttemptState.NEEDS_INPUT, authority=authority

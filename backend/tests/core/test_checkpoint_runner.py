@@ -38,7 +38,11 @@ def _fixture(tmp_path: Path):
         client_request_id=None,
     )
     repository.transition_job(job.job_id, JobState.RUNNING)
-    authority = repository.acquire_scheduler_lease("process-a", ttl_seconds=30)
+    authority = repository.claim_job(
+        job.job_id,
+        "process-a",
+        ttl_seconds=30,
+    ).authority
     storage = FileAttemptStorage(
         tmp_path / "attempts",
         repository,
@@ -88,7 +92,11 @@ def test_valid_checkpoint_is_reused_and_resumed_attempt_converges(
         decode=lambda payload: payload.decode("utf-8"),
     )
     resumed = repository.start_attempt(
-        repository.create_attempt(job.job_id, "knowledge-map").attempt_id,
+        repository.create_attempt(
+            job.job_id,
+            "knowledge-map",
+            authority=authority,
+        ).attempt_id,
         authority,
     )
     second = runner.run(
@@ -112,10 +120,10 @@ def test_fenced_runner_cannot_publish_checkpoint(tmp_path: Path) -> None:
 
     def fence_before_publish(_execution):
         clock.advance(31_000)
-        repository.acquire_scheduler_lease("process-b", ttl_seconds=30)
+        repository.claim_job(job.job_id, "process-b", ttl_seconds=30)
         return "late result"
 
-    with pytest.raises(DomainError, match="scheduler_lease_lost"):
+    with pytest.raises(DomainError, match="job_claim_fenced"):
         runner.run(
             job.job_id,
             "knowledge-map",

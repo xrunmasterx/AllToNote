@@ -4,16 +4,30 @@ import json
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.model import Attempt, AttemptState, CheckpointMetadata, CheckpointRecord
 from app.core.jobs.resource_lease import ExecutionAuthority, JobExecutionAuthority
-from app.core.ports.jobs import AttemptStoragePort, JobExecutionRepositoryPort
+from app.core.ports.jobs import (
+    AttemptStoragePort,
+    JobClaimRepositoryPort,
+    JobExecutionRepositoryPort,
+)
 
 
 _T = TypeVar("_T")
-_AUTHORITY_LOSS_CODES = frozenset({"attempt_fenced", "scheduler_lease_lost"})
+_AUTHORITY_LOSS_CODES = frozenset(
+    {"attempt_fenced", "job_claim_fenced", "scheduler_lease_lost"}
+)
+
+
+class _CheckpointRepositoryPort(
+    JobExecutionRepositoryPort,
+    JobClaimRepositoryPort,
+    Protocol,
+):
+    pass
 
 
 def _checkpoint_error() -> DomainError:
@@ -51,7 +65,7 @@ class CheckpointedStepRunner:
 
     def __init__(
         self,
-        repository: JobExecutionRepositoryPort,
+        repository: _CheckpointRepositoryPort,
         attempt_storage: AttemptStoragePort,
         *,
         checkpoint_reader: Callable[[CheckpointMetadata], bytes],
@@ -237,10 +251,16 @@ class CheckpointedStepRunner:
         )
 
     def _heartbeat(self, authority: ExecutionAuthority) -> None:
-        self._repository.heartbeat_scheduler_lease(
-            authority,
-            ttl_seconds=self._scheduler_lease_ttl_seconds,
-        )
+        if isinstance(authority, JobExecutionAuthority):
+            self._repository.heartbeat_job_claim(
+                authority,
+                ttl_seconds=self._scheduler_lease_ttl_seconds,
+            )
+        else:
+            self._repository.heartbeat_scheduler_lease(
+                authority,
+                ttl_seconds=self._scheduler_lease_ttl_seconds,
+            )
         if self._additional_heartbeat is not None:
             self._additional_heartbeat()
 

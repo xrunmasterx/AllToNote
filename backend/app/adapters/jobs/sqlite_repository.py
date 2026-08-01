@@ -54,7 +54,7 @@ from app.core.ports.job_queries import JobListRecord, JobQueryRecord
 from app.core.sensitive_identifiers import is_sensitive_identifier
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _BUSY_TIMEOUT_MS = 5_000
 _RESULT_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
 _JOBS_SCHEMA_V1 = """
@@ -222,10 +222,36 @@ _EXECUTION_OWNER_MIGRATION = """
         execution_owner TEXT NOT NULL DEFAULT 'foreground'
         CHECK (execution_owner IN ('foreground', 'engine'))
     """
-_SCHEMA_STATEMENTS = (
+_SCHEMA_STATEMENTS_V3 = (
     _JOBS_SCHEMA_V3,
     *_SCHEMA_STATEMENTS_V1[1:],
     _EXECUTION_BINDING_SCHEMA,
+)
+_SCHEDULER_LEASE_SCHEMA_V4 = """
+    CREATE TABLE leases (
+        lease_name TEXT PRIMARY KEY CHECK (lease_name = 'scheduler'),
+        owner TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL
+    )
+    """
+_JOB_EXECUTION_LEASE_SCHEMA = """
+    CREATE TABLE job_execution_leases (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+        owner TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        expires_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL
+    )
+    """
+_SCHEMA_STATEMENTS = (
+    _JOBS_SCHEMA_V3,
+    *_SCHEMA_STATEMENTS_V1[1:7],
+    _SCHEDULER_LEASE_SCHEMA_V4,
+    *_SCHEMA_STATEMENTS_V1[8:],
+    _EXECUTION_BINDING_SCHEMA,
+    _JOB_EXECUTION_LEASE_SCHEMA,
 )
 _DEFAULT_EXECUTION_BINDING = JobExecutionBinding(
     recipe_id="alltonote.legacy",
@@ -373,7 +399,7 @@ class SqliteJobRepository:
             raise
         except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
             _raise_schema_invalid(error)
-        if version not in (1, 2, _SCHEMA_VERSION):
+        if version not in (1, 2, 3, _SCHEMA_VERSION):
             _raise_schema_invalid()
         repository = cls(
             resolved_root,
@@ -443,7 +469,7 @@ class SqliteJobRepository:
     def _initialize_schema(self) -> None:
         with self._transaction(immediate=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, _SCHEMA_VERSION):
+            if version not in (0, 1, 2, 3, _SCHEMA_VERSION):
                 raise DomainError(
                     "job_store_schema_unsupported",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
@@ -462,12 +488,20 @@ class SqliteJobRepository:
                     _raise_schema_invalid()
                 self._migrate_v1_to_v2(connection)
                 self._migrate_v2_to_v3(connection)
+                self._migrate_v3_to_v4(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             elif version == 2:
                 if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V2):
                     _raise_schema_invalid()
                 self._migrate_v2_to_v3(connection)
+                self._migrate_v3_to_v4(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                actual_schema = _application_schema(connection)
+            elif version == 3:
+                if actual_schema != _expected_schema(_SCHEMA_STATEMENTS_V3):
+                    _raise_schema_invalid()
+                self._migrate_v3_to_v4(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 actual_schema = _application_schema(connection)
             if actual_schema != _expected_schema():
@@ -485,6 +519,51 @@ class SqliteJobRepository:
     @staticmethod
     def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
         connection.execute(_EXECUTION_OWNER_MIGRATION)
+
+    def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
+        legacy = connection.execute(
+            "SELECT * FROM leases WHERE lease_name = 'scheduler'"
+        ).fetchone()
+        if legacy is not None and int(legacy["expires_at"]) > self._clock():
+            raise DomainError(
+                "job_store_migration_busy",
+                ErrorCategory.RETRYABLE_RUNTIME,
+                "JobStore migration requires the legacy execution lease to expire",
+            )
+        connection.execute("ALTER TABLE leases RENAME TO leases_v3")
+        connection.execute(_SCHEDULER_LEASE_SCHEMA_V4)
+        connection.execute(_JOB_EXECUTION_LEASE_SCHEMA)
+        if legacy is not None:
+            if legacy["job_id"] is None:
+                connection.execute(
+                    """
+                    INSERT INTO leases (
+                        lease_name, owner, fencing_token, expires_at, heartbeat_at
+                    ) VALUES ('scheduler', ?, ?, ?, ?)
+                    """,
+                    (
+                        legacy["owner"],
+                        legacy["fencing_token"],
+                        legacy["expires_at"],
+                        legacy["heartbeat_at"],
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO job_execution_leases (
+                        job_id, owner, generation, expires_at, heartbeat_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        legacy["job_id"],
+                        legacy["owner"],
+                        legacy["fencing_token"],
+                        legacy["expires_at"],
+                        legacy["heartbeat_at"],
+                    ),
+                )
+        connection.execute("DROP TABLE leases_v3")
 
     @staticmethod
     def _legacy_execution_binding(request_json: str | None) -> JobExecutionBinding:
@@ -756,8 +835,8 @@ class SqliteJobRepository:
             "principal = ?",
             "state IN (?, ?)",
             "NOT EXISTS ("
-            "SELECT 1 FROM leases "
-            "WHERE lease_name = 'scheduler' "
+            "SELECT 1 FROM job_execution_leases "
+            "WHERE job_execution_leases.job_id = jobs.job_id "
             "AND CAST(expires_at AS INTEGER) > ?"
             ")",
         ]
@@ -915,7 +994,7 @@ class SqliteJobRepository:
         *,
         ttl_seconds: int,
     ) -> PersistedJobClaim:
-        """Atomically bind the serial scheduler lease to one persisted Job."""
+        """Atomically bind one persisted Job to an execution generation."""
 
         validate_lease_ttl(ttl_seconds)
         self._validate_owner_id(owner_id)
@@ -931,32 +1010,38 @@ class SqliteJobRepository:
                 )
             binding = self._get_execution_binding(connection, job_id)
             row = connection.execute(
-                "SELECT * FROM leases WHERE lease_name = 'scheduler'"
+                "SELECT * FROM job_execution_leases WHERE job_id = ?",
+                (job_id,),
             ).fetchone()
             if row is None:
-                fencing_token = 1
+                fencing_token = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(fencing_token), 0) + 1
+                    FROM attempts WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
                 connection.execute(
                     """
-                    INSERT INTO leases (
-                        lease_name, job_id, owner, fencing_token,
-                        expires_at, heartbeat_at
-                    ) VALUES ('scheduler', ?, ?, ?, ?, ?)
+                    INSERT INTO job_execution_leases (
+                        job_id, owner, generation, expires_at, heartbeat_at
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     (job_id, owner_id, fencing_token, expires_at, str(now_ms)),
                 )
             elif int(row["expires_at"]) > now_ms:
-                if row["owner"] != owner_id or row["job_id"] != job_id:
+                if row["owner"] != owner_id:
                     raise DomainError(
                         "scheduler_busy",
                         ErrorCategory.CONFLICT,
-                        "Workspace execution authority is bound to another Job owner",
+                        "Job execution authority is held by another owner",
                     )
-                fencing_token = row["fencing_token"]
+                fencing_token = row["generation"]
                 connection.execute(
                     """
-                    UPDATE leases SET expires_at = ?, heartbeat_at = ?
-                    WHERE lease_name = 'scheduler' AND job_id = ?
-                      AND owner = ? AND fencing_token = ?
+                    UPDATE job_execution_leases
+                    SET expires_at = ?, heartbeat_at = ?
+                    WHERE job_id = ? AND owner = ? AND generation = ?
                     """,
                     (
                         expires_at,
@@ -967,20 +1052,19 @@ class SqliteJobRepository:
                     ),
                 )
             else:
-                fencing_token = row["fencing_token"] + 1
+                fencing_token = row["generation"] + 1
                 connection.execute(
                     """
-                    UPDATE leases
-                    SET job_id = ?, owner = ?, fencing_token = ?,
-                        expires_at = ?, heartbeat_at = ?
-                    WHERE lease_name = 'scheduler'
+                    UPDATE job_execution_leases
+                    SET owner = ?, generation = ?, expires_at = ?, heartbeat_at = ?
+                    WHERE job_id = ?
                     """,
                     (
-                        job_id,
                         owner_id,
                         fencing_token,
                         expires_at,
                         str(now_ms),
+                        job_id,
                     ),
                 )
             authority = JobExecutionAuthority(
@@ -1069,7 +1153,6 @@ class SqliteJobRepository:
         now_ms = self._clock()
         expires_at = str(now_ms + ttl_seconds * 1_000)
         with self._transaction(immediate=True) as connection:
-            bound_job_id = None
             row = connection.execute(
                 "SELECT * FROM leases WHERE lease_name = 'scheduler'"
             ).fetchone()
@@ -1078,9 +1161,8 @@ class SqliteJobRepository:
                 connection.execute(
                     """
                     INSERT INTO leases (
-                        lease_name, job_id, owner, fencing_token,
-                        expires_at, heartbeat_at
-                    ) VALUES ('scheduler', NULL, ?, ?, ?, ?)
+                        lease_name, owner, fencing_token, expires_at, heartbeat_at
+                    ) VALUES ('scheduler', ?, ?, ?, ?)
                     """,
                     (owner_id, fencing_token, expires_at, str(now_ms)),
                 )
@@ -1092,7 +1174,6 @@ class SqliteJobRepository:
                         "Workspace scheduler is held by another process instance",
                     )
                 fencing_token = row["fencing_token"]
-                bound_job_id = row["job_id"]
                 connection.execute(
                     """
                     UPDATE leases SET expires_at = ?, heartbeat_at = ?
@@ -1105,8 +1186,7 @@ class SqliteJobRepository:
                 connection.execute(
                     """
                     UPDATE leases
-                    SET job_id = NULL, owner = ?, fencing_token = ?,
-                        expires_at = ?, heartbeat_at = ?
+                    SET owner = ?, fencing_token = ?, expires_at = ?, heartbeat_at = ?
                     WHERE lease_name = 'scheduler'
                     """,
                     (
@@ -1116,31 +1196,25 @@ class SqliteJobRepository:
                         str(now_ms),
                     ),
                 )
-            if bound_job_id is not None:
-                return JobExecutionAuthority(
-                    owner_id=owner_id,
-                    fencing_token=fencing_token,
-                    job_id=bound_job_id,
-                )
             return ExecutionAuthority(owner_id, fencing_token)
 
     def heartbeat_scheduler_lease(
         self, authority: ExecutionAuthority, *, ttl_seconds: int
     ) -> ExecutionAuthority:
+        if isinstance(authority, JobExecutionAuthority):
+            raise DomainError(
+                "scheduler_authority_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Scheduler operations require scheduler leadership authority",
+            )
         validate_lease_ttl(ttl_seconds)
         now_ms = self._clock()
-        job_id = (
-            authority.job_id
-            if isinstance(authority, JobExecutionAuthority)
-            else None
-        )
         with self._transaction(immediate=True) as connection:
             updated = connection.execute(
                 """
                 UPDATE leases SET expires_at = ?, heartbeat_at = ?
                 WHERE lease_name = 'scheduler' AND owner = ?
                   AND fencing_token = ? AND CAST(expires_at AS INTEGER) > ?
-                  AND ((? IS NULL AND job_id IS NULL) OR job_id = ?)
                 """,
                 (
                     str(now_ms + ttl_seconds * 1_000),
@@ -1148,8 +1222,6 @@ class SqliteJobRepository:
                     authority.owner_id,
                     authority.fencing_token,
                     now_ms,
-                    job_id,
-                    job_id,
                 ),
             )
             if updated.rowcount != 1:
@@ -1163,30 +1235,69 @@ class SqliteJobRepository:
     def release_scheduler_lease(
         self, authority: ExecutionAuthority
     ) -> bool:
-        job_id = (
-            authority.job_id
-            if isinstance(authority, JobExecutionAuthority)
-            else None
-        )
+        if isinstance(authority, JobExecutionAuthority):
+            raise DomainError(
+                "scheduler_authority_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Scheduler operations require scheduler leadership authority",
+            )
         with self._transaction(immediate=True) as connection:
             updated = connection.execute(
                 """
-                UPDATE leases SET job_id = NULL, expires_at = '0'
+                UPDATE leases SET expires_at = '0'
                 WHERE lease_name = 'scheduler' AND owner = ?
                   AND fencing_token = ?
-                  AND ((? IS NULL AND job_id IS NULL) OR job_id = ?)
                 """,
                 (
                     authority.owner_id,
                     authority.fencing_token,
-                    job_id,
-                    job_id,
+                ),
+            )
+            return updated.rowcount == 1
+
+    def heartbeat_job_claim(
+        self, authority: JobExecutionAuthority, *, ttl_seconds: int
+    ) -> JobExecutionAuthority:
+        validate_lease_ttl(ttl_seconds)
+        now_ms = self._clock()
+        with self._transaction(immediate=True) as connection:
+            updated = connection.execute(
+                """
+                UPDATE job_execution_leases
+                SET expires_at = ?, heartbeat_at = ?
+                WHERE job_id = ? AND owner = ? AND generation = ?
+                  AND CAST(expires_at AS INTEGER) > ?
+                """,
+                (
+                    str(now_ms + ttl_seconds * 1_000),
+                    str(now_ms),
+                    authority.job_id,
+                    authority.owner_id,
+                    authority.fencing_token,
+                    now_ms,
+                ),
+            )
+            if updated.rowcount != 1:
+                self._raise_job_claim_fenced()
+        return authority
+
+    def release_job_claim(self, authority: JobExecutionAuthority) -> bool:
+        with self._transaction(immediate=True) as connection:
+            updated = connection.execute(
+                """
+                UPDATE job_execution_leases SET expires_at = '0'
+                WHERE job_id = ? AND owner = ? AND generation = ?
+                """,
+                (
+                    authority.job_id,
+                    authority.owner_id,
+                    authority.fencing_token,
                 ),
             )
             return updated.rowcount == 1
 
     def start_attempt(
-        self, attempt_id: str, authority: ExecutionAuthority
+        self, attempt_id: str, authority: JobExecutionAuthority
     ) -> Attempt:
         with self._transaction(immediate=True) as connection:
             attempt = self._get_attempt(connection, attempt_id)
@@ -1210,11 +1321,7 @@ class SqliteJobRepository:
                     ErrorCategory.CANCELLED,
                     "Job cancellation was requested",
                 )
-            self._assert_scheduler_authority(
-                connection,
-                authority,
-                job_id=attempt.job_id,
-            )
+            self._assert_job_authority(connection, attempt.job_id, authority)
             connection.execute(
                 """
                 UPDATE attempts
@@ -1234,16 +1341,12 @@ class SqliteJobRepository:
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> Attempt:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
             attempt = self._get_attempt(connection, attempt_id)
-            self._assert_scheduler_authority(
-                connection,
-                authority,
-                job_id=job_id,
-            )
+            self._assert_job_authority(connection, job_id, authority)
             if (
                 job.state is not JobState.RUNNING
                 or attempt.job_id != job_id
@@ -1410,7 +1513,7 @@ class SqliteJobRepository:
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> Challenge | None:
         with self._transaction(immediate=True) as connection:
             job = self._get_job(connection, job_id)
@@ -2227,14 +2330,10 @@ class SqliteJobRepository:
     def reconcile_external_operations_after_process_loss(
         self,
         job_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> tuple[ExternalOperation, ...]:
         with self._transaction(immediate=True) as connection:
-            self._assert_scheduler_authority(
-                connection,
-                authority,
-                job_id=job_id,
-            )
+            self._assert_job_authority(connection, job_id, authority)
             rows = connection.execute(
                 """
                 SELECT operations.operation_id
@@ -2363,7 +2462,7 @@ class SqliteJobRepository:
         attempt_id: str,
         state: AttemptState,
         *,
-        authority: ExecutionAuthority | None = None,
+        authority: JobExecutionAuthority | None = None,
     ) -> Attempt:
         with self._transaction(immediate=True) as connection:
             if state is AttemptState.RUNNING:
@@ -2383,7 +2482,7 @@ class SqliteJobRepository:
                 self._assert_execution_authority(
                     connection, attempt.job_id, attempt.attempt_id, authority
                 )
-            elif isinstance(authority, JobExecutionAuthority):
+            elif authority is not None:
                 self._assert_job_authority(
                     connection,
                     attempt.job_id,
@@ -2391,12 +2490,6 @@ class SqliteJobRepository:
                 )
             else:
                 self._assert_no_bound_job_claim(connection, attempt.job_id)
-                if authority is not None:
-                    self._assert_scheduler_authority(
-                        connection,
-                        authority,
-                        job_id=attempt.job_id,
-                    )
             next_state = transition_attempt(attempt.state, state)
             now = utc_now_millis()
             connection.execute(
@@ -2411,7 +2504,7 @@ class SqliteJobRepository:
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> Iterator[sqlite3.Connection]:
         with self._transaction(immediate=True) as connection:
             self._assert_commit_guard(
@@ -2426,7 +2519,7 @@ class SqliteJobRepository:
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
         *,
         result_plan: VideoResultPlan,
         source_identity: SourceIdentityBinding,
@@ -2494,7 +2587,7 @@ class SqliteJobRepository:
         self,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
         *,
         result_plan: RecipeResultPlan,
         source_identity: SourceIdentityBinding,
@@ -2551,7 +2644,7 @@ class SqliteJobRepository:
         error: ErrorDetail,
         *,
         attempt_id: str | None = None,
-        authority: ExecutionAuthority | None = None,
+        authority: JobExecutionAuthority | None = None,
     ) -> Job:
         if (
             (attempt_id is not None and authority is None)
@@ -2603,7 +2696,7 @@ class SqliteJobRepository:
         connection: sqlite3.Connection,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> None:
         job = self._get_job(connection, job_id)
         if job.state is not JobState.RUNNING:
@@ -2630,7 +2723,7 @@ class SqliteJobRepository:
         connection: sqlite3.Connection,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> None:
         now = utc_now_millis()
         attempt_updated = connection.execute(
@@ -3446,64 +3539,22 @@ class SqliteJobRepository:
         )
         return self._get_attempt(connection, attempt_id)
 
-    def _assert_scheduler_authority(
-        self,
-        connection: sqlite3.Connection,
-        authority: ExecutionAuthority,
-        *,
-        job_id: str | None = None,
-    ) -> None:
-        authority_job_id = (
-            authority.job_id
-            if isinstance(authority, JobExecutionAuthority)
-            else job_id
-        )
-        allow_unbound = not isinstance(authority, JobExecutionAuthority)
-        if (
-            isinstance(authority, JobExecutionAuthority)
-            and job_id is not None
-            and authority.job_id != job_id
-        ):
-            raise DomainError(
-                "attempt_fenced",
-                ErrorCategory.CONFLICT,
-                "Execution authority is expired or fenced",
-            )
-        row = connection.execute(
-            """
-            SELECT 1 FROM leases
-            WHERE lease_name = 'scheduler' AND owner = ?
-              AND fencing_token = ? AND CAST(expires_at AS INTEGER) > ?
-              AND ((? AND job_id IS NULL) OR job_id = ?)
-            """,
-            (
-                authority.owner_id,
-                authority.fencing_token,
-                self._clock(),
-                allow_unbound,
-                authority_job_id,
-            ),
-        ).fetchone()
-        if row is None:
-            raise DomainError(
-                "attempt_fenced",
-                ErrorCategory.CONFLICT,
-                "Execution authority is expired or fenced",
-            )
-
     def _assert_job_authority(
         self,
         connection: sqlite3.Connection,
         job_id: str,
         authority: JobExecutionAuthority,
     ) -> None:
-        if authority.job_id != job_id:
+        if (
+            not isinstance(authority, JobExecutionAuthority)
+            or authority.job_id != job_id
+        ):
             self._raise_job_claim_fenced()
         row = connection.execute(
             """
-            SELECT 1 FROM leases
-            WHERE lease_name = 'scheduler' AND job_id = ? AND owner = ?
-              AND fencing_token = ? AND CAST(expires_at AS INTEGER) > ?
+            SELECT 1 FROM job_execution_leases
+            WHERE job_id = ? AND owner = ? AND generation = ?
+              AND CAST(expires_at AS INTEGER) > ?
             """,
             (
                 job_id,
@@ -3522,8 +3573,7 @@ class SqliteJobRepository:
     ) -> None:
         row = connection.execute(
             """
-            SELECT 1 FROM leases
-            WHERE lease_name = 'scheduler' AND job_id = ?
+            SELECT 1 FROM job_execution_leases WHERE job_id = ?
             """,
             (job_id,),
         ).fetchone()
@@ -3543,8 +3593,10 @@ class SqliteJobRepository:
         connection: sqlite3.Connection,
         job_id: str,
         attempt_id: str,
-        authority: ExecutionAuthority,
+        authority: JobExecutionAuthority,
     ) -> Attempt:
+        if not isinstance(authority, JobExecutionAuthority):
+            self._raise_job_claim_fenced()
         attempt = self._get_attempt(connection, attempt_id)
         if (
             attempt.job_id != job_id
@@ -3557,11 +3609,7 @@ class SqliteJobRepository:
                 ErrorCategory.CONFLICT,
                 "Attempt is not owned by the current execution authority",
             )
-        self._assert_scheduler_authority(
-            connection,
-            authority,
-            job_id=job_id,
-        )
+        self._assert_job_authority(connection, job_id, authority)
         return attempt
 
     @staticmethod
