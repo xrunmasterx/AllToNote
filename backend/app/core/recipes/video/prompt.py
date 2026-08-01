@@ -44,6 +44,7 @@ def _prompt_parts(request: KnowledgeModelRequest) -> tuple[str, str, str]:
         "每个包含实质内容的二级标题（##）章节都必须在该章节正文中"
         "至少使用一个允许的引用；方法论、流程和总结也不能例外；"
         "不得把引用放在标题中。\n"
+        "不得输出 Mermaid 或原始 HTML；流程请使用普通 Markdown 列表或表格。\n"
         f"{screenshot_rule}\n\n"
         "<BEGIN_UNTRUSTED_TRANSCRIPT_JSONL>\n"
     )

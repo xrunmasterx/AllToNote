@@ -24,6 +24,7 @@ from app.core.portable.artifacts import PortableArtifactRef, build_transcript
 from app.core.portable.evidence import build_evidence_set, rewrite_segment_citations
 from app.core.portable.jsonio import encode_json, encode_ndjson
 from app.core.portable.markdown_safety import (
+    downgrade_mermaid_fences,
     rendered_image_bundle_paths,
     validate_markdown_safety,
 )
@@ -715,6 +716,26 @@ def test_mermaid_fence_is_rejected_as_active_content() -> None:
             "```mermaid\ngraph TD; A-->B\n```\n",
             bundle_relative_path="drafts/note.md",
         )
+
+
+def test_mermaid_fence_can_be_downgraded_without_losing_its_body() -> None:
+    source = (
+        "# Note\r\n\r\n"
+        "``` MERMAID flowchart\r\n"
+        "graph TD; A-->B\r\n"
+        "```\r\n"
+    )
+
+    result = downgrade_mermaid_fences(source)
+
+    assert result == source.replace("``` MERMAID", "``` text")
+    validate_markdown_safety(result, bundle_relative_path="drafts/note.md")
+
+
+def test_mermaid_text_inside_an_outer_code_fence_is_not_rewritten() -> None:
+    source = "````text\n```mermaid\ngraph TD; A-->B\n```\n````\n"
+
+    assert downgrade_mermaid_fences(source) == source
 
 
 def test_markdown_scan_scales_linearly_on_unclosed_link_markers() -> None:

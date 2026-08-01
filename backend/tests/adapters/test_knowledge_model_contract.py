@@ -166,6 +166,15 @@ def test_prompt_requires_evidence_in_every_substantive_h2_section() -> None:
     assert "方法论、流程和总结也不能例外" in prompt
 
 
+def test_prompt_forbids_active_markdown_content() -> None:
+    transcript = _transcript(count=2)
+
+    prompt = build_video_prompt(_request(transcript), transcript.segments)
+
+    assert "不得输出 Mermaid 或原始 HTML" in prompt
+    assert "普通 Markdown 列表或表格" in prompt
+
+
 def test_parser_preserves_repeated_citation_uses_but_projects_unique_ids() -> None:
     output = (
         "# Note\n\n"

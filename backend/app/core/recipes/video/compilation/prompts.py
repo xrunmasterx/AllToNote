@@ -386,7 +386,8 @@ def build_global_composer_prompt(
             "preserve the source wording and mark it as uncertain; never guess or add claims. "
             "Give every substantive H2 a visible [^seg_NNNNNN] citation; use inline citation "
             "markers in section bodies, never headings, and never write footnote-definition "
-            "lines because Core adds them. "
+            "lines because Core adds them. Do not emit Mermaid or raw HTML; express flows "
+            "as ordinary Markdown lists or tables. "
             "Account for every coverage input exactly "
             f"once as covered or explicitly omitted. {screenshot_rule} Return only the JSON "
             "object required by the response schema."
@@ -413,6 +414,8 @@ def build_knowledge_repair_prompt(
             "knowledge. For substantive_h2_citations, put at least one allowed visible citation "
             "inside every listed failed H2 section. Use inline citation markers only and never "
             "put them in headings or write footnote-definition lines because Core adds them. "
+            "Do not emit Mermaid or raw HTML; express flows as ordinary Markdown lists or "
+            "tables. "
             "Return the complete "
             "repaired article and the exact frozen coverage ledger in the required JSON object."
         ),

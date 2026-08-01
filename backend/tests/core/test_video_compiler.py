@@ -654,6 +654,7 @@ def test_repair_prompt_names_each_failed_substantive_h2_section() -> None:
     assert "inside every listed failed H2 section" in prompt.system_instruction
     assert "write footnote-definition lines" in prompt.system_instruction
     assert "never put them in headings" in prompt.system_instruction
+    assert "Do not emit Mermaid or raw HTML" in prompt.system_instruction
 
 
 def test_direct_compiler_returns_one_article_in_one_model_wave(tmp_path: Path) -> None:
@@ -680,6 +681,8 @@ def test_direct_compiler_returns_one_article_in_one_model_wave(tmp_path: Path) -
     assert "preserve the source wording and mark it as uncertain" in (
         executor.requests[0].system_instruction
     )
+    assert "Do not emit Mermaid or raw HTML" in executor.requests[0].system_instruction
+    assert "ordinary Markdown lists or tables" in executor.requests[0].system_instruction
 
 
 def test_compiler_behavior_identity_covers_consolidation_versions(

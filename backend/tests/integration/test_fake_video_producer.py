@@ -685,6 +685,35 @@ def test_repeated_segment_citations_keep_two_uses_and_one_definition(
     _validate_committed_bundle(workspace_root, snapshot.result.bundle_id)
 
 
+def test_finalization_downgrades_mermaid_without_dropping_content() -> None:
+    transcript = TranscriptDocument(
+        language="zh-CN",
+        segments=(TranscriptSegment("seg_000001", 0, 1_000, "事实"),),
+    )
+    draft = GeneratedVideoDraft(
+        markdown=(
+            "# Note\n\n## Flow\n\n事实[^seg_000001]\n\n"
+            "```mermaid\ngraph TD; A-->B\n```\n"
+        ),
+        cited_segment_ids=("seg_000001",),
+        screenshot_requests=(),
+        model_identity="fixture/model-v1",
+        usage={},
+        warnings=(),
+    )
+    evidence_id = "ev_018f0000-0000-7000-8000-000000000109"
+
+    finalized = VideoService._finalize_draft(
+        draft,
+        transcript,
+        {"seg_000001": evidence_id},
+    )
+
+    assert "```mermaid" not in finalized.markdown
+    assert "```text\ngraph TD; A-->B\n```" in finalized.markdown
+    assert f"[^{evidence_id}]: Video 00:00.000-00:01.000" in finalized.markdown
+
+
 def test_quality_fail_still_commits_and_returns_success(
     runtime_factory: Callable[..., tuple[object, object]],
     workspace_root: Path,

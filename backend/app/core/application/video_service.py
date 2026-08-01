@@ -103,6 +103,7 @@ from app.core.portable.evidence import (
     build_evidence_set,
     rewrite_segment_citations,
 )
+from app.core.portable.markdown_safety import downgrade_mermaid_fences
 from app.core.portable.quality import evaluate_video_draft
 from app.core.recipes.video.compilation.quality import (
     CoverageOmissionV1 as TextCoverageOmissionV1,
@@ -2665,7 +2666,10 @@ class VideoService:
         evidence_ids: Mapping[str, str],
     ) -> GeneratedVideoDraft:
         by_segment = {segment.segment_id: segment for segment in transcript.segments}
-        markdown = rewrite_segment_citations(draft.markdown, evidence_ids)
+        markdown = rewrite_segment_citations(
+            downgrade_mermaid_fences(draft.markdown),
+            evidence_ids,
+        )
         definitions = []
         for segment_id in draft.cited_segment_ids:
             segment = by_segment[segment_id]

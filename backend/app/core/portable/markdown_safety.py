@@ -191,6 +191,51 @@ def _scan_markdown(markdown: str) -> _MarkdownScan:
     )
 
 
+def downgrade_mermaid_fences(markdown: str) -> str:
+    """Preserve Mermaid source as inert text without relaxing Markdown safety."""
+
+    if not isinstance(markdown, str):
+        raise _unsafe()
+    output: list[str] = []
+    fence_marker: str | None = None
+    fence_length = 0
+    for source_line in markdown.splitlines(keepends=True):
+        line = source_line.rstrip("\r\n")
+        ending = source_line[len(line) :]
+        fence = _fence_run(line)
+        if fence_marker is not None:
+            output.append(source_line)
+            if (
+                fence is not None
+                and fence[1] == fence_marker
+                and fence[2] >= fence_length
+                and not line[fence[0] + fence[2] :].strip(" \t")
+            ):
+                fence_marker = None
+                fence_length = 0
+            continue
+        if fence is None:
+            output.append(source_line)
+            continue
+        suffix_start = fence[0] + fence[2]
+        suffix = line[suffix_start:]
+        if fence[1] == "`" and "`" in suffix:
+            output.append(source_line)
+            continue
+        fence_marker = fence[1]
+        fence_length = fence[2]
+        token_start = suffix_start
+        while token_start < len(line) and line[token_start] in " \t":
+            token_start += 1
+        token_end = token_start
+        while token_end < len(line) and line[token_end] not in " \t":
+            token_end += 1
+        if line[token_start:token_end].casefold() == "mermaid":
+            line = line[:token_start] + "text" + line[token_end:]
+        output.append(line + ending)
+    return "".join(output)
+
+
 def markdown_visible_mask(markdown: str) -> bytes:
     """Return a mask for rendered text, excluding code and destinations."""
 
