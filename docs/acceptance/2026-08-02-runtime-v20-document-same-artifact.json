@@ -1,0 +1,202 @@
+{
+  "acceptance_schema": "alltonote.document.same-artifact.v1",
+  "status": "candidate-pass",
+  "recorded_at": "2026-08-02T04:35:41Z",
+  "scope": {
+    "candidate": "runtime-portable-video-current-v20",
+    "host": "windows-x86_64-current-user",
+    "workspace_unicode": true,
+    "capacity": 1,
+    "unsigned_portable_runtime": true,
+    "signed_document_pack": true,
+    "public_release": false,
+    "claim": "The exact V20 Runtime and the signed document-basic Pack completed two real born-digital PDFs, including Chinese text and tables, with clean reading projection, auditable Evidence, independent semantic verification, serialized capacity, and stable restart recovery."
+  },
+  "runtime": {
+    "source_commit": "68d517f1fb5e0ce79429c36e56cb7b3c2acbd447",
+    "version": "0.1.0",
+    "platform": "windows-x86_64",
+    "python": "3.14.6",
+    "sqlite": "3.53.4",
+    "wheel": {
+      "filename": "alltonote_runtime-0.1.0-py3-none-any.whl",
+      "byte_length": 601241,
+      "sha256": "ea2228ca8d4e4bb3203ba73d93eec2e425e42bf86508af108c9ff50f1da62792"
+    },
+    "candidate_manifest": {
+      "sha256": "c1369d1603d2248ffc1bb07d028e7a1e860873b1289dc130640e52a6cbed1956",
+      "file_count": 715,
+      "total_bytes": 41084745,
+      "verified_after_jobs_and_restart": true
+    }
+  },
+  "document_pack": {
+    "pack_id": "document-basic",
+    "version": "docling-2.117.0-tableformer-v2.3.0",
+    "platform": "windows-x86_64",
+    "python": "3.11.15",
+    "manifest_sha256": "sha256:7b72fe809a18ca62a2d7d80122a8350314f6bd9b8a4c56dba16ec17725e90d0f",
+    "signature_key_id": "alltonote-document-basic-2026-01",
+    "source_file_count": 33800,
+    "manifest_payload_file_count": 33799,
+    "fresh_install_result": "installed",
+    "dynamic_doctor_after_install": "pass",
+    "dynamic_doctor_after_jobs_and_restart": "pass"
+  },
+  "configuration": {
+    "composer": {
+      "provider_type": "codex-app-server",
+      "profile": "composer",
+      "model": "gpt-5.6-sol"
+    },
+    "verifier": {
+      "provider_type": "codex-app-server",
+      "profile": "verifier",
+      "model": "gpt-5.6-terra",
+      "distinct_from_composer": true
+    },
+    "output_language": "zh-CN",
+    "quality": "balanced",
+    "style": "structured",
+    "model_operation_files": 8,
+    "composer_operations": 4,
+    "verifier_operations": 4,
+    "provider_usage_available": false,
+    "provider_finish_reason_available": false
+  },
+  "workspace": {
+    "workspace_id": "6e8190cf-c744-4a42-9932-058d9ffa091f",
+    "name": "V20 文档验收",
+    "isolated_machine_state": true,
+    "final_file_count": 33848,
+    "final_total_bytes": 1701274530
+  },
+  "samples": [
+    {
+      "sample_id": "DOC-EN-01",
+      "input_label": "SA2023_RealTimeReflection.pdf",
+      "source_byte_length": 6200363,
+      "source_sha256": "sha256:155f56096e8196b08f0aab9d6a162daea0196d308ad323ab1aebc7fb749db6b1",
+      "job_id": "job_019fc0ab-3eba-715a-87ea-d3e208e25870",
+      "run_id": "run_019fc0ab-3eba-7d83-aa3b-fb67699ea082",
+      "bundle_id": "bnd_019fc0ab-3eba-7976-a2cb-c6a53600eb3e",
+      "bundle_manifest_sha256": "sha256:94b51f196f2b6c605e3f18beef2fbbb762542e78f542dce4aa5a468609a2c210",
+      "commit_sha256": "sha256:e356cc134d5b482794649b8f60f746e1fdbb0bebeb5f21c40c054f48e2bf3e96",
+      "draft_id": "art_019fc0ab-3eba-741c-a540-0999c53f24ee",
+      "draft_sha256": "sha256:fdf491c23965cb42320144fe51e8f6d59e58537b0d50d62bef079549b50e3792",
+      "job_wall_ms": 466156,
+      "execution_wall_ms": 465616,
+      "state": "succeeded",
+      "quality": "pass",
+      "publish_eligible": true,
+      "quality_repair_attempts": 1,
+      "semantic_verifier_model": "gpt-5.6-terra",
+      "page_count": 4,
+      "normalized_blocks": 82,
+      "structured_tables": 1,
+      "evidence_records": 82,
+      "knowledge_map_items": 48,
+      "page_coverage": 1.0,
+      "source_coverage": 0.7432009391508511,
+      "reading_bytes": 9389,
+      "reading_heading_count": 7,
+      "reading_body_truncated": false,
+      "reading_system_evidence_markers": 0,
+      "reading_document_page_markers": 0,
+      "evidence_validation": {
+        "invalid_page": 0,
+        "invalid_normalized_bbox": 0,
+        "invalid_excerpt_sha256": 0,
+        "wrong_locator_scheme": 0,
+        "missing_knowledge_block_refs": 0,
+        "duplicate_evidence_ids": 0
+      }
+    },
+    {
+      "sample_id": "DOC-ZH-TABLE-01",
+      "input_label": "J3BakedVolumetricGI技术分析精简版.pdf",
+      "source_byte_length": 588906,
+      "source_sha256": "sha256:cc2f703aaf3e1fbb9172304a16598a4387b9f90939ffc0eeef013aca62ba77b1",
+      "job_id": "job_019fc0ab-6fc4-798d-8481-2cd65bbde0bb",
+      "run_id": "run_019fc0ab-6fc4-7be4-9cba-2ed676cbfd7e",
+      "bundle_id": "bnd_019fc0ab-6fc4-7aca-a59f-aae6f01d82de",
+      "bundle_manifest_sha256": "sha256:fce2bdfc81acc1ce7d3f64f91d9d091b30d0f219786b0678b7152c5108e505e3",
+      "commit_sha256": "sha256:fc9e0313975443a617bbd071af9182c7acf2b1066a1ee8e4c282af357bb3761c",
+      "draft_id": "art_019fc0ab-6fc4-7c91-8167-90adb4ee5b46",
+      "draft_sha256": "sha256:3c07f9937de121364b34e4f5d72a783c8f1ea12a1a2e78145e14d97cc1a5bd9c",
+      "job_wall_ms": 916473,
+      "queue_wait_ms": 453740,
+      "execution_wall_ms": 462733,
+      "state": "succeeded",
+      "quality": "pass",
+      "publish_eligible": true,
+      "quality_repair_attempts": 1,
+      "semantic_verifier_model": "gpt-5.6-terra",
+      "page_count": 6,
+      "normalized_blocks": 109,
+      "structured_tables": 8,
+      "evidence_records": 109,
+      "knowledge_map_items": 58,
+      "page_coverage": 1.0,
+      "source_coverage": 0.8906131373561299,
+      "reading_bytes": 11772,
+      "reading_heading_count": 9,
+      "reading_body_truncated": false,
+      "reading_system_evidence_markers": 0,
+      "reading_document_page_markers": 0,
+      "terminology": {
+        "J3BakedVolumetricGI_preserved": true,
+        "UJ3BakedVolumetricGIData_preserved": true
+      },
+      "evidence_validation": {
+        "invalid_page": 0,
+        "invalid_normalized_bbox": 0,
+        "invalid_excerpt_sha256": 0,
+        "wrong_locator_scheme": 0,
+        "missing_knowledge_block_refs": 0,
+        "duplicate_evidence_ids": 0
+      }
+    }
+  ],
+  "scheduler": {
+    "capacity": 1,
+    "jobs_submitted_back_to_back": true,
+    "second_job_wait_reason": "resource_capacity",
+    "second_job_admitted_after_first_completed": true,
+    "parallel_heavy_execution_claimed": false
+  },
+  "reliability": {
+    "engine_restart": {
+      "initial_engine_id": "a3bb9668-1525-4747-8f78-455cdc50ba90",
+      "restart_engine_id": "3d5d7752-e79c-4545-a85b-b9f091345c19",
+      "new_engine_id_observed": true,
+      "english_event_count_before_after": 17,
+      "chinese_event_count_before_after": 19,
+      "model_operation_count_before_after": 8,
+      "result_refs_equal_before_after": true,
+      "draft_hashes_equal_before_after": true,
+      "engine_stopped_cleanly_after_check": true
+    },
+    "real_document_cancel_exercised": false,
+    "real_document_retry_exercised": false
+  },
+  "immutability": {
+    "runtime_candidate_full_manifest_verifier": "pass",
+    "runtime_manifest_before_after_equal": true,
+    "document_pack_source_manifest_before_after_equal": true,
+    "installed_pack_active_pointer_before_after_equal": true,
+    "english_source_before_after_equal": true,
+    "chinese_source_before_after_equal": true,
+    "active_pointer_sha256": "cffafd3906b2e31a1084a39957536f4e797b0a06501dbcf54ab99f21933b3a6c",
+    "post_restart_pack_dynamic_doctor": "pass"
+  },
+  "known_limits": [
+    "The current run used an already logged-in Codex app-server session on the current Windows user and is not a clean-user or clean-VM certification.",
+    "The Runtime candidate is an unsigned portable directory, not an Authenticode-signed installer or updater.",
+    "Both inputs are born-digital PDFs; scanned PDFs, OCR, DOCX, PPTX, and other document formats remain unclaimed.",
+    "Pack online discovery, download, update, rollback, remove, and clean uninstall were not exercised.",
+    "Only capacity 1 was exercised; capacity 2, multi-user operation, and sustained performance capacity remain unclaimed.",
+    "Provider token usage and finish reasons were unavailable, so exact model cost and token budgets could not be certified.",
+    "Real Document cancel and retry were not added to this acceptance; those paths remain covered only by automated tests in this slice."
+  ]
+}

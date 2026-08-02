@@ -7,8 +7,8 @@ authority: execution
 upstream:
   - ../specs/2026-07-18-alltonote-document-recipe-design.md
   - ../specs/2026-07-18-alltonote-recipe-extension-contract-design.md
-implementation_status: doc-00-and-doc-03-x0-b-passed-full-mvp-pending
-last_verified_at: 2026-07-31
+implementation_status: born-digital-pdf-current-user-candidate-passed-ppt-ocr-pending
+last_verified_at: 2026-08-02
 ```
 
 ## 1. 成功标准
@@ -36,7 +36,9 @@ X0-A 完成后，首个生产纵切只选择一份真实本地 born-digital PDF 
 
 状态：**PASS（2026-07-30）**。唯一真实输入、对照指标、Windows 依赖缺口与选择记录见 `docs/design-docs/document-born-digital-pdf-x0b/`。首个 PDF 纵切选择 `docling-slim==2.117.0` 作为 `document-basic` 的可替换隔离解析引擎；AllToNote 继续拥有 parser-neutral DTO、source SHA-256、Evidence 与 durable schema。轻量 `pdfplumber==0.11.8` 只保留为比较基线。
 
-实用硬化状态：**PASS（2026-07-31）**。`document-basic` 已固定 Docling/SciPy/CPU Torch/OpenCV/NumPy、layout 与 TableFormer revision/权重；Document Runtime 在写 machine state 前执行离线 doctor，解析 worker 不再无界收集 stdout/stderr。第二份 6 页中文、8 表格真实 PDF 关闭了 Windows 中文路径和表格结构缺口，Pack 升级为 `docling-2.117.0-tableformer-v2.3.0`；原英文论文回归通过。当前没有实现通用 Pack 安装器或 repair，也不因此扩展 PPTX/OCR。
+实用硬化状态：**PASS（2026-07-31）**。`document-basic` 已固定 Docling/SciPy/CPU Torch/OpenCV/NumPy、layout 与 TableFormer revision/权重；Document Runtime 在写 machine state 前执行离线 doctor，解析 worker 不再无界收集 stdout/stderr。第二份 6 页中文、8 表格真实 PDF 关闭了 Windows 中文路径和表格结构缺口，Pack 升级为 `docling-2.117.0-tableformer-v2.3.0`；原英文论文回归通过。
+
+当前发布候选状态：**PASS（当前 Windows 用户，2026-08-02）**。V20 Runtime 已从空 machine state 通过 document-specific 本地签名目录安装并激活正式 `document-basic` Pack；安装后与 Engine 重启后的静态/动态 doctor 均通过。同一制品串行完成英文论文和中文表格文档，reading Draft 无系统 Evidence 噪声，内部 Evidence/Knowledge Map 全部可验证，独立 composer/verifier 身份、Portable commit 和重启零重放均通过。证据见 [`Runtime V20 Document 同制品验收`](../../acceptance/2026-08-02-runtime-v20-document-same-artifact.md)。当前仍没有通用 Pack catalog/update/rollback/remove、公开 Runtime 安装器或 clean-VM 认证，也不因此扩展 PPTX/OCR。
 
 ## 3. Task DOC-01：文件身份与安全探测
 
@@ -77,6 +79,8 @@ Knowledge Note + deterministic Quality；来源语言/中文；section-aware inp
 当前增量（2026-08-01）：统一 `produce` CLI 已允许 `alltonote.document-note@1` 使用 `--detach`；Job 先以 `execution_owner=engine` 持久化，再用 Registry 的 `workspace_instance_id` 通知现有 Engine，直接参数和 request-file 两条入口共用同一提交路径。Document Workspace Runtime 现在显式携带该 machine-local instance identity；没有新增 Document 专用 Engine、JobStore 或协议。Windows `spawn` E2E 已让提交 CLI 在 Worker 放行前退出，并使用真实 `LocalEngineClient`、Host、Dispatcher、独立 Worker、Document Runtime、SQLite JobStore 与 Portable commit 完成同一 Job；Parser/Model 是受控外部 fixture。该结果与既有 Document 真重启零重放 Gate 共同关闭本地 detach 语义，但仍不等于带真实 Docling Pack、真实模型和正式签名 Runtime 的 clean-user 发布验收。
 
 同日补齐 detach 输入所有权：只有 Engine-owned Document 在 Job 创建前把 PDF 复制到 machine-state 的内容寻址快照，并把不含路径的 `document.input-snapshot.v1` 与 Job 原子持久化；执行前后都校验大小与 SHA-256，缺失、篡改、hardlink 或 reparse 路径禁止回退原文件。相同内容的并发提交通过持久文件锁复用同一快照；retry 显式继承绑定，历史无绑定 Job 仍只认原始输入。未引入 Vault blob、GC 或通用对象存储，验证边界见 [`Document detach 输入快照`](../../acceptance/2026-08-01-document-detached-input-snapshot.md)。
+
+当前真实制品验收（2026-08-02）：V20 Runtime、正式签名 `document-basic` Pack、真实 Docling worker 与两个冻结模型身份已在全新 Unicode Workspace 中共同跑通 4 页英文论文和 6 页中文/8 表格文档。两个 Job 的 normalized blocks、Evidence、Knowledge Map、Quality Report、Draft 和 Portable commit 均完整；reading 投影无 `[^ev_*]` 或 `Document page` 噪声；capacity=1 等待/准入、Engine 重启、结果身份不变、模型零重放和源文件/Runtime/Pack 不变均已验证。该结果把此前分散的 parser Spike、独立语义 Gate 和 detach 恢复测试合并为同一制品证据，但仍只属于当前用户候选，不替代扫描/OCR、PPTX、长文档、clean VM 或公开分发 Gate。详见 [`Runtime V20 Document 同制品验收`](../../acceptance/2026-08-02-runtime-v20-document-same-artifact.md)。
 
 ## 9. Task DOC-07：局部 OCR Pack
 
