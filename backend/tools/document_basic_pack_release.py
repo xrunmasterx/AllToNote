@@ -12,11 +12,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from collections.abc import Callable, Mapping
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 from urllib.parse import quote
 
 from cryptography.hazmat.primitives import serialization
@@ -839,6 +841,83 @@ def _cleanup_staging(staging: Path, output_path: Path) -> None:
         pass
 
 
+def _write_deterministic_pack_archive(source: Path, output: Path) -> str:
+    """Write one fixed ZIP transport artifact from a verified private snapshot."""
+
+    if output.suffix.casefold() != ".zip":
+        raise ReleaseError("Pack artifact output must use the .zip extension")
+    source_root = _source_root(source)
+    output_path, parent_metadata = _output_path(output)
+    temporary = output_path.with_name(f".{output_path.name}.staging-{uuid4().hex}")
+    digest = hashlib.sha256()
+    try:
+        with temporary.open("xb") as stream:
+            with zipfile.ZipFile(
+                stream,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+                strict_timestamps=True,
+            ) as archive:
+                for path in sorted(
+                    (item for item in source_root.rglob("*") if item.is_file()),
+                    key=lambda item: item.relative_to(source_root).as_posix().casefold(),
+                ):
+                    relative = path.relative_to(source_root).as_posix()
+                    info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = (stat.S_IFREG | 0o644) << 16
+                    with path.open("rb") as source_stream, archive.open(info, "w") as target:
+                        for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                            target.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with temporary.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if not _same_directory_identity(parent_metadata, output_path.parent.lstat()):
+            raise ReleaseError("output parent changed before publication")
+        try:
+            output_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ReleaseError("output appeared before publication")
+        os.rename(temporary, output_path)
+        return "sha256:" + digest.hexdigest()
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def package_signed_document_basic_pack(
+    *,
+    signed_root: Path,
+    output: Path,
+    trusted_keys: Mapping[str, DocumentPackTrustKey],
+) -> tuple[VerifiedDocumentPack, str]:
+    """Verify a signed Pack snapshot, then package it into the only supported ZIP form."""
+
+    source = _source_root(signed_root)
+    output_path, parent_metadata = _output_path(output)
+    if _paths_overlap(source, output_path):
+        raise ReleaseError("signed Pack and archive output must be disjoint")
+    staging = _output_staging(output_path, parent_metadata)
+    try:
+        _copy_tree_snapshot(source, staging)
+        verified = verify_document_basic_pack_source(
+            staging,
+            trusted_keys=trusted_keys,
+            platform_tag=_PLATFORM,
+        )
+        return verified, _write_deterministic_pack_archive(staging, output_path)
+    finally:
+        _cleanup_staging(staging, output_path)
+
+
 def assemble_document_basic_pack(
     *,
     python_root: Path,
@@ -971,6 +1050,9 @@ def _parser() -> argparse.ArgumentParser:
     sign.add_argument("--key-id", required=True)
     sign.add_argument("--assembled-root", type=Path, required=True)
     sign.add_argument("--output", type=Path, required=True)
+    archive = commands.add_parser("archive")
+    archive.add_argument("--signed-root", type=Path, required=True)
+    archive.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -1009,7 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
                 "platform": _PLATFORM,
                 "output": str(output),
             }
-        else:
+        elif args.command == "sign":
             from app.adapters.documents.document_basic_pack_trust import (
                 official_document_pack_trust_keys,
             )
@@ -1031,6 +1113,26 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest_sha256": verified.manifest_sha256,
                 "file_count": len(verified.files),
                 "output": str(verified.source_root),
+            }
+        else:
+            from app.adapters.documents.document_basic_pack_trust import (
+                official_document_pack_trust_keys,
+            )
+
+            verified, archive_sha256 = package_signed_document_basic_pack(
+                signed_root=args.signed_root,
+                output=args.output,
+                trusted_keys=official_document_pack_trust_keys(),
+            )
+            result = {
+                "schema_version": 1,
+                "result": "archived",
+                "pack_id": verified.pack_id,
+                "pack_version": verified.pack_version,
+                "platform": verified.platform,
+                "manifest_sha256": verified.manifest_sha256,
+                "archive_sha256": archive_sha256,
+                "output": str(args.output.resolve()),
             }
     except (DomainError, OSError, ReleaseError) as error:
         payload = {
@@ -1055,5 +1157,6 @@ __all__ = [
     "initialize_signing_key",
     "load_signing_key",
     "main",
+    "package_signed_document_basic_pack",
     "sign_document_basic_pack",
 ]

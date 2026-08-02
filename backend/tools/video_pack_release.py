@@ -38,6 +38,7 @@ from tools.document_basic_pack_release import (
     _paths_overlap,
     _probe_python_identity,
     _public_bytes,
+    _write_deterministic_pack_archive,
     _publish_staging,
     _source_root,
     _validate_key_id,
@@ -438,6 +439,33 @@ def sign_video_pack(
         raise
 
 
+def package_signed_video_pack(
+    *,
+    contract: OfficialVideoPackContract,
+    signed_root: Path,
+    output: Path,
+    trusted_keys: Mapping[str, PackTrustKey],
+) -> tuple[VerifiedOfficialVideoPack, str]:
+    """Verify a signed Video Pack snapshot, then package the fixed ZIP artifact."""
+
+    source = _source_root(signed_root)
+    output_path, parent_metadata = _output_path(output)
+    if _paths_overlap(source, output_path):
+        raise ReleaseError("signed Pack and archive output must be disjoint")
+    staging = _output_staging(output_path, parent_metadata)
+    try:
+        _copy_tree_snapshot(source, staging)
+        verified = verify_official_video_pack_source(
+            staging,
+            contract=contract,
+            trusted_keys=trusted_keys,
+            platform_tag=_PLATFORM,
+        )
+        return verified, _write_deterministic_pack_archive(staging, output_path)
+    finally:
+        _cleanup_staging(staging, output_path)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Release official Video Packs")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -453,6 +481,10 @@ def _parser() -> argparse.ArgumentParser:
     sign.add_argument("--assembled-root", type=Path, required=True)
     sign.add_argument("--output", type=Path, required=True)
     sign.add_argument("--key-id", default=_KEY_ID)
+    archive = commands.add_parser("archive")
+    archive.add_argument("pack_id", choices=("media-basic", "transcribe-cpu"))
+    archive.add_argument("--signed-root", type=Path, required=True)
+    archive.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -474,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                 "pack_version": contract.pack_version,
                 "assembled_root": str(output),
             }
-        else:
+        elif args.command == "sign":
             verified = sign_video_pack(
                 contract=contract,
                 assembled_root=args.assembled_root,
@@ -492,6 +524,21 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest_sha256": verified.manifest_sha256,
                 "output": str(args.output.resolve()),
             }
+        else:
+            verified, archive_sha256 = package_signed_video_pack(
+                contract=contract,
+                signed_root=args.signed_root,
+                output=args.output,
+                trusted_keys=official_video_pack_trust_keys(),
+            )
+            result = {
+                "pack_id": verified.pack_id,
+                "pack_version": verified.pack_version,
+                "platform": verified.platform,
+                "manifest_sha256": verified.manifest_sha256,
+                "archive_sha256": archive_sha256,
+                "output": str(args.output.resolve()),
+            }
     except (OSError, ReleaseError) as error:
         print(json.dumps({"ok": False, "error": str(error)}))
         return 1
@@ -503,4 +550,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["assemble_video_pack", "main", "sign_video_pack"]
+__all__ = [
+    "assemble_video_pack",
+    "main",
+    "package_signed_video_pack",
+    "sign_video_pack",
+]

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import warnings
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -21,12 +23,21 @@ from app.adapters.documents.document_basic_pack_installer import (
 from app.core.errors import DomainError, ErrorCategory
 from app.runtime_paths import resolve_runtime_paths
 from tests.document_pack_support import trust_keys, write_pack_source
+from tools.document_basic_pack_release import package_signed_document_basic_pack
 
 
 def _source(tmp_path: Path) -> Path:
     source = tmp_path / "source"
     write_pack_source(source)
     return source
+
+
+def _archive_source(source: Path, archive: Path) -> Path:
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_file():
+                bundle.writestr(path.relative_to(source).as_posix(), path.read_bytes())
+    return archive
 
 
 def _install(tmp_path: Path, source: Path, **kwargs: object):
@@ -39,6 +50,95 @@ def _install(tmp_path: Path, source: Path, **kwargs: object):
         probe=probe,
         **kwargs,
     )
+
+
+def test_installer_imports_signed_zip_without_preextract(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    archive = _archive_source(source, tmp_path / "document-basic.atnpack")
+
+    result = _install(tmp_path, archive)
+
+    assert result.result == "installed"
+    assert (result.generation / "manifest.json").read_bytes() == (
+        source / "manifest.json"
+    ).read_bytes()
+
+
+def test_installer_imports_release_generated_zip(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    archive = tmp_path / "document-basic.zip"
+    expected, archive_sha256 = package_signed_document_basic_pack(
+        signed_root=source,
+        output=archive,
+        trusted_keys=trust_keys(),
+    )
+
+    result = _install(tmp_path, archive)
+
+    assert result.manifest_sha256 == expected.manifest_sha256
+    assert archive_sha256.startswith("sha256:")
+
+
+def test_installer_reinstalls_signed_zip_idempotently(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    archive = _archive_source(source, tmp_path / "document-basic.atnpack")
+    first = _install(tmp_path, archive)
+    pointer_bytes = first.active_pointer.read_bytes()
+    pointer_mtime = first.active_pointer.stat().st_mtime_ns
+
+    second = _install(tmp_path, archive)
+
+    assert second.result == "already_active"
+    assert second.generation == first.generation
+    assert second.active_pointer.read_bytes() == pointer_bytes
+    assert second.active_pointer.stat().st_mtime_ns == pointer_mtime
+
+
+@pytest.mark.parametrize(
+    "entries",
+    (
+        (("../outside", b"x"),),
+        (("C:/outside", b"x"),),
+        (("same", b"first"), ("same", b"second")),
+        (("Case", b"first"), ("case", b"second")),
+    ),
+)
+def test_installer_rejects_unsafe_zip_before_activation(
+    tmp_path: Path,
+    entries: tuple[tuple[str, bytes], ...],
+) -> None:
+    archive = tmp_path / "unsafe.atnpack"
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Duplicate name")
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for name, content in entries:
+                member = zipfile.ZipInfo(name)
+                member.filename = name
+                bundle.writestr(member, content)
+
+    with pytest.raises(DomainError) as raised:
+        _install(tmp_path, archive)
+
+    assert raised.value.code == "pack_archive_unsafe"
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    assert not (
+        paths.data_dir / "packs" / PACK_ID / PACK_VERSION / "active.json"
+    ).exists()
+
+
+def test_installer_rejects_symlink_zip_member_before_activation(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "unsafe-link.atnpack"
+    member = zipfile.ZipInfo("linked")
+    member.external_attr = (0o120777 << 16)
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(member, b"target")
+
+    with pytest.raises(DomainError) as raised:
+        _install(tmp_path, archive)
+
+    assert raised.value.code == "pack_archive_unsafe"
 
 
 def test_installer_publishes_verified_generation_then_active_pointer(

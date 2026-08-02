@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import zipfile
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -17,6 +18,7 @@ from app.adapters.video_packs.official_video_pack_verifier import (
 from tools.document_basic_pack_release import ReleaseError
 from tools.video_pack_release import (
     assemble_video_pack,
+    package_signed_video_pack,
     sign_video_pack,
 )
 
@@ -140,6 +142,36 @@ def test_assembled_and_signed_video_pack_is_verifier_accepted(
         trusted_keys=_trust(),
         platform_tag="windows-x86_64",
     ).manifest_sha256 == verified.manifest_sha256
+
+
+def test_signed_video_pack_archive_is_deterministic_and_verifier_ready(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "signed"
+    source.mkdir()
+    from tests.video_pack_support import trust_keys as pack_trust_keys
+    from tests.video_pack_support import write_pack_source
+
+    write_pack_source(source, MEDIA_BASIC, platform_tag="windows-x86_64")
+
+    first, first_hash = package_signed_video_pack(
+        contract=MEDIA_BASIC,
+        signed_root=source,
+        output=tmp_path / "first.zip",
+        trusted_keys=pack_trust_keys(),
+    )
+    second, second_hash = package_signed_video_pack(
+        contract=MEDIA_BASIC,
+        signed_root=source,
+        output=tmp_path / "second.zip",
+        trusted_keys=pack_trust_keys(),
+    )
+
+    assert first.manifest_sha256 == second.manifest_sha256
+    assert first_hash == second_hash
+    assert (tmp_path / "first.zip").read_bytes() == (tmp_path / "second.zip").read_bytes()
+    with zipfile.ZipFile(tmp_path / "first.zip") as archive:
+        assert "manifest.json" in archive.namelist()
 
 
 def test_builder_rejects_dependency_drift_before_publication(

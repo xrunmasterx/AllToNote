@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from tools.document_basic_pack_release import (
     assemble_document_basic_pack,
     initialize_signing_key,
     load_signing_key,
+    package_signed_document_basic_pack,
     sign_document_basic_pack,
 )
 
@@ -237,6 +239,45 @@ def test_builder_creates_deterministic_verifier_accepted_pack(tmp_path: Path) ->
         platform_tag="windows-x86_64",
     )
     assert verified.signature_key_id == _KEY_ID
+
+
+def test_signed_document_pack_archive_is_deterministic_and_verifier_ready(
+    tmp_path: Path,
+) -> None:
+    assembled = tmp_path / "assembled"
+    signed = tmp_path / "signed"
+    _assemble(tmp_path / "source", assembled)
+    sign_document_basic_pack(
+        assembled_root=assembled,
+        output=signed,
+        key_id=_KEY_ID,
+        private_key=_PRIVATE_KEY,
+        trusted_keys=_trust(),
+    )
+
+    first, first_hash = package_signed_document_basic_pack(
+        signed_root=signed,
+        output=tmp_path / "first.zip",
+        trusted_keys=_trust(),
+    )
+    second, second_hash = package_signed_document_basic_pack(
+        signed_root=signed,
+        output=tmp_path / "second.zip",
+        trusted_keys=_trust(),
+    )
+
+    assert first.manifest_sha256 == second.manifest_sha256
+    assert first_hash == second_hash
+    assert (tmp_path / "first.zip").read_bytes() == (tmp_path / "second.zip").read_bytes()
+    with zipfile.ZipFile(tmp_path / "first.zip") as archive:
+        assert archive.namelist() == sorted(
+            (
+                path.relative_to(signed).as_posix()
+                for path in signed.rglob("*")
+                if path.is_file()
+            ),
+            key=str.casefold,
+        )
 
 
 def test_builder_fails_closed_before_publishing_for_wrong_trust_root(

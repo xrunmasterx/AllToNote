@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from errno import EACCES, ENOSYS
@@ -301,7 +302,145 @@ def _copy_regular_file(
         source_stream.close()
 
 
-def _materialize_source(source: Path, stage: Path) -> None:
+def _materialize_zip_source(
+    source: Path,
+    stage: Path,
+    *,
+    file_byte_limit: int,
+    total_byte_limit: int,
+    tree_entry_limit: int,
+) -> None:
+    try:
+        metadata = source.lstat()
+        if (
+            _is_link_or_reparse(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise _UnsafeSource("unsafe_archive_source")
+        source_stream = source.open("rb")
+    except _UnsafeSource:
+        raise
+    except OSError as error:
+        raise _UnsafeSource("archive_source_unavailable") from error
+
+    try:
+        opened = os.fstat(source_stream.fileno())
+        if not _same_open_file(metadata, opened):
+            raise _UnsafeSource("archive_source_changed_before_open")
+        try:
+            archive = zipfile.ZipFile(source_stream)
+        except (OSError, zipfile.BadZipFile) as error:
+            raise DomainError(
+                "pack_source_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "The Pack source must be a directory or a valid ZIP archive",
+            ) from error
+        with archive:
+            members = tuple(archive.infolist())
+            if not members or len(members) > tree_entry_limit:
+                raise _UnsafeSource("archive_entry_limit")
+            entries: dict[str, bool] = {}
+            total_declared = 0
+            for member in members:
+                raw_name = member.filename
+                is_directory = member.is_dir()
+                name = raw_name.removesuffix("/") if is_directory else raw_name
+                try:
+                    normalized = _normalized_relative_path(name)
+                except DomainError as error:
+                    raise _UnsafeSource("unsafe_archive_path") from error
+                collision = normalized.casefold()
+                member_limit = (
+                    _MAX_MANIFEST_BYTES
+                    if normalized == "manifest.json"
+                    else file_byte_limit
+                )
+                if collision in entries or member.flag_bits & 0x1:
+                    raise _UnsafeSource("unsafe_archive_entry")
+                unix_mode = member.external_attr >> 16
+                file_type = stat.S_IFMT(unix_mode)
+                if (
+                    (is_directory and (member.file_size or member.compress_size))
+                    or (is_directory and file_type not in (0, stat.S_IFDIR))
+                    or (
+                        not is_directory
+                        and file_type not in (0, stat.S_IFREG)
+                    )
+                    or (not is_directory and member.external_attr & 0x10)
+                    or member.file_size > member_limit
+                ):
+                    raise _UnsafeSource("unsafe_archive_entry")
+                entries[collision] = is_directory
+                total_declared += member.file_size
+                if total_declared > total_byte_limit + _MAX_MANIFEST_BYTES:
+                    raise _UnsafeSource("archive_total_limit")
+            for collision, is_directory in entries.items():
+                if is_directory:
+                    continue
+                segments = collision.split("/")
+                if any(
+                    entries.get("/".join(segments[:index])) is False
+                    for index in range(1, len(segments))
+                ):
+                    raise _UnsafeSource("archive_file_directory_collision")
+
+            total_written = 0
+            for member in members:
+                if member.is_dir():
+                    continue
+                normalized = _normalized_relative_path(member.filename)
+                member_limit = (
+                    _MAX_MANIFEST_BYTES
+                    if normalized == "manifest.json"
+                    else file_byte_limit
+                )
+                target = stage.joinpath(*normalized.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not _ordinary_directory(target.parent):
+                    raise _UnsafeSource("unsafe_stage_directory")
+                written = 0
+                try:
+                    with (
+                        archive.open(member) as archive_stream,
+                        target.open("xb") as target_stream,
+                    ):
+                        while chunk := archive_stream.read(1024 * 1024):
+                            written += len(chunk)
+                            total_written += len(chunk)
+                            if (
+                                written > member.file_size
+                                or written > member_limit
+                                or total_written
+                                > total_byte_limit + _MAX_MANIFEST_BYTES
+                            ):
+                                raise _UnsafeSource("archive_size_changed")
+                            target_stream.write(chunk)
+                        target_stream.flush()
+                        os.fsync(target_stream.fileno())
+                except _UnsafeSource:
+                    raise
+                except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+                    raise _UnsafeSource("archive_read_failed") from error
+                if written != member.file_size:
+                    raise _UnsafeSource("archive_size_changed")
+        finished = os.fstat(source_stream.fileno())
+        if not _same_open_file(opened, finished) or not _same_open_file(
+            metadata, source.lstat()
+        ):
+            raise _UnsafeSource("archive_source_changed_during_copy")
+    finally:
+        source_stream.close()
+
+
+def _materialize_source(
+    source: Path,
+    stage: Path,
+    *,
+    file_byte_limit: int = _MAX_FILE_BYTES,
+    total_byte_limit: int = _MAX_TOTAL_BYTES,
+    tree_entry_limit: int = _MAX_TREE_ENTRY_COUNT,
+) -> None:
     try:
         metadata = source.lstat()
     except OSError as error:
@@ -310,19 +449,34 @@ def _materialize_source(source: Path, stage: Path) -> None:
             ErrorCategory.INVALID_REQUEST,
             "The document-basic Pack source is unavailable",
         ) from error
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise DomainError(
-            "pack_source_invalid",
-            ErrorCategory.INVALID_REQUEST,
-            "The document-basic Pack source must be a directory",
-        )
     if _is_link_or_reparse(metadata):
         raise DomainError(
             "pack_archive_unsafe",
             ErrorCategory.INVALID_REQUEST,
             "The document-basic Pack source contains unsafe filesystem entries",
         )
-
+    if stat.S_ISREG(metadata.st_mode):
+        try:
+            _materialize_zip_source(
+                source,
+                stage,
+                file_byte_limit=file_byte_limit,
+                total_byte_limit=total_byte_limit,
+                tree_entry_limit=tree_entry_limit,
+            )
+        except _UnsafeSource as error:
+            raise DomainError(
+                "pack_archive_unsafe",
+                ErrorCategory.INVALID_REQUEST,
+                "The document-basic Pack source contains unsafe archive entries",
+            ) from error
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise DomainError(
+            "pack_source_invalid",
+            ErrorCategory.INVALID_REQUEST,
+            "The document-basic Pack source must be a directory",
+        )
     entry_count = 0
     total_bytes = 0
 
@@ -343,7 +497,7 @@ def _materialize_source(source: Path, stage: Path) -> None:
                 raise OSError("unsafe_stage_directory")
             for name in directories:
                 entry_count += 1
-                if entry_count > _MAX_TREE_ENTRY_COUNT:
+                if entry_count > tree_entry_limit:
                     raise _UnsafeSource("source_entry_limit")
                 child = current_path / name
                 _safe_relative(child, source)
@@ -365,7 +519,7 @@ def _materialize_source(source: Path, stage: Path) -> None:
                 file_limit = (
                     _MAX_MANIFEST_BYTES
                     if relative == "manifest.json"
-                    else _MAX_FILE_BYTES
+                    else file_byte_limit
                 )
                 copied = _copy_regular_file(
                     child,
@@ -373,7 +527,7 @@ def _materialize_source(source: Path, stage: Path) -> None:
                     byte_limit=file_limit,
                 )
                 total_bytes += copied
-                if total_bytes > _MAX_TOTAL_BYTES + _MAX_MANIFEST_BYTES:
+                if total_bytes > total_byte_limit + _MAX_MANIFEST_BYTES:
                     raise _UnsafeSource("source_total_limit")
     except DomainError:
         raise
@@ -584,7 +738,11 @@ def install_document_basic_pack(
                 _cleanup_orphans(pack_root, legacy_root)
             active_path = pack_root / "active.json"
             active = _read_active_state(active_path)
-            if active.kind == "valid" and not repair:
+            if (
+                active.kind == "valid"
+                and not repair
+                and _ordinary_directory(source_root)
+            ):
                 requested = verify_document_basic_pack_manifest(
                     source_root,
                     trusted_keys=trusted_keys,

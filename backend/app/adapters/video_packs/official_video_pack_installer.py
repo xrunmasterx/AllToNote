@@ -37,6 +37,9 @@ from app.adapters.video_packs.official_video_pack import OfficialVideoPackContra
 from app.adapters.video_packs.official_video_pack_verifier import (
     PackTrustKey,
     VerifiedOfficialVideoPack,
+    _MAX_FILE_BYTES,
+    _MAX_TOTAL_BYTES,
+    _MAX_TREE_ENTRY_COUNT,
     canonical_receipt_bytes,
     verify_official_video_pack_generation,
     verify_official_video_pack_source,
@@ -296,7 +299,13 @@ def install_official_video_pack(
             if not _ordinary_directory(stage):
                 raise _install_conflict(contract)
             try:
-                _materialize_source(source_root, stage)
+                _materialize_source(
+                    source_root,
+                    stage,
+                    file_byte_limit=_MAX_FILE_BYTES,
+                    total_byte_limit=_MAX_TOTAL_BYTES,
+                    tree_entry_limit=_MAX_TREE_ENTRY_COUNT,
+                )
                 verified = verify_official_video_pack_source(
                     stage,
                     contract=contract,

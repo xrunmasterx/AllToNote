@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -36,6 +37,37 @@ def _paths(tmp_path: Path) -> RuntimePaths:
         state_dir=tmp_path / "state",
         log_dir=tmp_path / "logs",
     )
+
+
+def _archive_source(source: Path, archive: Path) -> Path:
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_file():
+                bundle.writestr(path.relative_to(source).as_posix(), path.read_bytes())
+    return archive
+
+
+@pytest.mark.parametrize("contract", (MEDIA_BASIC, TRANSCRIBE_CPU))
+def test_install_imports_signed_zip_without_preextract(tmp_path: Path, contract) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_pack_source(source, contract, platform_tag=PLATFORM)
+    archive = _archive_source(source, tmp_path / f"{contract.pack_id}.atnpack")
+
+    result = install_official_video_pack(
+        archive,
+        contract=contract,
+        paths=_paths(tmp_path),
+        trusted_keys=trust_keys(),
+        probe=lambda _verified, _stage: None,
+        platform_tag=PLATFORM,
+        environ={},
+    )
+
+    assert result.result == "installed"
+    assert result.generation.joinpath("manifest.json").read_bytes() == (
+        source / "manifest.json"
+    ).read_bytes()
 
 
 @pytest.mark.parametrize("contract", (MEDIA_BASIC, TRANSCRIBE_CPU))
