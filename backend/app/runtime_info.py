@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import platform
-import shutil
 import sqlite3
 from collections.abc import Mapping
 from contextlib import closing
@@ -384,7 +383,59 @@ def runtime_doctor(
     )
 
     if dynamic:
+        checks.extend(_dynamic_video_pack_checks(active_paths))
         checks.extend(_dynamic_checks())
+    return tuple(checks)
+
+
+def _dynamic_video_pack_checks(paths: RuntimePaths) -> tuple[RuntimeCheck, ...]:
+    from app.adapters.video_packs.official_video_pack_probe import (
+        probe_official_video_pack_entrypoints,
+    )
+    from app.adapters.video_packs.official_video_pack_resolver import (
+        OfficialVideoPackResolver,
+    )
+    from app.adapters.video_packs.official_video_pack_trust import (
+        official_video_pack_trust_keys,
+    )
+
+    resolver = OfficialVideoPackResolver(
+        paths,
+        trusted_keys=official_video_pack_trust_keys(),
+    )
+    checks: list[RuntimeCheck] = []
+    for contract in (MEDIA_BASIC, TRANSCRIBE_CPU):
+        code = f"pack.{contract.pack_id}.dynamic"
+        try:
+            resolved = resolver.resolve_active(contract)
+        except DomainError as error:
+            if error.code == "pack_unavailable":
+                continue
+            checks.append(
+                RuntimeCheck(
+                    code,
+                    "fail",
+                    f"Repair or reinstall the compatible {contract.pack_id} Pack",
+                    True,
+                )
+            )
+            continue
+        try:
+            probe_official_video_pack_entrypoints(
+                contract.pack_id,
+                resolved.entrypoints,
+            )
+        except DomainError:
+            checks.append(
+                RuntimeCheck(
+                    code,
+                    "fail",
+                    f"Repair or reinstall the compatible {contract.pack_id} Pack",
+                    True,
+                )
+            )
+        else:
+            checks.append(RuntimeCheck(code, "pass", None, True))
     return tuple(checks)
 
 
@@ -393,18 +444,11 @@ def _dynamic_checks() -> tuple[RuntimeCheck, ...]:
 
     codex_status = CodexAppServerStatusService.get_status()
     codex_ready = bool(codex_status.ready and codex_status.default_model)
-    ffmpeg_ready = shutil.which("ffmpeg") is not None
     return (
         RuntimeCheck(
             "dynamic.model.codex-app-server",
             "pass" if codex_ready else "warn",
             None if codex_ready else "Install or sign in to the local Codex CLI",
-            True,
-        ),
-        RuntimeCheck(
-            "dynamic.tool.ffmpeg",
-            "pass" if ffmpeg_ready else "warn",
-            None if ffmpeg_ready else "Install or configure FFmpeg",
             True,
         ),
     )

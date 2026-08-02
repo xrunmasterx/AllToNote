@@ -98,6 +98,54 @@ def test_pack_doctor_unhealthy_is_completed_diagnostic_with_exit_zero(capsys) ->
     assert envelope["data"]["healthy"] is False
 
 
+def test_pack_doctor_human_output_explains_actionable_checks(capsys) -> None:
+    service = FakePackService()
+    service.doctor_result["installed"] = False
+    service.doctor_result["healthy"] = False
+    service.doctor_result["manifest_sha256"] = None
+    service.doctor_result["checks"] = (
+        {
+            "code": "pack.document-basic.optional",
+            "status": "warn",
+            "action": "Install document-basic when needed",
+            "dynamic": False,
+        },
+        {
+            "code": "pack.document-basic.static",
+            "status": "fail",
+            "action": "Install document-basic",
+            "dynamic": False,
+        },
+    )
+
+    assert main(
+        ["pack", "doctor", "document-basic"],
+        pack_service=service,
+    ) == 0
+    captured = capsys.readouterr()
+
+    assert captured.out == (
+        "document-basic healthy: no\n"
+        "WARN [pack.document-basic.optional]: Install document-basic when needed\n"
+        "FAIL [pack.document-basic.static]: Install document-basic\n"
+    )
+    assert captured.err == ""
+    assert service.install_calls == []
+
+
+def test_pack_doctor_human_output_keeps_all_pass_result_concise(capsys) -> None:
+    service = FakePackService()
+
+    assert main(
+        ["pack", "doctor", "document-basic"],
+        pack_service=service,
+    ) == 0
+    captured = capsys.readouterr()
+
+    assert captured.out == "document-basic healthy: yes\n"
+    assert captured.err == ""
+
+
 def test_pack_install_projects_no_source_or_destination_path(
     tmp_path: Path,
     capsys,

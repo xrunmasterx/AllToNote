@@ -584,3 +584,181 @@ def test_runtime_doctor_dynamic_results_are_structured(
         "action": "Configure the fixture",
         "dynamic": True,
     }
+
+
+def test_runtime_doctor_human_output_explains_non_pass_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        runtime_info_module,
+        "runtime_doctor",
+        lambda *, dynamic: (
+            RuntimeCheck("runtime.contract", "pass", None, False),
+            RuntimeCheck(
+                "pack.media-basic",
+                "warn",
+                "Install media-basic when Video is needed",
+                False,
+            ),
+            RuntimeCheck(
+                "pack.transcribe-cpu.dynamic",
+                "fail",
+                "Repair or reinstall transcribe-cpu",
+                True,
+            ),
+        ),
+    )
+
+    assert main(["runtime", "doctor", "--dynamic"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.out == (
+        "Runtime healthy: no\n"
+        "WARN [pack.media-basic]: Install media-basic when Video is needed\n"
+        "FAIL [pack.transcribe-cpu.dynamic]: Repair or reinstall transcribe-cpu\n"
+    )
+    assert captured.err == ""
+
+
+def test_runtime_doctor_dynamic_probes_resolved_video_packs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.adapters.video_packs.official_video_pack_probe as probe_module
+    import app.adapters.video_packs.official_video_pack_resolver as resolver_module
+
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+    probed: list[str] = []
+
+    class Resolver:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def resolve_active(self, contract: OfficialVideoPackContract) -> object:
+            return type(
+                "Resolved",
+                (),
+                {"entrypoints": {"python": Path(f"{contract.pack_id}.exe")}},
+            )()
+
+    monkeypatch.setattr(
+        runtime_info_module,
+        "official_video_pack_installed",
+        lambda _data_dir, _contract: True,
+    )
+    monkeypatch.setattr(resolver_module, "OfficialVideoPackResolver", Resolver)
+    monkeypatch.setattr(
+        probe_module,
+        "probe_official_video_pack_entrypoints",
+        lambda pack_id, _entrypoints: probed.append(pack_id),
+    )
+    monkeypatch.setattr(runtime_info_module, "_dynamic_checks", lambda: ())
+
+    checks = runtime_doctor(dynamic=True, paths=paths, environ={})
+
+    assert probed == [MEDIA_BASIC.pack_id, TRANSCRIBE_CPU.pack_id]
+    assert next(
+        check for check in checks if check.code == "pack.media-basic.dynamic"
+    ) == RuntimeCheck("pack.media-basic.dynamic", "pass", None, True)
+    assert next(
+        check for check in checks if check.code == "pack.transcribe-cpu.dynamic"
+    ) == RuntimeCheck("pack.transcribe-cpu.dynamic", "pass", None, True)
+
+
+def test_runtime_doctor_dynamic_keeps_absent_optional_video_pack_as_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.adapters.video_packs.official_video_pack_probe as probe_module
+    import app.adapters.video_packs.official_video_pack_resolver as resolver_module
+
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+
+    class Resolver:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def resolve_active(self, contract: OfficialVideoPackContract) -> object:
+            if contract is TRANSCRIBE_CPU:
+                raise DomainError(
+                    "pack_unavailable",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Pack is absent",
+                )
+            return type(
+                "Resolved",
+                (),
+                {"entrypoints": {"python": Path("media-basic.exe")}},
+            )()
+
+    monkeypatch.setattr(
+        runtime_info_module,
+        "official_video_pack_installed",
+        lambda _data_dir, contract: contract is MEDIA_BASIC,
+    )
+    monkeypatch.setattr(resolver_module, "OfficialVideoPackResolver", Resolver)
+    monkeypatch.setattr(
+        probe_module,
+        "probe_official_video_pack_entrypoints",
+        lambda _pack_id, _entrypoints: None,
+    )
+    monkeypatch.setattr(runtime_info_module, "_dynamic_checks", lambda: ())
+
+    checks = runtime_doctor(dynamic=True, paths=paths, environ={})
+
+    transcribe = next(
+        check for check in checks if check.code == "pack.transcribe-cpu"
+    )
+    assert transcribe.status == "warn"
+    assert transcribe.action == (
+        "Install or repair the compatible transcribe-cpu Pack"
+    )
+    assert not any(
+        check.code == "pack.transcribe-cpu.dynamic" for check in checks
+    )
+
+
+def test_runtime_doctor_dynamic_fails_corrupt_video_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.adapters.video_packs.official_video_pack_resolver as resolver_module
+
+    paths = resolve_runtime_paths(local_data_parent=tmp_path / "local")
+
+    class Resolver:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def resolve_active(self, contract: OfficialVideoPackContract) -> object:
+            if contract is MEDIA_BASIC:
+                raise DomainError(
+                    "pack_active_invalid",
+                    ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                    "Pack is corrupt",
+                )
+            raise DomainError(
+                "pack_unavailable",
+                ErrorCategory.WORKSPACE_INCOMPATIBLE,
+                "Pack is absent",
+            )
+
+    monkeypatch.setattr(
+        runtime_info_module,
+        "official_video_pack_installed",
+        lambda _data_dir, _contract: False,
+    )
+    monkeypatch.setattr(resolver_module, "OfficialVideoPackResolver", Resolver)
+    monkeypatch.setattr(runtime_info_module, "_dynamic_checks", lambda: ())
+
+    checks = runtime_doctor(dynamic=True, paths=paths, environ={})
+
+    assert next(
+        check for check in checks if check.code == "pack.media-basic.dynamic"
+    ) == RuntimeCheck(
+        "pack.media-basic.dynamic",
+        "fail",
+        "Repair or reinstall the compatible media-basic Pack",
+        True,
+    )

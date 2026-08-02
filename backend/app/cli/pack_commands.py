@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import os
-import json
-import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
 from app.cli.contracts import ApplicationResult
+from app.cli.diagnostics import human_diagnostic_lines
 from app.core.errors import DomainError, ErrorCategory
 
 
@@ -299,76 +298,11 @@ class _DefaultPackService:
         pack_id: str,
         entrypoints: Mapping[str, Path],
     ) -> None:
-        from app.adapters.video_packs.official_pack_process import (
-            minimal_worker_environment,
+        from app.adapters.video_packs.official_video_pack_probe import (
+            probe_official_video_pack_entrypoints,
         )
 
-        expected = (
-            {"requests": "2.32.3", "yt-dlp": "2026.7.4"}
-            if pack_id == "media-basic"
-            else {
-                "av": "14.2.0",
-                "ctranslate2": "4.6.0",
-                "faster-whisper": "1.1.1",
-                "tokenizers": "0.21.1",
-            }
-        )
-        script = (
-            "import importlib.metadata as m,json;"
-            f"names={tuple(expected)!r};"
-            "versions={n:m.version(n) for n in names};"
-            + (
-                "import yt_dlp,requests;"
-                if pack_id == "media-basic"
-                else "import faster_whisper,ctranslate2,av,tokenizers;"
-            )
-            + "print(json.dumps(versions,sort_keys=True))"
-        )
-        environment = minimal_worker_environment()
-        try:
-            completed = subprocess.run(
-                (str(entrypoints["python"]), "-I", "-B", "-c", script),
-                check=True,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=60,
-                env=environment,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            actual = json.loads(completed.stdout.decode("utf-8"))
-            if actual != expected:
-                raise ValueError("dependency identity mismatch")
-            if pack_id == "media-basic":
-                for name in ("ffmpeg", "ffprobe"):
-                    tool = subprocess.run(
-                        (str(entrypoints[name]), "-version"),
-                        check=True,
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        timeout=30,
-                        env=environment,
-                        creationflags=getattr(
-                            subprocess, "CREATE_NO_WINDOW", 0
-                        ),
-                    )
-                    first_line = tool.stdout.decode(
-                        "utf-8", errors="replace"
-                    ).splitlines()[0]
-                    if not first_line.startswith(f"{name} version 8.1.2"):
-                        raise ValueError("FFmpeg identity mismatch")
-        except (
-            KeyError,
-            OSError,
-            ValueError,
-            UnicodeError,
-            json.JSONDecodeError,
-            subprocess.SubprocessError,
-        ) as error:
-            raise DomainError(
-                "pack_probe_failed",
-                ErrorCategory.WORKSPACE_INCOMPATIBLE,
-                f"The {pack_id} Pack failed its isolated dynamic probe",
-            ) from error
+        probe_official_video_pack_entrypoints(pack_id, entrypoints)
 
 
 def pack_command_result(
@@ -384,6 +318,7 @@ def pack_command_result(
     command = f"pack {command_name}"
     if command_name == "doctor":
         raw = active_service.doctor(dynamic=bool(getattr(args, "dynamic")))
+        checks = tuple(raw.get("checks") or ())
         data = {
             key: raw.get(key)
             for key in (
@@ -393,17 +328,18 @@ def pack_command_result(
                 "healthy",
                 "dynamic",
                 "manifest_sha256",
-                "checks",
             )
         }
+        data["checks"] = checks
         return ApplicationResult(
             command=command,
             correlation_id=correlation_id,
             ok=True,
             data=data,
             versions=versions or {},
-            human_lines=(
+            human_lines=human_diagnostic_lines(
                 f"{data['pack_id']} healthy: {'yes' if data['healthy'] is True else 'no'}",
+                checks,
             ),
         )
 

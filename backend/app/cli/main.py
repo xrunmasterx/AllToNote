@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TextIO
 
 from app.cli.contracts import ApplicationResult, CLI_PROTOCOL_VERSION
+from app.cli.diagnostics import human_diagnostic_lines
 from app.cli.errors import (
     ExitCode,
     MappedCliError,
@@ -1629,6 +1630,7 @@ def _runtime_command_result(
     if args.runtime_command == "doctor":
         checks = runtime_doctor(dynamic=args.dynamic)
         healthy = all(check.status != "fail" for check in checks)
+        check_records = tuple(check.to_mapping() for check in checks)
         return ApplicationResult(
             command=command,
             correlation_id=correlation_id,
@@ -1636,10 +1638,13 @@ def _runtime_command_result(
             data={
                 "healthy": healthy,
                 "dynamic": args.dynamic,
-                "checks": tuple(check.to_mapping() for check in checks),
+                "checks": check_records,
             },
             versions=_versions(),
-            human_lines=(f"Runtime healthy: {'yes' if healthy else 'no'}",),
+            human_lines=human_diagnostic_lines(
+                f"Runtime healthy: {'yes' if healthy else 'no'}",
+                check_records,
+            ),
         )
 
     info = build_runtime_info()
