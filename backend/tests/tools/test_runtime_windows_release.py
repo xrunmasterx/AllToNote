@@ -426,7 +426,7 @@ def test_engine_idle_probe_uses_the_current_host_contract(
 def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     lock = _load_lock(LOCK)
 
-    assert lock["runtime_source_commit"] == "393bc839e87743276eb3eb9f5c9498e46776d22e"
+    assert lock["runtime_source_commit"] == "18eeeddad2ebba98b291e7028aecbf7dcf545b2b"
     assert lock["builder"] == {
         "implementation": "CPython",
         "version": "3.14.0",
@@ -450,8 +450,8 @@ def test_checked_in_lock_freezes_the_validated_runtime_inputs() -> None:
     assert lock["python"]["version"] == "3.14.6"
     assert lock["wheels"][0] == {
         "filename": "alltonote_runtime-0.1.0-py3-none-any.whl",
-        "byte_length": 596009,
-        "sha256": "8d842ca9ea6d9bce48e2396c80048cb171fe53354a44a55b29308a92d235e441",
+        "byte_length": 596993,
+        "sha256": "73fd727f335d81b0899c8a2a7f0bc336205c0f193dd3851a63b8d9a5917db579",
     }
     assert lock["sqlite"] == {
         "version": "3.53.4",
