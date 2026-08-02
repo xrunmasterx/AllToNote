@@ -228,7 +228,17 @@ class DocumentBundleAssembler:
         location: CandidateLocationCapabilityPort,
         source_canonical_identity: str,
         source_id: str | None = None,
+        quality_repair_attempts: int = 0,
     ) -> DocumentCandidate:
+        if (
+            type(quality_repair_attempts) is not int
+            or not 0 <= quality_repair_attempts <= 1
+        ):
+            raise DomainError(
+                "document_quality_repair_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Document quality repair count is invalid",
+            )
         ids = {
             role: self._derived_id(
                 job_id,
@@ -513,7 +523,9 @@ class DocumentBundleAssembler:
                 }
             )
             quality_profile = "alltonote.document-native-extraction"
-            metrics: dict[str, object] = {"quality_repair_attempts": 0}
+            metrics: dict[str, object] = {
+                "quality_repair_attempts": quality_repair_attempts
+            }
         else:
             knowledge_quality_check: dict[str, object]
             if verification is None:
@@ -546,7 +558,7 @@ class DocumentBundleAssembler:
             )
             quality_profile = "alltonote.document-knowledge-note"
             metrics = {
-                "quality_repair_attempts": 0,
+                "quality_repair_attempts": quality_repair_attempts,
                 "referenced_block_count": len(referenced_ids),
                 "substantive_block_count": len(substantive_blocks),
                 "source_coverage_ratio": source_coverage_ratio,
@@ -778,7 +790,7 @@ class DocumentBundleAssembler:
                 "quality": {
                     "overall": quality_overall,
                     "publish_eligible": publish_eligible,
-                    "repair_attempts": 0,
+                    "repair_attempts": quality_repair_attempts,
                 },
                 "redactions": {"source_path": "omitted"},
             }

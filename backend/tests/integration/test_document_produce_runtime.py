@@ -41,6 +41,7 @@ from app.core.application.document_knowledge_compiler import (
 from app.core.application.document_service import (
     CHECKPOINT_SCHEMA,
     DocumentKnowledgeCompilationInput,
+    DocumentKnowledgeRepairInput,
     DocumentKnowledgeVerificationInput,
     DocumentService,
 )
@@ -497,6 +498,68 @@ class _KnowledgeCompiler:
             input_tokens=5,
             output_tokens=5,
             token_counts_complete=True,
+        )
+
+    def repair(
+        self,
+        request: DocumentKnowledgeRepairInput,
+        *,
+        execution,
+    ) -> CompiledDocumentKnowledgeNoteV1:
+        raise AssertionError("repair was not expected")
+
+
+class _RepairingKnowledgeCompiler(_KnowledgeCompiler):
+    def __init__(self) -> None:
+        super().__init__(
+            verifier_provider_profile="reviewer",
+            verifier_model_identity="fixture/reviewer-v1",
+        )
+        self.repair_calls = 0
+        self.verify_calls = 0
+
+    def verify(
+        self,
+        request: DocumentKnowledgeVerificationInput,
+        *,
+        execution,
+    ) -> DocumentKnowledgeVerificationV1:
+        result = super().verify(request, execution=execution)
+        self.verify_calls += 1
+        if self.verify_calls == 1:
+            return replace(
+                result,
+                claims=tuple(
+                    replace(claim, status="insufficient-evidence")
+                    if claim.claim_id == "section-0001-heading-0001"
+                    else claim
+                    for claim in result.claims
+                ),
+            )
+        return result
+
+    def repair(
+        self,
+        request: DocumentKnowledgeRepairInput,
+        *,
+        execution,
+    ) -> CompiledDocumentKnowledgeNoteV1:
+        execution.heartbeat()
+        self.repair_calls += 1
+        assert request.failed_claim_ids == ("section-0001-heading-0001",)
+        return replace(
+            request.compiled,
+            sections=(
+                replace(
+                    request.compiled.sections[0],
+                    heading=replace(
+                        request.compiled.sections[0].heading,
+                        text="Source topic",
+                    ),
+                ),
+            ),
+            input_tokens=request.compiled.input_tokens + 3,
+            output_tokens=request.compiled.output_tokens + 2,
         )
 
 
@@ -1656,6 +1719,56 @@ def test_document_v3_independent_verifier_is_frozen_and_publishable(
     assert completed.result is not None
     assert completed.result.quality_overall == "pass"
     assert completed.result.publish_eligible is True
+
+
+def test_document_v3_repairs_failed_claims_once_and_records_the_attempt(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\nfixture\n")
+    compiler = _RepairingKnowledgeCompiler()
+    service, repository = _service(
+        tmp_path / "machine",
+        _Parser(),
+        IWikiPortableGateway(),
+        owner_id="runtime-one",
+        knowledge_compiler=compiler,
+    )
+    submission = ProduceService(
+        RecipeRegistry(((DOCUMENT_NOTE_V1, DocumentRecipeAdapter(service)),))
+    ).submit(
+        ProduceRequest(
+            1,
+            RecipeKey("alltonote.document-note", 1),
+            InputDescriptor("file", str(source)),
+            str(workspace),
+            ("knowledge-note",),
+            {
+                "provider_profile": "default",
+                "model_override": "fixture/model-v1",
+                "output_language": "en",
+                "verifier_provider_profile": "reviewer",
+                "verifier_model_override": "fixture/reviewer-v1",
+            },
+        )
+    )
+
+    completed = service.wait_job(submission.job_id)
+
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert completed.result.quality_overall == "pass"
+    assert completed.result.publish_eligible is True
+    assert compiler.calls == 1
+    assert compiler.repair_calls == 1
+    assert compiler.verify_calls == 2
+    bundle = workspace / "raw" / "personal" / "bundles" / completed.result.bundle_id
+    quality_file = next((bundle / "quality").glob("*.json"))
+    quality = json.loads(quality_file.read_text(encoding="utf-8"))
+    receipt = json.loads((bundle / "receipt.json").read_text(encoding="utf-8"))
+    assert quality["metrics"]["quality_repair_attempts"] == 1
+    assert receipt["quality"]["repair_attempts"] == 1
 
 
 def test_document_runtime_routes_v2_self_review_and_v3_independent_verifier(

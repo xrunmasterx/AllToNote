@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 from app.core.application.document_knowledge_compiler import (
     CompiledDocumentKnowledgeNoteV1,
-    DocumentKnowledgeClaimV1,
     DocumentCompilationContext,
+    document_knowledge_claims,
 )
 from app.core.application.model_call_coordinator import ModelCallCoordinator
 from app.core.domain.document import ParsedDocument
@@ -49,37 +49,6 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise _invalid_response()
         value[key] = item
     return value
-
-
-def document_knowledge_claims(
-    compiled: CompiledDocumentKnowledgeNoteV1,
-) -> tuple[tuple[str, DocumentKnowledgeClaimV1], ...]:
-    claims: list[tuple[str, DocumentKnowledgeClaimV1]] = [
-        ("title-0001", compiled.title)
-    ]
-    claims.extend(
-        (f"overview-{index:04d}", claim)
-        for index, claim in enumerate(compiled.overview, start=1)
-    )
-    for section_index, section in enumerate(compiled.sections, start=1):
-        claims.append(
-            (f"section-{section_index:04d}-heading-0001", section.heading)
-        )
-        claims.extend(
-            (
-                f"section-{section_index:04d}-paragraph-{index:04d}",
-                claim,
-            )
-            for index, claim in enumerate(section.paragraphs, start=1)
-        )
-        claims.extend(
-            (
-                f"section-{section_index:04d}-key-point-{index:04d}",
-                claim,
-            )
-            for index, claim in enumerate(section.key_points, start=1)
-        )
-    return tuple(claims)
 
 
 def compiled_document_knowledge_sha256(

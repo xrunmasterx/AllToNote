@@ -69,6 +69,7 @@ from app.core.application.produce_service import ProduceService
 from app.core.application.document_service import (
     CHECKPOINT_SCHEMA as DOCUMENT_CHECKPOINT_SCHEMA,
     DocumentKnowledgeCompilationInput,
+    DocumentKnowledgeRepairInput,
     DocumentKnowledgeVerificationInput,
     DocumentService,
 )
@@ -77,6 +78,7 @@ from app.core.application.document_knowledge_compiler import (
     DocumentCompilationContext,
     DocumentKnowledgeCompilationRequestV1,
     DocumentKnowledgeCompiler,
+    DocumentKnowledgeRepairRequestV1,
 )
 from app.core.application.document_knowledge_verifier import (
     DocumentKnowledgeVerificationRequestV1,
@@ -1206,6 +1208,52 @@ class _RuntimeDocumentKnowledgeCompiler:
                 parsed=request.parsed,
                 compiled=request.compiled,
                 model_binding=selected_profile.binding,
+            ),
+            DocumentCompilationContext(
+                execution=ModelCallExecution(
+                    job_id=job_id,
+                    step_id=step_id,
+                    attempt_id=attempt_id,
+                    authority=authority,
+                    heartbeat=heartbeat,
+                ),
+                cancellation_token=CancellationToken(
+                    self.profile.repository,
+                    job_id,
+                ),
+            ),
+        )
+
+    def repair(
+        self,
+        request: DocumentKnowledgeRepairInput,
+        *,
+        execution: object,
+    ) -> CompiledDocumentKnowledgeNoteV1:
+        self.profile.validate_selection(
+            provider_profile=request.provider_profile,
+            model_override=request.model_override,
+        )
+        try:
+            job_id = execution.job_id
+            step_id = execution.step_id
+            attempt_id = execution.attempt_id
+            authority = execution.authority
+            heartbeat = execution.heartbeat
+        except AttributeError:
+            raise DomainError(
+                "document_knowledge_repair_contract_invalid",
+                ErrorCategory.INTERNAL,
+                "Document execution context is invalid",
+            ) from None
+        return self.compiler.repair(
+            DocumentKnowledgeRepairRequestV1(
+                schema_version=1,
+                parsed=request.parsed,
+                compiled=request.compiled,
+                failed_claim_ids=request.failed_claim_ids,
+                output_language=request.output_language,
+                model_binding=self.profile.binding,
             ),
             DocumentCompilationContext(
                 execution=ModelCallExecution(

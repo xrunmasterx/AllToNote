@@ -230,6 +230,16 @@ class DocumentKnowledgeVerificationInput:
     verifier_model_override: str
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentKnowledgeRepairInput:
+    parsed: ParsedDocument
+    compiled: CompiledDocumentKnowledgeNoteV1
+    failed_claim_ids: tuple[str, ...]
+    provider_profile: str
+    model_override: str | None
+    output_language: str
+
+
 class DocumentKnowledgeCompilerPort(Protocol):
     def model_identity(self) -> str: ...
 
@@ -248,6 +258,13 @@ class DocumentKnowledgeCompilerPort(Protocol):
         *,
         execution: CheckpointedStepExecutionContext,
     ) -> DocumentKnowledgeVerificationV1: ...
+
+    def repair(
+        self,
+        request: DocumentKnowledgeRepairInput,
+        *,
+        execution: CheckpointedStepExecutionContext,
+    ) -> CompiledDocumentKnowledgeNoteV1: ...
 
 
 class _DocumentServiceRepositoryPort(
@@ -947,6 +964,7 @@ class DocumentService:
         connector_id, canonical_identity = self._source_identity(request)
         compiled: CompiledDocumentKnowledgeNoteV1 | None = None
         verification: DocumentKnowledgeVerificationV1 | None = None
+        quality_repair_attempts = 0
         if isinstance(request, DocumentKnowledgeProduceRequest):
             compiler = self._require_knowledge_compiler()
             compiled = compiler.compile(
@@ -974,6 +992,66 @@ class DocumentService:
                 ),
                 execution=execution,
             )
+            if (
+                not verification.passed
+                and verification.model_identity != compiled.model_identity
+            ):
+                initial_verification = verification
+                compiled = compiler.repair(
+                    DocumentKnowledgeRepairInput(
+                        parsed=parsed,
+                        compiled=compiled,
+                        failed_claim_ids=tuple(
+                            claim.claim_id
+                            for claim in verification.claims
+                            if claim.status != "supported"
+                        ),
+                        provider_profile=request.provider_profile,
+                        model_override=request.model_override,
+                        output_language=request.output_language,
+                    ),
+                    execution=execution,
+                )
+                quality_repair_attempts = 1
+                verification = compiler.verify(
+                    DocumentKnowledgeVerificationInput(
+                        parsed=parsed,
+                        compiled=compiled,
+                        verifier_provider_profile=(
+                            request.verifier_provider_profile
+                            or request.provider_profile
+                        ),
+                        verifier_model_override=(
+                            request.verifier_model_override
+                            or request.model_override
+                            or compiler.model_identity()
+                        ),
+                    ),
+                    execution=execution,
+                )
+                verification = replace(
+                    verification,
+                    input_tokens=(
+                        initial_verification.input_tokens
+                        + verification.input_tokens
+                    ),
+                    output_tokens=(
+                        initial_verification.output_tokens
+                        + verification.output_tokens
+                    ),
+                    token_counts_complete=(
+                        initial_verification.token_counts_complete
+                        and verification.token_counts_complete
+                    ),
+                    warnings=tuple(
+                        dict.fromkeys(
+                            (
+                                *initial_verification.warnings,
+                                *verification.warnings,
+                            )
+                        )
+                    ),
+                )
         candidate = DocumentBundleAssembler().assemble(
             parsed,
             compiled=compiled,
@@ -987,6 +1065,7 @@ class DocumentService:
                 canonical_identity,
             ),
             source_canonical_identity=canonical_identity,
+            quality_repair_attempts=quality_repair_attempts,
         )
         block_count = sum(len(page.blocks) for page in parsed.pages)
         return DocumentCandidateCheckpoint(

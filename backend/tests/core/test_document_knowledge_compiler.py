@@ -16,6 +16,7 @@ from app.core.application.document_knowledge_compiler import (
     DocumentCompilationContext,
     DocumentKnowledgeCompilationRequestV1,
     DocumentKnowledgeCompiler,
+    DocumentKnowledgeRepairRequestV1,
 )
 from app.core.application.document_knowledge_verifier import (
     DocumentKnowledgeVerificationRequestV1,
@@ -332,6 +333,78 @@ def test_document_compiler_returns_semantic_note_with_separate_evidence(
         "blk_problem",
         "blk_method",
     ]
+
+
+def test_document_compiler_repairs_only_failed_claims_once(
+    tmp_path: Path,
+) -> None:
+    original = _compiled_note(tmp_path / "original")
+    original = replace(
+        original,
+        sections=(
+            replace(
+                original.sections[0],
+                heading=replace(
+                    original.sections[0].heading,
+                    text="Method and repository boundary",
+                ),
+            ),
+        ),
+    )
+    compiler, context, executor = _compiler(tmp_path / "repair", _response())
+
+    repaired = compiler.repair(
+        DocumentKnowledgeRepairRequestV1(
+            schema_version=1,
+            parsed=_document(),
+            compiled=original,
+            failed_claim_ids=("section-0001-heading-0001",),
+            output_language="en",
+            model_binding=_binding(),
+        ),
+        context,
+    )
+
+    assert repaired.sections[0].heading.text == "Method"
+    assert repaired.title == original.title
+    assert repaired.overview == original.overview
+    assert repaired.sections[0].paragraphs == original.sections[0].paragraphs
+    assert repaired.sections[0].key_points == original.sections[0].key_points
+    assert repaired.input_tokens == 240
+    assert repaired.output_tokens == 160
+    assert len(executor.requests) == 1
+    assert executor.requests[0].stage_id == "document-knowledge-repair"
+    assert executor.requests[0].prompt_version == 1
+    payload = json.loads(executor.requests[0].user_content)
+    assert payload["failed_claim_ids"] == ["section-0001-heading-0001"]
+    assert "byte-for-byte unchanged" in executor.requests[0].system_instruction
+
+
+def test_document_compiler_repair_rejects_changes_to_supported_claims(
+    tmp_path: Path,
+) -> None:
+    original = _compiled_note(tmp_path / "original")
+    response = _response()
+    response["title"] = {
+        "text": "Changed supported title",
+        "source_block_ids": ["blk_title"],
+    }
+    compiler, context, _executor = _compiler(tmp_path / "repair", response)
+
+    with pytest.raises(DomainError) as caught:
+        compiler.repair(
+            DocumentKnowledgeRepairRequestV1(
+                schema_version=1,
+                parsed=_document(),
+                compiled=original,
+                failed_claim_ids=("section-0001-heading-0001",),
+                output_language="en",
+                model_binding=_binding(),
+            ),
+            context,
+        )
+
+    assert caught.value.code == "document_knowledge_repair_changed_supported_claim"
 
 
 def test_document_compiler_accepts_success_from_production_legacy_executor(
