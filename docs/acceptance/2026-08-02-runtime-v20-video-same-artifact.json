@@ -1,0 +1,238 @@
+{
+  "acceptance_schema": "alltonote.video.same-artifact.v1",
+  "status": "candidate-pass",
+  "recorded_at": "2026-08-02T03:10:00Z",
+  "scope": {
+    "candidate": "runtime-portable-video-current-v20",
+    "host": "windows-x86_64-current-user",
+    "capacity": 1,
+    "unsigned_portable": true,
+    "public_release": false,
+    "claim": "The exact V20 Runtime and two signed Video Packs completed the project-owned local fixture and the three frozen anonymous Bilibili inputs through the media-download plus CPU-ASR branch."
+  },
+  "runtime": {
+    "source_commit": "68d517f1fb5e0ce79429c36e56cb7b3c2acbd447",
+    "version": "0.1.0",
+    "platform": "windows-x86_64",
+    "python": "3.14.6",
+    "sqlite": "3.53.4",
+    "source_archive": {
+      "byte_length": 1718703,
+      "sha256": "d1884d3a3e3cd8bd5ec22c3b4103e96c29baadf5a7edd2aa2f45f9f6f1f4ef34"
+    },
+    "wheel": {
+      "filename": "alltonote_runtime-0.1.0-py3-none-any.whl",
+      "byte_length": 601241,
+      "sha256": "ea2228ca8d4e4bb3203ba73d93eec2e425e42bf86508af108c9ff50f1da62792"
+    },
+    "candidate_manifest": {
+      "sha256": "c1369d1603d2248ffc1bb07d028e7a1e860873b1289dc130640e52a6cbed1956",
+      "file_count": 715,
+      "total_bytes": 41084745,
+      "verified_before_and_after_jobs": true
+    },
+    "built_in_gates": {
+      "builder_toolchain": true,
+      "wheel_install_attestation": true,
+      "engine_lifecycle": true,
+      "unicode_workspace_init": true,
+      "sqlite_wal": true,
+      "legacy_jobstore_migration": true
+    }
+  },
+  "packs": [
+    {
+      "pack_id": "media-basic",
+      "version": "yt-dlp-2026.7.4-ffmpeg-8.1.2-r1",
+      "manifest_sha256": "sha256:c50a8edb2b530b70fdccade4fb7ddfebf8c3a6792702e660eb85f69f5c189e24",
+      "dynamic_doctor_before": "pass",
+      "dynamic_doctor_after": "pass"
+    },
+    {
+      "pack_id": "transcribe-cpu",
+      "version": "faster-whisper-1.1.1-small-536b0662-r1",
+      "manifest_sha256": "sha256:d47c7568cc0e27b4f75fb63b86a8195ddc09a1f260e9512238e17220b8e3f970",
+      "transcriber_identity": "faster-whisper/1.1.1/small/cpu-int8@536b0662742c02347bc0e980a01041f333bce120",
+      "dynamic_doctor_before": "pass",
+      "dynamic_doctor_after": "pass"
+    }
+  ],
+  "configuration": {
+    "provider_profile": "composer",
+    "provider_type": "codex-app-server",
+    "model": "gpt-5.6-sol",
+    "verifier_profile": "verifier",
+    "verifier_model": "gpt-5.6-terra",
+    "output_language": "zh-CN",
+    "quality": "balanced",
+    "style": "structured",
+    "screenshots": "off",
+    "plaintext_secret_copied": false
+  },
+  "samples": [
+    {
+      "sample_id": "LOCAL-01",
+      "input": "project-owned-local-course.mp4",
+      "source_sha256": "sha256:4493bc26df912798b56a754ede158f229970d2ecb81d2892c13aed058b2ac08e",
+      "source_duration_ms": 12000,
+      "job_id": "job_019fc059-e593-7943-af2b-0290d9125e03",
+      "bundle_id": "bnd_019fc059-e593-73dc-8d76-47796eb850ff",
+      "draft_id": "art_019fc059-e593-772f-9e77-901b69c884d7",
+      "job_wall_ms": 74345,
+      "state": "succeeded",
+      "quality": "pass",
+      "publish_eligible": true,
+      "retry_of_job_id": null
+    },
+    {
+      "sample_id": "V01",
+      "input_identity": "BV1Np3j6QEQc:p=1",
+      "source_duration_ms": 534801,
+      "subtitle_acquisition": "generated",
+      "transcript_basis": "asr-transcript",
+      "job_id": "job_019fc05b-9eb6-79bb-8ca7-c3b8283670d6",
+      "run_id": "run_019fc05b-9eb6-7ecb-a42e-dab5eeefd91a",
+      "bundle_id": "bnd_019fc05b-9eb6-7c39-985f-fd493b651205",
+      "draft_id": "art_019fc05b-9eb6-7950-8976-43b86c483579",
+      "draft_sha256": "sha256:33b8066ca544d640b9deb688cee4cddfb1e0e3d97fdafdbe2b430de479634395",
+      "job_wall_ms": 427635,
+      "stage_ms": {
+        "acquire": 9428,
+        "normalize_transcript": 154432,
+        "generate_draft": 254850
+      },
+      "state": "succeeded",
+      "quality": "pass",
+      "publish_eligible": true,
+      "model_calls": 1,
+      "repair_operations": 0,
+      "canonical_bytes": 42546,
+      "reading_bytes": 11500,
+      "evidence_ids": 275,
+      "reading_system_evidence_markers": 0,
+      "audit_system_evidence_markers": 550,
+      "review_locator_pass": true,
+      "retry_of_job_id": null
+    },
+    {
+      "sample_id": "V02",
+      "input_identity": "BV1jbXKBGECC:p=1",
+      "source_duration_ms": 276201,
+      "subtitle_acquisition": "generated",
+      "transcript_basis": "asr-transcript",
+      "job_id": "job_019fc062-fa97-7851-bdb2-ceba5a486cf2",
+      "run_id": "run_019fc062-fa97-73e0-87b4-a641ef43a061",
+      "bundle_id": "bnd_019fc062-fa97-76e6-a646-d4952e3fa042",
+      "draft_id": "art_019fc062-fa97-783e-a427-473a32b85f86",
+      "draft_sha256": "sha256:fb76fde6c9eb9ffebf3246dea699288bd94cb75c2a5e27e074e8b5f13907642c",
+      "job_wall_ms": 294269,
+      "stage_ms": {
+        "acquire": 6175,
+        "normalize_transcript": 98777,
+        "generate_draft": 180818
+      },
+      "state": "succeeded",
+      "quality": "pass",
+      "publish_eligible": true,
+      "model_calls": 1,
+      "repair_operations": 0,
+      "canonical_bytes": 28406,
+      "reading_bytes": 7755,
+      "evidence_ids": 183,
+      "reading_system_evidence_markers": 0,
+      "audit_system_evidence_markers": 366,
+      "terminology": {
+        "DeepSeek": 1,
+        "OpenClaw": 5,
+        "Claude Code": 4,
+        "DBC": 0,
+        "OpenCrawl": 0,
+        "OpenCrew": 0,
+        "Cloud Code": 0
+      },
+      "review_locator_pass": true,
+      "retry_of_job_id": null
+    },
+    {
+      "sample_id": "V03",
+      "input_identity": "BV1jDKH6gE3b:p=1",
+      "source_duration_ms": 691652,
+      "subtitle_acquisition": "generated",
+      "transcript_basis": "asr-transcript",
+      "job_id": "job_019fc067-f904-7d8f-9d75-f2cf3f98b047",
+      "run_id": "run_019fc067-f904-786b-aabb-5689872d886d",
+      "bundle_id": "bnd_019fc067-f904-7cfd-ba6c-9e2fdd62ecfd",
+      "draft_id": "art_019fc067-f904-70f4-8a02-0de82aa8f3c2",
+      "draft_sha256": "sha256:9c78bd908ab629b37c50d875283cc1b6297774311ba193169204a3e2eae37088",
+      "job_wall_ms": 474784,
+      "stage_ms": {
+        "acquire": 9063,
+        "normalize_transcript": 186197,
+        "generate_draft": 270415
+      },
+      "state": "succeeded",
+      "quality": "pass",
+      "publish_eligible": true,
+      "model_calls": 3,
+      "sequential_waves": 2,
+      "repair_operations": 0,
+      "canonical_bytes": 16316,
+      "reading_bytes": 8990,
+      "evidence_ids": 65,
+      "reading_system_evidence_markers": 0,
+      "audit_system_evidence_markers": 130,
+      "terminology": {
+        "Claude Code": 9,
+        "Grok": 1,
+        "Issues": 2,
+        "Cloud Code": 0,
+        "Omapad": 0,
+        "Growk": 0,
+        "Asus": 0
+      },
+      "review_locator_pass": true,
+      "retry_of_job_id": null
+    }
+  ],
+  "reliability": {
+    "engine_restart": {
+      "stopped_cleanly": true,
+      "new_engine_id_observed": true,
+      "v03_result_refs_equal_before_after": true
+    },
+    "cancel": {
+      "job_id": "job_019fc070-75b2-78c5-97c1-ca6bcaedd75d",
+      "final_state": "cancelled",
+      "result_refs": null,
+      "cancel_latency_ms": 689,
+      "wait_error_code": "job_cancelled"
+    },
+    "retry": {
+      "parent_job_id": "job_019fc070-75b2-78c5-97c1-ca6bcaedd75d",
+      "child_job_id": "job_019fc071-4ea4-7261-b621-3b87595acb14",
+      "child_bundle_id": "bnd_019fc071-4ea4-7f87-80c5-acc0239d62a8",
+      "child_state": "succeeded",
+      "child_wall_ms": 67352,
+      "pack_snapshot_equal": true,
+      "input_snapshot_equal": true,
+      "cross_job_checkpoint_resume_claimed": false
+    }
+  },
+  "immutability": {
+    "runtime_manifest_before_after_equal": true,
+    "media_pack_source_manifest_before_after_equal": true,
+    "transcribe_pack_source_manifest_before_after_equal": true,
+    "local_fixture_before_after_equal": true,
+    "post_run_runtime_dynamic_doctor": "pass",
+    "post_run_pack_dynamic_doctors": "pass"
+  },
+  "known_limits": [
+    "The three frozen Bilibili inputs had no platform subtitle and do not prove a subtitle-positive live path.",
+    "The current run used an already logged-in Codex app-server session on the current Windows user and is not a clean-user or clean-VM certification.",
+    "The candidate is an unsigned portable directory, not an Authenticode-signed installer or updater.",
+    "Pack online discovery, download, update, rollback, remove, and clean uninstall were not exercised.",
+    "Only Bilibili and the local connector were exercised; YouTube, Douyin, Kuaishou, screenshots, parallel capacity, and multi-user operation remain unclaimed.",
+    "Provider token usage was unavailable, so exact model cost and token budgets could not be certified.",
+    "Fresh V20 drafts received automated quality and targeted terminology/readability checks; the user's earlier V01/V02/V03 keep decisions were not silently reused as a new manual rating."
+  ]
+}
