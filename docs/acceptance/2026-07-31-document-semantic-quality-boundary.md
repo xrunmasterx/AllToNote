@@ -22,6 +22,10 @@ Draft，并要求每个生成条目引用真实存在的 `source_block_ids`。Bu
   不同时，持久化 schema v3 请求；只有独立 review、extraction、source/page
   coverage 和全部 claim verdict 同时通过，才允许
   `quality.overall=pass` 与 `publish_eligible=true`；
+- 标题与章节标题仍是必须引用来源、必须获得 `supported` 的 claim，但它们的
+  角色是结构性标签：只要是所引 block 的忠实简洁概括且没有新增事实，就不
+  要求逐字出现；overview、paragraph 和 key point 仍按每个实质性细节均由
+  所引 block 蕴含的事实标准复核；
 - Publisher 不得把“引用 ID 存在”或“覆盖率达标”解释为事实一致性通过。
 
 ## 回归证明
@@ -48,6 +52,12 @@ block，并把 verdict 绑定到 compiled note digest、source/parser identity �
 ModelCallCoordinator shard，可分别
 恢复而不重复成功的付费调用。Quality Artifact 记录 `method=model`，Knowledge
 Map 保存逐 claim verdict。
+
+2026-08-02 的 V16 真实中文表格 PDF 失败证据进一步区分了结构标签与事实
+claim：编写器现在要求 overview、paragraph 和 key point 的每个实质性细节都被
+该条目的引用 block 支持，否则应删除该细节；验证请求显式携带
+`structural-label` 或 `factual` 角色。该变化没有放宽 `passed` 条件，任何 claim 的 `unsupported`、
+`insufficient-evidence` 或 `contradicted` 仍会使自动发布失败。
 
 产品 Runtime 现在支持可选的独立 verifier binding。未配置时继续接受并生成
 schema v2 请求，保持同模型 advisory；配置有效且不同的 verifier profile/model

@@ -311,6 +311,7 @@ def test_document_compiler_returns_semantic_note_with_separate_evidence(
     assert result.output_tokens == 80
     assert len(executor.requests) == 1
     assert executor.requests[0].stage_id == "document-knowledge-compose"
+    assert executor.requests[0].prompt_version == 2
     payload = json.loads(executor.requests[0].user_content)
     assert [block["block_id"] for block in payload["source_blocks"]] == [
         "blk_title",
@@ -318,6 +319,8 @@ def test_document_compiler_returns_semantic_note_with_separate_evidence(
         "blk_method",
     ]
     assert "untrusted source data" in executor.requests[0].system_instruction
+    instruction = executor.requests[0].system_instruction.lower()
+    assert "every material detail" in instruction and "cited blocks" in instruction
     assert "[^blk_" not in json.dumps(result.to_dict())
     assert "uniqueItems" not in executor.requests[0].response_schema_json
     schema = json.loads(executor.requests[0].response_schema_json)
@@ -538,14 +541,42 @@ def test_document_verifier_checks_every_claim_against_only_its_cited_blocks(
     assert len(result.claims) == 5
     assert len(executor.requests) == 1
     assert executor.requests[0].stage_id == "document-knowledge-verify"
+    assert executor.requests[0].prompt_version == 2
     payload = json.loads(executor.requests[0].user_content)
     overview = next(
         claim for claim in payload["claims"] if claim["claim_id"] == "overview-0001"
     )
+    title = next(
+        claim for claim in payload["claims"] if claim["claim_id"] == "title-0001"
+    )
+    heading = next(
+        claim
+        for claim in payload["claims"]
+        if claim["claim_id"] == "section-0001-heading-0001"
+    )
+    paragraph = next(
+        claim
+        for claim in payload["claims"]
+        if claim["claim_id"] == "section-0001-paragraph-0001"
+    )
+    key_point = next(
+        claim
+        for claim in payload["claims"]
+        if claim["claim_id"] == "section-0001-key-point-0001"
+    )
     assert overview["cited_sources"] == [
         {"block_id": "blk_problem", "text": "P" * 32}
     ]
+    assert title["claim_role"] == "structural-label"
+    assert heading["claim_role"] == "structural-label"
+    assert overview["claim_role"] == "factual"
+    assert paragraph["claim_role"] == "factual"
+    assert key_point["claim_role"] == "factual"
     assert "only against its cited source" in executor.requests[0].system_instruction
+    assert (
+        "structural-label" in executor.requests[0].system_instruction
+        and "no new factual detail" in executor.requests[0].system_instruction
+    )
 
 
 def test_document_verifier_fails_closed_when_any_claim_is_not_supported(

@@ -28,7 +28,7 @@ from app.core.domain.document import (
     DocumentPage,
     ParsedDocument,
 )
-from app.core.domain.ids import new_typed_id
+from app.core.domain.ids import new_typed_id, sha256_digest
 from app.core.errors import DomainError, ErrorCategory
 from app.core.portable.document_bundle_assembler import DocumentBundleAssembler
 from app.core.portable.markdown_safety import validate_markdown_safety
@@ -799,6 +799,11 @@ def test_semantically_verified_document_is_publishable_and_auditable(
             / "knowledge-map.json"
         ).read_text(encoding="utf-8")
     )
+    receipt = json.loads(
+        (candidate.candidate.absolute_path / "receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
 
     assert gateway.validate_candidate(
         workspace,
@@ -810,6 +815,14 @@ def test_semantically_verified_document_is_publishable_and_auditable(
     assert checks["knowledge-note-quality"] == "pass"
     assert checks["source-coverage"] == "pass"
     assert quality["method"] == {"kind": "model"}
+    assert receipt["parameters"]["sha256"] == sha256_digest(
+        "document-knowledge-note-v2"
+    )
+    assert [
+        executor["identity"]
+        for executor in receipt["executors"]
+        if executor["kind"] == "model"
+    ] == ["fixture/model-v1", "fixture/verifier-v1"]
     assert knowledge_map["semantic_verification"]["model_identity"] == (
         "fixture/verifier-v1"
     )
@@ -817,3 +830,66 @@ def test_semantically_verified_document_is_publishable_and_auditable(
         claim["status"] == "supported"
         for claim in knowledge_map["semantic_verification"]["claims"]
     )
+
+
+def test_factual_failure_blocks_publish_even_when_structural_labels_pass(
+    tmp_path: Path,
+) -> None:
+    workspace = _candidate_workspace(tmp_path)
+    parsed = _document_with_blocks(
+        ("section_header", "Source title"),
+        ("paragraph", "The source states the problem and method."),
+    )
+    compiled = _compiled_note()
+    verification = _verification(compiled, parsed=parsed)
+    factual_claim_id = "section-0001-key-point-0001"
+    verification = replace(
+        verification,
+        claims=tuple(
+            replace(claim, status="insufficient-evidence")
+            if claim.claim_id == factual_claim_id
+            else claim
+            for claim in verification.claims
+        ),
+    )
+
+    candidate = DocumentBundleAssembler().assemble(
+        parsed,
+        compiled=compiled,
+        verification=verification,
+        job_id=new_typed_id("job"),
+        created_at="2026-07-31T00:00:00.000Z",
+        source_canonical_identity="sha256:" + "f" * 64,
+        location=IWikiPortableGateway().candidate_location(
+            workspace,
+            local_instance_id="document-factual-quality",
+            nonce="fixture",
+        ),
+    )
+    quality = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "quality"
+            / f"{candidate.quality_report_artifact_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+    knowledge_map = json.loads(
+        (
+            candidate.candidate.absolute_path
+            / "evidence"
+            / "knowledge-map.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert candidate.quality_overall == "fail"
+    assert candidate.publish_eligible is False
+    checks = {value["id"]: value["status"] for value in quality["checks"]}
+    assert checks["knowledge-note-quality"] == "fail"
+    assert quality["messages"].count("knowledge-note-semantic-quality") == 1
+    stored_claims = {
+        claim["claim_id"]: claim["status"]
+        for claim in knowledge_map["semantic_verification"]["claims"]
+    }
+    assert stored_claims[factual_claim_id] == "insufficient-evidence"
+    assert stored_claims["title-0001"] == "supported"
+    assert stored_claims["section-0001-heading-0001"] == "supported"

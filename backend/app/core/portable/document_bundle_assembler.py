@@ -730,7 +730,7 @@ class DocumentBundleAssembler:
                 "recipe": {"id": "alltonote.document-note", "version": 1},
                 "parameters": {
                     "sha256": sha256_digest(
-                        "document-knowledge-note-v1"
+                        "document-knowledge-note-v2"
                         if compiled is not None
                         else "document-first-slice-v1"
                     ),
@@ -750,6 +750,16 @@ class DocumentBundleAssembler:
                             }
                         ]
                         if compiled is not None
+                        else []
+                    ),
+                    *(
+                        [
+                            {
+                                "kind": "model",
+                                "identity": verification.model_identity,
+                            }
+                        ]
+                        if verification is not None
                         else []
                     ),
                 ],
