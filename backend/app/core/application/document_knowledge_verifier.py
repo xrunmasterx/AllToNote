@@ -22,7 +22,7 @@ from app.core.ports.model_executor import (
 )
 
 
-_STAGE_VERSION = 1
+_STAGE_VERSION = 2
 _PROMPT_VERSION = 2
 _PARSER_VERSION = 1
 _DEFAULT_MAX_SOURCE_BYTES = 384 * 1024
@@ -147,6 +147,7 @@ class DocumentKnowledgeVerificationRequestV1:
     parsed: ParsedDocument = field(repr=False)
     compiled: CompiledDocumentKnowledgeNoteV1 = field(repr=False)
     model_binding: ModelExecutionBinding
+    claim_ids: tuple[str, ...] | None = None
     max_source_bytes: int = _DEFAULT_MAX_SOURCE_BYTES
     max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES
     max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS
@@ -158,6 +159,18 @@ class DocumentKnowledgeVerificationRequestV1:
             or not isinstance(self.parsed, ParsedDocument)
             or not isinstance(self.compiled, CompiledDocumentKnowledgeNoteV1)
             or not isinstance(self.model_binding, ModelExecutionBinding)
+            or (
+                self.claim_ids is not None
+                and (
+                    type(self.claim_ids) is not tuple
+                    or not self.claim_ids
+                    or any(
+                        type(claim_id) is not str or not claim_id
+                        for claim_id in self.claim_ids
+                    )
+                    or len(self.claim_ids) != len(set(self.claim_ids))
+                )
+            )
             or type(self.max_source_bytes) is not int
             or self.max_source_bytes < 1
             or type(self.max_response_bytes) is not int
@@ -307,7 +320,24 @@ class DocumentKnowledgeVerifier:
             for page in request.parsed.pages
             for block in page.blocks
         }
-        claims = document_knowledge_claims(request.compiled)
+        all_claims = document_knowledge_claims(request.compiled)
+        all_claim_ids = tuple(claim_id for claim_id, _claim in all_claims)
+        if request.claim_ids is not None and not set(request.claim_ids).issubset(
+            all_claim_ids
+        ):
+            raise DomainError(
+                "document_knowledge_verification_contract_invalid",
+                ErrorCategory.INVALID_REQUEST,
+                "Document semantic verification request is invalid",
+            )
+        selected_claim_ids = (
+            frozenset(request.claim_ids)
+            if request.claim_ids is not None
+            else frozenset(all_claim_ids)
+        )
+        claims = tuple(
+            claim for claim in all_claims if claim[0] in selected_claim_ids
+        )
         claim_ids = tuple(claim_id for claim_id, _claim in claims)
         payload = {
             "claims": [

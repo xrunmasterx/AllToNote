@@ -228,6 +228,7 @@ class DocumentKnowledgeVerificationInput:
     compiled: CompiledDocumentKnowledgeNoteV1
     verifier_provider_profile: str
     verifier_model_override: str
+    claim_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1026,11 +1027,34 @@ class DocumentService:
                             or request.model_override
                             or compiler.model_identity()
                         ),
+                        claim_ids=tuple(
+                            claim.claim_id
+                            for claim in initial_verification.claims
+                            if claim.status != "supported"
+                        ),
                     ),
                     execution=execution,
                 )
+                repaired_claims = {
+                    claim.claim_id: claim for claim in verification.claims
+                }
+                failed_claim_ids = tuple(
+                    claim.claim_id
+                    for claim in initial_verification.claims
+                    if claim.status != "supported"
+                )
+                if tuple(repaired_claims) != failed_claim_ids:
+                    raise DomainError(
+                        "document_knowledge_verification_response_invalid",
+                        ErrorCategory.RECIPE_FAILED,
+                        "The Document semantic verification response violated its strict contract",
+                    )
                 verification = replace(
                     verification,
+                    claims=tuple(
+                        repaired_claims.get(claim.claim_id, claim)
+                        for claim in initial_verification.claims
+                    ),
                     input_tokens=(
                         initial_verification.input_tokens
                         + verification.input_tokens

@@ -517,6 +517,7 @@ class _RepairingKnowledgeCompiler(_KnowledgeCompiler):
         )
         self.repair_calls = 0
         self.verify_calls = 0
+        self.verification_claim_ids: list[tuple[str, ...] | None] = []
 
     def verify(
         self,
@@ -526,6 +527,15 @@ class _RepairingKnowledgeCompiler(_KnowledgeCompiler):
     ) -> DocumentKnowledgeVerificationV1:
         result = super().verify(request, execution=execution)
         self.verify_calls += 1
+        self.verification_claim_ids.append(request.claim_ids)
+        if request.claim_ids is not None:
+            selected = frozenset(request.claim_ids)
+            result = replace(
+                result,
+                claims=tuple(
+                    claim for claim in result.claims if claim.claim_id in selected
+                ),
+            )
         if self.verify_calls == 1:
             return replace(
                 result,
@@ -1763,12 +1773,23 @@ def test_document_v3_repairs_failed_claims_once_and_records_the_attempt(
     assert compiler.calls == 1
     assert compiler.repair_calls == 1
     assert compiler.verify_calls == 2
+    assert compiler.verification_claim_ids == [
+        None,
+        ("section-0001-heading-0001",),
+    ]
     bundle = workspace / "raw" / "personal" / "bundles" / completed.result.bundle_id
     quality_file = next((bundle / "quality").glob("*.json"))
     quality = json.loads(quality_file.read_text(encoding="utf-8"))
     receipt = json.loads((bundle / "receipt.json").read_text(encoding="utf-8"))
+    knowledge_map = json.loads(
+        (bundle / "evidence" / "knowledge-map.json").read_text(encoding="utf-8")
+    )
     assert quality["metrics"]["quality_repair_attempts"] == 1
     assert receipt["quality"]["repair_attempts"] == 1
+    assert all(
+        claim["status"] == "supported"
+        for claim in knowledge_map["semantic_verification"]["claims"]
+    )
 
 
 def test_document_runtime_routes_v2_self_review_and_v3_independent_verifier(

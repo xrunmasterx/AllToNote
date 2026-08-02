@@ -1208,6 +1208,7 @@ class _RuntimeDocumentKnowledgeCompiler:
                 parsed=request.parsed,
                 compiled=request.compiled,
                 model_binding=selected_profile.binding,
+                claim_ids=request.claim_ids,
             ),
             DocumentCompilationContext(
                 execution=ModelCallExecution(

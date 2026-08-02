@@ -674,6 +674,33 @@ def test_document_verifier_fails_closed_when_any_claim_is_not_supported(
     assert result.claims[3].status == "insufficient-evidence"
 
 
+def test_document_verifier_can_target_only_the_repaired_claim(
+    tmp_path: Path,
+) -> None:
+    compiled = _compiled_note(tmp_path / "compile")
+    claim_id = "section-0001-paragraph-0001"
+    verifier, context, executor = _verifier(
+        tmp_path / "verify",
+        {"claims": [{"claim_id": claim_id, "status": "supported"}]},
+    )
+
+    result = verifier.verify(
+        DocumentKnowledgeVerificationRequestV1(
+            schema_version=1,
+            parsed=_document(),
+            compiled=compiled,
+            model_binding=_binding(),
+            claim_ids=(claim_id,),
+        ),
+        context,
+    )
+
+    assert result.passed is True
+    assert tuple(claim.claim_id for claim in result.claims) == (claim_id,)
+    payload = json.loads(executor.requests[0].user_content)
+    assert [claim["claim_id"] for claim in payload["claims"]] == [claim_id]
+
+
 @pytest.mark.parametrize(
     "claims",
     (
