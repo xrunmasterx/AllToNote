@@ -461,6 +461,7 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
         timeout_seconds=0.75,
         output_schema={"type": "object"},
         reasoning_effort="medium",
+        image_webp=(b"RIFF1234WEBPtest",),
     )
 
     assert result == "# Note"
@@ -469,6 +470,9 @@ def test_run_markdown_turn_sends_thread_id_from_thread_start_response(monkeypatc
     assert turn_start["params"]["threadId"] == "thread-123"
     assert turn_start["params"]["outputSchema"] == {"type": "object"}
     assert turn_start["params"]["effort"] == "medium"
+    assert turn_start["params"]["input"][1] == {
+        "type": "image", "url": "data:image/webp;base64,UklGRjEyMzRXRUJQdGVzdA=="
+    }
 
 
 def test_completed_turn_with_empty_markdown_has_known_outcome(monkeypatch):

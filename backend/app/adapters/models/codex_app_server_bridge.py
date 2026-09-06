@@ -38,6 +38,7 @@ class CodexAppServerTurnClient(Protocol):
         output_schema: dict[str, object] | None = None,
         reasoning_effort: str | None = None,
         check_cancelled: Callable[[], None] | None = None,
+        image_webp: tuple[bytes, ...] = (),
     ) -> str: ...
 
 
@@ -122,6 +123,7 @@ class CodexAppServerCompletionBridge:
                 output_schema=output_schema,
                 reasoning_effort=self._reasoning_effort(request.stage_id),
                 check_cancelled=check_cancelled,
+                **({"image_webp": request.image_webp} if request.image_webp else {}),
             )
         except CodexAppServerError as error:
             if error.outcome_known and error.code == "invalid_json_schema":

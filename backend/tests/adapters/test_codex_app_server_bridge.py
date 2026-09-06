@@ -73,6 +73,24 @@ class _Token:
         return None
 
 
+def test_complete_request_forwards_actual_image_bytes_to_app_server() -> None:
+    class ImageClient:
+        def run_markdown_turn(self, prompt, model, **kwargs):
+            assert kwargs["image_webp"] == (b"RIFF1234WEBPtest",)
+            assert kwargs["cwd"] is None
+            assert model == "gpt-5.5-codex"
+            return "Visible chart"
+
+    bridge = CodexAppServerCompletionBridge(model_identity="gpt-5.5-codex", client=ImageClient())
+    request = ModelExecutionRequest(
+        schema_version=1, stage_id="visual-analyze", stage_version=1,
+        prompt_id="visual-analyze", prompt_version=1, system_instruction="Inspect images",
+        user_content="Frame one", output_mode=ModelOutputMode.TEXT,
+        max_output_tokens=100, timeout_seconds=60, image_webp=(b"RIFF1234WEBPtest",),
+    )
+    assert bridge.complete_request("Inspect", request).markdown == "Visible chart"
+
+
 def test_complete_once_maps_one_call_to_one_frozen_codex_turn() -> None:
     client = _FakeClient(lambda _prompt, _model: "# Note\n\nBody")
     bridge = CodexAppServerCompletionBridge(

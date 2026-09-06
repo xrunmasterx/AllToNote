@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import base64
+import atexit
+
+from collections import deque
 from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import json
 import math
@@ -13,6 +18,8 @@ import time
 from typing import Any, Optional
 
 from app.services.codex_app_server import CodexAppServerStatusService
+from app.gpt.model_slots import model_call_slot
+from app.adapters.worker_process import _CREATE_SUSPENDED, _WindowsJob
 
 
 class CodexAppServerError(RuntimeError):
@@ -38,10 +45,30 @@ class CodexTurnState:
     error: Optional[str] = None
     error_code: Optional[str] = None
     error_outcome_known: bool = False
+    thread_id: str | None = None
+    filter_thread: bool = False
+
+
+@dataclass(eq=False)
+class _Connection:
+    process: subprocess.Popen[str]
+    messages: queue.Queue
+    stderr: deque[str]
+    readers: tuple[threading.Thread, threading.Thread]
+    cwd: str
+    windows_job: _WindowsJob | None = None
+    initialized: bool = False
+    reusable: bool = False
+    request_id: int = 0
+
+    def next_id(self) -> int:
+        self.request_id += 1
+        return self.request_id
 
 
 class CodexAppServerClient:
-    def __init__(self, codex_bin: Optional[str] = None, timeout_seconds: int = 600):
+    def __init__(self, codex_bin: Optional[str] = None, timeout_seconds: int = 600,
+                 *, pool_size: int = 0, machine_slot_root: Path | None = None):
         self.codex_bin = codex_bin or CodexAppServerStatusService.find_codex_bin()
         if not self.codex_bin:
             raise CodexAppServerError(
@@ -49,6 +76,142 @@ class CodexAppServerClient:
             )
         self.timeout_seconds = timeout_seconds
         self._turn_local = threading.local()
+        if type(pool_size) is not int or pool_size < 0:
+            raise ValueError("invalid_codex_pool_size")
+        self._pool_size = pool_size
+        self._machine_slot_root = machine_slot_root
+        self._condition = threading.Condition()
+        self._idle: list[_Connection] = []
+        self._connections: set[_Connection] = set()
+        self._waiters: deque[object] = deque()
+        self._leased = 0
+        self._closed = False
+        if pool_size:
+            atexit.register(self.close)
+
+    def close(self) -> None:
+        """Stop owned transports; other clients and workers are unaffected."""
+        with self._condition:
+            self._closed = True
+            connections = tuple(self._connections)
+            self._idle.clear()
+            self._condition.notify_all()
+        for connection in connections:
+            self._close_connection(connection)
+        if self._pool_size:
+            atexit.unregister(self.close)
+
+    def _close_connection(self, connection: _Connection) -> None:
+        with self._condition:
+            if connection not in self._connections:
+                return
+            self._connections.remove(connection)
+        if connection.windows_job is not None:
+            connection.windows_job.close()
+            connection.process.wait(timeout=5)
+        else:
+            self._terminate_process(connection.process)
+        for reader in connection.readers:
+            reader.join(timeout=1)
+        for stream in (connection.process.stdin, connection.process.stdout, connection.process.stderr):
+            if hasattr(stream, "close"):
+                stream.close()
+
+    def _start_connection(self, cwd: str) -> _Connection:
+        try:
+            CodexAppServerStatusService.assert_ready()
+        except RuntimeError as exc:
+            raise CodexAppServerError(str(exc), outcome_known=True) from exc
+        messages: queue.Queue = queue.Queue()
+        stderr: deque[str] = deque(maxlen=200)
+        # Reuse the worker's kill-on-parent-exit containment: a crashed CLI
+        # must not leave model processes running after its admission locks close.
+        windows_job = _WindowsJob() if self._is_windows() else None
+        process = None
+        try:
+            process = subprocess.Popen(
+                [self.codex_bin, "app-server", "--stdio"], cwd=cwd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", bufsize=1,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW | _CREATE_SUSPENDED}
+                   if windows_job is not None else {}),
+            )
+            if windows_job is not None:
+                windows_job.assign_and_resume(process)
+        except BaseException:
+            if windows_job is not None:
+                windows_job.close()
+            if process is not None:
+                self._terminate_process(process)
+            raise
+        readers = (
+            threading.Thread(target=self._read_stdout_messages, args=(process, messages), daemon=True),
+            threading.Thread(target=self._read_stderr_logs, args=(process, stderr), daemon=True),
+        )
+        connection = _Connection(process, messages, stderr, readers, cwd, windows_job)
+        with self._condition:
+            self._connections.add(connection)
+        for reader in readers:
+            reader.start()
+        return connection
+
+    @contextmanager
+    def _connection(self, cwd: str, deadline: float, check_cancelled: Callable[[], None] | None):
+        ticket = object()
+        connection = None
+        reserved = False
+        try:
+            with self._condition:
+                self._waiters.append(ticket)
+            while not reserved:
+                if check_cancelled is not None:
+                    check_cancelled()
+                with self._condition:
+                    if self._closed:
+                        raise CodexAppServerError("Codex client is closed", outcome_known=True)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CodexAppServerError("Timed out waiting for Codex connection capacity", outcome_known=True)
+                    if self._waiters[0] is ticket and (not self._pool_size or self._leased < self._pool_size):
+                        self._waiters.popleft()
+                        self._leased += 1
+                        reserved = True
+                        if self._idle:
+                            connection = self._idle.pop()
+                    else:
+                        self._condition.wait(timeout=min(remaining, _CANCELLATION_POLL_SECONDS))
+            gate = (model_call_slot(self._machine_slot_root, deadline=deadline, check_cancelled=check_cancelled)
+                    if self._machine_slot_root is not None else nullcontext())
+            with gate:
+                if connection is not None and (connection.cwd != cwd or connection.process.poll() is not None
+                                                or not connection.readers[0].is_alive()):
+                    self._close_connection(connection)
+                    connection = None
+                if connection is None:
+                    connection = self._start_connection(cwd)
+                connection.reusable = False
+                if connection.initialized:
+                    connection.stderr.clear()
+                try:
+                    with self._condition:
+                        if self._closed:
+                            raise CodexAppServerError("Codex client is closed", outcome_known=True)
+                    yield connection
+                finally:
+                    if not connection.reusable or not self._pool_size:
+                        self._close_connection(connection)
+                    self._turn_local.stderr_logs = tuple(connection.stderr)
+        except TimeoutError as error:
+            raise CodexAppServerError(str(error), outcome_known=True) from error
+        finally:
+            with self._condition:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+                if reserved:
+                    self._leased -= 1
+                if connection is not None and connection in self._connections and not self._closed:
+                    self._idle.append(connection)
+                self._condition.notify_all()
 
     @property
     def stderr_logs(self) -> list[str]:
@@ -77,6 +240,12 @@ class CodexAppServerClient:
     def handle_notification(message: dict[str, Any], state: CodexTurnState) -> None:
         method = message.get("method")
         params = message.get("params") or {}
+        if state.filter_thread and (
+            (params.get("threadId") is not None and params["threadId"] != state.thread_id)
+            or (method in {"item/agentMessage/delta", "item/completed", "turn/completed"}
+                and (state.thread_id is None or params.get("threadId") != state.thread_id))
+        ):
+            return
 
         if method == "item/agentMessage/delta":
             delta = params.get("delta")
@@ -129,6 +298,7 @@ class CodexAppServerClient:
         output_schema: dict[str, object] | None = None,
         reasoning_effort: str | None = None,
         check_cancelled: Callable[[], None] | None = None,
+        image_webp: tuple[bytes, ...] = (),
     ) -> str:
         self._turn_local.stderr_logs = ()
         resolved_timeout = (
@@ -150,64 +320,31 @@ class CodexAppServerClient:
             raise CodexAppServerError("Codex app-server turn options are invalid")
         if check_cancelled is not None:
             check_cancelled()
-        try:
-            CodexAppServerStatusService.assert_ready()
-        except RuntimeError as exc:
-            raise CodexAppServerError(str(exc)) from exc
-
-        stdout_queue: queue.Queue[dict[str, Any] | Exception] = queue.Queue()
-        stderr_logs: list[str] = []
-        process = subprocess.Popen(
-            [self.codex_bin, "app-server", "--stdio"],
-            cwd=cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-        )
-
-        stdout_thread = threading.Thread(
-            target=self._read_stdout_messages,
-            args=(process, stdout_queue),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=self._read_stderr_logs,
-            args=(process, stderr_logs),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-
-        state = CodexTurnState()
         deadline = time.monotonic() + resolved_timeout
-        try:
-            self._send_request(
-                process,
-                1,
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "alltonote",
-                        "title": "AllToNote",
-                        "version": "0.0.0",
+        with self._connection(cwd or str(Path.cwd()), deadline, check_cancelled) as connection:
+            process, stdout_queue = connection.process, connection.messages
+            state = CodexTurnState(filter_thread=bool(self._pool_size))
+            if not connection.initialized:
+                initialize_id = connection.next_id()
+                self._send_request(
+                    process,
+                    initialize_id,
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "alltonote",
+                            "title": "AllToNote",
+                            "version": "0.0.0",
+                        },
+                        "capabilities": {
+                            "experimentalApi": True,
+                            "requestAttestation": False,
+                        },
                     },
-                    "capabilities": {
-                        "experimentalApi": True,
-                        "requestAttestation": False,
-                    },
-                },
-            )
-            self._wait_for_response(
-                stdout_queue,
-                state,
-                1,
-                deadline,
-                check_cancelled,
-            )
-            self._send_notification(process, "initialized")
+                )
+                self._wait_for_response(stdout_queue, state, initialize_id, deadline, check_cancelled)
+                self._send_notification(process, "initialized")
+                connection.initialized = True
 
             thread_params = {
                 "model": model,
@@ -221,20 +358,24 @@ class CodexAppServerClient:
                     "run commands, inspect files, or modify files."
                 ),
             }
-            self._send_request(process, 2, "thread/start", thread_params)
+            thread_request_id = connection.next_id()
+            self._send_request(process, thread_request_id, "thread/start", thread_params)
             thread_response = self._wait_for_response(
                 stdout_queue,
                 state,
-                2,
+                thread_request_id,
                 deadline,
                 check_cancelled,
             )
             thread_id = self._extract_thread_id(thread_response)
             if not thread_id:
                 raise CodexAppServerError("Codex app-server thread/start response did not include a thread id")
+            state.thread_id = thread_id
 
             turn_params: dict[str, Any] = {
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "input": [{"type": "text", "text": prompt, "text_elements": []}]
+                + [{"type": "image", "url": "data:image/webp;base64," + base64.b64encode(value).decode("ascii")}
+                   for value in image_webp],
                 "approvalPolicy": "never",
                 "model": model,
                 "threadId": thread_id,
@@ -243,11 +384,12 @@ class CodexAppServerClient:
                 turn_params["outputSchema"] = output_schema
             if reasoning_effort is not None:
                 turn_params["effort"] = reasoning_effort
-            self._send_request(process, 3, "turn/start", turn_params)
+            turn_request_id = connection.next_id()
+            self._send_request(process, turn_request_id, "turn/start", turn_params)
             self._wait_for_response(
                 stdout_queue,
                 state,
-                3,
+                turn_request_id,
                 deadline,
                 check_cancelled,
             )
@@ -266,12 +408,20 @@ class CodexAppServerClient:
                     code=state.error_code,
                     outcome_known=state.error_outcome_known,
                 )
-            return self.clean_markdown(state.text)
-        finally:
-            self._terminate_process(process)
-            stdout_thread.join(timeout=1)
-            stderr_thread.join(timeout=1)
-            self._turn_local.stderr_logs = tuple(stderr_logs)
+            result = self.clean_markdown(state.text)
+            if self._pool_size:
+                # Unload the completed ephemeral thread before lending the
+                # transport to another independent generation/review request.
+                try:
+                    unsubscribe_id = connection.next_id()
+                    self._send_request(process, unsubscribe_id, "thread/unsubscribe", {"threadId": thread_id})
+                    self._wait_for_response(stdout_queue, state, unsubscribe_id,
+                                            min(deadline, time.monotonic() + 5), check_cancelled)
+                    connection.reusable = True
+                except (CodexAppServerError, OSError):
+                    # A completed answer remains valid; discard the transport.
+                    connection.reusable = False
+            return result
 
     def _send_request(
         self,
@@ -388,7 +538,7 @@ class CodexAppServerClient:
     @staticmethod
     def _read_stderr_logs(
         process: subprocess.Popen[str],
-        stderr_logs: list[str],
+        stderr_logs: list[str] | deque[str],
     ) -> None:
         if process.stderr is None:
             return

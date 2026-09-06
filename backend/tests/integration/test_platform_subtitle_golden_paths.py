@@ -197,10 +197,17 @@ class _V2Completion:
         payload = json.loads(user_content)
         self._calls.model += 1
         self._calls.model_stages.append(
-            "faithful-edit" if "section" in payload else "global-compose"
+            "faithful-review" if "frames" in payload
+            else "faithful-edit" if "section" in payload else "global-compose"
         )
         if self._failure == "unknown":
             raise TimeoutError("provider response was lost")
+        if "frames" in payload:
+            return LegacyModelResponse(
+                markdown=json.dumps({"pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "frames": [], "uncertainties": []}),
+                provider_request_id=f"fixture-review-{self._calls.model}",
+                input_tokens=40, output_tokens=20, actual_model="fixture/model-v2",
+            )
         if "section" in payload:
             section = payload["section"]
             segments = section["segments"]
@@ -349,12 +356,12 @@ def _create_runtime(
 
     def resolve_pack_ports(
         snapshot: JobPackEnvironmentSnapshot,
-    ) -> tuple[object, object | None, str]:
+    ) -> tuple[object, object | None, str, None]:
         if resolved_pack_environments is not None:
             resolved_pack_environments.append(snapshot)
         if pack_resolution_error is not None:
             raise pack_resolution_error
-        return source, transcriber, "fixture/transcriber-v1"
+        return source, transcriber, "fixture/transcriber-v1", None
 
     runtime, service = runtime_module._create_platform_video_runtime_components(
         machine_root,
@@ -623,7 +630,7 @@ def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
         and document.publish_eligible
         for document in result.documents
     )
-    assert calls.model_stages == ["global-compose", "faithful-edit"]
+    assert calls.model_stages == ["global-compose", "faithful-edit", "faithful-review"]
 
     bundle = workspace_root / result.workspace_relative_bundle_path
     manifest = json.loads((bundle / "bundle.json").read_bytes())
@@ -709,7 +716,8 @@ def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
             quality_path.read_bytes()
         )
         assert receipt_output["model_binding"]["sha256"].startswith("sha256:")
-        assert receipt_output["execution"]["model_calls"] == 1
+        expected_calls = 2 if document.document_kind is VideoDocumentKind.FAITHFUL_EDITION else 1
+        assert receipt_output["execution"]["model_calls"] == expected_calls
         assert "legacy_finish_reason_unavailable" in receipt_output["warnings"]
         assert receipt_output["quality"]["check_count"] == len(
             compiler_checks
@@ -736,8 +744,8 @@ def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
     assert recovered.job_id == submitted.job_id
     assert recovered.result is not None
     assert recovered.result.bundle_id == result.bundle_id
-    assert calls.model == 2
-    assert calls.model_stages == ["global-compose", "faithful-edit"]
+    assert calls.model == 3
+    assert calls.model_stages == ["global-compose", "faithful-edit", "faithful-review"]
 
 
 def test_platform_runtime_v2_unknown_model_outcome_is_not_resent(
@@ -805,7 +813,7 @@ def test_platform_runtime_v2_produces_single_faithful_edition(
         completed.result.documents[0].document_kind
         is VideoDocumentKind.FAITHFUL_EDITION
     )
-    assert calls.model == 1
+    assert calls.model == 2
     assert "Keep the edited body in the source language en." in calls.model_prompts[0]
 
 
@@ -836,7 +844,7 @@ def test_platform_runtime_passes_explicit_faithful_translation_target(
     completed = runtime.wait_job(runtime.submit_video(request).job_id)
 
     assert completed.state is JobState.SUCCEEDED
-    assert calls.model == 1
+    assert calls.model == 2
     assert (
         "Translate conservatively from en to zh-CN;"
         in calls.model_prompts[0]

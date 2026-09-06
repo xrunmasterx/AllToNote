@@ -5,6 +5,7 @@ import hashlib
 import os
 import stat
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -228,15 +229,24 @@ def _validate_ordinary_directory(path: Path) -> None:
 
 
 def read_descriptor(path: Path) -> EngineDescriptor | None:
-    if not _lexically_exists(path):
-        return None
-    if not _ordinary_file(path):
-        raise _state_unsafe()
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise _state_unsafe() from error
+    for attempt in range(3):
+        if not _lexically_exists(path):
+            return None
+        if not _ordinary_file(path):
+            raise _state_unsafe()
+        try:
+            descriptor = os.open(path, flags)
+            break
+        except PermissionError as error:
+            # Windows descriptor retirement may briefly hold DELETE access,
+            # conflicting with CRT open sharing. Retry only this bounded window;
+            # revalidate identity each time and still reject persistent denial.
+            if os.name != "nt" or attempt == 2:
+                raise _state_unsafe() from error
+            time.sleep(0.02)
+        except OSError as error:
+            raise _state_unsafe() from error
     try:
         if not _open_matches(path, descriptor):
             raise _state_unsafe()

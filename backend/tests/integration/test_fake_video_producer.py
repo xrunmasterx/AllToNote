@@ -1925,7 +1925,7 @@ def test_distinct_jobs_on_one_runtime_execute_serially(
     assert max_active == 1
 
 
-def test_machine_admission_keeps_competing_video_job_queued(
+def test_machine_admission_keeps_fifth_video_job_queued(
     tmp_path: Path,
     workspace_root: Path,
 ) -> None:
@@ -1939,6 +1939,9 @@ def test_machine_admission_keeps_competing_video_job_queued(
         assert release.wait(timeout=5)
 
     store = MachineResourceLeaseStore.open(tmp_path / "shared-machine")
+    occupied = [store.acquire(name, ResourceOwner("other-workspace", f"other-process-{index}"),
+                              ttl_seconds=300)
+                for index, name in enumerate(HEAVY_PRODUCTION_RESOURCE_NAMES[1:])]
     first_calls = runtime_module.FakeCallCounts()
     second_calls = runtime_module.FakeCallCounts()
     first = _create_fake_runtime(
@@ -1992,6 +1995,8 @@ def test_machine_admission_keeps_competing_video_job_queued(
     assert second.wait_job(second_job.job_id).state is JobState.SUCCEEDED
     assert second_calls.download == second_calls.transcribe == second_calls.model == 1
     assert second_calls.commit == 1
+    for lease in occupied:
+        assert lease.release()
 
 
 def test_live_job_claim_keeps_new_video_job_queued(

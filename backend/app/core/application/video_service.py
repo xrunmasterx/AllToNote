@@ -45,6 +45,8 @@ from app.core.application.video_checkpoints import (
 from app.core.config.events import JOB_CONFIG_SNAPSHOT_EVENT
 from app.core.config.model import JobConfigSnapshot
 from app.core.domain.ids import new_typed_id, sha256_digest
+from app.core.domain.visual_frame import VisualFrame
+from app.core.portable.markdown_safety import is_backslash_escaped, markdown_visible_mask
 from app.core.domain.video import (
     FaithfulLanguagePolicy,
     GeneratedVideoDraft,
@@ -72,7 +74,7 @@ from app.core.jobs.model import (
     JobExecutionOwner,
 )
 from app.core.jobs.resource_lease import (
-    HEAVY_PRODUCTION_RESOURCE_NAME,
+    HEAVY_PRODUCTION_RESOURCE_NAMES,
     ExecutionAuthority,
     JobExecutionAuthority,
     ResourceLease,
@@ -437,6 +439,7 @@ class VideoKnowledgeCompilationInput:
     screenshot_policy: ScreenshotPolicy
     provider_profile: str
     model_override: str | None
+    visual_frames: tuple[VisualFrame, ...] = ()
 
 
 class VideoKnowledgeCompilerPort(Protocol):
@@ -464,6 +467,7 @@ class VideoFaithfulCompilationInput:
     output_language: str
     provider_profile: str
     model_override: str | None
+    visual_frames: tuple[VisualFrame, ...] = ()
 
 
 class VideoFaithfulCompilerPort(Protocol):
@@ -805,11 +809,16 @@ class VideoService:
             )
         if self._resource_lease_store is None or self._resource_owner is None:
             return
-        self._active_resource_lease = self._resource_lease_store.acquire(
-            HEAVY_PRODUCTION_RESOURCE_NAME,
-            self._resource_owner,
-            ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
-        )
+        for resource_name in HEAVY_PRODUCTION_RESOURCE_NAMES:
+            try:
+                self._active_resource_lease = self._resource_lease_store.acquire(
+                    resource_name, self._resource_owner,
+                    ttl_seconds=_SCHEDULER_LEASE_TTL_SECONDS,
+                )
+                return
+            except DomainError as error:
+                if error.code != "resource_busy" or resource_name == HEAVY_PRODUCTION_RESOURCE_NAMES[-1]:
+                    raise
 
     def _assert_expected_job_authority(self, job_id: str) -> None:
         if (
@@ -1115,7 +1124,7 @@ class VideoService:
             "preflight",
             request_hash,
             authority,
-            lambda _execution: self._preflight(request),
+            lambda _execution: self._preflight(request, execution_request),
             encode=lambda value: _encode_object(
                 {"step": "preflight", "policy_hash": value}
             ),
@@ -1462,6 +1471,38 @@ class VideoService:
         portable_drafts: list[VideoDraftBundleInput] = []
         generated_drafts: list[GeneratedVideoDraft] = []
         screenshots: tuple[DisplayAssetInput, ...] = ()
+        visual_frames: tuple[VisualFrame, ...] = ()
+        candidate_plan: tuple[ScreenshotPlanItem, ...] = ()
+        candidate_assets: tuple[DisplayAssetInput, ...] = ()
+        selected_asset_ids: set[str] = set()
+        if request.style == "illustrated-reading":
+            if request.screenshot_policy is not ScreenshotPolicy.ON_DEMAND:
+                raise DomainError("illustrated_reading_requires_screenshots", ErrorCategory.INVALID_REQUEST,
+                                  "Illustrated reading requires on_demand screenshots")
+            candidate_plan = build_visual_candidate_plan(
+                job_id, transcript,
+                dense=all(output.document_kind is VideoDocumentKind.FAITHFUL_EDITION for output in outputs),
+            )
+            screenshots = self._checkpointed(
+                job_id, "optional_screenshots", request_hash, authority,
+                lambda execution: self._operations.screenshots(
+                    candidate_plan, transcript, acquired,
+                    acquisition_checkpoint=acquisition_checkpoint, execution=execution,
+                ),
+                encode=_encode_screenshots, decode=_decode_screenshots,
+                resumed_attempt=resumed_attempt,
+            )
+            if (len(screenshots) != len(candidate_plan)
+                    or any(asset.artifact_id != item.artifact_id or asset.relative_path != item.relative_path
+                           for item, asset in zip(candidate_plan, screenshots))):
+                raise DomainError("visual_candidates_missing", ErrorCategory.RECIPE_FAILED,
+                                  "Not all visual candidates were captured")
+            visual_frames = tuple(
+                VisualFrame(item.segment_id, item.timestamp_ms, asset.payload)
+                for item, asset in zip(candidate_plan, screenshots)
+            )
+            candidate_assets = screenshots
+            screenshots = ()
         for ordinal, output in enumerate(outputs):
             step_id = (
                 "generate_draft"
@@ -1514,6 +1555,7 @@ class VideoService:
                         source,
                         transcript,
                         execution=execution,
+                        visual_frames=visual_frames,
                     ),
                     transcript,
                     evidence_ids,
@@ -1526,7 +1568,19 @@ class VideoService:
                 draft,
                 markdown=rewrite_segment_citations(draft.markdown, evidence_ids),
             )
-            if output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE:
+            if visual_frames:
+                selected_ids = tuple(value.segment_id for value in draft.screenshot_requests)
+                candidates = {item.segment_id: (item, asset) for item, asset in zip(candidate_plan, candidate_assets)}
+                if ((not selected_ids and output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE)
+                        or any(value not in candidates for value in selected_ids)):
+                    raise DomainError("visual_selection_invalid", ErrorCategory.RECIPE_FAILED,
+                                      "Illustrated reading must select supplied candidate frames")
+                selected_plan = tuple(candidates[value][0] for value in selected_ids)
+                selected_assets = tuple(candidates[value][1] for value in selected_ids)
+                draft = bind_screenshot_assets(draft, selected_plan, selected_assets, inline=True)
+                selected_asset_ids.update(asset.artifact_id for asset in selected_assets)
+                screenshots = tuple(asset for asset in candidate_assets if asset.artifact_id in selected_asset_ids)
+            elif output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE:
                 screenshots = self._checkpointed(
                     job_id,
                     "optional_screenshots",
@@ -1627,7 +1681,9 @@ class VideoService:
                     recipe_version=output.recipe_version,
                     quality_profile=output.quality_preset,
                     transcript_basis=transcript_basis,
-                    source_language=source.language,
+                    source_language=(transcript.language
+                                     if output.document_kind is VideoDocumentKind.FAITHFUL_EDITION
+                                     else source.language),
                     language_policy=language_policy,
                     target_language=target_language,
                     model_binding_sha256=model_binding_sha256,
@@ -1644,7 +1700,7 @@ class VideoService:
                 )
             )
             generated_drafts.append(draft)
-        if VideoDocumentKind.KNOWLEDGE_NOTE not in {
+        if not visual_frames and VideoDocumentKind.KNOWLEDGE_NOTE not in {
             output.document_kind for output in outputs
         }:
             screenshots = self._checkpointed(
@@ -1743,6 +1799,7 @@ class VideoService:
         transcript: TranscriptDocument,
         *,
         execution: VideoStepExecutionContext,
+        visual_frames: tuple[VisualFrame, ...] = (),
     ) -> GeneratedVideoDraft:
         if output.document_kind is VideoDocumentKind.KNOWLEDGE_NOTE:
             return self._generate_draft(
@@ -1751,6 +1808,7 @@ class VideoService:
                 transcript,
                 execution=execution,
                 output=output,
+                visual_frames=visual_frames,
             )
         compiler = self._faithful_compiler
         if compiler is None:
@@ -1763,7 +1821,7 @@ class VideoService:
             VideoFaithfulCompilationInput(
                 output=output,
                 source_title=source.title,
-                source_language=source.language,
+                source_language=transcript.language,
                 source_duration_ms=source.duration_ms,
                 transcript_basis=source.subtitle_acquisition,
                 transcript=transcript,
@@ -1771,6 +1829,7 @@ class VideoService:
                 output_language=request.output_language,
                 provider_profile=request.provider_profile,
                 model_override=request.model_override,
+                visual_frames=visual_frames,
             ),
             execution=execution,
         )
@@ -1784,6 +1843,7 @@ class VideoService:
         *,
         execution: VideoStepExecutionContext,
         output: ResolvedVideoOutput | None = None,
+        visual_frames: tuple[VisualFrame, ...] = (),
     ) -> GeneratedVideoDraft:
         if request.request_schema_version == 1:
             return self._operations.generate_draft(
@@ -1822,6 +1882,7 @@ class VideoService:
                 screenshot_policy=request.screenshot_policy,
                 provider_profile=request.provider_profile,
                 model_override=request.model_override,
+                visual_frames=visual_frames,
             ),
             execution=execution,
         )
@@ -1851,6 +1912,7 @@ class VideoService:
             plan = compiled.plan  # type: ignore[attr-defined]
             coverage = compiled.coverage  # type: ignore[attr-defined]
             warnings = tuple(compiled.warnings)  # type: ignore[attr-defined]
+            visual_review_passed = getattr(compiled, "visual_review_passed", False)
             required_coverage_ids = tuple(
                 (*coverage.covered_input_ids, *(item.input_id for item in coverage.omissions))
             )
@@ -1880,7 +1942,7 @@ class VideoService:
                 ],
                 "method_summary": {
                     "deterministic": len(quality_assessment.checks),
-                    "model": 0,
+                    "model": int(visual_review_passed),
                     "human": 0,
                 },
                 "metrics": {
@@ -1890,6 +1952,8 @@ class VideoService:
                     "coverage_input_count": len(required_coverage_ids),
                 },
             }
+            if visual_review_passed:
+                quality_summary["checks"].append({"id": "visual_image_text_review", "status": "pass"})
             usage = {
                 "input_tokens": compiled_usage.input_tokens,
                 "output_tokens": compiled_usage.output_tokens,
@@ -2096,7 +2160,9 @@ class VideoService:
             or not model_identity.strip()
             or not set(cited_segment_ids).issubset(known_segment_ids)
             or len(cited_segment_ids) != len(set(cited_segment_ids))
-            or screenshot_requests
+            or any(not isinstance(value, ScreenshotRequest)
+                   or value.segment_id not in known_segment_ids or value.offset_ms != 0
+                   for value in screenshot_requests)
             or assessment.overall is QualityOverall.FAIL
             or type(compiled_usage.input_tokens) is not int
             or compiled_usage.input_tokens < 0
@@ -2108,7 +2174,7 @@ class VideoService:
             or type(summary.model_operation_count) is not int
             or summary.model_operation_count < summary.section_count
             or type(summary.sequential_model_waves) is not int
-            or not 1 <= summary.sequential_model_waves <= 2
+            or not 1 <= summary.sequential_model_waves <= 9
             or type(summary.repair_operation_count) is not int
             or summary.repair_operation_count < 0
             or type(summary.body_segment_reference_coverage_ratio) is not float
@@ -2130,7 +2196,7 @@ class VideoService:
             return GeneratedVideoDraft(
                 markdown=markdown,
                 cited_segment_ids=cited_segment_ids,
-                screenshot_requests=(),
+                screenshot_requests=screenshot_requests,
                 model_identity=model_identity,
                 usage=usage,
                 warnings=warnings,
@@ -2463,8 +2529,16 @@ class VideoService:
             tuple(steps),
         )
 
-    def _preflight(self, request: VideoProduceRequest) -> str:
-        capabilities = self._operations.preflight_capabilities(request)
+    def _preflight(
+        self, request: VideoProduceRequest, execution_request: VideoProduceRequest
+    ) -> str:
+        if request.style == "illustrated-reading" and (
+            request.request_schema_version != 2
+            or request.screenshot_policy is not ScreenshotPolicy.ON_DEMAND
+        ):
+            raise DomainError("illustrated_reading_requires_screenshots", ErrorCategory.INVALID_REQUEST,
+                              "Illustrated reading requires recipe v2 and on_demand screenshots")
+        capabilities = self._operations.preflight_capabilities(execution_request)
         if not isinstance(capabilities, VideoPreflightCapabilities):
             raise DomainError(
                 "preflight_capabilities_invalid",
@@ -2545,11 +2619,12 @@ class VideoService:
                 request.screenshot_policy is not ScreenshotPolicy.OFF
                 and VideoDocumentKind.KNOWLEDGE_NOTE
                 not in request.requested_outputs
+                and request.style != "illustrated-reading"
             ):
                 raise DomainError(
-                    "screenshot_requires_knowledge_note",
+                    "faithful_screenshots_require_illustrated_reading",
                     ErrorCategory.WORKSPACE_INCOMPATIBLE,
-                    "Video preflight check failed",
+                    "Faithful screenshots require the illustrated-reading style",
                 )
         checks = (
             (capabilities.runtime_version == RUNTIME_VERSION, "runtime_version_unsupported"),
@@ -3110,6 +3185,33 @@ def build_screenshot_plan(
             "Screenshot requests are invalid",
         )
     requests = draft.screenshot_requests
+    return _build_screenshot_request_plan(job_id, policy, requests, transcript)
+
+
+def build_visual_candidate_plan(job_id: str, transcript: TranscriptDocument, *, dense: bool = False) -> tuple[ScreenshotPlanItem, ...]:
+    """Bounded chronological sampling; the vision model selects useful frames."""
+    duration = transcript.segments[-1].end_ms
+    if dense:
+        # Correction frames are evidence candidates, NOT mandatory article illustrations.
+        count = min(192, len(transcript.segments))
+        segments = tuple(transcript.segments[index * len(transcript.segments) // count] for index in range(count))
+    else:
+        count = min(24, max(1, (duration + 44_999) // 45_000))
+        segments = tuple(dict.fromkeys(
+            min(transcript.segments, key=lambda segment: abs(segment.start_ms - (index + 0.5) * duration / count))
+            for index in range(count)
+        ))
+    return _build_screenshot_request_plan(
+        job_id, ScreenshotPolicy.ON_DEMAND,
+        tuple(ScreenshotRequest(segment.segment_id, (segment.end_ms - segment.start_ms) // 2 if dense else 0)
+              for segment in segments), transcript,
+    )
+
+
+def _build_screenshot_request_plan(
+    job_id: str, policy: ScreenshotPolicy, requests: tuple[ScreenshotRequest, ...],
+    transcript: TranscriptDocument,
+) -> tuple[ScreenshotPlanItem, ...]:
     if policy is ScreenshotPolicy.OFF:
         if requests:
             raise DomainError(
@@ -3173,6 +3275,8 @@ def bind_screenshot_assets(
     draft: GeneratedVideoDraft,
     plan: tuple[ScreenshotPlanItem, ...],
     assets: tuple[DisplayAssetInput, ...],
+    *,
+    inline: bool = False,
 ) -> GeneratedVideoDraft:
     def invalid() -> DomainError:
         return DomainError(
@@ -3207,6 +3311,16 @@ def bind_screenshot_assets(
         )
         for ordinal, item in enumerate(plan, start=1)
     ]
+    if inline:
+        markdown = draft.markdown
+        visible = markdown_visible_mask(markdown)
+        anchors = tuple(match for match in re.finditer(r"\[SCREENSHOT:(seg_[0-9]{6,})\]", markdown)
+                        if visible[match.start()] and not is_backslash_escaped(markdown, match.start()))
+        if tuple(match.group(1) for match in anchors) != tuple(item.segment_id for item in plan):
+            raise invalid()
+        for match, line in reversed(tuple(zip(anchors, image_lines))):
+            markdown = markdown[:match.start()] + line + markdown[match.end():]
+        return replace(draft, markdown=markdown, screenshot_requests=())
     markdown = (
         draft.markdown.rstrip("\r\n")
         + "\n\n## Screenshots\n\n"

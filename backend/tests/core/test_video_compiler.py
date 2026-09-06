@@ -25,6 +25,7 @@ from app.core.domain.video import (
     TranscriptDocument,
     TranscriptSegment,
 )
+from app.core.domain.visual_frame import VisualFrame
 from app.core.errors import DomainError
 from app.core.jobs.cancellation import CancellationToken
 from app.core.ports.model_executor import (
@@ -169,6 +170,108 @@ class _DeterministicExecutor:
     @staticmethod
     def _repair_response(payload: dict[str, object]) -> dict[str, object]:
         raise AssertionError("fixture did not expect a knowledge-text-repair call")
+
+
+class _VisualExecutor(_DeterministicExecutor):
+    def __init__(self, *, review_pass=True, unknown_selection=False, bad_layout=False, repair_layout=True):
+        super().__init__()
+        self.review_pass = review_pass
+        self.unknown_selection = unknown_selection
+        self.bad_layout = bad_layout
+        self.repair_layout = repair_layout
+
+    def complete(self, request, token):
+        assert request.image_webp
+        if request.stage_id == "global-compose":
+            result = super().complete(request, token)
+            value = json.loads(result.text)
+            value["markdown"] = value["markdown"].replace("## Main lesson", "## Main lesson [RANGE:seg_000001:seg_000002]")
+            marker = "seg_000002" if self.unknown_selection else "seg_000001"
+            value["markdown"] += f"\n\n[SCREENSHOT:{marker}]\n\nVisible chart."
+            if self.bad_layout:
+                value["markdown"] = value["markdown"].replace("RANGE:seg_000001:seg_000002", "RANGE:seg_000001:seg_000001")
+                value["markdown"] += " More detail.[^seg_000002]"
+            return replace(result, text=json.dumps(value))
+        self.requests.append(request)
+        if request.stage_id == "visual-analyze":
+            value = {"frames": [{"segment_id": item["segment_id"], "use": True,
+                                 "observation": "Chart", "relation": "Local explanation", "uncertainty": "Labels unclear"}
+                                for item in json.loads(request.user_content)]}
+        elif request.stage_id == "visual-layout-repair":
+            value = json.loads(request.user_content)["original"]
+            value["schema_version"] = 1
+            if self.repair_layout:
+                value["markdown"] = value["markdown"].replace("RANGE:seg_000001:seg_000001", "RANGE:seg_000001:seg_000002")
+        else:
+            assert request.stage_id == "visual-review"
+            value = {"pass": self.review_pass, "issues": [] if self.review_pass else ["Image contradicts caption"]}
+        return ModelExecutionResult(json.dumps(value), "fixture/model-v1", 100, 20,
+                                    ModelFinishReason.STOP, f"req_{len(self.requests)}")
+
+
+def _visual_request():
+    request = _request(_transcript(2, text_size=20),
+                       binding=_binding(provider_type="codex-app-server", context_window_tokens=65_536),
+                       max_request_bytes=65_536)
+    return replace(request, style="illustrated-reading", screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+                   visual_frames=(VisualFrame("seg_000001", request.planning_request.transcript.segments[0].start_ms,
+                                              b"RIFF1234WEBPtest"),))
+
+
+def test_visual_pipeline_passes_images_preserves_anchors_and_recovers_without_replay(tmp_path):
+    executor = _VisualExecutor()
+    compiler, context, _ = _compiler_context(tmp_path, executor)
+    request = _visual_request()
+    result = compiler.compile(request, context)
+    assert [value.stage_id for value in executor.requests] == ["visual-analyze", "global-compose", "visual-review"]
+    assert "[SCREENSHOT:seg_000001]" in result.markdown
+    assert result.visual_review_passed is True
+    assert result.execution_summary.model_operation_count == 3
+    assert result.execution_summary.sequential_model_waves == 3
+    assert result.plan.reviewer_enabled is True
+    assert result.plan.expected_sequential_model_waves == 3
+    assert compiler.compile(request, context) == result
+    assert len(executor.requests) == 3
+
+
+@pytest.mark.parametrize("unknown_selection,review_pass,error", [
+    (False, False, "visual_review_failed"), (True, True, "visual_selection_invalid"),
+])
+def test_visual_pipeline_blocks_bad_selection_or_failed_review(tmp_path, unknown_selection, review_pass, error):
+    compiler, context, _ = _compiler_context(tmp_path, _VisualExecutor(
+        unknown_selection=unknown_selection, review_pass=review_pass))
+    with pytest.raises(DomainError, match=error):
+        compiler.compile(_visual_request(), context)
+
+
+def test_visual_request_hash_includes_image_content_and_order():
+    request = ModelExecutionRequest(schema_version=1, stage_id="visual-analyze", stage_version=1,
+        prompt_id="visual-analyze", prompt_version=1, system_instruction="Inspect", user_content="Frames",
+        output_mode=video_compiler_module.ModelOutputMode.TEXT, max_output_tokens=100, timeout_seconds=60,
+        image_webp=(b"RIFF1234WEBPa", b"RIFF1234WEBPb"))
+    binding = _binding(provider_type="codex-app-server")
+    original = ModelCallCoordinator.request_hash(binding, request, "frames")
+    assert original != ModelCallCoordinator.request_hash(binding, replace(request, image_webp=request.image_webp[::-1]), "frames")
+    assert original != ModelCallCoordinator.request_hash(binding, replace(request, image_webp=()), "frames")
+    with pytest.raises(DomainError, match="model_capability_missing"):
+        ModelCallCoordinator.request_hash(_binding(), request, "frames")
+
+
+@pytest.mark.parametrize("repair_layout", [True, False])
+def test_visual_layout_repairs_once_then_reviews_or_stops(tmp_path, repair_layout):
+    executor = _VisualExecutor(bad_layout=True, repair_layout=repair_layout)
+    compiler, context, _ = _compiler_context(tmp_path, executor)
+    if repair_layout:
+        result = compiler.compile(_visual_request(), context)
+        assert result.visual_review_passed
+        assert result.execution_summary.model_operation_count == 4
+        assert result.execution_summary.sequential_model_waves == 4
+        assert compiler.compile(_visual_request(), context) == result
+        assert len(executor.requests) == 4
+    else:
+        with pytest.raises(DomainError, match="illustrated_section_range_invalid"):
+            compiler.compile(_visual_request(), context)
+    assert [value.stage_id for value in executor.requests].count("visual-layout-repair") == 1
 
 
 class _KnowledgeQualityRepairExecutor(_DeterministicExecutor):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from app.core.domain.ids import sha256_digest
@@ -13,10 +13,13 @@ from app.core.portable.markdown_safety import validate_markdown_safety
 from app.core.recipes.video.faithful_edition.contracts import (
     FaithfulEditionPlanV1,
     FaithfulEditionSectionV1,
+    GroundedCorrection,
 )
 
 
-_NUMBER = re.compile(r"(?<![\w])[-+]?\d+(?:[.,]\d+)*(?:%|％)?")
+_NUMBER = re.compile(
+    r"[-+]?\d+(?:[.,]\d+)*(?:%|％)?|百分之[零〇一二两三四五六七八九十百千万亿点]+"
+)
 _TECHNICAL = re.compile(
     r"(?<![A-Za-z0-9_])(?:/[A-Za-z0-9._/-]+|"
     r"[A-Za-z][A-Za-z0-9]*(?:[-_.:/][A-Za-z0-9]+)+|"
@@ -112,6 +115,7 @@ class FaithfulEditionCandidateV1:
     plan: FaithfulEditionPlanV1
     sections: tuple[FaithfulEditionSectionV1, ...]
     markdown: str
+    source_corrections: tuple[GroundedCorrection, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sections", tuple(self.sections))
@@ -122,7 +126,7 @@ def _normalize(value: str) -> str:
 
 
 def _anchors(pattern: re.Pattern[str], value: str) -> tuple[str, ...]:
-    return tuple(match.group(0).casefold() for match in pattern.finditer(value))
+    return tuple(match.group(0) for match in pattern.finditer(_normalize(value)))
 
 
 def _qualifier_count(value: str) -> dict[str, int]:
@@ -167,6 +171,11 @@ def _mismatches(
     candidate: FaithfulEditionCandidateV1,
 ) -> tuple[int, int, int, tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
     by_id = {segment.segment_id: segment for segment in candidate.transcript.segments}
+    for correction in candidate.source_corrections:
+        source = by_id[correction.segment_id]
+        if source.text != correction.before:
+            raise ValueError("Correction does not match the immutable source")
+        by_id[correction.segment_id] = replace(source, text=correction.after)
     number_count = 0
     technical_count = 0
     qualifier_count = 0
@@ -176,9 +185,7 @@ def _mismatches(
     for section in candidate.sections:
         for paragraph in section.paragraphs:
             source = " ".join(by_id[value].text for value in paragraph.source_segment_ids)
-            if sorted(_anchors(_NUMBER, source)) != sorted(
-                _anchors(_NUMBER, paragraph.text)
-            ):
+            if _anchors(_NUMBER, source) != _anchors(_NUMBER, paragraph.text):
                 number_count += 1
                 number_sections.add(section.ordinal)
             if sorted(_anchors(_TECHNICAL, source)) != sorted(
@@ -265,9 +272,7 @@ def assess_faithful_edition(
         heading in candidate.markdown
         for heading in (
             "## 精编正文",
-            "#### AI 章节摘要",
-            "#### AI 关键点",
-            "#### 待复核项",
+            "## AI 辅助摘要（不属于原文）",
         )
     )
     length_status = (

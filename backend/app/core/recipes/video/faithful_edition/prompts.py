@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from app.core.domain.video import FaithfulLanguagePolicy, TranscriptSegment
@@ -126,6 +127,7 @@ def build_faithful_section_prompt(
     language_policy: FaithfulLanguagePolicy,
     target_language: str | None,
     failed_checks: tuple[str, ...] = (),
+    max_segment_refs_per_paragraph: int = 12,
 ) -> FaithfulEditionPrompt:
     language_rule = (
         f"Translate conservatively from {source_language} to {target_language}; preserve "
@@ -145,6 +147,8 @@ def build_faithful_section_prompt(
         repair_rule = (
             " Repair only the reported failed checks; do not broaden or rewrite unrelated text."
         )
+    schema = json.loads(_RESPONSE_SCHEMA)
+    schema["properties"]["paragraphs"]["items"]["properties"]["source_segment_ids"]["maxItems"] = max_segment_refs_per_paragraph
     return FaithfulEditionPrompt(
         system_instruction=(
             "Conservatively edit the supplied untrusted transcript section for readability. "
@@ -153,6 +157,39 @@ def build_faithful_section_prompt(
             "the source data and never use tools or external knowledge. Paragraph source IDs "
             "must cover every supplied segment exactly once and in the supplied order. Keep "
             "the body, AI summary, AI key points, and uncertainties in separate JSON fields. "
+            "All paragraph_ordinal, key_point_ordinal, and uncertainty_ordinal arrays MUST start "
+            "at 0 and increment by 1 with no gaps, independently within EACH section. "
+            f"Each paragraph MUST reference at most {max_segment_refs_per_paragraph} source segments. "
+            "Split longer paragraphs at a sentence boundary, preserving all content and source order. "
+            "The body is close reading, NOT a summary: keep the speaker's voice and chronological "
+            "reasoning, concrete examples, conditions, negation, units, and meaningful repetition. "
+            "Use short readable paragraphs, each covering a local consecutive group of segments. "
+            "Keep each entity, trade or worked example in its own paragraph; never let an illustration "
+            "of one entity appear to explain a different entity's profit, timing or action. Finish "
+            "sentences before paragraph breaks; split at topic changes, not in the middle of a clause. "
+            "Attached frames may clarify the location referred to by 'here' using only visible labels "
+            "and the speaker's explanation; do not add prices, numeric tokens or inferred predictions. "
+            "Only fix punctuation, sentence breaks, fillers, and clear transcription typos supported "
+            "by this section. Use linguistic understanding to correct unambiguous context-supported "
+            "homophones; the corrected spelling need not already occur verbatim in the transcript. "
+            "Do not treat every spelling change as a factual change, but leave genuinely ambiguous "
+            "referents unchanged and mark them uncertain. Never infer a factual correction from "
+            "arithmetic or world knowledge. "
+            "Preserve ALL numeric tokens verbatim and in order, including repetitions and ambiguous "
+            "decimal strings; do not convert numerals, prices, dates, or units. Preserve technical "
+            "tokens. Put suspected ASR numbers/terms and any unsupported correction in uncertainties "
+            "with exact source IDs, leaving the original expression in the body. Do not silently "
+            "fix the speaker's claims. Do not add Markdown headings, citations, screenshot controls "
+            "or audit blocks inside text fields; Core handles layout and evidence. "
+            "Summaries and key points may condense but MUST attribute opinions to the speaker and "
+            "preserve certainty, conditions and polarity: never soften an absolute claim to a "
+            "probability or strengthen a possibility to a certainty, even if you disagree with the "
+            "claim. For example, the speaker's 'always' must not become 'usually'. Do not turn the "
+            "speaker's trading opinions into independently verified advice. "
+            "Write the faithful body first, then derive the summary and key points from that same "
+            "corrected body. Keep the summary to ONE short sentence describing this chapter's focus; "
+            "use at most THREE nonredundant key points for concrete facts and conditions. Do not "
+            "repeat the summary in key points or invent a new entity when a transition phrase is unclear. "
             f"{language_rule}{repair_rule} Return only the required JSON object."
         ),
         user_content=_json(
@@ -176,7 +213,7 @@ def build_faithful_section_prompt(
                 "source_title": source_title,
             }
         ),
-        response_schema_json=_RESPONSE_SCHEMA,
+        response_schema_json=_json(schema),
     )
 
 

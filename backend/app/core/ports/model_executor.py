@@ -125,9 +125,22 @@ class ModelExecutionRequest:
     timeout_seconds: int | float
     response_schema_json: str | None = field(default=None, repr=False)
     temperature: int | float | None = None
+    image_webp: tuple[bytes, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         code = "model_execution_request_invalid"
+        if (
+            type(self.image_webp) is not tuple
+            or len(self.image_webp) > 24
+            or any(
+                type(value) is not bytes
+                or not value.startswith(b"RIFF")
+                or value[8:12] != b"WEBP"
+                for value in self.image_webp
+            )
+            or sum(len(value) for value in self.image_webp) > 20 * 1024 * 1024
+        ):
+            raise DomainError(code, ErrorCategory.INVALID_REQUEST, "Invalid WebP image inputs")
         for field_name in (
             "stage_id",
             "prompt_id",

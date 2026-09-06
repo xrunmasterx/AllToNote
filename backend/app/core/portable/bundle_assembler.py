@@ -218,6 +218,12 @@ def _contains_path_after_prefix_boundary(
 def _contains_embedded_posix_path(value: str) -> bool:
     for match in _EMBEDDED_POSIX_PATH.finditer(value):
         candidate = match.group(0).rstrip(_PATH_TRAILING_BOUNDARIES)
+        # A slash inside a Unicode word pair (e.g. 多/空账户比) is not a root path.
+        # Still reject multi-component paths, including those adjacent to Chinese prose.
+        if (match.start() > 0 and value[match.start() - 1].isalnum()
+                and len(candidate) > 1 and candidate[1].isalnum()
+                and "/" not in candidate[1:] and "\\" not in candidate[1:]):
+            continue
         if any(
             character not in _SEPARATOR_NOTATION_CHARACTERS
             for character in candidate

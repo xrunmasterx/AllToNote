@@ -1360,6 +1360,8 @@ def test_assembler_rejects_absolute_path_in_portable_metadata(
         "（/），",
         "（/、\\）",
         "(/,\\)",
+        "多/空账户比",
+        "输入/输出",
     ),
 )
 def test_assembler_allows_separator_notation_at_punctuation_boundaries(
@@ -1425,6 +1427,9 @@ def test_assembler_allows_embedded_https_url_in_general_metadata(
         "diagnostic (/home/alice/private.log) failed",
         "diagnostic `/etc/passwd` failed",
         "diagnostic （/home/alice/private.log），failed",
+        "位置/home/alice/private.log",
+        "位置/用户/秘密",
+        "位置 /秘密",
     ),
 )
 def test_assembler_rejects_embedded_local_paths_at_separator_and_punctuation_boundaries(

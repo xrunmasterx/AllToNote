@@ -81,6 +81,7 @@ def parse_model_output(
     *,
     known_segment_ids: tuple[str, ...],
     allow_screenshots: bool,
+    preserve_screenshot_anchors: bool = False,
 ) -> ParsedModelOutput:
     """Parse visible model controls while treating code and escapes as literals."""
 
@@ -175,7 +176,8 @@ def parse_model_output(
                 )
             screenshot_set.add(segment_id)
             screenshots.append(ScreenshotRequest(segment_id))
-            removals.append((cursor, closing + 1))
+            if not preserve_screenshot_anchors:
+                removals.append((cursor, closing + 1))
             cursor = closing + 1
             continue
         if markdown.startswith("[SCREENSHOT", cursor):

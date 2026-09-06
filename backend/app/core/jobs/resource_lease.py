@@ -17,6 +17,8 @@ SECONDARY_HEAVY_PRODUCTION_RESOURCE_NAME = "produce:heavy:slot-2:v1"
 HEAVY_PRODUCTION_RESOURCE_NAMES = (
     HEAVY_PRODUCTION_RESOURCE_NAME,
     SECONDARY_HEAVY_PRODUCTION_RESOURCE_NAME,
+    "produce:heavy:slot-3:v1",
+    "produce:heavy:slot-4:v1",
 )
 _HANDOFF_NONCE = re.compile(r"[A-Za-z0-9_-]{43}")
 

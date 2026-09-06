@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Mapping
@@ -204,10 +205,14 @@ def project_reading_markdown(markdown: str) -> str:
     """Project an audited draft into human reading Markdown.
 
     The committed draft remains authoritative. This projection removes only
-    rendered system Evidence footnotes; ordinary footnotes and code literals
-    remain part of the reading text.
+    system Evidence footnotes and faithful-edition review metadata; ordinary
+    footnotes and code literals remain part of the reading text.
     """
 
+    without_log = _without_faithful_edit_log(markdown)
+    faithful = without_log != markdown
+    if faithful:
+        markdown = _without_faithful_review_notes(without_log)
     visible = markdown_visible_mask(markdown)
     projected_lines: list[str] = []
     offset = 0
@@ -270,10 +275,130 @@ def project_reading_markdown(markdown: str) -> str:
         projected_lines.append(line)
         offset += source_line_length
 
-    if not changed:
+    projected = markdown
+    if changed:
+        projected = "".join(projected_lines).rstrip(" \t\r\n")
+        projected = f"{projected}\n" if projected else ""
+    return _inline_faithful_summaries(projected) if faithful else projected
+
+
+def _inline_faithful_summaries(markdown: str) -> str:
+    """Pair audited summaries with their exact chapter headings, never by position."""
+    visible = markdown_visible_mask(markdown)
+    headings = [match for match in re.finditer(r"(?m)^(#{2,3}) (.+)$", markdown)
+                if visible[match.start()]]
+    body = [match for match in headings if match.group(0) == "## 精编正文"]
+    auxiliary = [match for match in headings
+                 if match.group(0) == "## AI 辅助摘要（不属于原文）"]
+    if len(body) != 1 or len(auxiliary) != 1 or body[0].start() >= auxiliary[0].start():
         return markdown
-    projected = "".join(projected_lines).rstrip(" \t\r\n")
-    return f"{projected}\n" if projected else ""
+    split = auxiliary[0].start()
+    chapters = [match for match in headings
+                if body[0].end() < match.start() < split and match.group(1) == "###"]
+    summaries = [match for match in headings if match.start() > split]
+    chapter_keys = [match.group(2) for match in chapters]
+    summary_keys = [match.group(2) for match in summaries]
+    if (not chapters or len(set(chapter_keys)) != len(chapter_keys)
+            or len(set(summary_keys)) != len(summary_keys)
+            or any(match.group(1) != "###" for match in summaries)
+            or not set(summary_keys).issubset(chapter_keys)):
+        return markdown
+    by_chapter = {
+        match.group(2): markdown[match.end():
+            summaries[index + 1].start() if index + 1 < len(summaries) else len(markdown)
+        ].strip()
+        for index, match in enumerate(summaries)
+    }
+    output = [markdown[:chapters[0].start()].rstrip()]
+    for index, chapter in enumerate(chapters):
+        end = chapters[index + 1].start() if index + 1 < len(chapters) else split
+        output.append(chapter.group(0))
+        summary = by_chapter.get(chapter.group(2))
+        if summary:
+            # Older audit drafts used headings for these reader-facing labels.
+            summary_visible = markdown_visible_mask(summary)
+            summary = re.sub(
+                r"(?m)^#### (AI 章节摘要|AI 关键点)[ \t]*\r?$",
+                lambda match: f"**{match.group(1)}**"
+                if summary_visible[match.start()] else match.group(0),
+                summary,
+            )
+            output.append("<details open>\n<summary>AI 摘要与关键点（不属于原文）</summary>\n\n"
+                          + summary + "\n\n</details>")
+        output.append(markdown[chapter.end():end].strip())
+    return "\n\n".join(output) + "\n"
+
+
+def _without_faithful_review_notes(markdown: str) -> str:
+    """Hide review-only blocks in drafts identified by their system edit log."""
+    output: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+    review_section = False
+    for line in markdown.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        fence = _FENCE.match(content)
+        if fence is not None:
+            marker = fence.group(1)
+            if fence_character is None:
+                fence_character, fence_length = marker[0], len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+            output.append(line)
+            continue
+        if fence_character is not None:
+            output.append(line)
+            continue
+        if re.match(r"^#{1,4} ", content):
+            review_section = content == "#### 待复核项"
+        if review_section or content.startswith("> 待核对："):
+            continue
+        if re.fullmatch(r"<!-- time:\d+-\d+ -->", content):
+            continue
+        if content == "> 正文仅依据转录稿保守整理；疑似识别错误保留待核对，不代表已核验原音频。":
+            line = "> 正文依据转录稿整理，未核验原音频。" + line[len(content):]
+        if not content and output and not output[-1].strip():
+            continue
+        output.append(line)
+    return "".join(output)
+
+
+def _without_faithful_edit_log(markdown: str) -> str:
+    """Hide only valid, top-level, system-owned edit-log fences in reading views."""
+    lines = markdown.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    fence_character: str | None = None
+    fence_length = 0
+    while index < len(lines):
+        line = lines[index]
+        if fence_character is None and line.rstrip("\r\n") == "```alltonote-edit-log-v1":
+            end = index + 1
+            while end < len(lines) and lines[end].rstrip("\r\n") != "```":
+                end += 1
+            if end < len(lines):
+                try:
+                    payload = json.loads("".join(lines[index + 1:end]))
+                    valid = (type(payload) is dict
+                             and set(payload) == {"schema_version", "kind", "records"}
+                             and payload["schema_version"] == 1
+                             and payload["kind"] == "faithful-edit-log"
+                             and type(payload["records"]) is list)
+                except (ValueError, RecursionError):
+                    valid = False
+                if valid:
+                    index = end + 1
+                    continue
+        fence = _FENCE.match(line)
+        if fence:
+            marker = fence.group(1)
+            if fence_character is None:
+                fence_character, fence_length = marker[0], len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = None
+        output.append(line)
+        index += 1
+    return "".join(output)
 
 
 def _backslash_escaped(value: str, index: int) -> bool:

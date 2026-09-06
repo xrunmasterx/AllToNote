@@ -2175,9 +2175,11 @@ def test_codex_runtime_factory_uses_workspace_instance_machine_root(
     )
     exact_resolutions.clear()
     pack_port_resolver = captured["pack_port_resolver"]
-    _source, transcriber, transcriber_identity = pack_port_resolver(
+    _source, transcriber, transcriber_identity, ffmpeg_executable = pack_port_resolver(
         captured["pack_environment"]
     )
+    assert captured["ffmpeg_executable"] == resolved["media-basic"].entrypoints["ffmpeg"]
+    assert ffmpeg_executable == resolved["media-basic"].entrypoints["ffmpeg"]
     if transcribe_available:
         assert transcriber_identity == transcriber.identity
         assert exact_resolutions == expected_exact_resolutions

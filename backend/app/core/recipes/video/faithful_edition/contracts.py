@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from app.core.domain.video import FaithfulLanguagePolicy, TranscriptDocument
+from app.core.domain.visual_frame import VisualFrame
 from app.core.domain.transcript import transcript_sha256
 from app.core.errors import DomainError, ErrorCategory
 from app.core.recipes.video.compilation.contracts import (
@@ -51,6 +52,17 @@ class FaithfulUncertaintyCategory(StrEnum):
 
 
 @dataclass(frozen=True)
+class GroundedCorrection:
+    segment_id: str
+    before: str
+    after: str
+    frame_segment_id: str
+    visible_quote: str
+    reason: str
+    frame_sha256: str = ""
+
+
+@dataclass(frozen=True)
 class FaithfulEditionParserLimitsV1:
     max_response_bytes: int
     max_title_characters: int
@@ -86,6 +98,9 @@ class FaithfulEditionRequestV1:
     reserved_output_tokens: int
     parser_limits: FaithfulEditionParserLimitsV1
     max_repair_attempts: int
+    visual_frames: tuple[VisualFrame, ...] = ()
+    source_corrections: tuple[GroundedCorrection, ...] = ()
+    chapter_start_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -121,8 +136,33 @@ class FaithfulEditionRequestV1:
             or self.parser_limits.max_response_bytes > self.max_request_bytes
             or type(self.max_repair_attempts) is not int
             or not 0 <= self.max_repair_attempts <= 1
+            or type(self.visual_frames) is not tuple
+            or len(self.visual_frames) > 192
+            or any(not isinstance(frame, VisualFrame) for frame in self.visual_frames)
         ):
             raise invalid_contract("Faithful edition request is invalid")
+        by_id = {segment.segment_id: segment for segment in self.transcript.segments}
+        frame_ids = [frame.segment_id for frame in self.visual_frames]
+        if (
+            len(frame_ids) != len(set(frame_ids))
+            or any(frame.segment_id not in by_id
+                   or not by_id[frame.segment_id].start_ms <= frame.timestamp_ms < by_id[frame.segment_id].end_ms
+                   for frame in self.visual_frames)
+            or list(self.visual_frames) != sorted(self.visual_frames, key=lambda frame: frame.timestamp_ms)
+        ):
+            raise invalid_contract("Faithful frame anchors must match the transcript in order")
+        if (type(self.source_corrections) is not tuple
+                or any(not isinstance(value, GroundedCorrection) for value in self.source_corrections)
+                or type(self.chapter_start_ids) is not tuple):
+            raise invalid_contract("Grounded source corrections must use the frozen contract")
+        correction_ids = [value.segment_id for value in self.source_corrections]
+        if (len(correction_ids) != len(set(correction_ids))
+                or any(value.segment_id not in by_id or value.before != by_id[value.segment_id].text
+                       or not value.after.strip() for value in self.source_corrections)
+                or len(self.chapter_start_ids) != len(set(self.chapter_start_ids))
+                or any(value not in by_id for value in self.chapter_start_ids)
+                or list(self.chapter_start_ids) != sorted(self.chapter_start_ids, key=lambda value: by_id[value].start_ms)):
+            raise invalid_contract("Grounded source corrections or chapter boundaries are invalid")
 
 
 @dataclass(frozen=True)

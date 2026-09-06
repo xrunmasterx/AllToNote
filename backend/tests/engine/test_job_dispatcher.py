@@ -47,7 +47,7 @@ _VIDEO_BINDING = JobExecutionBinding(
 )
 
 
-@pytest.mark.parametrize("capacity", (0, 3, True))
+@pytest.mark.parametrize("capacity", (0, 5, True))
 def test_dispatcher_rejects_unsupported_active_worker_capacity(
     tmp_path: Path,
     capacity: object,
@@ -321,7 +321,7 @@ def test_dispatcher_capacity_two_runs_two_workers_and_bounds_the_third(
         assert two_started.wait(timeout=5)
         with started_lock:
             assert len(started) == 2
-            assert set(started_resources) == set(HEAVY_PRODUCTION_RESOURCE_NAMES)
+            assert set(started_resources) == set(HEAVY_PRODUCTION_RESOURCE_NAMES[:2])
         for _index in range(500):
             if any(
                 event.event_type == "scheduler.waiting.v1"
@@ -364,6 +364,55 @@ def test_dispatcher_capacity_two_runs_two_workers_and_bounds_the_third(
         repository.get_job(second.job_id).state,
         repository.get_job(third.job_id).state,
     } == {JobState.CANCELLED}
+
+
+def test_default_capacity_four_bounds_fifth_video_and_preserves_queue(tmp_path):
+    paths, repository, first, first_reference = _registered_job(tmp_path, client_request_id="four-videos")
+    references = [first_reference]
+    for index in range(4):
+        job = repository.create_job(
+            request_hash="sha256:" + str(index + 1) * 64,
+            principal="local-user", client_request_id=f"concurrent-video-{index}",
+            execution_owner=JobExecutionOwner.ENGINE, execution_binding=_VIDEO_BINDING,
+        )
+        references.append(EngineJobReference(first_reference.workspace_instance_id, job.job_id))
+    lock = threading.Lock()
+    four_started = threading.Event()
+    fifth_started = threading.Event()
+    release = threading.Event()
+    started = []
+
+    def run_worker(launch, check_running):
+        with lock:
+            started.append(launch.reference.job_id)
+            if len(started) == 4:
+                four_started.set()
+            if len(started) == 5:
+                fifth_started.set()
+        assert release.wait(5)
+        check_running()
+        repository.cancel_job(launch.reference.job_id)
+        return 0
+
+    dispatcher = EngineJobDispatcher(paths, worker_runner=run_worker, reconcile_interval_seconds=60)
+    try:
+        for reference in references:
+            dispatcher.notify(reference)
+        dispatcher.start()
+        assert four_started.wait(5)
+        with lock:
+            assert len(started) == 4
+        assert repository.get_engine_worker_launch_count(references[-1].job_id) == 0
+        release.set()
+        assert fifth_started.wait(5)
+        for _ in range(500):
+            if not dispatcher.has_work:
+                break
+            threading.Event().wait(0.01)
+        assert not dispatcher.has_work
+    finally:
+        release.set()
+        dispatcher.close(force=True)
 
 
 def test_legacy_heavy_holder_consumes_one_capacity_two_slot(tmp_path: Path) -> None:
@@ -795,7 +844,7 @@ def test_pending_queue_is_bounded_and_reports_backpressure(tmp_path: Path) -> No
         tmp_path,
         client_request_id="second",
     )
-    dispatcher = EngineJobDispatcher(paths, maximum_pending_jobs=1)
+    dispatcher = EngineJobDispatcher(paths, maximum_pending_jobs=1, maximum_active_workers=1)
 
     dispatcher.notify(first)
     with pytest.raises(DomainError) as raised:
@@ -852,6 +901,7 @@ def test_failed_oldest_job_does_not_starve_lost_notification_job(
         worker_runner=run_worker,
         maximum_pending_jobs=1,
         reconcile_interval_seconds=0.01,
+        maximum_active_workers=1,
     )
     try:
         dispatcher.start()
@@ -1171,6 +1221,7 @@ def test_unexpected_worker_exception_does_not_kill_dispatcher_loop(
         worker_runner=run_worker,
         maximum_pending_jobs=1,
         reconcile_interval_seconds=0.01,
+        maximum_active_workers=1,
     )
     try:
         dispatcher.notify(poison)

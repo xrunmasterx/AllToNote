@@ -29,7 +29,6 @@ from app.core.jobs.model import (
     JobState,
 )
 from app.core.jobs.resource_lease import (
-    HEAVY_PRODUCTION_RESOURCE_NAME,
     HEAVY_PRODUCTION_RESOURCE_NAMES,
     JobExecutionAuthority,
     ResourceLease,
@@ -50,8 +49,8 @@ WORKER_HEARTBEAT_INTERVAL_SECONDS = 30.0
 WORKER_CANCELLATION_POLL_SECONDS = 0.25
 WORKER_CANCELLATION_GRACE_SECONDS = 5.0
 MAXIMUM_AUTOMATIC_WORKER_LAUNCHES = 3
-DEFAULT_MAXIMUM_ACTIVE_WORKERS = 1
 MAXIMUM_ACTIVE_WORKERS = len(HEAVY_PRODUCTION_RESOURCE_NAMES)
+DEFAULT_MAXIMUM_ACTIVE_WORKERS = MAXIMUM_ACTIVE_WORKERS
 _SCHEDULER_WAITING_EVENT = "scheduler.waiting.v1"
 _SCHEDULER_ADMITTED_EVENT = "scheduler.admitted.v1"
 _SCHEDULER_WAITING_PAYLOAD = json.dumps(
@@ -732,11 +731,7 @@ class EngineJobDispatcher:
         )
         last_busy: DomainError | None = None
         source_lease: ResourceLease | None = None
-        resource_names = (
-            (HEAVY_PRODUCTION_RESOURCE_NAME,)
-            if self._maximum_active_workers == 1
-            else HEAVY_PRODUCTION_RESOURCE_NAMES
-        )
+        resource_names = HEAVY_PRODUCTION_RESOURCE_NAMES[:self._maximum_active_workers]
         for resource_name in resource_names:
             try:
                 source_lease = resource_store.acquire(

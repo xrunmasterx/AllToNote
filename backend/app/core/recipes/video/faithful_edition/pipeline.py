@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from app.core.domain.ids import sha256_digest
 from app.core.domain.transcript import transcript_sha256
@@ -73,15 +73,8 @@ def _segment_payload(segment: TranscriptSegment) -> dict[str, object]:
     }
 
 
-def _is_excluded(
-    segment: TranscriptSegment,
-    previous: TranscriptSegment | None,
-) -> bool:
-    if _EXCLUDED_MARKER.fullmatch(segment.text):
-        return True
-    return previous is not None and " ".join(segment.text.split()).casefold() == " ".join(
-        previous.text.split()
-    ).casefold()
+def _is_excluded(segment: TranscriptSegment) -> bool:
+    return _EXCLUDED_MARKER.fullmatch(segment.text) is not None
 
 
 def plan_faithful_edition(
@@ -94,12 +87,13 @@ def plan_faithful_edition(
             "Faithful planning requires the frozen request contract",
         )
     transcript = request.transcript
+    corrections = {value.segment_id: value.after for value in request.source_corrections}
     excluded: list[str] = []
     eligible: list[tuple[int, TranscriptSegment, int]] = []
-    previous: TranscriptSegment | None = None
     for ordinal, segment in enumerate(transcript.segments):
+        segment = replace(segment, text=corrections.get(segment.segment_id, segment.text))
         encoded_bytes = len(encode_json(_segment_payload(segment)))
-        if _is_excluded(segment, previous):
+        if _is_excluded(segment):
             excluded.append(segment.segment_id)
         else:
             if encoded_bytes > request.section_input_byte_budget:
@@ -109,7 +103,6 @@ def plan_faithful_edition(
                     "A transcript segment exceeds the faithful section input budget",
                 )
             eligible.append((ordinal, segment, encoded_bytes))
-        previous = segment
     if not eligible:
         raise DomainError(
             "faithful_transcript_empty",
@@ -121,7 +114,11 @@ def plan_faithful_edition(
     current: list[tuple[int, TranscriptSegment, int]] = []
     current_bytes = 0
     for value in eligible:
-        if current and current_bytes + value[2] > request.section_input_byte_budget:
+        if current and (
+            current_bytes + value[2] > request.section_input_byte_budget
+            or value[1].segment_id in request.chapter_start_ids
+            or (not request.chapter_start_ids and value[1].end_ms - current[0][1].start_ms > 150_000)
+        ):
             batches.append(current)
             current = []
             current_bytes = 0
@@ -173,8 +170,8 @@ def plan_faithful_edition(
         language_policy=request.language_policy,
         target_language=request.target_language,
         model_binding_sha256=_binding_sha256(request),
-        stage_version=1,
-        prompt_version=1,
+        stage_version=3,
+        prompt_version=5,
         sections=tuple(sections),
         excluded_segment_ids=tuple(excluded),
         max_concurrency=min(request.model_binding.max_concurrency, len(sections)),

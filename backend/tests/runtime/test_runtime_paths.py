@@ -360,7 +360,7 @@ def test_same_workspace_under_two_machine_roots_does_not_share_lease(
     assert first_instance.machine_root != second_instance.machine_root
 
 
-def test_workspace_runtimes_share_one_machine_production_admission(
+def test_workspace_video_runtimes_can_use_distinct_machine_slots(
     tmp_path: Path,
 ) -> None:
     local_app_data = tmp_path / "local-app-data"
@@ -404,13 +404,11 @@ def test_workspace_runtimes_share_one_machine_production_admission(
         first_wait = executor.submit(first.wait_job, first_job.job_id)
         assert entered.wait(timeout=5)
         try:
-            with pytest.raises(DomainError, match="resource_busy"):
-                second.wait_job(second_job.job_id)
-            assert second.get_job(second_job.job_id).state.value == "queued"
+            assert second.wait_job(second_job.job_id).state.value == "succeeded"
             assert second.job_repository.latest_checkpoint(
                 second_job.job_id,
                 "preflight",
-            ) is None
+            ) is not None
         finally:
             release.set()
         assert first_wait.result(timeout=15).state.value == "succeeded"

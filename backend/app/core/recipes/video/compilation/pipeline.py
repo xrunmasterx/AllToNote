@@ -692,6 +692,7 @@ def parse_composed_knowledge_draft(
     allowed_segment_ids: tuple[str, ...],
     allow_screenshots: bool,
     limits: ComposerParserLimitsV1,
+    preserve_screenshot_anchors: bool = False,
 ) -> ComposedKnowledgeDraftV1:
     try:
         input_ids = tuple(allowed_input_ids)
@@ -784,6 +785,7 @@ def parse_composed_knowledge_draft(
         markdown,
         known_segment_ids=segment_ids,
         allow_screenshots=allow_screenshots,
+        preserve_screenshot_anchors=preserve_screenshot_anchors,
     )
     covered = tuple(sorted(raw_covered, key=allowed_order.__getitem__))
     omission_order = {value: index for index, value in enumerate(input_ids)}

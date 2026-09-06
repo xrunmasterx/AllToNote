@@ -267,6 +267,8 @@ class ModelCallCoordinator:
                         "system_instruction": request.system_instruction,
                         "temperature": request.temperature,
                         "user_content": request.user_content,
+                        **({"image_webp_sha256": [sha256_digest(value) for value in request.image_webp]}
+                           if request.image_webp else {}),
                     },
                     "shard_key": shard_key,
                 }
@@ -313,6 +315,12 @@ class ModelCallCoordinator:
                 "model_capability_missing",
                 ErrorCategory.POLICY_DENIED,
                 "The frozen model binding does not support structured output",
+            )
+        if request.image_webp and binding.provider_type != "codex-app-server":
+            raise DomainError(
+                "model_capability_missing",
+                ErrorCategory.POLICY_DENIED,
+                "Image input is currently wired only for Codex app-server",
             )
         if request.temperature is not None and not binding.supports_temperature:
             raise DomainError(

@@ -264,3 +264,37 @@ def test_descriptor_cleanup_refuses_changed_path_identity(
 
     assert comparisons == 2
     assert instance.descriptor.read_bytes() == owner.to_bytes()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing violation recovery")
+@pytest.mark.parametrize("mode", ("transient", "permanent", "disappeared", "hardlink"))
+def test_descriptor_sharing_retry_preserves_security_checks(tmp_path, monkeypatch, mode):
+    instance = EngineInstancePaths.from_runtime_paths(_paths(tmp_path))
+    instance.root.mkdir(parents=True)
+    owner = _descriptor(instance, engine_id=str(uuid4()), nonce="a" * 43)
+    publish_descriptor(instance.descriptor, owner)
+    original_open = os.open
+    attempts = 0
+
+    def busy_open(path, flags, *args, **kwargs):
+        nonlocal attempts
+        if Path(path) == instance.descriptor:
+            attempts += 1
+            if mode == "permanent" or attempts == 1:
+                if mode in {"disappeared", "hardlink"}:
+                    instance.descriptor.unlink()
+                if mode == "hardlink":
+                    canary = tmp_path / "outside.json"
+                    canary.write_bytes(owner.to_bytes())
+                    os.link(canary, instance.descriptor)
+                raise PermissionError(13, "Sharing violation", str(path))
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(engine_instance_module.os, "open", busy_open)
+    if mode in {"permanent", "hardlink"}:
+        with pytest.raises(DomainError, match="engine_state_root_unsafe"):
+            engine_instance_module.read_descriptor(instance.descriptor)
+        assert attempts == (3 if mode == "permanent" else 1)
+    else:
+        result = engine_instance_module.read_descriptor(instance.descriptor)
+        assert result == (None if mode == "disappeared" else owner)

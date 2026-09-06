@@ -53,10 +53,12 @@ def _bind(
     draft: GeneratedVideoDraft,
     plan: tuple[object, ...],
     assets: tuple[object, ...],
+    *,
+    inline: bool = False,
 ) -> GeneratedVideoDraft:
     binder = getattr(video_service, "bind_screenshot_assets", None)
     assert callable(binder), "Core screenshot asset binder is missing"
-    return binder(draft, plan, assets)
+    return binder(draft, plan, assets, inline=inline)
 
 
 def _asset(item: object) -> DisplayAssetInput:
@@ -84,6 +86,46 @@ def test_half_open_offsets_accept_first_and_last_millisecond_in_model_order() ->
         f"assets/{plan[0].artifact_id}.webp",
         f"assets/{plan[1].artifact_id}.webp",
     ]
+
+
+def test_visual_candidates_are_bounded_unique_and_chronological() -> None:
+    transcript = TranscriptDocument("en", tuple(
+        TranscriptSegment(f"seg_{index + 1:06d}", index * 10_000, (index + 1) * 10_000, "chart")
+        for index in range(500)
+    ))
+    plan = video_service.build_visual_candidate_plan(JOB_ID, transcript)
+    assert len(plan) == 24
+    times = [item.timestamp_ms for item in plan]
+    assert times == sorted(set(times))
+    assert times[0] < 210_000 and times[-1] > 4_790_000
+
+
+def test_screenshot_anchors_stay_inside_corresponding_sections() -> None:
+    draft = replace(_draft(ScreenshotRequest("seg_000001")), markdown=(
+        "# Note\n\n## First\n\nExplanation.\n\n[SCREENSHOT:seg_000001]\n\n## Second\n\nOther topic.\n"
+    ))
+    plan = _build(ScreenshotPolicy.ON_DEMAND, *draft.screenshot_requests)
+    result = _bind(draft, plan, tuple(_asset(item) for item in plan), inline=True)
+    assert result.markdown.index("![Video screenshot") < result.markdown.index("## Second")
+    assert "## Screenshots" not in result.markdown
+    assert "[SCREENSHOT:" not in result.markdown
+
+
+def test_partial_screenshot_anchors_fail_instead_of_falling_back_to_gallery() -> None:
+    draft = replace(_draft(ScreenshotRequest("seg_000001")), markdown="# Note\n[SCREENSHOT:seg_000002]")
+    plan = _build(ScreenshotPolicy.ON_DEMAND, *draft.screenshot_requests)
+    with pytest.raises(DomainError, match="screenshot_asset_binding_invalid"):
+        _bind(draft, plan, tuple(_asset(item) for item in plan), inline=True)
+
+
+def test_inline_binding_does_not_replace_screenshot_controls_inside_code() -> None:
+    draft = replace(_draft(ScreenshotRequest("seg_000001")), markdown=(
+        "# Note\n\n`[SCREENSHOT:seg_000001]` is literal.\n\n[SCREENSHOT:seg_000001]\n"
+    ))
+    plan = _build(ScreenshotPolicy.ON_DEMAND, *draft.screenshot_requests)
+    result = _bind(draft, plan, tuple(_asset(item) for item in plan), inline=True)
+    assert "`[SCREENSHOT:seg_000001]`" in result.markdown
+    assert result.markdown.count("![Video screenshot") == 1
 
 
 @pytest.mark.parametrize(

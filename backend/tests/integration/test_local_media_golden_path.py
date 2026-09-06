@@ -43,15 +43,18 @@ from app.core.domain.video import (
     ScreenshotPolicy,
     TranscriptDocument,
     TranscriptSegment,
+    VideoDocumentKind,
     VideoProduceRequest,
 )
 from app.core.errors import DomainError, ErrorCategory
 from app.core.jobs.external_operation import ExternalOperationGuard
 from app.core.jobs.model import JobExecutionOwner
 from app.core.jobs.resource_lease import JobExecutionAuthority
+from app.core.packs.events import ExecutionPackIdentity, JobPackEnvironmentSnapshot
 from app.core.portable.bundle_assembler import DisplayAssetInput
 from app.core.portable.quality import evaluate_video_draft
 from app.core.ports.transcript import MediaInput
+from app.core.ports.model_executor import ModelExecutionBinding
 from app.job_runtime import JobRuntime
 
 
@@ -958,6 +961,192 @@ def test_platform_runtime_routes_local_source_without_platform_uri(
     assert manifest["source_revisions"][0]["materialization"]["kind"] == (
         "external_local"
     )
+
+
+class _FaithfulScreenshotCompletion:
+    def complete_request(self, prompt, request, *, check_cancelled=None):
+        if check_cancelled:
+            check_cancelled()
+        payload = json.loads(request.user_content)
+        if request.stage_id == "faithful-source-prepare":
+            response = {"corrections": [], "chapter_start_ids": [],
+                        "illustration_ids": [payload["frames"][0]["segment_id"]]}
+        elif request.stage_id == "faithful-source-check":
+            response = {"pass": True, "issues": []}
+        elif request.stage_id == "faithful-review":
+            assert len(request.image_webp) == 1
+            assert request.image_webp[0][:4] == b"RIFF"
+            response = {"pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "uncertainties": [],
+                        "frames": [{"segment_id": payload["frames"][0]["segment_id"],
+                                    "use": True, "caption": "Visible lesson frame."}]}
+        else:
+            assert request.stage_id == "faithful-edit"
+            section = payload["section"]
+            segments = section["segments"]
+            response = {
+                "schema_version": 1, "section_id": section["section_id"],
+                "section_ordinal": section["section_ordinal"], "title": "Source lesson",
+                "paragraphs": [{"paragraph_ordinal": 0,
+                                "text": " ".join(segment["text"] for segment in segments),
+                                "source_segment_ids": [segment["segment_id"] for segment in segments]}],
+                "summary": {"text": "Summary", "source_segment_ids": [segments[0]["segment_id"]]},
+                "key_points": [], "uncertainties": [], "warnings": [],
+            }
+        return LegacyModelResponse(markdown=json.dumps(response), provider_request_id=request.stage_id,
+                                   input_tokens=40, output_tokens=20, actual_model="fixture/model-v1")
+
+
+@pytest.mark.parametrize("faithful", [False, True])
+@pytest.mark.parametrize("pack_activation", [False, True])
+@pytest.mark.parametrize("detached", [False, True])
+def test_platform_runtime_wires_frozen_ffmpeg_screenshots(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pack_activation: bool,
+    detached: bool,
+    faithful: bool,
+) -> None:
+    calls = Calls()
+    process_factory = _ScreenshotProcessFactory(calls)
+    executable = tmp_path / "signed-pack" / "ffmpeg.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"fixture executable")
+    adapter_type = FFmpegScreenshotAdapter
+    monkeypatch.setattr(
+        runtime_module,
+        "FFmpegScreenshotAdapter",
+        lambda storage, repository, **options: adapter_type(
+            storage, repository, process_factory=process_factory, **options
+        ),
+    )
+    source = LegacyVideoSourceAdapter(local_machine_id="fixture-machine")
+    transcriber = _TranscriptFake(calls)
+    snapshot = JobPackEnvironmentSnapshot(
+        schema_version=1,
+        packs=(
+            ExecutionPackIdentity(
+                pack_id="media-basic",
+                pack_version="fixture-v1",
+                platform="windows-x86_64",
+                manifest_sha256="sha256:" + "a" * 64,
+            ),
+        ),
+    )
+    runtime = runtime_module.create_platform_video_runtime(
+        tmp_path / "platform-screenshot-machine",
+        source=source,
+        source_metadata={"local": {**LOCAL_METADATA, "language": "und" if faithful else "en"}},
+        transcriber=transcriber,
+        ffmpeg_executable=None if pack_activation else executable,
+        pack_environment=snapshot if pack_activation else None,
+        pack_port_resolver=(
+            (lambda _snapshot: (source, transcriber, "fixture/transcriber-v1", executable))
+            if pack_activation
+            else None
+        ),
+        model=LegacyModelBinding(
+            provider_kind="codex-app-server" if faithful else "fixture/provider-v1",
+            model_identity="fixture/model-v1",
+            bridge=_FaithfulScreenshotCompletion() if faithful else _ScreenshotCompletion(calls),
+            capabilities=LegacyModelCapabilities(screenshot_requests=True),
+        ),
+        model_execution_profile="default" if faithful else None,
+        model_execution_binding=(ModelExecutionBinding(
+            schema_version=1, provider_type="codex-app-server", model_identity="fixture/model-v1",
+            credential_profile_ref="default", context_window_tokens=16384, max_output_tokens=2048,
+            max_concurrency=2, supports_structured_output=True, supports_temperature=True,
+            timeout_seconds=60,
+        ) if faithful else None),
+    )
+    request = _request(local_video, workspace_root, "platform-screenshot",
+                       screenshot_policy=ScreenshotPolicy.ON_DEMAND)
+    if faithful:
+        request = VideoProduceRequest(
+            request_schema_version=2, workspace_root=workspace_root, input_value=str(local_video),
+            recipe_id="alltonote.video-producer", recipe_version=2,
+            requested_outputs=(VideoDocumentKind.FAITHFUL_EDITION,),
+            style="illustrated-reading", screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+        )
+    submitted = runtime.submit_video(
+        request,
+        execution_owner=(
+            JobExecutionOwner.ENGINE if detached else JobExecutionOwner.FOREGROUND
+        ),
+    )
+    if detached:
+        local_video.unlink()
+    completed = runtime.wait_job(submitted.job_id)
+    assert completed.state is JobState.SUCCEEDED
+    assert completed.result is not None
+    assert calls.ffmpeg == 1
+    assert process_factory.argv[0][0] == str(executable)
+    bundle = workspace_root / completed.result.workspace_relative_bundle_path
+    draft = (
+        bundle / "drafts" / f"{completed.result.primary_draft_artifact_id}.md"
+    ).read_text("utf-8")
+    assets = list((bundle / "assets").glob("*.webp"))
+    assert len(assets) == 1
+    assert f"(../assets/{assets[0].name})" in draft
+    assert "[SCREENSHOT:" not in draft
+    if faithful:
+        assert "来源语言：en" in draft
+        report = json.loads(next((bundle / "quality").glob("*.json")).read_text("utf-8"))
+        assert report["overall"] == "pass"
+        assert next(check for check in report["checks"] if check["id"] == "h2_evidence")["status"] == "pass"
+        manifest = json.loads((bundle / "bundle.json").read_text("utf-8"))
+        primary = next(artifact for artifact in manifest["artifacts"]
+                       if artifact["artifact_id"] == completed.result.primary_draft_artifact_id)
+        assert primary["extensions"]["alltonote.video:draft"]["source_language"] == "en"
+
+
+@pytest.mark.parametrize(
+    "failure", ["unwired", "missing_executable", "remote", "missing_input", "model"]
+)
+def test_platform_screenshot_preflight_precedes_expensive_work(
+    tmp_path: Path,
+    workspace_root: Path,
+    local_video: Path,
+    failure: str,
+) -> None:
+    calls = Calls()
+    executable = tmp_path / "ffmpeg.exe"
+    if failure != "missing_executable":
+        executable.write_bytes(b"fixture executable")
+    runtime = runtime_module.create_platform_video_runtime(
+        tmp_path / "platform-preflight-machine",
+        source=LegacyVideoSourceAdapter(local_machine_id="fixture-machine"),
+        source_metadata={"local": LOCAL_METADATA},
+        transcriber=_TranscriptFake(calls),
+        ffmpeg_executable=None if failure == "unwired" else executable,
+        model=LegacyModelBinding(
+            provider_kind="fixture/provider-v1",
+            model_identity="fixture/model-v1",
+            bridge=_ScreenshotCompletion(calls),
+            capabilities=LegacyModelCapabilities(screenshot_requests=failure != "model"),
+        ),
+    )
+    request = _request(
+        local_video, workspace_root, "screenshot-preflight",
+        screenshot_policy=ScreenshotPolicy.ON_DEMAND,
+    )
+    if failure == "remote":
+        request = replace(request, input_value="https://www.youtube.com/watch?v=GoldenPath1")
+    elif failure == "missing_input":
+        local_video.unlink()
+    submitted = runtime.submit_video(request)
+    completed = runtime.wait_job(submitted.job_id)
+    assert completed.state is JobState.FAILED
+    assert completed.error is not None
+    assert calls.transcriber == calls.model == calls.ffmpeg == 0
+    assert completed.error.code == {
+        "unwired": "screenshot_capability_unavailable",
+        "missing_executable": "ffmpeg_unavailable",
+        "remote": "screenshot_source_unsupported",
+        "missing_input": "source_unsupported",
+        "model": "screenshot_model_incompatible",
+    }[failure]
 
 
 def test_valid_local_screenshot_uses_snapshot_once_and_checkpoints_verified_webp(

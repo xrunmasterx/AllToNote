@@ -444,6 +444,7 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         result_root: Path,
         storage: FileAttemptStorage | None = None,
         transcriber: TranscriptPort | None = None,
+        ffmpeg_executable: Path | None = None,
     ) -> None:
         self._repository = repository
         self._source = source
@@ -456,12 +457,39 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         self._acquisition_root = result_root / "acquisition"
         self._storage = storage
         self._transcriber = transcriber
+        self._ffmpeg_executable = ffmpeg_executable
+        if ffmpeg_executable is not None:
+            assert storage is not None
+        self._screenshot_adapter = (
+            FFmpegScreenshotAdapter(
+                storage, repository, ffmpeg_executable=str(ffmpeg_executable)
+            )
+            if ffmpeg_executable is not None
+            else None
+        )
 
     def preflight_capabilities(
         self, request: VideoProduceRequest
     ) -> VideoPreflightCapabilities:
-        del request
-        return VideoPreflightCapabilities()
+        screenshot_available = self._screenshot_adapter is not None
+        ffmpeg_available = True
+        if request.screenshot_policy is not ScreenshotPolicy.OFF and screenshot_available:
+            source = self._source.resolve(request.input_value)
+            if source.platform != "local":
+                raise DomainError(
+                    "screenshot_source_unsupported",
+                    ErrorCategory.INVALID_REQUEST,
+                    "Screenshots require a local video file; download the video first",
+                )
+            assert self._ffmpeg_executable is not None
+            ffmpeg_available = self._ffmpeg_executable.is_file()
+        return VideoPreflightCapabilities(
+            screenshot_capability=screenshot_available,
+            screenshot_model_compatible=(
+                request.recipe_version == 2 or self._model.capabilities.screenshot_requests
+            ),
+            ffmpeg_loadable=ffmpeg_available,
+        )
 
     def resolve_source(
         self,
@@ -849,20 +877,33 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         acquisition_checkpoint: CheckpointMetadata,
         execution: VideoStepExecutionContext,
     ) -> tuple[DisplayAssetInput, ...]:
-        del transcript, acquired, acquisition_checkpoint, execution
-        if plan:
+        if not plan:
+            return ()
+        if self._screenshot_adapter is None:
             raise DomainError(
                 "screenshot_capability_unavailable",
                 ErrorCategory.POLICY_DENIED,
-                "Platform subtitle composition does not provide screenshots",
+                "The runtime does not provide a screenshot adapter",
             )
-        return ()
+        return self._screenshot_adapter.extract(
+            plan,
+            transcript,
+            acquired,
+            acquisition_checkpoint=acquisition_checkpoint,
+            execution=execution,
+        )
 
     def after_portable_commit(self, result: object) -> None:
         del result
 
 
 class _LocalVideoOperations(_PlatformVideoOperations):
+    def preflight_capabilities(
+        self, request: VideoProduceRequest
+    ) -> VideoPreflightCapabilities:
+        del request
+        return VideoPreflightCapabilities()
+
     def __init__(
         self,
         repository: SqliteJobRepository,
@@ -1370,7 +1411,9 @@ class _RuntimeVideoKnowledgeCompiler:
             prompt_overhead_bytes=1_400,
             reserved_output_tokens=binding.max_output_tokens,
             max_request_bytes=max_request_bytes,
-            max_chunk_duration_ms=self._MAX_CHUNK_DURATION_MS,
+            max_chunk_duration_ms=(request.transcript.segments[-1].end_ms
+                                   if request.style == "illustrated-reading"
+                                   else self._MAX_CHUNK_DURATION_MS),
             estimated_map_output_tokens_per_chunk=map_output_tokens,
             map_output_byte_budget_per_chunk=map_output_bytes,
             max_repair_attempts=1,
@@ -1382,6 +1425,7 @@ class _RuntimeVideoKnowledgeCompiler:
             output_language=request.output_language,
             style=request.style,
             screenshot_policy=request.screenshot_policy,
+            visual_frames=request.visual_frames,
             map_parser_limits=KnowledgeMapParserLimitsV1(
                 max_response_bytes=map_output_bytes,
                 max_items=map_item_limit,
@@ -1432,12 +1476,19 @@ class _RuntimeFaithfulEditionCompiler:
             document_kind=VideoDocumentKind.FAITHFUL_EDITION,
             behavior={
                 "parser": 1,
-                "planner": 1,
-                "prompt": 1,
-                "quality": 1,
-                "repair_prompt": 1,
-                "repair_stage": 1,
-                "section_stage": 1,
+                "planner": 2,
+                "prompt": 4,
+                "quality": 4,
+                "repair_prompt": 4,
+                "repair_stage": 2,
+                "section_stage": 2,
+                "semantic_visual_review": 3,
+                "semantic_repair": 1,
+                "source_grounding": 4,
+                "caption_source_numbers": 1,
+                "semantic_chapters": 1,
+                "dense_correction_frames": 1,
+                "audit_layout": 2,
             },
         )
 
@@ -1469,7 +1520,8 @@ class _RuntimeFaithfulEditionCompiler:
         max_request_bytes = (
             binding.context_window_tokens - binding.max_output_tokens
         )
-        section_input_byte_budget = max_request_bytes // 2
+        # Reserve room for the edited section plus original transcript and image review.
+        section_input_byte_budget = min(max_request_bytes // 4, 12 * 1024)
         max_response_bytes = min(
             binding.max_output_tokens * 4,
             max_request_bytes,
@@ -1508,7 +1560,7 @@ class _RuntimeFaithfulEditionCompiler:
                 max_title_characters=200,
                 max_paragraphs=64,
                 max_paragraph_characters=min(max_response_bytes, 32 * 1024),
-                max_segment_refs_per_paragraph=256,
+                max_segment_refs_per_paragraph=12,
                 max_key_points=64,
                 max_uncertainties=64,
                 max_auxiliary_text_characters=min(
@@ -1517,6 +1569,7 @@ class _RuntimeFaithfulEditionCompiler:
                 max_warnings=64,
             ),
             max_repair_attempts=1,
+            visual_frames=request.visual_frames,
         )
         return self._compiler.compile(
             faithful_request,
@@ -1795,7 +1848,7 @@ def _resolve_execution_owner_id(
 
 _PackPortResolver = Callable[
     [JobPackEnvironmentSnapshot],
-    tuple[VideoSourcePort, TranscriptPort | None, str],
+    tuple[VideoSourcePort, TranscriptPort | None, str, Path | None],
 ]
 
 
@@ -1805,6 +1858,7 @@ def _create_platform_video_runtime_components(
     source: VideoSourcePort,
     source_metadata: Mapping[str, Mapping[str, object]],
     transcriber: TranscriptPort | None = None,
+    ffmpeg_executable: Path | None = None,
     generated_transcriber_identity: str | None = None,
     model: LegacyModelBinding,
     model_execution_binding: ModelExecutionBinding | None = None,
@@ -1848,6 +1902,7 @@ def _create_platform_video_runtime_components(
         result_root,
         storage=storage,
         transcriber=transcriber,
+        ffmpeg_executable=ffmpeg_executable,
     )
     portable = IWikiPortableGateway()
 
@@ -1869,7 +1924,7 @@ def _create_platform_video_runtime_components(
         def activate_pack_environment(
             snapshot: JobPackEnvironmentSnapshot,
         ) -> tuple[VideoRecipeOperations, str]:
-            resolved_source, resolved_transcriber, identity = (
+            resolved_source, resolved_transcriber, identity, resolved_ffmpeg = (
                 pack_port_resolver(snapshot)
             )
             return (
@@ -1881,6 +1936,7 @@ def _create_platform_video_runtime_components(
                     result_root,
                     storage=storage,
                     transcriber=resolved_transcriber,
+                    ffmpeg_executable=resolved_ffmpeg,
                 ),
                 identity,
             )
@@ -1936,6 +1992,7 @@ def create_platform_video_runtime(
     source: VideoSourcePort,
     source_metadata: Mapping[str, Mapping[str, object]],
     transcriber: TranscriptPort | None = None,
+    ffmpeg_executable: Path | None = None,
     generated_transcriber_identity: str | None = None,
     model: LegacyModelBinding,
     model_execution_binding: ModelExecutionBinding | None = None,
@@ -1959,6 +2016,7 @@ def create_platform_video_runtime(
         source=source,
         source_metadata=source_metadata,
         transcriber=transcriber,
+        ffmpeg_executable=ffmpeg_executable,
         generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=model_execution_binding,
@@ -2824,7 +2882,16 @@ def create_codex_app_server_runtime_for_workspace(
     model_identity = requested_model_identity or status.default_model
     provider_profile = requested_provider_profile or "default"
     _admit_codex_video_profile(current_config_snapshot, provider_profile)
-    bridge = CodexAppServerCompletionBridge(model_identity=model_identity)
+    from app.gpt.codex_app_server_client import CodexAppServerClient
+    from app.gpt.model_slots import VIDEO_MODEL_CONCURRENCY
+
+    bridge = CodexAppServerCompletionBridge(
+        model_identity=model_identity,
+        client=CodexAppServerClient(
+            pool_size=VIDEO_MODEL_CONCURRENCY,
+            machine_slot_root=paths.data_dir / "machine" / "model-slots",
+        ),
+    )
     model = LegacyModelBinding(
         provider_kind="codex-app-server",
         model_identity=model_identity,
@@ -2838,7 +2905,7 @@ def create_codex_app_server_runtime_for_workspace(
         credential_profile_ref="codex/local-login",
         context_window_tokens=128_000,
         max_output_tokens=16_000,
-        max_concurrency=2,
+        max_concurrency=VIDEO_MODEL_CONCURRENCY,
         supports_structured_output=True,
         supports_temperature=False,
         timeout_seconds=600,
@@ -2849,6 +2916,7 @@ def create_codex_app_server_runtime_for_workspace(
     )
     if execution_pack_environment is None:
         media_pack = pack_resolver.resolve_active(MEDIA_BASIC)
+        ffmpeg_executable = media_pack.entrypoints["ffmpeg"]
         try:
             transcribe_pack = pack_resolver.resolve_active(TRANSCRIBE_CPU)
         except DomainError as error:
@@ -2882,7 +2950,7 @@ def create_codex_app_server_runtime_for_workspace(
 
     def resolve_pack_ports(
         snapshot: JobPackEnvironmentSnapshot,
-    ) -> tuple[VideoSourcePort, TranscriptPort | None, str]:
+    ) -> tuple[VideoSourcePort, TranscriptPort | None, str, Path]:
         pack_ids = frozenset(pack.pack_id for pack in snapshot.packs)
         if pack_ids not in (
             frozenset({MEDIA_BASIC.pack_id}),
@@ -2960,10 +3028,11 @@ def create_codex_app_server_runtime_for_workspace(
                 if resolved_transcriber is not None
                 else "transcribe-cpu/unavailable"
             ),
+            resolved_media.entrypoints["ffmpeg"],
         )
 
     if execution_pack_environment is not None:
-        source, transcriber, generated_transcriber_identity = (
+        source, transcriber, generated_transcriber_identity, ffmpeg_executable = (
             resolve_pack_ports(pack_environment)
         )
 
@@ -3001,6 +3070,7 @@ def create_codex_app_server_runtime_for_workspace(
         source=source,
         source_metadata={},
         transcriber=transcriber,
+        ffmpeg_executable=ffmpeg_executable,
         generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=binding,

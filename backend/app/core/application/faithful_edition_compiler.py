@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+import json
 
 from app.core.application.model_call_coordinator import ModelCallCoordinator
 from app.core.application.video_compiler import VideoCompilationContext
 from app.core.domain.video import (
     FaithfulLanguagePolicy,
+    QualityOverall,
     ScreenshotRequest,
     TranscriptSegment,
     VideoDocumentKind,
 )
+from app.core.domain.visual_frame import VisualFrame
 from app.core.errors import DomainError, ErrorCategory
 from app.core.ports.model_executor import (
     ModelExecutionRequest,
@@ -22,6 +25,8 @@ from app.core.recipes.video.faithful_edition.contracts import (
     FaithfulEditionRequestV1,
     FaithfulEditionSectionV1,
     FaithfulSectionRefV1,
+    FaithfulUncertaintyCategory,
+    FaithfulUncertaintyV1,
 )
 from app.core.recipes.video.faithful_edition.pipeline import (
     parse_faithful_section,
@@ -34,8 +39,18 @@ from app.core.recipes.video.faithful_edition.prompts import (
 from app.core.recipes.video.faithful_edition.quality import (
     FaithfulEditionCandidateV1,
     FaithfulTextAssessmentV1,
+    FaithfulQualityCheckV1,
+    QualityCheckMethod,
     QualityCheckStatus,
     assess_faithful_edition,
+)
+from app.core.recipes.video.faithful_edition.review import (
+    REVIEW_INSTRUCTION, FaithfulSectionReview, edit_log_markdown, parse_review,
+    plain_markdown, review_payload, review_schema,
+)
+from app.core.recipes.video.faithful_edition.source_grounding import (
+    GROUNDING_INSTRUCTION, GROUNDING_CHECK_INSTRUCTION, SourceGrounding,
+    grounding_payload, grounding_schema, parse_grounding,
 )
 
 
@@ -77,9 +92,9 @@ class FaithfulCompilationSummaryV1:
             or type(self.model_operation_count) is not int
             or self.model_operation_count < self.section_count
             or type(self.sequential_model_waves) is not int
-            or not 1 <= self.sequential_model_waves <= 2
+            or not 1 <= self.sequential_model_waves <= 9
             or type(self.repair_operation_count) is not int
-            or not 0 <= self.repair_operation_count <= self.section_count
+            or not 0 <= self.repair_operation_count <= 2 * self.section_count
             or type(self.uncertainty_count) is not int
             or self.uncertainty_count < 0
             or type(self.anchor_warning_count) is not int
@@ -125,7 +140,9 @@ class FaithfulCompiledVideoDocument:
             or not self.markdown.strip()
             or not citations
             or len(citations) != len(set(citations))
-            or screenshots
+            or any(not isinstance(value, ScreenshotRequest) for value in screenshots)
+            or len({value.segment_id for value in screenshots}) != len(screenshots)
+            or any(value.segment_id not in citations for value in screenshots)
             or not isinstance(self.plan, FaithfulEditionPlanV1)
             or not isinstance(self.text_assessment, FaithfulTextAssessmentV1)
             or not isinstance(self.execution_summary, FaithfulCompilationSummaryV1)
@@ -149,6 +166,7 @@ class _FaithfulSectionExecution:
     result: ModelExecutionResult
     section: FaithfulEditionSectionV1 | None
     response_error: DomainError | None
+    review: tuple[FaithfulSectionReview, ModelExecutionResult] | None = None
 
 
 class FaithfulEditionCompiler:
@@ -182,6 +200,13 @@ class FaithfulEditionCompiler:
                 ErrorCategory.POLICY_DENIED,
                 "Balanced faithful editing requires structured model output",
             )
+        if request.visual_frames and request.model_binding.provider_type != "codex-app-server":
+            raise DomainError("model_capability_missing", ErrorCategory.POLICY_DENIED,
+                              "Faithful image review requires the wired codex-app-server image transport")
+        preparation_results: list[ModelExecutionResult] = []
+        preparation_waves = 0
+        if request.visual_frames:
+            request, preparation_results, preparation_waves = self._ground_source(request, context)
         plan = plan_faithful_edition(request)
         section_inputs = tuple(
             (
@@ -198,6 +223,7 @@ class FaithfulEditionCompiler:
                 source_language=request.source_language,
                 language_policy=request.language_policy,
                 target_language=request.target_language,
+                max_segment_refs_per_paragraph=request.parser_limits.max_segment_refs_per_paragraph,
             )
             for section_ref, segments in section_inputs
         )
@@ -210,8 +236,14 @@ class FaithfulEditionCompiler:
             stage_id="faithful-edit",
             shard_prefix="section",
             capture_response_errors=True,
+            review_plan=plan,
         )
-        results = [value.result for value in outcomes]
+        results = [*preparation_results, *(value.result for value in outcomes)]
+        early_reviews = {
+            value.section_ref.ordinal: (value.section, value.review)
+            for value in outcomes if value.review is not None
+        }
+        results.extend(value.review[1] for value in outcomes if value.review is not None)
         sections_by_ordinal = {
             value.section_ref.ordinal: value.section
             for value in outcomes
@@ -255,6 +287,7 @@ class FaithfulEditionCompiler:
                 plan=plan,
                 sections=tuple(sections),
                 markdown=markdown,
+                source_corrections=request.source_corrections,
             )
         )
         if (
@@ -275,8 +308,82 @@ class FaithfulEditionCompiler:
                     plan=plan,
                     sections=tuple(sections),
                     markdown=markdown,
+                    source_corrections=request.source_corrections,
                 )
             )
+
+        captions: dict[str, str] = {}
+        excluded_auxiliaries: frozenset[int] = frozenset()
+        if assessment.overall is not QualityOverall.FAIL:
+            # A repaired section must never inherit the review of its earlier text.
+            pending = [section for section in sections
+                       if section.ordinal not in early_reviews
+                       or early_reviews[section.ordinal][0] != section]
+            late_reviews = self._review_sections(request, context, plan, pending) if pending else ()
+            results.extend(result for _, result in late_reviews)
+            by_ordinal = {section.ordinal: review for section, review in zip(pending, late_reviews)}
+            reviews = tuple(by_ordinal[section.ordinal] if section.ordinal in by_ordinal
+                            else early_reviews[section.ordinal][1] for section in sections)
+            sequential_waves += 1
+            failed_reviews = {section.ordinal: review for section, (review, _) in zip(sections, reviews)
+                              if not review.body_pass or not review.auxiliary_pass}
+            if failed_reviews and plan.max_repair_attempts == 1:
+                repaired, repair_results = self._repair_reviewed_sections(
+                    request, context, plan, sections, failed_reviews,
+                )
+                for section in repaired:
+                    sections[section.ordinal] = section
+                results.extend(repair_results)
+                repair_count += len(repaired)
+                sequential_waves += 1
+                repaired_assessment = assess_faithful_edition(FaithfulEditionCandidateV1(
+                    transcript=request.transcript, plan=plan, sections=tuple(sections),
+                    markdown=self._assemble_markdown(request, sections),
+                    source_corrections=request.source_corrections,
+                ))
+                if repaired_assessment.overall is QualityOverall.FAIL:
+                    raise DomainError("faithful_semantic_repair_failed", ErrorCategory.RECIPE_FAILED,
+                                      "Semantic repair violated deterministic fidelity checks")
+                rechecks = self._review_sections(request, context, plan, repaired,
+                                                shard_prefix="recheck-section")
+                results.extend(result for _, result in rechecks)
+                sequential_waves += 1
+                updated_reviews = dict(zip((section.ordinal for section in repaired), rechecks))
+                reviews = tuple(updated_reviews.get(section.ordinal, review)
+                                for section, review in zip(sections, reviews))
+            if any(not review.body_pass for review, _ in reviews):
+                raise DomainError("faithful_review_failed", ErrorCategory.RECIPE_FAILED,
+                                  "Faithful body still failed semantic review after the bounded repair policy")
+            for index, (review, _) in enumerate(reviews):
+                section = sections[index]
+                uncertainties = list(section.uncertainties)
+                for ordinal, description in review.uncertainties:
+                    uncertainties.append(FaithfulUncertaintyV1(
+                        len(uncertainties), FaithfulUncertaintyCategory.OTHER, description,
+                        section.paragraphs[ordinal].source_segment_ids,
+                    ))
+                sections[index] = replace(section, uncertainties=tuple(uncertainties))
+                captions.update(review.captions)
+            excluded_auxiliaries = frozenset(index for index, (review, _) in enumerate(reviews)
+                                            if not review.auxiliary_pass)
+            markdown = self._assemble_markdown(request, sections, captions=captions,
+                                               excluded_auxiliaries=excluded_auxiliaries)
+            assessment = assess_faithful_edition(FaithfulEditionCandidateV1(
+                transcript=request.transcript, plan=plan, sections=tuple(sections), markdown=markdown,
+                source_corrections=request.source_corrections,
+            ))
+            assessment = replace(assessment, overall=(QualityOverall.PASS_WITH_WARNINGS
+                if excluded_auxiliaries and assessment.overall is QualityOverall.PASS else assessment.overall),
+                checks=(*assessment.checks, FaithfulQualityCheckV1(
+                check_id="faithful_semantic_review", method=QualityCheckMethod.MODEL,
+                status=QualityCheckStatus.PASS, severity="error", scope="document",
+                safe_details="Each edited section was reviewed against all mapped source segments and supplied frames; not audio verification",
+            ), FaithfulQualityCheckV1(
+                check_id="faithful_auxiliary_review", method=QualityCheckMethod.MODEL,
+                status=QualityCheckStatus.WARNING if excluded_auxiliaries else QualityCheckStatus.PASS,
+                severity="warning", scope="document",
+                safe_details="Optional summaries failing review were omitted; the faithful body is assessed independently",
+            )))
 
         citations = tuple(
             source_id
@@ -294,7 +401,15 @@ class FaithfulEditionCompiler:
             for section in sections
             for warning in section.warnings
         )
+        if excluded_auxiliaries:
+            warning_values.append("faithful_auxiliary_omitted_after_review")
         warnings = tuple(dict.fromkeys(warning_values))
+        if request.source_corrections:
+            assessment = replace(assessment, checks=(*assessment.checks, FaithfulQualityCheckV1(
+                check_id="source_correction_review", method=QualityCheckMethod.MODEL,
+                status=QualityCheckStatus.PASS, severity="error", scope="document",
+                safe_details="ASR corrections were separately checked against original segments and cited frames; original transcript retained",
+            )))
         input_complete = all(value.input_tokens is not None for value in results)
         output_complete = all(value.output_tokens is not None for value in results)
         model_identities = {value.actual_model_identity for value in results}
@@ -310,13 +425,13 @@ class FaithfulEditionCompiler:
             model_identity=request.model_binding.model_identity,
             markdown=markdown,
             cited_segment_ids=citations,
-            screenshot_requests=(),
+            screenshot_requests=tuple(ScreenshotRequest(source_id) for source_id in captions),
             plan=plan,
             text_assessment=assessment,
             execution_summary=FaithfulCompilationSummaryV1(
                 section_count=len(sections),
                 model_operation_count=len(results),
-                sequential_model_waves=sequential_waves,
+                sequential_model_waves=sequential_waves + preparation_waves,
                 repair_operation_count=repair_count,
                 uncertainty_count=metrics.uncertainty_count,
                 anchor_warning_count=metrics.anchor_warning_count,
@@ -332,6 +447,95 @@ class FaithfulEditionCompiler:
             warnings=warnings,
         )
 
+    def _ground_source(
+        self, request: FaithfulEditionRequestV1, context: VideoCompilationContext,
+    ) -> tuple[FaithfulEditionRequestV1, list[ModelExecutionResult], int]:
+        segments = request.transcript.segments
+        frames_by_id = {frame.segment_id: frame for frame in request.visual_frames}
+        check_schema = json.dumps({
+            "type": "object", "additionalProperties": False, "required": ["pass", "issues"],
+            "properties": {"pass": {"type": "boolean"},
+                           "issues": {"type": "array", "items": {"type": "string"}}},
+        })
+
+        def prepare(start: int) -> tuple[SourceGrounding, tuple[ModelExecutionResult, ...]]:
+            owned = segments[start:start + 16]
+            frames = tuple(frames_by_id[value.segment_id] for value in owned if value.segment_id in frames_by_id)
+            payload = grounding_payload(owned, frames, segments[max(0, start - 4):start],
+                                        segments[start + 16:start + 20])
+            payload["source_title"] = request.source_title
+
+            def call(stage: str, instruction: str, schema: str) -> ModelExecutionResult:
+                content = json.dumps(payload, ensure_ascii=False)
+                if (len(content.encode("utf-8")) + len(instruction.encode("utf-8"))
+                        + len(schema.encode("utf-8")) + 2048 * len(frames) > request.max_request_bytes):
+                    raise DomainError("model_request_budget_exceeded", ErrorCategory.POLICY_DENIED,
+                                      "Source grounding exceeds the frozen request budget")
+                return self._coordinator.execute(request.model_binding, ModelExecutionRequest(
+                    schema_version=1, stage_id=stage, stage_version=4, prompt_id=stage, prompt_version=4,
+                    system_instruction=instruction, user_content=content,
+                    output_mode=ModelOutputMode.JSON_SCHEMA, response_schema_json=schema,
+                    image_webp=tuple(frame.payload for frame in frames),
+                    temperature=0 if request.model_binding.supports_temperature else None,
+                    max_output_tokens=request.reserved_output_tokens,
+                    timeout_seconds=request.model_binding.timeout_seconds,
+                ), context.execution, f"{stage}-{start:06d}", context.cancellation_token)
+
+            results = []
+            for attempt in range(1 + request.max_repair_attempts):
+                proposed = call("faithful-source-prepare" if attempt == 0 else "faithful-source-repair",
+                                GROUNDING_INSTRUCTION, grounding_schema())
+                results.append(proposed)
+                try:
+                    grounding = parse_grounding(proposed.text, owned, frames,
+                                                max_response_bytes=request.parser_limits.max_response_bytes)
+                except DomainError as error:
+                    if error.code != "faithful_source_grounding_invalid" or attempt == request.max_repair_attempts:
+                        raise
+                    payload["invalid_proposal"] = proposed.text
+                    payload["review_feedback"] = [
+                        "Proposal failed the source contract. Return only schema fields and owned IDs; "
+                        "copy each complete before text EXACTLY from segments, never truncate it. "
+                        "Preserve its whole meaning in after. Use only supplied nearby frame IDs; "
+                        "numeric changes require a visible quote containing the new number. "
+                        "Do not include unchanged corrections, duplicate IDs or more than two illustrations."]
+                    continue
+                payload["proposal"] = asdict(grounding)
+                checked = call("faithful-source-check" if attempt == 0 else "faithful-source-recheck",
+                               GROUNDING_CHECK_INSTRUCTION, check_schema)
+                results.append(checked)
+                try:
+                    from app.core.recipes.video.faithful_edition.review import _unique_object
+                    if len(checked.text.encode("utf-8")) > request.parser_limits.max_response_bytes:
+                        raise ValueError
+                    verdict = json.loads(checked.text, object_pairs_hook=_unique_object)
+                    if (type(verdict) is not dict or set(verdict) != {"pass", "issues"}
+                            or type(verdict["pass"]) is not bool or type(verdict["issues"]) is not list
+                            or len(verdict["issues"]) > 64
+                            or any(type(issue) is not str or not 1 <= len(issue.strip()) <= 2000 for issue in verdict["issues"])
+                            or verdict["pass"] != (not verdict["issues"])):
+                        raise ValueError
+                except (ValueError, TypeError, RecursionError):
+                    raise DomainError("faithful_source_review_invalid", ErrorCategory.RECIPE_FAILED,
+                                      "Source correction review violated its bounded response contract") from None
+                if verdict["pass"]:
+                    return grounding, tuple(results)
+                payload["review_feedback"] = verdict["issues"]
+            raise DomainError("faithful_source_review_failed", ErrorCategory.RECIPE_FAILED,
+                              "Source corrections or topic boundaries still lack video evidence after bounded repair")
+
+        with ThreadPoolExecutor(max_workers=request.model_binding.max_concurrency) as pool:
+            outcomes = tuple(pool.map(prepare, range(0, len(segments), 16)))
+        corrections = tuple(value for grounding, _ in outcomes for value in grounding.corrections)
+        starts = tuple(dict.fromkeys((segments[0].segment_id,
+            *(value for grounding, _ in outcomes for value in grounding.chapter_start_ids))))
+        selected = {value for grounding, _ in outcomes for value in grounding.illustration_ids}
+        frames = tuple(frame for frame in request.visual_frames if frame.segment_id in selected)
+        if len(frames) > 24:
+            frames = tuple(frames[index * len(frames) // 24] for index in range(24))
+        return replace(request, source_corrections=corrections, chapter_start_ids=starts,
+                       visual_frames=frames), [result for _, results in outcomes for result in results], max(len(results) for _, results in outcomes)
+
     @staticmethod
     def _section_segments(
         request: FaithfulEditionRequestV1,
@@ -339,8 +543,9 @@ class FaithfulEditionCompiler:
         section_ref: FaithfulSectionRefV1,
     ) -> tuple[TranscriptSegment, ...]:
         excluded = frozenset(plan.excluded_segment_ids)
+        corrections = {value.segment_id: value.after for value in request.source_corrections}
         return tuple(
-            value
+            replace(value, text=corrections.get(value.segment_id, value.text))
             for value in request.transcript.segments[
                 section_ref.start_segment_ordinal : section_ref.end_segment_ordinal_exclusive
             ]
@@ -377,6 +582,8 @@ class FaithfulEditionCompiler:
         stage_id: str,
         shard_prefix: str,
         capture_response_errors: bool,
+        images_by_ordinal: dict[int, tuple[bytes, ...]] | None = None,
+        review_plan: FaithfulEditionPlanV1 | None = None,
     ) -> tuple[_FaithfulSectionExecution, ...]:
         def execute_one(
             value: tuple[
@@ -385,16 +592,23 @@ class FaithfulEditionCompiler:
             ],
         ) -> _FaithfulSectionExecution:
             (section_ref, segments), prompt = value
+            ids = {segment.segment_id for segment in segments}
+            frames = tuple(frame for frame in request.visual_frames if frame.segment_id in ids)
+            payload = json.loads(prompt.user_content)
+            if frames:
+                payload["frames"] = [{"image_index": index + 1, "segment_id": frame.segment_id,
+                                      "timestamp_ms": frame.timestamp_ms} for index, frame in enumerate(frames)]
             model_request = ModelExecutionRequest(
                 schema_version=1,
                 stage_id=stage_id,
-                stage_version=1,
+                stage_version=3,
                 prompt_id=f"{stage_id}-balanced",
-                prompt_version=1,
+                prompt_version=5,
                 system_instruction=prompt.system_instruction,
-                user_content=prompt.user_content,
+                user_content=json.dumps(payload, ensure_ascii=False),
                 output_mode=ModelOutputMode.JSON_SCHEMA,
                 response_schema_json=prompt.response_schema_json,
+                image_webp=(images_by_ordinal or {}).get(section_ref.ordinal, tuple(frame.payload for frame in frames)),
                 temperature=0 if request.model_binding.supports_temperature else None,
                 max_output_tokens=request.reserved_output_tokens,
                 timeout_seconds=request.model_binding.timeout_seconds,
@@ -427,11 +641,27 @@ class FaithfulEditionCompiler:
                     section=None,
                     response_error=error,
                 )
+            review = None
+            if review_plan is not None:
+                # Run the same deterministic checks on this section's immutable
+                # source before reviewing it. The full-document gate still runs.
+                local_assessment = assess_faithful_edition(FaithfulEditionCandidateV1(
+                    transcript=replace(request.transcript, segments=tuple(
+                        segment for segment in request.transcript.segments if segment.segment_id in ids
+                    )),
+                    plan=review_plan, sections=(section,),
+                    markdown=self._assemble_markdown(request, [section]),
+                    source_corrections=tuple(value for value in request.source_corrections
+                                             if value.segment_id in ids),
+                ))
+                if local_assessment.overall is not QualityOverall.FAIL:
+                    review = self._review_sections(request, context, review_plan, [section])[0]
             return _FaithfulSectionExecution(
                 section_ref=section_ref,
                 result=result,
                 section=section,
                 response_error=None,
+                review=review,
             )
 
         values = tuple(zip(section_inputs, prompts))
@@ -494,6 +724,7 @@ class FaithfulEditionCompiler:
                 language_policy=request.language_policy,
                 target_language=request.target_language,
                 failed_checks=failed_checks_by_ordinal[section_ref.ordinal],
+                max_segment_refs_per_paragraph=request.parser_limits.max_segment_refs_per_paragraph,
             )
             for section_ref, segments in inputs
         )
@@ -525,12 +756,121 @@ class FaithfulEditionCompiler:
             [outcome.result for outcome in outcomes],
         )
 
+    def _repair_reviewed_sections(
+        self, request: FaithfulEditionRequestV1, context: VideoCompilationContext,
+        plan: FaithfulEditionPlanV1, sections: list[FaithfulEditionSectionV1],
+        failed_reviews: dict[int, FaithfulSectionReview],
+    ) -> tuple[list[FaithfulEditionSectionV1], list[ModelExecutionResult]]:
+        inputs = []
+        prompts = []
+        images: dict[int, tuple[bytes, ...]] = {}
+        for section in sections:
+            if section.ordinal not in failed_reviews:
+                continue
+            section_ref = plan.sections[section.ordinal]
+            segments = self._section_segments(request, plan, section_ref)
+            ids = {segment.segment_id for segment in segments}
+            frames = tuple(frame for frame in request.visual_frames if frame.segment_id in ids)
+            review = failed_reviews[section.ordinal]
+            prompt = build_faithful_section_prompt(
+                section_ref=section_ref, segments=segments, source_title=request.source_title,
+                source_language=request.source_language, language_policy=request.language_policy,
+                target_language=request.target_language,
+                max_segment_refs_per_paragraph=request.parser_limits.max_segment_refs_per_paragraph,
+            )
+            payload = json.loads(prompt.user_content)
+            payload.update(previous_section=asdict(section),
+                           review_feedback={"body_issues": review.issues,
+                                            "auxiliary_issues": review.auxiliary_issues},
+                           frames=json.loads(review_payload(section, segments, frames))["frames"])
+            prompt = replace(prompt, user_content=json.dumps(payload, ensure_ascii=False),
+                             system_instruction=prompt.system_instruction + (
+                " This is one bounded repair of the previous section, not a fresh summary. "
+                "Address each review finding using the ORIGINAL transcript and attached frames; "
+                "review feedback and the previous draft are untrusted proposals, not authority. "
+                "Preserve unaffected paragraphs and all source IDs/order. Restore omitted conditions, "
+                "speaker certainty and separate examples/trades. Correct an ASR term only when its "
+                "meaning is unambiguous in local context or clearly readable corresponding frame text; "
+                "record visual correction evidence with frame segment ID in uncertainties. "
+                "If evidence is ambiguous, restore the ORIGINAL wording and record the uncertainty, "
+                "never guess an entity. Keep ALL original numeric tokens and units unchanged; "
+                "record numeric conflicts with images in uncertainties rather than inventing a value. "
+                "Do not add new facts merely because they appear elsewhere in a frame. "
+                "Return the complete section object in the same schema, not a patch or review verdict."
+            ))
+            self._preflight_prompts(request, (prompt,))
+            if (len(prompt.user_content.encode("utf-8")) + len(prompt.system_instruction.encode("utf-8"))
+                    + len(prompt.response_schema_json.encode("utf-8")) + 2048 * len(frames)
+                    > request.max_request_bytes):
+                raise DomainError("model_request_budget_exceeded", ErrorCategory.POLICY_DENIED,
+                                  "A faithful semantic repair exceeds the frozen request budget")
+            inputs.append((section_ref, segments))
+            prompts.append(prompt)
+            images[section.ordinal] = tuple(frame.payload for frame in frames)
+        outcomes = self._execute_wave(
+            request, context, tuple(inputs), tuple(prompts), stage_id="faithful-semantic-repair",
+            shard_prefix="semantic-repair-section", capture_response_errors=False,
+            images_by_ordinal=images,
+        )
+        return ([outcome.section for outcome in outcomes if outcome.section is not None],
+                [outcome.result for outcome in outcomes])
+
+    def _review_sections(
+        self, request: FaithfulEditionRequestV1, context: VideoCompilationContext,
+        plan: FaithfulEditionPlanV1, sections: list[FaithfulEditionSectionV1],
+        *, shard_prefix: str = "review-section",
+    ) -> tuple[tuple[FaithfulSectionReview, ModelExecutionResult], ...]:
+        def review_one(section: FaithfulEditionSectionV1) -> tuple[FaithfulSectionReview, ModelExecutionResult]:
+            segments = self._section_segments(request, plan, plan.sections[section.ordinal])
+            ids = {segment.segment_id for segment in segments}
+            frames: tuple[VisualFrame, ...] = tuple(
+                frame for frame in request.visual_frames if frame.segment_id in ids
+            )
+            payload = review_payload(section, segments, frames)
+            schema = review_schema()
+            if (len(payload.encode("utf-8")) + len(schema.encode("utf-8"))
+                    + len(REVIEW_INSTRUCTION.encode("utf-8")) + 2048 * len(frames)
+                    > request.max_request_bytes):
+                raise DomainError("model_request_budget_exceeded", ErrorCategory.POLICY_DENIED,
+                                  "A faithful review exceeds the frozen request budget")
+            model_request = ModelExecutionRequest(
+                schema_version=1, stage_id="faithful-review", stage_version=1,
+                prompt_id="faithful-review-balanced", prompt_version=5,
+                system_instruction=REVIEW_INSTRUCTION, user_content=payload,
+                output_mode=ModelOutputMode.JSON_SCHEMA, response_schema_json=schema,
+                temperature=0 if request.model_binding.supports_temperature else None,
+                max_output_tokens=request.reserved_output_tokens,
+                timeout_seconds=request.model_binding.timeout_seconds,
+                image_webp=tuple(frame.payload for frame in frames),
+            )
+            result = self._coordinator.execute(
+                request.model_binding, model_request, context.execution,
+                f"{shard_prefix}-{section.ordinal:04d}", context.cancellation_token,
+            )
+            return parse_review(result.text, section, frames,
+                                max_response_bytes=request.parser_limits.max_response_bytes), result
+
+        if len(sections) == 1:
+            return (review_one(sections[0]),)
+        with ThreadPoolExecutor(max_workers=min(len(sections), request.model_binding.max_concurrency)) as pool:
+            return tuple(pool.map(review_one, sections))
+
     @staticmethod
     def _assemble_markdown(
         request: FaithfulEditionRequestV1,
         sections: list[FaithfulEditionSectionV1],
+        *, captions: dict[str, str] | None = None,
+        excluded_auxiliaries: frozenset[int] = frozenset(),
     ) -> str:
-        lines = [f"# {request.source_title} — 高保真精编稿", ""]
+        captions = captions or {}
+        by_id = {segment.segment_id: segment for segment in request.transcript.segments}
+        frame_times = {frame.segment_id: frame.timestamp_ms for frame in request.visual_frames}
+        def clock(milliseconds: int) -> str:
+            seconds = milliseconds // 1000
+            return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+        lines = [f"# {plain_markdown(request.source_title)} — 高保真精编稿", "",
+                 "> 正文仅依据转录稿保守整理；疑似识别错误保留待核对，不代表已核验原音频。", ""]
         if request.language_policy is FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT:
             lines.extend(
                 (
@@ -542,11 +882,19 @@ class FaithfulEditionCompiler:
             )
         else:
             lines.extend((f"> 来源语言：{request.source_language}", ""))
+        if request.source_corrections:
+            lines[2] = "> 正文依据转录与对应画面校正整理；未逐句核验原音频。"
+        if request.chapter_start_ids and not excluded_auxiliaries:
+            lines.extend(("## 全文概览（AI）", ""))
+            lines.extend(f"- {plain_markdown(section.summary.text)}"
+                         + "".join(f"[^{source}]" for source in section.summary.source_segment_ids)
+                         for section in sections)
+            lines.append("")
         lines.extend(("## 精编正文", ""))
         for section in sections:
             lines.extend(
                 (
-                    f"### {section.title}",
+                    f"### {clock(section.start_ms)}–{clock(section.end_ms)} {plain_markdown(section.title)}",
                     "",
                     f"<!-- time:{section.start_ms}-{section.end_ms} -->",
                     "",
@@ -556,21 +904,39 @@ class FaithfulEditionCompiler:
                 citations = "".join(
                     f"[^{value}]" for value in paragraph.source_segment_ids
                 )
-                lines.extend((f"{paragraph.text}{citations}", ""))
+                lines.extend((f"{plain_markdown(paragraph.text)}{citations}", ""))
+                for source_id in paragraph.source_segment_ids:
+                    if source_id in captions:
+                        lines.extend((f"[SCREENSHOT:{source_id}]", "",
+                                      f"*画面 {clock(frame_times.get(source_id, by_id[source_id].start_ms))}：{plain_markdown(captions[source_id])}*", ""))
+                local_uncertainties = [value for value in section.uncertainties
+                                       if set(value.source_segment_ids).intersection(paragraph.source_segment_ids)]
+                if local_uncertainties:
+                    lines.extend(("> 待核对：" + "；".join(dict.fromkeys(
+                        plain_markdown(value.description) for value in local_uncertainties
+                    )), ""))
+
+        lines.extend(("## AI 辅助摘要（不属于原文）", ""))
+        if excluded_auxiliaries:
+            lines.extend(("> 部分章节的 AI 摘要未通过复核，已省略；不影响上方已独立复核的正文。", ""))
+        for section in sections:
+            if section.ordinal in excluded_auxiliaries:
+                continue
+            lines.extend((f"### {clock(section.start_ms)}–{clock(section.end_ms)} {plain_markdown(section.title)}", ""))
             summary_citations = "".join(
                 f"[^{value}]" for value in section.summary.source_segment_ids
             )
             lines.extend(
                 (
-                    "#### AI 章节摘要",
+                    "**AI 章节摘要**",
                     "",
-                    f"{section.summary.text}{summary_citations}",
+                    f"{plain_markdown(section.summary.text)}{summary_citations}",
                     "",
                 )
             )
-            lines.extend(("#### AI 关键点", ""))
+            lines.extend(("**AI 关键点**", ""))
             lines.extend(
-                f"- {value.text}"
+                f"- {plain_markdown(value.text)}"
                 + "".join(f"[^{source}]" for source in value.source_segment_ids)
                 for value in section.key_points
             )
@@ -578,13 +944,15 @@ class FaithfulEditionCompiler:
                 lines.append("- 无")
             lines.extend(("", "#### 待复核项", ""))
             lines.extend(
-                f"- [{value.category.value}] {value.description}"
+                f"- [{value.category.value}] {plain_markdown(value.description)}"
                 + "".join(f"[^{source}]" for source in value.source_segment_ids)
                 for value in section.uncertainties
             )
             if not section.uncertainties:
                 lines.append("- 无")
             lines.append("")
+        lines.extend((edit_log_markdown(sections, request.transcript.segments,
+                                      source_corrections=request.source_corrections), ""))
         return "\n".join(lines).rstrip() + "\n"
 
 
