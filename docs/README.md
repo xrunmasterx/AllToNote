@@ -59,6 +59,7 @@ iwiki 已发布的 Workspace / Schema / SDK / CLI / Validator 合同
 ```text
 docs/
 ├─ README.md                         # 唯一文档入口、阅读和存放规则
+├─ guides/                           # 当前已实现能力的用户与 AI 操作指南
 ├─ superpowers/
 │  ├─ specs/                         # 当前或仍需保留的正式设计规格
 │  └─ plans/                         # 可执行实施计划和已完成计划记录
@@ -199,12 +200,22 @@ ADR 至少包含：背景、决策、备选方案、影响、迁移方式和回�
 
 只“部分被取代”的文档不得直接移入 history；应保留原路径并明确哪些章节仍有效。
 
+### 3.8 `docs/guides/`
+
+存放基于当前实现、供用户和 AI 直接执行的操作指南。Guide 必须标注最后核验日期和提交，
+不得把设计目标、声明性 capability 或未发布命令写成当前可用能力；涉及凭据时只记录安全的
+路径传参方式，不得保存凭据内容。
+
+当前入口：
+
+- [`AllToNote CLI：YouTube 视频转笔记与本地逐字稿`](guides/alltonote-cli-youtube.md)
+
 ## 4. 文档类型与状态
 
 新增或实质修改正式文档时，在标题后提供以下元数据；旧文档由任务 `DOC-02` 渐进补齐：
 
 ```yaml
-doc_type: product | architecture | architecture-decision | contract-design | subsystem-design | plan | tasks | research | acceptance | history
+doc_type: product | architecture | architecture-decision | contract-design | subsystem-design | plan | tasks | research | acceptance | guide | history
 status: draft | confirmed | active | partially-superseded | blocked | completed | superseded
 authority: external-contract | system | subsystem | execution | evidence
 upstream:
@@ -385,7 +396,16 @@ flowchart LR
 
 ## 9. 当前仓库事实
 
-截至 2026-07-30：
+2026-09-06 核验：产品源码基线为 `913a3a270fe7e81c3add23beae0c992e37454275`，
+核验时本地与远端 `master` 一致；后续文档提交不改变这一产品源码基线。
+本地资料统一放在 `local-data/`，由 Git 和 Docker 忽略。`AGENTS.md` 已受 Git 跟踪。
+V20 目录候选仍基于 `68d517f`，不能将其视为当前 master 的同提交产物。
+独立 iWiki 分支仍有未合入 master 的提交，不属于冗余源码。
+与主线同提交的 `video-dogfood-validation` 工作树已移除，试用资料已归入
+`local-data/workspaces/video-pilot/`；整理与验证记录见
+[`2026-09-06-local-data-cleanup.md`](acceptance/2026-09-06-local-data-cleanup.md)。
+
+以下保留 2026-07-30 的历史交接快照；其中提交、工作树、任务状态和文件跟踪状态不代表当前状态：
 
 - 集成主工作树：`G:\AllToNote`，分支 `master`，当前提交 `567f02d7ef67b9416601c225677fadd6d1a68653`，与 `origin/master` 一致。
 - 当前阶段工作树：`G:\.worktrees\AllToNote\video-dogfood-validation`，分支 `codex/video-dogfood-validation`。

@@ -1,3 +1,6 @@
+# Machine-local workspaces, release artifacts, and cleanup archives
+/local-data/
+
 # Logs
 logs
 *.log

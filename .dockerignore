@@ -10,6 +10,7 @@ BillNote_frontend/src-tauri/target
 BillNote_frontend/src-tauri/bin
 
 # 运行时数据
+local-data/
 backend/data
 backend/static
 backend/models

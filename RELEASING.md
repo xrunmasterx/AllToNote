@@ -1,17 +1,20 @@
 # 发版手册（Release Manager）
 
-本文档面向**发版执行者**，覆盖从 `develop` 切发版到产物上架商店的完整步骤。日常分支与提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+本文档面向**发版执行者**，描述 AllToNote 仓库已有 Web、浏览器扩展与 Tauri 发布流程。
+2026-09-06 核验时远端主线为 `master`，没有 `develop`；发布分支从最新 `origin/master` 创建。
+Runtime 目录候选及签名 Pack 的验收另见 [`docs/acceptance/`](./docs/acceptance/)，
+不能把扩展或桌面发布流程当作 Runtime 已公开发布的证明。日常提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ---
 
 ## 流程总览
 
 ```
-develop  ──→  release/X.Y.Z  ──→  PR ─→  master  ──→  打 tag vX.Y.Z
-                  │                    │                    │
-                  └──→ PR 回灌 ──→ develop                   └──→ CI 自动构建插件产物 + 挂到 GitHub Release
-                                                                  ↓
-                                                                  人工上传商店（Chrome/Edge/Firefox）
+origin/master → release/X.Y.Z → PR → master → tag vX.Y.Z
+                                              ↓
+                                CI 构建产物并上传 GitHub Release
+                                              ↓
+                                人工上传商店（Chrome/Edge/Firefox）
 ```
 
 ---
@@ -19,8 +22,8 @@ develop  ──→  release/X.Y.Z  ──→  PR ─→  master  ──→  打 
 ## 1. 切发布分支
 
 ```bash
-git checkout develop && git pull origin develop
-git checkout -b release/X.Y.Z
+git fetch origin
+git checkout -b release/X.Y.Z origin/master
 ```
 
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)：`MAJOR.MINOR.PATCH`。
@@ -38,19 +41,18 @@ git commit -am "docs: vX.Y.Z CHANGELOG + README 版本"
 git push -u origin release/X.Y.Z
 ```
 
-## 3. 合并到 master + 回灌 develop
+## 3. 合并到 master
 
-在 GitHub 上发起两个 PR：
+在 GitHub 上发起发布 PR：
 
 | PR | base | 合并方式 | 合并后 commit 标题 |
 |---|---|---|---|
 | `release/X.Y.Z` → `master` | `master` | **Merge commit (--no-ff)** | `chore(release): vX.Y.Z` |
-| `release/X.Y.Z` → `develop` | `develop` | **Merge commit (--no-ff)** | `chore(release): merge release/X.Y.Z back into develop` |
 
 > ⚠️ Merge commit 的标题**必须**符合 `type(scope): subject` 格式（commitlint 在 push 到 master/develop 时会校验）。
 > 历史上用过 `Release vX.Y.Z` 这种形式，会被 commitlint 报 `type-empty` / `subject-empty`。
 
-`master` 分支保护要求 review 通过。回灌 `develop` 是为了把发版冻结期内的小修同步回来。
+合并前满足当前仓库实际配置的分支保护、review 和 CI 要求；不向不存在的 `develop` 回灌。
 
 ## 4. 打 tag
 
@@ -71,7 +73,7 @@ push tag **会自动触发 [`.github/workflows/release-extension.yml`](.github/w
 
 CI 默认会创建 / 更新 `vX.Y.Z` 对应的 Release。如果你想自己写 release notes：
 
-1. 打开 https://github.com/JefferyHcool/BiliNote/releases/new
+1. 打开 https://github.com/xrunmasterx/AllToNote/releases/new
 2. Tag: 选 `vX.Y.Z`
 3. Title: `vX.Y.Z`
 4. Body: 直接贴 [`CHANGELOG.md`](./CHANGELOG.md) 的对应段
@@ -110,7 +112,7 @@ CI 默认会创建 / 更新 `vX.Y.Z` 对应的 Release。如果你想自己写 r
 ## 7. 清理
 
 ```bash
-# release 分支已合到 master 与 develop，删掉
+# release 分支已合到 master，删掉
 git push origin --delete release/X.Y.Z
 git branch -d release/X.Y.Z
 ```
@@ -121,7 +123,7 @@ git branch -d release/X.Y.Z
 
 `.github/workflows/release-extension.yml` 末尾有三段商店自动发布的 job 注释。要启用：
 
-1. 在 https://github.com/JefferyHcool/BiliNote/settings/secrets/actions 加 secrets：
+1. 在 https://github.com/xrunmasterx/AllToNote/settings/secrets/actions 加 secrets：
 
 | 商店 | 需要的 secret |
 |---|---|
@@ -146,7 +148,7 @@ git branch -d release/X.Y.Z
 git checkout master && git pull
 git checkout -b hotfix/<scope>-<事项>
 # … 修复 ...
-# PR base=master 合入；同时 PR base=develop 回灌
+# PR base=master 合入
 ```
 
 合入 master 后通常打 patch tag（如 `v2.1.1`），CI 流程同上。
