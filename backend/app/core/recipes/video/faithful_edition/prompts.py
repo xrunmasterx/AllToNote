@@ -56,7 +56,10 @@ _RESPONSE_SCHEMA = _json(
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["text", "source_segment_ids"],
-                "properties": {"text": _STRING, "source_segment_ids": _SOURCE_IDS},
+                "properties": {
+                    "text": {"type": "string"},
+                    "source_segment_ids": {"type": "array", "items": _STRING},
+                },
             },
             "key_points": {
                 "type": "array",
@@ -164,20 +167,34 @@ def build_faithful_section_prompt(
             "The body is close reading, NOT a summary: keep the speaker's voice and chronological "
             "reasoning, concrete examples, conditions, negation, units, and meaningful repetition. "
             "Use short readable paragraphs, each covering a local consecutive group of segments. "
-            "Keep each entity, trade or worked example in its own paragraph; never let an illustration "
-            "of one entity appear to explain a different entity's profit, timing or action. Finish "
+            "Keep distinct subjects, procedures and worked examples identifiable within paragraphs; "
+            "never associate one subject's illustration with another subject's result or action. Finish "
             "sentences before paragraph breaks; split at topic changes, not in the middle of a clause. "
             "Attached frames may clarify the location referred to by 'here' using only visible labels "
-            "and the speaker's explanation; do not add prices, numeric tokens or inferred predictions. "
-            "Only fix punctuation, sentence breaks, fillers, and clear transcription typos supported "
+            "and the speaker's explanation; do not add numeric tokens or inferred conclusions. "
+            "Edit punctuation, sentence breaks, fillers, redundant restatements and clear transcription typos supported "
             "by this section. Use linguistic understanding to correct unambiguous context-supported "
             "homophones; the corrected spelling need not already occur verbatim in the transcript. "
             "Do not treat every spelling change as a factual change, but leave genuinely ambiguous "
             "referents unchanged and mark them uncertain. Never infer a factual correction from "
             "arithmetic or world knowledge. "
-            "Preserve ALL numeric tokens verbatim and in order, including repetitions and ambiguous "
-            "decimal strings; do not convert numerals, prices, dates, or units. Preserve technical "
-            "tokens. Put suspected ASR numbers/terms and any unsupported correction in uncertainties "
+            "Before editing, identify each substantive claim or step and its subject, action/status, "
+            "conditions, numbers/units, time limits, certainty, evidence, exceptions and corrections. "
+            "Retain these relationships, not just isolated keywords; do not invent missing fields. "
+            "Remove fillers and merge local restatements ONLY when they add no information. Keep "
+            "all contributing source IDs on the merged paragraph, including redundant segments. "
+            "Group adjacent restatements BEFORE splitting into paragraphs; do not retain them as "
+            "separate paragraphs or repeat a list already stated. Saying 'again' or 'let me emphasize' "
+            "alone does not add meaning: retain the emphasized requirement once, with its full force "
+            "and conditions. A repeated description of a procedure is not an instruction to execute "
+            "the procedure twice; distinguish it from actual repeated steps. "
+            "Never merge different subjects, events, procedural repetitions, examples, conditions, "
+            "emphasis that changes meaning, or an earlier claim with its later correction. "
+            "Do not target a compression ratio. Preserve numeric spelling and order and every "
+            "distinct number and technical token. Repeated occurrences may be removed only as part "
+            "of a redundant restatement of the SAME claim within its mapped paragraph; never remove "
+            "a number or term needed by a different claim. Do not convert numerals, dates or units. "
+            "Put suspected ASR numbers/terms and any unsupported correction in uncertainties "
             "with exact source IDs, leaving the original expression in the body. Do not silently "
             "fix the speaker's claims. Do not add Markdown headings, citations, screenshot controls "
             "or audit blocks inside text fields; Core handles layout and evidence. "
@@ -185,11 +202,21 @@ def build_faithful_section_prompt(
             "preserve certainty, conditions and polarity: never soften an absolute claim to a "
             "probability or strengthen a possibility to a certainty, even if you disagree with the "
             "claim. For example, the speaker's 'always' must not become 'usually'. Do not turn the "
-            "speaker's trading opinions into independently verified advice. "
+            "speaker's opinions into independently verified facts or advice. "
             "Write the faithful body first, then derive the summary and key points from that same "
-            "corrected body. Keep the summary to ONE short sentence describing this chapter's focus; "
-            "use at most THREE nonredundant key points for concrete facts and conditions. Do not "
-            "repeat the summary in key points or invent a new entity when a transition phrase is unclear. "
+            "corrected body. The title must identify the actual subject and discussion, resolving "
+            "pronouns only when the supplied source establishes their referent. "
+            "summary is an OPTIONAL contribution to the document's opening overview, NOT a chapter "
+            "description: give a main conclusion with its essential conditions, or return exactly "
+            '{"text":"","source_segment_ids":[]} for an incidental mention or simple self-contained remark. '
+            "Do not write 'the speaker discusses X' in place of the useful conclusion. "
+            "key_points is the ONLY chapter-level AI block: use it when it helps navigate a developed "
+            "discussion; return [] when the body already states a simple point concisely. Never "
+            "produce a placeholder such as 'none'. Select nonredundant important points, not a fixed "
+            "number of bullets. Keep decisive prerequisites, deadlines, limitations and uncertainty "
+            "with each selected conclusion; never reduce a conditional claim to a bare number or "
+            "action. Do not repeat the overview sentence verbatim. Use consistent spelling and "
+            "writing conventions across title, body and auxiliary text. "
             f"{language_rule}{repair_rule} Return only the required JSON object."
         ),
         user_content=_json(

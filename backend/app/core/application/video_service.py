@@ -3203,8 +3203,11 @@ def build_visual_candidate_plan(job_id: str, transcript: TranscriptDocument, *, 
         ))
     return _build_screenshot_request_plan(
         job_id, ScreenshotPolicy.ON_DEMAND,
-        tuple(ScreenshotRequest(segment.segment_id, (segment.end_ms - segment.start_ms) // 2 if dense else 0)
-              for segment in segments), transcript,
+        tuple(ScreenshotRequest(
+            segment.segment_id,
+            max((segment.end_ms - segment.start_ms) // 2,
+                segment.end_ms - segment.start_ms - 500) if dense else 0,
+        ) for segment in segments), transcript,
     )
 
 

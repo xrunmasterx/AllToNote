@@ -170,8 +170,8 @@ def plan_faithful_edition(
         language_policy=request.language_policy,
         target_language=request.target_language,
         model_binding_sha256=_binding_sha256(request),
-        stage_version=3,
-        prompt_version=5,
+        stage_version=4,
+        prompt_version=6,
         sections=tuple(sections),
         excluded_segment_ids=tuple(excluded),
         max_concurrency=min(request.model_binding.max_concurrency, len(sections)),
@@ -275,14 +275,17 @@ def parse_faithful_section(
         )
 
     summary_value = value["summary"]
-    summary_ids = _sourced_ids(summary_value, fields=_SUMMARY_FIELDS, allowed=allowed)
-    if (
-        type(summary_value["text"]) is not str
-        or not summary_value["text"].strip()
-        or len(summary_value["text"]) > limits.max_auxiliary_text_characters
-    ):
-        raise _response_error("Faithful summary is invalid")
-    summary = FaithfulAuxiliaryTextV1(summary_value["text"], summary_ids)
+    if summary_value == {"text": "", "source_segment_ids": []}:
+        summary = FaithfulAuxiliaryTextV1("", ())
+    else:
+        summary_ids = _sourced_ids(summary_value, fields=_SUMMARY_FIELDS, allowed=allowed)
+        if (
+            type(summary_value["text"]) is not str
+            or not summary_value["text"].strip()
+            or len(summary_value["text"]) > limits.max_auxiliary_text_characters
+        ):
+            raise _response_error("Faithful summary is invalid")
+        summary = FaithfulAuxiliaryTextV1(summary_value["text"], summary_ids)
 
     key_points_value = value["key_points"]
     if type(key_points_value) is not list or len(key_points_value) > limits.max_key_points:

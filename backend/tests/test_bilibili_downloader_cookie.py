@@ -6,6 +6,9 @@ import pytest
 from app.downloaders import bilibili_downloader as module
 
 
+_REAL_YOUTUBE_DL = module.yt_dlp.YoutubeDL
+
+
 class _FakeYoutubeDL:
     captured_opts: list[dict] = []
     cookie_contents: list[str] = []
@@ -25,11 +28,8 @@ class _FakeYoutubeDL:
         if cookiefile:
             self.cookie_contents.append(Path(cookiefile).read_text(encoding="utf-8"))
 
-        if self.opts.get("merge_output_format") == "mp4":
-            output_path = self.opts["outtmpl"].replace(
-                "%(id)s.%(ext)s", "BV1fixture.mp4"
-            )
-            Path(output_path).touch()
+        if self.opts.get("merge_output_format"):
+            Path(self.prepare_filename({"id": "BV1fixture", "format_id": "1080+a", "ext": "mkv"})).touch()
 
         if self.opts.get("writesubtitles"):
             return {
@@ -46,7 +46,14 @@ class _FakeYoutubeDL:
             "title": "Fixture video",
             "duration": 12,
             "thumbnail": "https://example.com/thumb.jpg",
+            "format_id": "1080+a",
+            "ext": "mkv",
         }
+
+    def prepare_filename(self, info):
+        return (self.opts["outtmpl"].replace("%(id)s", info["id"])
+                .replace("%(format_id)s", info["format_id"])
+                .replace("%(ext)s", info["ext"]))
 
 
 class _FailingYoutubeDL(_FakeYoutubeDL):
@@ -153,3 +160,77 @@ def test_no_cookie_does_not_create_cookiefile(monkeypatch, tmp_path):
     )
 
     assert "cookiefile" not in _FakeYoutubeDL.captured_opts[0]
+
+
+def _video(format_id, height, *, ext="mp4", fps=30, preference=0, tbr=2000,
+           vcodec="avc1", acodec="none"):
+    return {
+        "format_id": format_id,
+        "url": f"https://example.com/{format_id}.{ext}",
+        "ext": ext, "width": height * 16 // 9, "height": height,
+        "fps": fps, "preference": preference, "tbr": tbr,
+        "vcodec": vcodec, "acodec": acodec,
+    }
+
+
+_AUDIO = {
+    "format_id": "audio", "url": "https://example.com/audio.m4a",
+    "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 128,
+}
+
+
+@pytest.mark.parametrize("formats,expected_format,expected_ext", [
+    ([_video("1080", 1080, preference=10),
+      _video("2160", 2160, ext="webm", vcodec="vp9", preference=-10), _AUDIO],
+     "2160+audio", "mkv"),
+    ([_video("2160", 2160, fps=30), _video("1080", 1080, fps=60), _AUDIO],
+     "2160+audio", "mkv"),
+    ([_video("30fps", 1080, fps=30), _video("60fps", 1080, fps=60), _AUDIO],
+     "60fps+audio", "mkv"),
+    ([_video("low", 1080, tbr=2000), _video("high", 1080, tbr=8000), _AUDIO],
+     "high+audio", "mkv"),
+    ([_video("360", 360), _AUDIO], "360+audio", "mkv"),
+    ([_video("combined", 1080, acodec="mp4a")], "combined", "mp4"),
+    ([_video("silent", 2160, ext="webm", vcodec="vp9")], "silent", "webm"),
+])
+def test_video_download_selects_best_available_format_and_actual_path(
+    monkeypatch, tmp_path, formats, expected_format, expected_ext,
+):
+    class SelectingYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, video_url, download):
+            assert download is True
+            # Use yt-dlp's real selector, without accessing the network.
+            with _REAL_YOUTUBE_DL({**self.opts, "quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.process_ie_result({
+                    "id": "BV1fixture", "title": "Fixture", "formats": formats,
+                }, download=False)
+                assert info["format_id"] == expected_format
+                assert info["ext"] == expected_ext
+                Path(ydl.prepare_filename(info)).write_bytes(b"selected-video")
+                return info
+
+    _configure(monkeypatch, SelectingYoutubeDL, cookie=None)
+    old_video = tmp_path / "BV1fixture.mp4"
+    old_video.write_bytes(b"old-low-resolution")
+
+    result = module.BilibiliDownloader().download_video(
+        "https://www.bilibili.com/video/BV1fixture", output_dir=str(tmp_path),
+    )
+
+    assert Path(result) == tmp_path / f"BV1fixture.f{expected_format}.{expected_ext}"
+    assert Path(result).read_bytes() == b"selected-video"
+    assert old_video.read_bytes() == b"old-low-resolution"
+    assert len(_FakeYoutubeDL.captured_opts) == 1
+    assert "postprocessors" not in _FakeYoutubeDL.captured_opts[0]
+
+
+def test_video_download_rejects_missing_selected_file(monkeypatch, tmp_path):
+    class MissingYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, video_url, download):
+            return {"id": "BV1fixture", "format_id": "1080", "ext": "webm"}
+
+    _configure(monkeypatch, MissingYoutubeDL, cookie=None)
+    with pytest.raises(FileNotFoundError):
+        module.BilibiliDownloader().download_video(
+            "https://www.bilibili.com/video/BV1fixture", output_dir=str(tmp_path),
+        )

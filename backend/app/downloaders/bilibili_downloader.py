@@ -202,29 +202,24 @@ class BilibiliDownloader(Downloader, ABC):
         output_dir: Union[str, None] = None,
     ) -> str:
         """
-        下载视频，返回视频文件路径
+        下载当前账号可访问的最佳画质视频，返回实际视频文件路径。
         """
 
         if output_dir is None:
             output_dir = get_data_dir()
         os.makedirs(output_dir, exist_ok=True)
-        video_id=extract_video_id(video_url, "bilibili")
-        video_path = os.path.join(output_dir, f"{video_id}.mp4")
-        if os.path.exists(video_path):
-            return video_path
-
-        # 检查是否已经存在
-
-
-        output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
+        # 按实际格式缓存，避免旧低清 MP4 阻止重新选择更高画质。
+        output_path = os.path.join(output_dir, "%(id)s.f%(format_id)s.%(ext)s")
 
         ydl_opts = {
-            'format': 'bv*[ext=mp4]/bestvideo+bestaudio/best',
+            'format': 'bv*+ba/bv*',
+            'format_sort': ['res', 'fps'],
+            'format_sort_force': True,
             'outtmpl': output_path,
             'http_headers': {'Referer': 'https://www.bilibili.com'},
             'noplaylist': True,
             'quiet': False,
-            'merge_output_format': 'mp4',  # 确保合并成 mp4
+            'merge_output_format': 'mkv',  # 不为容器兼容性降低画质或转码
         }
         with self._cookiefile_for_download() as cookiefile:
             if cookiefile:
@@ -232,8 +227,7 @@ class BilibiliDownloader(Downloader, ABC):
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=True)
-                video_id = info.get("id")
-                video_path = os.path.join(output_dir, f"{video_id}.mp4")
+                video_path = ydl.prepare_filename(info)
 
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"视频文件未找到: {video_path}")

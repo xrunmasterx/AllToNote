@@ -56,6 +56,13 @@ from app.core.recipes.video.faithful_edition.quality import (
     FaithfulTextAssessmentV1,
     assess_faithful_edition,
 )
+from app.core.recipes.video.faithful_edition.review import REVIEW_INSTRUCTION
+
+
+def test_review_instruction_ignores_surface_and_screen_only_differences():
+    assert "equivalent numeral spelling" in REVIEW_INSTRUCTION
+    assert "screen-only label" in REVIEW_INSTRUCTION
+    assert "adjacent segment" in REVIEW_INSTRUCTION
 
 
 class _FaithfulExecutor:
@@ -359,7 +366,7 @@ def _assessment_for_source_and_target(
         "zh-CN",
         (TranscriptSegment("seg_000001", 0, 1_000, source_text),),
     )
-    request = _request(transcript=transcript)
+    request = replace(_request(transcript=transcript), section_input_byte_budget=8192)
     plan = plan_faithful_edition(request)
     section_ref = plan.sections[0]
     section = FaithfulEditionSectionV1(
@@ -584,7 +591,8 @@ def test_compiler_preserves_order_separates_regions_and_never_requests_screensho
     )
     assert result.screenshot_requests == ()
     assert "## 精编正文" in result.markdown
-    assert "**AI 章节摘要**" in result.markdown
+    assert "## 全文概览（AI）" in result.markdown
+    assert "**AI 章节摘要**" not in result.markdown
     assert "**AI 关键点**" in result.markdown
     assert "#### AI" not in result.markdown
     assert "### 待复核项" in result.markdown
@@ -989,3 +997,132 @@ def test_faithful_edit_log_is_exact_and_hidden_only_in_reading(tmp_path: Path) -
     assert "42 items" in reading
     assert "<summary>AI 摘要与关键点（不属于原文）</summary>" in reading
     assert project_reading_markdown(reading) == reading
+
+
+@pytest.mark.parametrize("source,target", [
+    ("冷却10分钟。再说一次，冷却10分钟。", "冷却10分钟。"),
+    ("使用API-v2保存。使用API-v2保存即可。", "使用API-v2保存即可。"),
+    ("版本2只支持API，不支持MCP。再说一次，版本2只支持API，不支持MCP。",
+     "版本2只支持API，不支持MCP。"),
+])
+def test_redundant_anchor_occurrences_can_be_removed(source, target):
+    assessment = _assessment_for_source_and_target(source, target)
+    assert assessment.metrics.number_mismatch_count == 0
+    assert assessment.metrics.technical_token_mismatch_count == 0
+
+
+@pytest.mark.parametrize("source,target", [
+    ("等待10分钟，再等待20分钟。", "等待20分钟，再等待10分钟。"),
+    ("先10分钟，再20分钟。", "先10分钟，再10分钟，再20分钟。"),
+    ("先10分钟，再20分钟。", "等待10分钟。"),
+    ("冷却10分钟。冷却10分钟。", "冷却15分钟。"),
+])
+def test_deduplication_still_rejects_numeric_changes(source, target):
+    assert _assessment_for_source_and_target(source, target).metrics.number_mismatch_count == 1
+
+
+@pytest.mark.parametrize("source,target", [
+    ("使用API和MCP。", "使用API。"),
+    ("使用API。", "使用API和API。"),
+    ("使用API和API。", "使用MCP。"),
+])
+def test_deduplication_still_rejects_technical_token_changes(source, target):
+    assert _assessment_for_source_and_target(source, target).metrics.technical_token_mismatch_count == 1
+
+
+@pytest.mark.parametrize("overview,points", [(False, False), (True, False), (False, True), (True, True)])
+def test_optional_overview_and_chapter_points_render_independently(tmp_path, overview, points):
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-edit":
+                payload = json.loads(result.text)
+                if not overview:
+                    payload["summary"] = {"text": "", "source_segment_ids": []}
+                if not points:
+                    payload["key_points"] = []
+                return replace(result, text=json.dumps(payload))
+            return result
+
+    compiler, context = _compiler_context(tmp_path, Executor())
+    result = compiler.compile(replace(_request(), section_input_byte_budget=8192), context)
+    reading = project_reading_markdown(result.markdown)
+    assert ("## 全文概览（AI）" in reading) == overview
+    assert ("<details open>" in reading) == points
+    assert reading.count("Section summary") == int(overview)
+    assert "AI 章节摘要" not in reading
+    assert "- 无" not in reading
+    assert "42 items" in reading
+    assert project_reading_markdown(reading) == reading
+
+
+@pytest.mark.parametrize("summary", [
+    {"text": "", "source_segment_ids": ["seg_000001"]},
+    {"text": "Conclusion", "source_segment_ids": []},
+    {"text": " ", "source_segment_ids": []},
+    {"text": "Conclusion", "source_segment_ids": ["seg_999999"]},
+])
+def test_optional_summary_does_not_allow_unbound_text(tmp_path, summary):
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-edit":
+                payload = json.loads(result.text)
+                payload["summary"] = summary
+                return replace(result, text=json.dumps(payload))
+            return result
+
+    compiler, context = _compiler_context(tmp_path, Executor())
+    with pytest.raises(DomainError, match="faithful_section_response_invalid"):
+        compiler.compile(replace(_request(), max_repair_attempts=0), context)
+
+
+def test_deduplication_keeps_all_source_ids_and_exact_audit(tmp_path):
+    transcript = TranscriptDocument("zh-CN", (
+        TranscriptSegment("seg_000001", 0, 1000, "冷却10分钟。"),
+        TranscriptSegment("seg_000002", 1000, 2000, "再说一次，冷却10分钟。"),
+    ))
+
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-edit":
+                payload = json.loads(result.text)
+                payload["paragraphs"][0]["text"] = "冷却10分钟。"
+                payload["summary"] = {"text": "", "source_segment_ids": []}
+                payload["key_points"] = []
+                return replace(result, text=json.dumps(payload))
+            return result
+
+    executor = Executor()
+    compiler, context = _compiler_context(tmp_path, executor)
+    result = compiler.compile(replace(_request(transcript=transcript), section_input_byte_budget=8192), context)
+    assert result.cited_segment_ids == ("seg_000001", "seg_000002")
+    audit = json.loads(result.markdown.split("```alltonote-edit-log-v1\n")[1].split("\n```")[0])
+    assert audit["records"][0]["before"] == "冷却10分钟。 再说一次，冷却10分钟。"
+    assert audit["records"][0]["after"] == "冷却10分钟。"
+    assert project_reading_markdown(result.markdown).count("冷却10分钟。") == 1
+    review = next(call for call in executor.requests if call.stage_id == "faithful-review")
+    assert len(json.loads(review.user_content)["transcript"]) == 2
+
+
+def test_anchor_preservation_cannot_bypass_review_of_distinct_steps(tmp_path):
+    transcript = TranscriptDocument("zh-CN", (
+        TranscriptSegment("seg_000001", 0, 1000, "加热10分钟，再冷却10分钟。"),
+    ))
+
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            payload = json.loads(result.text)
+            if request.stage_id in {"faithful-edit", "faithful-semantic-repair"}:
+                payload["paragraphs"][0]["text"] = "加热10分钟。"
+            elif request.stage_id == "faithful-review":
+                payload.update({"pass": False, "issues": ["seg_000001: cooling step omitted"]})
+            return replace(result, text=json.dumps(payload))
+
+    executor = Executor()
+    compiler, context = _compiler_context(tmp_path, executor)
+    with pytest.raises(DomainError, match="faithful_review_failed"):
+        compiler.compile(replace(_request(transcript=transcript), section_input_byte_budget=8192), context)
+    assert len([call for call in executor.requests if call.stage_id == "faithful-review"]) == 2

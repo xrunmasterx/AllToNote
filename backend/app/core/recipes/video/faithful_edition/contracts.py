@@ -293,6 +293,8 @@ class FaithfulAuxiliaryTextV1:
     source_segment_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        if self.text == "" and self.source_segment_ids == ():
+            return
         _validate_sourced_text(0, self.text, self.source_segment_ids, "summary")
         object.__setattr__(self, "source_segment_ids", tuple(self.source_segment_ids))
 

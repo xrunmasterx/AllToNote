@@ -18,7 +18,8 @@ from app.core.recipes.video.faithful_edition.contracts import (
 
 
 _NUMBER = re.compile(
-    r"[-+]?\d+(?:[.,]\d+)*(?:%|％)?|百分之[零〇一二两三四五六七八九十百千万亿点]+"
+    r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:%|％)?|"
+    r"百分之[零〇一二两三四五六七八九十百千万亿点]+"
 )
 _TECHNICAL = re.compile(
     r"(?<![A-Za-z0-9_])(?:/[A-Za-z0-9._/-]+|"
@@ -126,7 +127,15 @@ def _normalize(value: str) -> str:
 
 
 def _anchors(pattern: re.Pattern[str], value: str) -> tuple[str, ...]:
-    return tuple(match.group(0) for match in pattern.finditer(_normalize(value)))
+    normalized = _normalize(value)
+    values = []
+    for match in pattern.finditer(normalized):
+        anchor = match.group(0)
+        preceding = normalized[:match.start()].rstrip()
+        if anchor.startswith("-") and preceding and preceding[-1].isdigit():
+            anchor = anchor[1:]
+        values.append(anchor)
+    return tuple(values)
 
 
 def _qualifier_count(value: str) -> dict[str, int]:
@@ -167,6 +176,14 @@ def _check(
     )
 
 
+def _retains_anchors(source: tuple[str, ...], target: tuple[str, ...]) -> bool:
+    """Permit only duplicate removal; semantic review must verify claim relationships."""
+    if set(source) != set(target):
+        return False
+    remaining = iter(source)
+    return all(any(value == expected for value in remaining) for expected in target)
+
+
 def _mismatches(
     candidate: FaithfulEditionCandidateV1,
 ) -> tuple[int, int, int, tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -185,11 +202,12 @@ def _mismatches(
     for section in candidate.sections:
         for paragraph in section.paragraphs:
             source = " ".join(by_id[value].text for value in paragraph.source_segment_ids)
-            if _anchors(_NUMBER, source) != _anchors(_NUMBER, paragraph.text):
+            if not _retains_anchors(_anchors(_NUMBER, source), _anchors(_NUMBER, paragraph.text)):
                 number_count += 1
                 number_sections.add(section.ordinal)
-            if sorted(_anchors(_TECHNICAL, source)) != sorted(
-                _anchors(_TECHNICAL, paragraph.text)
+            if not _retains_anchors(
+                tuple(sorted(_anchors(_TECHNICAL, source))),
+                tuple(sorted(_anchors(_TECHNICAL, paragraph.text))),
             ):
                 technical_count += 1
                 technical_sections.add(section.ordinal)
@@ -275,14 +293,6 @@ def assess_faithful_edition(
             "## AI 辅助摘要（不属于原文）",
         )
     )
-    length_status = (
-        QualityCheckStatus.NOT_APPLICABLE
-        if candidate.plan.language_policy
-        is FaithfulLanguagePolicy.TRANSLATE_TO_OUTPUT
-        else QualityCheckStatus.PASS
-        if 0.45 <= length_ratio <= 1.8
-        else QualityCheckStatus.WARNING
-    )
     qualifier_status = (
         QualityCheckStatus.NOT_APPLICABLE
         if candidate.plan.language_policy
@@ -320,8 +330,8 @@ def assess_faithful_edition(
         ),
         _check(
             "length_change",
-            length_status,
-            "Length ratio is observational for translation and bounded for source-language editing",
+            QualityCheckStatus.NOT_APPLICABLE,
+            "Length ratio is observational; semantic review checks omissions without a compression target",
             severity="warning",
         ),
         _check(

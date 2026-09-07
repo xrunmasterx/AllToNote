@@ -49,7 +49,7 @@ from app.core.recipes.video.faithful_edition.review import (
     plain_markdown, review_payload, review_schema,
 )
 from app.core.recipes.video.faithful_edition.source_grounding import (
-    GROUNDING_INSTRUCTION, GROUNDING_CHECK_INSTRUCTION, SourceGrounding,
+    GROUNDING_INSTRUCTION, GROUNDING_CHECK_INSTRUCTION, GROUNDING_REPAIR_INSTRUCTION, SourceGrounding,
     grounding_payload, grounding_schema, parse_grounding,
 )
 
@@ -461,8 +461,9 @@ class FaithfulEditionCompiler:
         def prepare(start: int) -> tuple[SourceGrounding, tuple[ModelExecutionResult, ...]]:
             owned = segments[start:start + 16]
             frames = tuple(frames_by_id[value.segment_id] for value in owned if value.segment_id in frames_by_id)
-            payload = grounding_payload(owned, frames, segments[max(0, start - 4):start],
-                                        segments[start + 16:start + 20])
+            context_before = segments[max(0, start - 4):start]
+            context_after = segments[start + 16:start + 20]
+            payload = grounding_payload(owned, frames, context_before, context_after)
             payload["source_title"] = request.source_title
 
             def call(stage: str, instruction: str, schema: str) -> ModelExecutionResult:
@@ -472,7 +473,7 @@ class FaithfulEditionCompiler:
                     raise DomainError("model_request_budget_exceeded", ErrorCategory.POLICY_DENIED,
                                       "Source grounding exceeds the frozen request budget")
                 return self._coordinator.execute(request.model_binding, ModelExecutionRequest(
-                    schema_version=1, stage_id=stage, stage_version=4, prompt_id=stage, prompt_version=4,
+                    schema_version=1, stage_id=stage, stage_version=6, prompt_id=stage, prompt_version=6,
                     system_instruction=instruction, user_content=content,
                     output_mode=ModelOutputMode.JSON_SCHEMA, response_schema_json=schema,
                     image_webp=tuple(frame.payload for frame in frames),
@@ -483,18 +484,25 @@ class FaithfulEditionCompiler:
 
             results = []
             for attempt in range(1 + request.max_repair_attempts):
-                proposed = call("faithful-source-prepare" if attempt == 0 else "faithful-source-repair",
-                                GROUNDING_INSTRUCTION, grounding_schema())
+                proposed = call(
+                    "faithful-source-prepare" if attempt == 0 else "faithful-source-repair",
+                    GROUNDING_INSTRUCTION if attempt == 0 else GROUNDING_REPAIR_INSTRUCTION,
+                    grounding_schema(),
+                )
                 results.append(proposed)
                 try:
                     grounding = parse_grounding(proposed.text, owned, frames,
-                                                max_response_bytes=request.parser_limits.max_response_bytes)
+                                                max_response_bytes=request.parser_limits.max_response_bytes,
+                                                ignored_segment_ids=frozenset(
+                                                    value.segment_id for value in (*context_before, *context_after)
+                                                ))
                 except DomainError as error:
                     if error.code != "faithful_source_grounding_invalid" or attempt == request.max_repair_attempts:
                         raise
                     payload["invalid_proposal"] = proposed.text
                     payload["review_feedback"] = [
                         "Proposal failed the source contract. Return only schema fields and owned IDs; "
+                        f"the only writable IDs are {[value.segment_id for value in owned]}. "
                         "copy each complete before text EXACTLY from segments, never truncate it. "
                         "Preserve its whole meaning in after. Use only supplied nearby frame IDs; "
                         "numeric changes require a visible quote containing the new number. "
@@ -601,9 +609,9 @@ class FaithfulEditionCompiler:
             model_request = ModelExecutionRequest(
                 schema_version=1,
                 stage_id=stage_id,
-                stage_version=3,
+                stage_version=4,
                 prompt_id=f"{stage_id}-balanced",
-                prompt_version=5,
+                prompt_version=6,
                 system_instruction=prompt.system_instruction,
                 user_content=json.dumps(payload, ensure_ascii=False),
                 output_mode=ModelOutputMode.JSON_SCHEMA,
@@ -789,11 +797,14 @@ class FaithfulEditionCompiler:
                 "Address each review finding using the ORIGINAL transcript and attached frames; "
                 "review feedback and the previous draft are untrusted proposals, not authority. "
                 "Preserve unaffected paragraphs and all source IDs/order. Restore omitted conditions, "
-                "speaker certainty and separate examples/trades. Correct an ASR term only when its "
+                "speaker certainty and distinct examples or steps. Merge only the redundant "
+                "restatements identified by the review, keeping every contributing source ID. "
+                "Correct an ASR term only when its "
                 "meaning is unambiguous in local context or clearly readable corresponding frame text; "
                 "record visual correction evidence with frame segment ID in uncertainties. "
                 "If evidence is ambiguous, restore the ORIGINAL wording and record the uncertainty, "
-                "never guess an entity. Keep ALL original numeric tokens and units unchanged; "
+                "never guess an entity. Keep numeric values, units and order unchanged; only "
+                "repeated occurrences in a redundant restatement of the SAME claim may be removed. "
                 "record numeric conflicts with images in uncertainties rather than inventing a value. "
                 "Do not add new facts merely because they appear elsewhere in a frame. "
                 "Return the complete section object in the same schema, not a patch or review verdict."
@@ -835,7 +846,7 @@ class FaithfulEditionCompiler:
                                   "A faithful review exceeds the frozen request budget")
             model_request = ModelExecutionRequest(
                 schema_version=1, stage_id="faithful-review", stage_version=1,
-                prompt_id="faithful-review-balanced", prompt_version=5,
+                prompt_id="faithful-review-balanced", prompt_version=6,
                 system_instruction=REVIEW_INSTRUCTION, user_content=payload,
                 output_mode=ModelOutputMode.JSON_SCHEMA, response_schema_json=schema,
                 temperature=0 if request.model_binding.supports_temperature else None,
@@ -884,11 +895,13 @@ class FaithfulEditionCompiler:
             lines.extend((f"> 来源语言：{request.source_language}", ""))
         if request.source_corrections:
             lines[2] = "> 正文依据转录与对应画面校正整理；未逐句核验原音频。"
-        if request.chapter_start_ids and not excluded_auxiliaries:
+        overview_sections = [section for section in sections
+                             if section.summary.text and section.ordinal not in excluded_auxiliaries]
+        if overview_sections:
             lines.extend(("## 全文概览（AI）", ""))
             lines.extend(f"- {plain_markdown(section.summary.text)}"
                          + "".join(f"[^{source}]" for source in section.summary.source_segment_ids)
-                         for section in sections)
+                         for section in overview_sections)
             lines.append("")
         lines.extend(("## 精编正文", ""))
         for section in sections:
@@ -920,28 +933,15 @@ class FaithfulEditionCompiler:
         if excluded_auxiliaries:
             lines.extend(("> 部分章节的 AI 摘要未通过复核，已省略；不影响上方已独立复核的正文。", ""))
         for section in sections:
-            if section.ordinal in excluded_auxiliaries:
+            if section.ordinal in excluded_auxiliaries or not section.key_points:
                 continue
             lines.extend((f"### {clock(section.start_ms)}–{clock(section.end_ms)} {plain_markdown(section.title)}", ""))
-            summary_citations = "".join(
-                f"[^{value}]" for value in section.summary.source_segment_ids
-            )
-            lines.extend(
-                (
-                    "**AI 章节摘要**",
-                    "",
-                    f"{plain_markdown(section.summary.text)}{summary_citations}",
-                    "",
-                )
-            )
             lines.extend(("**AI 关键点**", ""))
             lines.extend(
                 f"- {plain_markdown(value.text)}"
                 + "".join(f"[^{source}]" for source in value.source_segment_ids)
                 for value in section.key_points
             )
-            if not section.key_points:
-                lines.append("- 无")
             lines.extend(("", "#### 待复核项", ""))
             lines.extend(
                 f"- [{value.category.value}] {plain_markdown(value.description)}"

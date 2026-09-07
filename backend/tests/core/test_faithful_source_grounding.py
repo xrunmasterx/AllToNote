@@ -6,7 +6,11 @@ import pytest
 from app.core.domain.video import TranscriptDocument, TranscriptSegment
 from app.core.domain.visual_frame import VisualFrame
 from app.core.errors import DomainError
-from app.core.recipes.video.faithful_edition.source_grounding import parse_grounding
+from app.core.recipes.video.faithful_edition.source_grounding import (
+    GROUNDING_CHECK_INSTRUCTION,
+    GROUNDING_REPAIR_INSTRUCTION,
+    parse_grounding,
+)
 from app.core.recipes.video.faithful_edition.pipeline import plan_faithful_edition
 from app.core.application.artifact_query_service import project_reading_markdown
 from test_faithful_edition_compiler import _FaithfulExecutor, _compiler_context, _request, _binding
@@ -14,6 +18,16 @@ from test_faithful_edition_compiler import _FaithfulExecutor, _compiler_context,
 
 SEGMENT = TranscriptSegment("seg_000001", 0, 1000, "到这个1.25左右")
 FRAME = VisualFrame(SEGMENT.segment_id, 500, b"RIFF\x04\x00\x00\x00WEBP")
+
+
+def test_grounding_review_instruction_blocks_only_owned_substantive_corrections():
+    assert "SAME owned segment" in GROUNDING_CHECK_INSTRUCTION
+    assert "screen-only aliases" in GROUNDING_CHECK_INSTRUCTION
+    assert "Chinese versus Arabic digits" in GROUNDING_CHECK_INSTRUCTION
+    assert "context without a readable same-segment frame" in GROUNDING_CHECK_INSTRUCTION
+    assert "reasonable alternate grouping" in GROUNDING_CHECK_INSTRUCTION
+    assert "Address every valid review_feedback item" in GROUNDING_REPAIR_INSTRUCTION
+    assert "never copy words owned by an adjacent segment" in GROUNDING_REPAIR_INSTRUCTION
 
 
 def _proposal():
@@ -38,6 +52,39 @@ def test_grounding_rejects_invalid_evidence(fault):
     if fault == "duplicate_illustration": value["illustration_ids"] *= 2
     with pytest.raises(DomainError, match="faithful_source_grounding_invalid"):
         parse_grounding(json.dumps(value), (SEGMENT,), (FRAME,), max_response_bytes=16000)
+
+
+def test_grounding_ignores_only_explicit_read_only_context_ids():
+    context_id = "seg_000002"
+    value = _proposal()
+    value["corrections"].append({**value["corrections"][0], "segment_id": context_id})
+    value["chapter_start_ids"] = [context_id]
+    value["illustration_ids"].append(context_id)
+
+    parsed = parse_grounding(
+        json.dumps(value), (SEGMENT,), (FRAME,), max_response_bytes=16000,
+        ignored_segment_ids=frozenset({context_id}),
+    )
+
+    assert len(parsed.corrections) == 1
+    assert parsed.chapter_start_ids == ()
+    assert parsed.illustration_ids == (FRAME.segment_id,)
+
+
+@pytest.mark.parametrize(("before", "after", "quote"), [
+    ("区间是74到74000", "区间是74,000到74,700", "区间是74,000-74,700"),
+    ("第二个位置61515", "第二个位置65,000，65,000", "第二个位置65,00065,000"),
+    ("第二个位置61515", "第二个位置65000", "第二个位置65,000"),
+])
+def test_grounding_accepts_visible_range_and_repeated_number_formats(before, after, quote):
+    segment = replace(SEGMENT, text=before)
+    frame = replace(FRAME, segment_id=segment.segment_id)
+    value = _proposal()
+    value["corrections"][0].update(before=before, after=after, visible_quote=quote)
+
+    parsed = parse_grounding(json.dumps(value), (segment,), (frame,), max_response_bytes=16000)
+
+    assert parsed.corrections[0].after == after
 
 
 @pytest.mark.parametrize("before,after,quote", [
@@ -187,3 +234,16 @@ def test_dense_frames_are_bounded_chronological_and_inside_segments():
     assert len(plan) == 192
     assert all(item.timestamp_ms % 1000 == 500 for item in plan)
     assert [item.timestamp_ms for item in plan] == sorted(item.timestamp_ms for item in plan)
+
+
+def test_long_dense_frame_is_near_segment_end_for_late_burned_subtitle():
+    from app.core.application.video_service import build_visual_candidate_plan
+    transcript = TranscriptDocument("zh", (
+        TranscriptSegment("seg_000001", 314_320, 317_521, "4430到4450"),
+    ))
+
+    plan = build_visual_candidate_plan(
+        "job_018f0000-0000-7000-8000-000000000001", transcript, dense=True,
+    )
+
+    assert plan[0].timestamp_ms == 317_021
