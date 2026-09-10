@@ -10,6 +10,7 @@ from app.core.domain.video import FaithfulLanguagePolicy, QualityOverall, Transc
 from app.core.errors import DomainError
 from app.core.portable.jsonio import encode_utf8_lf
 from app.core.portable.markdown_safety import validate_markdown_safety
+from app.core.portable.numeric_spelling import normalize_numeric_spelling
 from app.core.recipes.video.faithful_edition.contracts import (
     FaithfulEditionPlanV1,
     FaithfulEditionSectionV1,
@@ -128,6 +129,11 @@ def _normalize(value: str) -> str:
 
 def _anchors(pattern: re.Pattern[str], value: str) -> tuple[str, ...]:
     normalized = _normalize(value)
+    if pattern is _NUMBER:
+        # Chinese integer fractions name the denominator first. Compare their
+        # equivalent slash spelling without interpreting arbitrary prose/numbers.
+        normalized = re.sub(r"(?<![\d.])([1-9]\d*)\s*分之\s*(\d+)(?![\d.])",
+                            lambda match: f"{match[2]}/{match[1]}", normalized)
     values = []
     for match in pattern.finditer(normalized):
         anchor = match.group(0)
@@ -184,6 +190,13 @@ def _retains_anchors(source: tuple[str, ...], target: tuple[str, ...]) -> bool:
     return all(any(value == expected for value in remaining) for expected in target)
 
 
+def same_numeric_anchors(source: str, target: str) -> bool:
+    if _retains_anchors(_anchors(_NUMBER, source), _anchors(_NUMBER, target)):
+        return True
+    source, target = normalize_numeric_spelling(source, target)
+    return _retains_anchors(_anchors(_NUMBER, source), _anchors(_NUMBER, target))
+
+
 def _mismatches(
     candidate: FaithfulEditionCandidateV1,
 ) -> tuple[int, int, int, tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -202,7 +215,7 @@ def _mismatches(
     for section in candidate.sections:
         for paragraph in section.paragraphs:
             source = " ".join(by_id[value].text for value in paragraph.source_segment_ids)
-            if not _retains_anchors(_anchors(_NUMBER, source), _anchors(_NUMBER, paragraph.text)):
+            if not same_numeric_anchors(source, paragraph.text):
                 number_count += 1
                 number_sections.add(section.ordinal)
             if not _retains_anchors(
@@ -289,7 +302,7 @@ def assess_faithful_edition(
     regions_separated = all(
         heading in candidate.markdown
         for heading in (
-            "## 精编正文",
+            "## 正文",
             "## AI 辅助摘要（不属于原文）",
         )
     )

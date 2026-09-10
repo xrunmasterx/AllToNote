@@ -93,7 +93,7 @@ def test_faithful_reading_hides_review_notes_but_keeps_body_images_and_summary()
     markdown = (
         "# 保真稿\n\n"
         "> 正文仅依据转录稿保守整理；疑似识别错误保留待核对，不代表已核验原音频。\n\n"
-        "## 精编正文\n\n### 00:00–02:29 开盘交易\n\n"
+        "## 正文\n\n### 00:00–02:29 开盘交易\n\n"
         "<!-- time:0-149620 -->\n\n"
         f"目前的浮盈是9000多美金。[^{EVIDENCE_ONE}]\n\n"
         "> 待核对：福音依据上下文改为浮盈。\n\n"
@@ -144,7 +144,7 @@ def test_faithful_reading_preserves_review_markers_in_code_and_ordinary_quotes()
 
 def test_faithful_summaries_lead_matching_chapters_with_missing_middle_summary() -> None:
     markdown = (
-        "## 精编正文\n\n### 00:00–02:00 第一段\n\n正文一。\n\n"
+        "## 正文\n\n### 00:00–02:00 第一段\n\n正文一。\n\n"
         "![截图](../assets/chart.webp)\n\n"
         "### 02:00–04:00 第二段\n\n正文二。\n\n"
         "### 04:00–06:00 第三段\n\n正文三。\n\n"
@@ -158,7 +158,7 @@ def test_faithful_summaries_lead_matching_chapters_with_missing_middle_summary()
     )
     reading = project_reading_markdown(markdown)
     assert reading.count("<details open>") == reading.count("</details>") == 2
-    assert reading.count("<summary>AI 摘要与关键点（不属于原文）</summary>") == 2
+    assert reading.count("<summary>摘要</summary>") == 2
     assert reading.index("### 00:00") < reading.index("摘要一") < reading.index("关键点一")
     assert reading.index("关键点一") < reading.index("正文一") < reading.index("![截图]")
     assert reading.index("![截图]") < reading.index("### 02:00") < reading.index("正文二")
@@ -166,15 +166,15 @@ def test_faithful_summaries_lead_matching_chapters_with_missing_middle_summary()
     assert "## AI 辅助摘要" not in reading
     assert "未通过复核" not in reading
     assert EVIDENCE_ONE not in reading
-    assert "**AI 章节摘要**" in reading
-    assert "**AI 关键点**" in reading
+    assert "**AI 章节摘要**" not in reading
+    assert "**AI 关键点**" not in reading
     assert "#### AI" not in reading
     assert project_reading_markdown(reading) == reading
 
 
-def test_summary_labels_preserve_body_headings_and_code_literals() -> None:
+def test_summary_labels_are_removed_without_changing_body_headings_or_code_literals() -> None:
     literal = "```markdown\n#### AI 章节摘要\n#### AI 关键点\n```"
-    body = "## 精编正文\n\n### 00:00–02:00 第一段\n\n#### AI 关键点\n\n正文。\n"
+    body = "## 正文\n\n### 00:00–02:00 第一段\n\n#### AI 关键点\n\n正文。\n"
     for label in ("#### AI 章节摘要", "**AI 章节摘要**"):
         markdown = (
             body + "\n## AI 辅助摘要（不属于原文）\n\n"
@@ -184,14 +184,16 @@ def test_summary_labels_preserve_body_headings_and_code_literals() -> None:
         reading = project_reading_markdown(markdown)
         assert literal in reading
         assert "#### AI 关键点\n\n正文。" in reading
-        assert "**AI 章节摘要**\n\n摘要。" in reading
-        assert "**AI 关键点**\n\n- 关键点。" in reading
+        assert "摘要。" in reading
+        assert "- 关键点。" in reading
+        assert "**AI 章节摘要**" not in reading
+        assert "**AI 关键点**" not in reading
         assert "<details open>" in reading
         assert project_reading_markdown(reading) == reading
 
 
 def test_faithful_reading_without_approved_summaries_has_no_empty_disclosures() -> None:
-    body = "## 精编正文\n\n### 00:00–02:00 第一段\n\n正文。\n"
+    body = "## 正文\n\n### 00:00–02:00 第一段\n\n正文。\n"
     markdown = body + "\n## AI 辅助摘要（不属于原文）\n\n> 部分章节未通过复核。\n" + FAITHFUL_LOG
     assert project_reading_markdown(markdown) == body
 

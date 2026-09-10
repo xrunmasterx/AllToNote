@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from app.core.domain.ids import sha256_digest
@@ -24,6 +24,9 @@ from app.core.ports.model_executor import (
     ModelOutputMode,
 )
 from app.core.ports.source import CancellationTokenPort
+from app.core.application.reviewed_call_cache import (
+    ReviewedCallCachePort, active_reviewed_calls, run_reviewed_calls, T,
+)
 
 
 _SAFE_SHARD_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -86,6 +89,8 @@ class ModelCallCoordinator:
         result_store: ModelOperationResultStorePort,
         executor: ModelExecutorPort,
         max_attempts: int = 2,
+        reviewed_cache: ReviewedCallCachePort | None = None,
+        cache_namespace: Callable[[ModelCallExecution], str] | None = None,
     ) -> None:
         if type(max_attempts) is not int or max_attempts < 1:
             raise DomainError(
@@ -97,6 +102,18 @@ class ModelCallCoordinator:
         self._result_store = result_store
         self._executor = executor
         self._max_attempts = max_attempts
+        if reviewed_cache is not None and cache_namespace is None:
+            raise ValueError("Reviewed cache requires an explicit authorization namespace")
+        self._reviewed_cache = reviewed_cache
+        self._cache_namespace = cache_namespace
+
+    def run_reviewed(
+        self, key: str, execution: ModelCallExecution,
+        action: Callable[[], T], approved: Callable[[T], bool],
+    ) -> T:
+        namespace = self._cache_namespace(execution) if self._cache_namespace else ""
+        scoped_key = sha256_digest(encode_json({"namespace": namespace, "key": key}))
+        return run_reviewed_calls(self._reviewed_cache, scoped_key, action, approved)
 
     def execute(
         self,
@@ -136,18 +153,26 @@ class ModelCallCoordinator:
                 raise
 
             if operation.outcome is ExternalOutcome.SUCCEEDED:
-                return self._recover_terminal_operation(
+                result = self._recover_terminal_operation(
                     operation,
                     binding,
                     request_hash,
                     token,
                 )
+                calls = active_reviewed_calls.get()
+                if calls is not None:
+                    calls.completed[request_hash] = result
+                return result
 
             token.raise_if_cancelled()
             execution.heartbeat()
             guard.start(operation.operation_id)
             try:
-                result = self._executor.complete(request, token)
+                calls = active_reviewed_calls.get()
+                cached = calls.cached.get(request_hash) if calls is not None else None
+                result = (replace(cached, input_tokens=0, output_tokens=0, provider_request_id=None,
+                                  warnings=tuple(dict.fromkeys((*cached.warnings, "reviewed_call_cache_hit"))))
+                          if cached is not None else self._executor.complete(request, token))
             except DomainError as error:
                 if error.code == "external_outcome_unknown":
                     guard.unknown(
@@ -202,7 +227,7 @@ class ModelCallCoordinator:
                 self._finish_terminal_error(guard, operation, shard_key, error)
                 raise error
 
-            if result.actual_model_identity != binding.model_identity:
+            if not binding.accepts_model(result.actual_model_identity):
                 error = DomainError(
                     "model_identity_mismatch",
                     ErrorCategory.RECIPE_FAILED,
@@ -231,6 +256,8 @@ class ModelCallCoordinator:
                 summary_json=self._success_summary(shard_key, request_hash, stored),
             )
             token.raise_if_cancelled()
+            if calls is not None:
+                calls.completed[request_hash] = result
             return result
 
     @staticmethod
@@ -249,6 +276,7 @@ class ModelCallCoordinator:
                         "max_concurrency": binding.max_concurrency,
                         "max_output_tokens": binding.max_output_tokens,
                         "model_identity": binding.model_identity,
+                        "fallback_model_identity": binding.fallback_model_identity,
                         "provider_type": binding.provider_type,
                         "schema_version": binding.schema_version,
                         "supports_structured_output": binding.supports_structured_output,
@@ -344,7 +372,7 @@ class ModelCallCoordinator:
             request_hash,
             operation.summary_json,
         )
-        if result.actual_model_identity != binding.model_identity:
+        if not binding.accepts_model(result.actual_model_identity):
             raise DomainError(
                 "model_identity_mismatch",
                 ErrorCategory.RECIPE_FAILED,

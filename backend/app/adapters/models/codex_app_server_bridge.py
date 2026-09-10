@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import logging
 from typing import Protocol
 
 from app.adapters.models.legacy_gpt import (
@@ -14,16 +15,18 @@ from app.core.portable.identity import is_executor_identity
 from app.core.ports.model_executor import ModelExecutionRequest, ModelOutputMode
 from app.gpt.codex_app_server_client import CodexAppServerClient, CodexAppServerError
 
+logger = logging.getLogger(__name__)
+
 
 _SUPPORTED_OUTER_FENCES = frozenset({"```json", "```markdown"})
 _STRUCTURED_EXTRACTION_STAGES = frozenset(
-    {"knowledge-map", "knowledge-consolidate", "faithful-edit"}
+    {"knowledge-map", "knowledge-consolidate"}
 )
 _STRUCTURED_EXTRACTION_EFFORT = "medium"
 _COMPOSITION_EFFORT = "high"
 _EXECUTION_POLICY_IDENTITY = (
-    "codex-app-server-stage-effort-v1/"
-    "knowledge-map,knowledge-consolidate,faithful-edit:medium/default:high"
+    "codex-app-server-stage-effort-v2/"
+    "knowledge-map,knowledge-consolidate:medium/default:high"
 )
 
 
@@ -50,6 +53,7 @@ class CodexAppServerCompletionBridge:
         *,
         model_identity: str,
         client: CodexAppServerTurnClient | None = None,
+        fallback_model_identity: str | None = None,
     ) -> None:
         if not is_executor_identity(model_identity):
             raise DomainError(
@@ -66,6 +70,11 @@ class CodexAppServerCompletionBridge:
             )
         self._model_identity = model_identity
         self._client = resolved_client
+        if fallback_model_identity is not None and (
+            not is_executor_identity(fallback_model_identity) or fallback_model_identity == model_identity
+        ):
+            raise ValueError("Invalid fallback model identity")
+        self._fallback_model_identity = fallback_model_identity
 
     def complete_once(
         self,
@@ -114,10 +123,13 @@ class CodexAppServerCompletionBridge:
             if request.output_mode is ModelOutputMode.JSON_SCHEMA
             else None
         )
-        try:
-            returned_text = self._client.run_markdown_turn(
+        selected_model = self._model_identity
+        warnings = ["provider_output_token_limit_unenforced"]
+
+        def run(model: str) -> str:
+            return self._client.run_markdown_turn(
                 prompt,
-                self._model_identity,
+                model,
                 cwd=None,
                 timeout_seconds=request.timeout_seconds,
                 output_schema=output_schema,
@@ -125,7 +137,24 @@ class CodexAppServerCompletionBridge:
                 check_cancelled=check_cancelled,
                 **({"image_webp": request.image_webp} if request.image_webp else {}),
             )
+
+        try:
+            try:
+                returned_text = run(selected_model)
+            except CodexAppServerError as error:
+                if not self._is_capacity_error(error) or self._fallback_model_identity is None:
+                    raise
+                if check_cancelled:
+                    check_cancelled()
+                selected_model = self._fallback_model_identity
+                logger.warning("model_capacity_fallback stage=%s primary=%s fallback=%s",
+                               request.stage_id, self._model_identity, selected_model)
+                warnings.append(f"model_capacity_fallback:{self._model_identity}->{selected_model}")
+                returned_text = run(selected_model)
         except CodexAppServerError as error:
+            if self._is_capacity_error(error):
+                raise DomainError("model_capacity_exhausted", ErrorCategory.RECIPE_FAILED,
+                                  "Selected models returned explicit capacity refusals") from None
             if error.outcome_known and error.code == "invalid_json_schema":
                 raise DomainError(
                     "model_response_schema_unsupported",
@@ -137,9 +166,24 @@ class CodexAppServerCompletionBridge:
                     "The model provider returned a known failure"
                 ) from None
             raise
+        finally:
+            timings = getattr(self._client, "timings", None)
+            if isinstance(timings, dict):
+                logger.info("video_performance %s", json.dumps({
+                    "stage": request.stage_id, "transport": timings,
+                }))
         return self._normalized_response(
             returned_text,
-            warnings=("provider_output_token_limit_unenforced",),
+            warnings=tuple(warnings),
+            model_identity=selected_model,
+        )
+
+    @staticmethod
+    def _is_capacity_error(error: CodexAppServerError) -> bool:
+        # Unknown timeouts, authentication, billing and policy refusals must not
+        # become automatic cross-model retries.
+        return error.code in {"server_is_overloaded", "model_at_capacity"} or (
+            "Selected model is at capacity" in str(error)
         )
 
     @staticmethod
@@ -157,6 +201,7 @@ class CodexAppServerCompletionBridge:
         returned_text: object,
         *,
         warnings: tuple[str, ...] = (),
+        model_identity: str | None = None,
     ) -> LegacyModelResponse:
         if type(returned_text) is not str or not returned_text.strip():
             raise LegacyReturnedInvalidResponse(
@@ -171,7 +216,7 @@ class CodexAppServerCompletionBridge:
 
         return LegacyModelResponse(
             markdown=cleaned_text,
-            actual_model=self._model_identity,
+            actual_model=model_identity or self._model_identity,
             warnings=warnings,
         )
 

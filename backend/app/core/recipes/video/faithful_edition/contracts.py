@@ -13,7 +13,7 @@ from app.core.recipes.video.compilation.contracts import (
     TranscriptBasis,
     TranscriptQualityAssessmentV1,
 )
-from app.core.ports.model_executor import ModelExecutionBinding
+from app.core.ports.model_executor import ModelExecutionBinding, MAX_MODEL_IMAGES, MAX_MODEL_IMAGE_BYTES
 
 
 _SEGMENT_ID = re.compile(r"seg_[0-9]{6,}\Z")
@@ -101,6 +101,15 @@ class FaithfulEditionRequestV1:
     visual_frames: tuple[VisualFrame, ...] = ()
     source_corrections: tuple[GroundedCorrection, ...] = ()
     chapter_start_ids: tuple[str, ...] = ()
+    source_fact_notes: tuple[tuple[str, str], ...] = ()
+    unresolved_source_ids: tuple[str, ...] = ()
+    # Tunable local working budgets; not claimed provider maxima or token counts.
+    max_request_images: int = 40
+    max_request_image_bytes: int = MAX_MODEL_IMAGE_BYTES
+    max_request_image_pixels: int = 40 * 1920 * 1080
+    allow_partial_fallback: bool = False
+    contextual_workflow: bool = False
+    semantic_context_json: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -139,9 +148,28 @@ class FaithfulEditionRequestV1:
             or type(self.visual_frames) is not tuple
             or len(self.visual_frames) > 192
             or any(not isinstance(frame, VisualFrame) for frame in self.visual_frames)
+            or not _positive(self.max_request_images)
+            or self.max_request_images > MAX_MODEL_IMAGES
+            or not _positive(self.max_request_image_bytes)
+            or self.max_request_image_bytes > MAX_MODEL_IMAGE_BYTES
+            or not _positive(self.max_request_image_pixels)
+            or type(self.allow_partial_fallback) is not bool
+            or type(self.contextual_workflow) is not bool
+            or type(self.semantic_context_json) is not str
+            or len(self.semantic_context_json.encode("utf-8")) > self.max_request_bytes
         ):
             raise invalid_contract("Faithful edition request is invalid")
         by_id = {segment.segment_id: segment for segment in self.transcript.segments}
+        if (type(self.unresolved_source_ids) is not tuple
+                or any(type(value) is not str or value not in by_id for value in self.unresolved_source_ids)
+                or len(set(self.unresolved_source_ids)) != len(self.unresolved_source_ids)):
+            raise invalid_contract("Unresolved source references must be unique source IDs")
+        if (type(self.source_fact_notes) is not tuple
+                or any(type(item) is not tuple or len(item) != 2 or type(item[0]) is not str or item[0] not in by_id
+                       or type(item[1]) is not str or not 1 <= len(item[1].strip()) <= 16000
+                       for item in self.source_fact_notes)
+                or len({item[0] for item in self.source_fact_notes}) != len(self.source_fact_notes)):
+            raise invalid_contract("Source fact notes must be bounded and source-owned")
         frame_ids = [frame.segment_id for frame in self.visual_frames]
         if (
             len(frame_ids) != len(set(frame_ids))
@@ -179,6 +207,7 @@ class FaithfulSectionRefV1:
     estimated_input_tokens: int
     encoded_input_bytes: int
     segment_ids_sha256: str
+    reading_chapter_id: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -200,6 +229,8 @@ class FaithfulSectionRefV1:
             or not _positive(self.encoded_input_bytes)
             or type(self.segment_ids_sha256) is not str
             or _SHA256.fullmatch(self.segment_ids_sha256) is None
+            or (self.reading_chapter_id != "" and
+                (type(self.reading_chapter_id) is not str or _SECTION_ID.fullmatch(self.reading_chapter_id) is None))
         ):
             raise invalid_contract("Faithful section reference is invalid")
 

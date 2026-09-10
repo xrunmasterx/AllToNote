@@ -25,12 +25,25 @@ def model_call_slot(
     deadline: float,
     check_cancelled: Callable[[], None] | None = None,
 ) -> Iterator[None]:
+    with resource_slot(root, resource="model-call", capacity=MODEL_CALL_CAPACITY,
+                       deadline=deadline, check_cancelled=check_cancelled):
+        yield
+
+
+@contextmanager
+def resource_slot(
+    root: Path, *, resource: str, capacity: int, deadline: float,
+    check_cancelled: Callable[[], None] | None = None,
+) -> Iterator[None]:
     """Hold an OS lock only during a call; process death releases admission.
 
     Files are stable lock identities, not lease records: never unlink them.
     The fixed slot namespace prevents workers from independently multiplying
     provider concurrency. Waiting does not start a model request.
     """
+    if (resource not in {"model-call", "transcribe", "download", "ffmpeg"}
+            or type(capacity) is not int or capacity < 1):
+        raise ValueError("Invalid resource admission")
     root.mkdir(parents=True, exist_ok=True)
     held: int | None = None
     try:
@@ -38,9 +51,9 @@ def model_call_slot(
             if check_cancelled is not None:
                 check_cancelled()
             if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for machine model capacity")
-            for slot in range(MODEL_CALL_CAPACITY):
-                descriptor = os.open(root / f"model-call-{slot}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+                raise TimeoutError(f"Timed out waiting for machine {resource} capacity")
+            for slot in range(capacity):
+                descriptor = os.open(root / f"{resource}-{slot}.lock", os.O_CREAT | os.O_RDWR, 0o600)
                 try:
                     if os.name == "nt":
                         msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)

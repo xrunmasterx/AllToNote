@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import partial
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from app.adapters.video_packs.resource_admission import admitted_pack_worker
+from app.adapters.video_packs.official_pack_process import run_json_worker
+from app.adapters.video_packs.persistent_transcribe_process import run_persistent_transcriber
 
 from app.adapters.iwiki.portable_gateway import IWikiPortableGateway
 from app.adapters.documents.docling_worker_parser import (
@@ -42,6 +47,7 @@ from app.adapters.models.codex_app_server_bridge import (
 )
 from app.adapters.models.legacy_model_executor import LegacyModelExecutor
 from app.adapters.models.model_result_store import ModelOperationResultStore
+from app.adapters.models.reviewed_call_cache import ReviewedCallCache
 from app.adapters.sources.legacy_video import LegacyVideoSourceAdapter
 from app.adapters.sources.legacy_video import VerifiedSourceIdentityRegistry
 from app.adapters.transcription.legacy_transcriber import (
@@ -445,6 +451,7 @@ class _PlatformVideoOperations(VideoRecipeOperations):
         storage: FileAttemptStorage | None = None,
         transcriber: TranscriptPort | None = None,
         ffmpeg_executable: Path | None = None,
+        resource_slot_root: Path | None = None,
     ) -> None:
         self._repository = repository
         self._source = source
@@ -462,7 +469,8 @@ class _PlatformVideoOperations(VideoRecipeOperations):
             assert storage is not None
         self._screenshot_adapter = (
             FFmpegScreenshotAdapter(
-                storage, repository, ffmpeg_executable=str(ffmpeg_executable)
+                storage, repository, ffmpeg_executable=str(ffmpeg_executable),
+                resource_slot_root=resource_slot_root,
             )
             if ffmpeg_executable is not None
             else None
@@ -1066,6 +1074,7 @@ class _RuntimeCompilationProfile:
                 "max_concurrency": binding.max_concurrency,
                 "max_output_tokens": binding.max_output_tokens,
                 "model_identity": binding.model_identity,
+                "fallback_model_identity": binding.fallback_model_identity,
                 "provider_type": binding.provider_type,
                 "schema_version": binding.schema_version,
                 "supports_structured_output": binding.supports_structured_output,
@@ -1489,6 +1498,11 @@ class _RuntimeFaithfulEditionCompiler:
                 "semantic_chapters": 1,
                 "dense_correction_frames": 1,
                 "audit_layout": 2,
+                "partial_source_fallback": 1,
+                "optional_frame_review": 1,
+                "fraction_spelling": 1,
+                "contextual_workflow": 1,
+                "final_json_recovery": 1,
             },
         )
 
@@ -1540,6 +1554,8 @@ class _RuntimeFaithfulEditionCompiler:
             else None
         )
         faithful_request = FaithfulEditionRequestV1(
+            allow_partial_fallback=True,
+            contextual_workflow=True,
             schema_version=1,
             recipe_id=request.output.recipe_id,
             recipe_version=request.output.recipe_version,
@@ -1560,7 +1576,7 @@ class _RuntimeFaithfulEditionCompiler:
                 max_title_characters=200,
                 max_paragraphs=64,
                 max_paragraph_characters=min(max_response_bytes, 32 * 1024),
-                max_segment_refs_per_paragraph=12,
+                max_segment_refs_per_paragraph=24,
                 max_key_points=64,
                 max_uncertainties=64,
                 max_auxiliary_text_characters=min(
@@ -1624,10 +1640,17 @@ def _create_runtime_model_services(
             "The model bridge execution policy identity must not be empty",
         )
     executor = LegacyModelExecutor(binding=binding, bridge=bridge)
+    def reviewed_cache_namespace(execution: ModelCallExecution) -> str:
+        job = repository.get_job(execution.job_id)
+        return json.dumps([job.principal, job.request_hash, provider_profile,
+                           provider_execution_policy], separators=(",", ":"))
+
     coordinator = ModelCallCoordinator(
         operation_store=repository,
         result_store=ModelOperationResultStore(result_root / "model-operations"),
         executor=executor,
+        reviewed_cache=ReviewedCallCache(result_root / "reviewed-model-groups"),
+        cache_namespace=reviewed_cache_namespace,
     )
     profile = _RuntimeCompilationProfile(
         repository=repository,
@@ -1859,6 +1882,7 @@ def _create_platform_video_runtime_components(
     source_metadata: Mapping[str, Mapping[str, object]],
     transcriber: TranscriptPort | None = None,
     ffmpeg_executable: Path | None = None,
+    resource_slot_root: Path | None = None,
     generated_transcriber_identity: str | None = None,
     model: LegacyModelBinding,
     model_execution_binding: ModelExecutionBinding | None = None,
@@ -1903,6 +1927,7 @@ def _create_platform_video_runtime_components(
         storage=storage,
         transcriber=transcriber,
         ffmpeg_executable=ffmpeg_executable,
+        resource_slot_root=resource_slot_root,
     )
     portable = IWikiPortableGateway()
 
@@ -1937,6 +1962,7 @@ def _create_platform_video_runtime_components(
                     storage=storage,
                     transcriber=resolved_transcriber,
                     ffmpeg_executable=resolved_ffmpeg,
+                    resource_slot_root=resource_slot_root,
                 ),
                 identity,
             )
@@ -1993,6 +2019,7 @@ def create_platform_video_runtime(
     source_metadata: Mapping[str, Mapping[str, object]],
     transcriber: TranscriptPort | None = None,
     ffmpeg_executable: Path | None = None,
+    resource_slot_root: Path | None = None,
     generated_transcriber_identity: str | None = None,
     model: LegacyModelBinding,
     model_execution_binding: ModelExecutionBinding | None = None,
@@ -2017,6 +2044,7 @@ def create_platform_video_runtime(
         source_metadata=source_metadata,
         transcriber=transcriber,
         ffmpeg_executable=ffmpeg_executable,
+        resource_slot_root=resource_slot_root,
         generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=model_execution_binding,
@@ -2885,8 +2913,10 @@ def create_codex_app_server_runtime_for_workspace(
     from app.gpt.codex_app_server_client import CodexAppServerClient
     from app.gpt.model_slots import VIDEO_MODEL_CONCURRENCY
 
+    fallback_model = "gpt-5.6-luna" if model_identity == "gpt-5.6-terra" else None
     bridge = CodexAppServerCompletionBridge(
         model_identity=model_identity,
+        fallback_model_identity=fallback_model,
         client=CodexAppServerClient(
             pool_size=VIDEO_MODEL_CONCURRENCY,
             machine_slot_root=paths.data_dir / "machine" / "model-slots",
@@ -2906,6 +2936,7 @@ def create_codex_app_server_runtime_for_workspace(
         context_window_tokens=128_000,
         max_output_tokens=16_000,
         max_concurrency=VIDEO_MODEL_CONCURRENCY,
+        fallback_model_identity=fallback_model,
         supports_structured_output=True,
         supports_temperature=False,
         timeout_seconds=600,
@@ -2914,6 +2945,11 @@ def create_codex_app_server_runtime_for_workspace(
         paths,
         trusted_keys=official_video_pack_trust_keys(),
     )
+    resource_slot_root = paths.data_dir / "machine" / "video-slots"
+    download_runner = partial(admitted_pack_worker, resource_root=resource_slot_root,
+                              resource="download", runner=run_json_worker)
+    transcribe_runner = partial(admitted_pack_worker, resource_root=resource_slot_root,
+                                resource="transcribe", runner=run_persistent_transcriber)
     if execution_pack_environment is None:
         media_pack = pack_resolver.resolve_active(MEDIA_BASIC)
         ffmpeg_executable = media_pack.entrypoints["ffmpeg"]
@@ -2927,9 +2963,11 @@ def create_codex_app_server_runtime_for_workspace(
             LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
             media_pack,
             cookie_resolver=_bilibili_cookie,
+            runner=download_runner,
         )
         transcriber = (
-            PackedCpuTranscriber(transcribe_pack)
+            PackedCpuTranscriber(transcribe_pack, runner=transcribe_runner,
+                                 cache_root=instance.machine_root / "external-results" / "transcripts")
             if transcribe_pack is not None
             else None
         )
@@ -3014,9 +3052,11 @@ def create_codex_app_server_runtime_for_workspace(
             LegacyVideoSourceAdapter(local_machine_id=instance.instance_id),
             resolved_media,
             cookie_resolver=_bilibili_cookie,
+            runner=download_runner,
         )
         resolved_transcriber = (
-            PackedCpuTranscriber(resolved_transcribe)
+            PackedCpuTranscriber(resolved_transcribe, runner=transcribe_runner,
+                                 cache_root=instance.machine_root / "external-results" / "transcripts")
             if resolved_transcribe is not None
             else None
         )
@@ -3071,6 +3111,7 @@ def create_codex_app_server_runtime_for_workspace(
         source_metadata={},
         transcriber=transcriber,
         ffmpeg_executable=ffmpeg_executable,
+        resource_slot_root=resource_slot_root,
         generated_transcriber_identity=generated_transcriber_identity,
         model=model,
         model_execution_binding=binding,

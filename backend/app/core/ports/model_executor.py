@@ -13,6 +13,10 @@ from app.core.ports.source import CancellationTokenPort
 
 _PROVIDER_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 
+# Local transport safety envelope, not a provider/model context limit.
+MAX_MODEL_IMAGES = 192
+MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024
+
 
 class ModelOutputMode(StrEnum):
     TEXT = "text"
@@ -72,9 +76,14 @@ class ModelExecutionBinding:
     supports_structured_output: bool
     supports_temperature: bool
     timeout_seconds: int | float
+    fallback_model_identity: str | None = None
 
     def __post_init__(self) -> None:
         code = "model_execution_binding_invalid"
+        if self.fallback_model_identity is not None:
+            _require_text(self.fallback_model_identity, code=code, field_name="fallback_model_identity")
+            if self.fallback_model_identity == self.model_identity:
+                raise DomainError(code, ErrorCategory.INVALID_REQUEST, "Fallback must use a different model")
         for field_name in (
             "provider_type",
             "model_identity",
@@ -110,6 +119,11 @@ class ModelExecutionBinding:
             field_name="timeout_seconds",
         )
 
+    def accepts_model(self, identity: str) -> bool:
+        return identity == self.model_identity or (
+            self.fallback_model_identity is not None and identity == self.fallback_model_identity
+        )
+
 
 @dataclass(frozen=True)
 class ModelExecutionRequest:
@@ -131,14 +145,14 @@ class ModelExecutionRequest:
         code = "model_execution_request_invalid"
         if (
             type(self.image_webp) is not tuple
-            or len(self.image_webp) > 24
+            or len(self.image_webp) > MAX_MODEL_IMAGES
             or any(
                 type(value) is not bytes
                 or not value.startswith(b"RIFF")
                 or value[8:12] != b"WEBP"
                 for value in self.image_webp
             )
-            or sum(len(value) for value in self.image_webp) > 20 * 1024 * 1024
+            or sum(len(value) for value in self.image_webp) > MAX_MODEL_IMAGE_BYTES
         ):
             raise DomainError(code, ErrorCategory.INVALID_REQUEST, "Invalid WebP image inputs")
         for field_name in (

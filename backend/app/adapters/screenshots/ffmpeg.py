@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import time
+from contextlib import nullcontext
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -23,6 +24,7 @@ from app.core.ports.jobs import (
     ScreenshotOutputCapability,
     ScreenshotSourceCapability,
 )
+from app.adapters.video_packs.resource_admission import video_resource_slot
 
 
 _SIGTERM = getattr(signal, "SIGTERM", 15)
@@ -71,6 +73,7 @@ class FFmpegScreenshotAdapter:
         platform_name: str | None = None,
         timeout_seconds: float = 30.0,
         termination_timeout_seconds: float = 2.0,
+        resource_slot_root: Path | None = None,
     ) -> None:
         self._storage = storage
         self._repository = repository
@@ -83,6 +86,7 @@ class FFmpegScreenshotAdapter:
         self._platform_name = platform_name or ("windows" if os.name == "nt" else "posix")
         self._timeout_seconds = timeout_seconds
         self._termination_timeout_seconds = termination_timeout_seconds
+        self._resource_slot_root = resource_slot_root
 
     def extract(
         self,
@@ -119,14 +123,11 @@ class FFmpegScreenshotAdapter:
             ) from None
         assets = []
         for item in plan:
-            assets.append(
-                self._extract_one(
-                    item,
-                    execution,
-                    token,
-                    source,
-                )
-            )
+            gate = (video_resource_slot(self._resource_slot_root, "ffmpeg", timeout_seconds=1800,
+                                        check_cancelled=token.raise_if_cancelled)
+                    if self._resource_slot_root is not None else nullcontext())
+            with gate:
+                assets.append(self._extract_one(item, execution, token, source))
         return tuple(assets)
 
     @staticmethod

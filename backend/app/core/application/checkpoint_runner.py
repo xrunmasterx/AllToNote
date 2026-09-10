@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
+import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
@@ -17,6 +19,7 @@ from app.core.ports.jobs import (
 
 
 _T = TypeVar("_T")
+logger = logging.getLogger(__name__)
 _AUTHORITY_LOSS_CODES = frozenset(
     {"attempt_fenced", "job_claim_fenced", "scheduler_lease_lost"}
 )
@@ -119,6 +122,9 @@ class CheckpointedStepRunner:
                         authority=authority,
                     )
                 self._heartbeat(authority)
+                logger.info("video_performance %s", json.dumps({
+                    "job_id": job_id, "step_id": step_id, "checkpoint_hit": True,
+                }))
                 return value
         if self._is_resumed_step(resumed_attempt, job_id, step_id):
             attempt = resumed_attempt
@@ -141,7 +147,17 @@ class CheckpointedStepRunner:
                 authority=authority,
                 heartbeat=lambda: self._heartbeat(authority),
             )
-            value = self._run_action(action, execution)
+            action_started = time.monotonic()
+            action_succeeded = False
+            try:
+                value = self._run_action(action, execution)
+                action_succeeded = True
+            finally:
+                action_seconds = time.monotonic() - action_started
+                logger.info("video_performance %s", json.dumps({
+                    "job_id": job_id, "step_id": step_id, "checkpoint_hit": False,
+                    "success": action_succeeded, "action_seconds": action_seconds,
+                }))
             self._heartbeat(authority)
             payload = (
                 encode(value)
@@ -160,7 +176,7 @@ class CheckpointedStepRunner:
                     schema_id=self._checkpoint_schema,
                     input_hash=input_hash,
                     payload=payload,
-                    metadata_json="{}",
+                    metadata_json=json.dumps({"action_seconds": action_seconds}),
                 ),
                 authority,
             )

@@ -9,6 +9,7 @@ from app.core.errors import DomainError
 from app.core.recipes.video.faithful_edition.source_grounding import (
     GROUNDING_CHECK_INSTRUCTION,
     GROUNDING_REPAIR_INSTRUCTION,
+    grounding_payload,
     parse_grounding,
 )
 from app.core.recipes.video.faithful_edition.pipeline import plan_faithful_edition
@@ -17,7 +18,8 @@ from test_faithful_edition_compiler import _FaithfulExecutor, _compiler_context,
 
 
 SEGMENT = TranscriptSegment("seg_000001", 0, 1000, "到这个1.25左右")
-FRAME = VisualFrame(SEGMENT.segment_id, 500, b"RIFF\x04\x00\x00\x00WEBP")
+FRAME = VisualFrame(SEGMENT.segment_id, 500, bytes.fromhex(
+    "524946461a000000574542505650384c0d0000002f00000000071011118888fe0700"))
 
 
 def test_grounding_review_instruction_blocks_only_owned_substantive_corrections():
@@ -112,7 +114,7 @@ def test_grounded_terms_and_numbers_reach_body_and_preserve_raw_audit(tmp_path, 
         model_binding=replace(_binding(), provider_type="codex-app-server"))
     result = compiler.compile(request, context)
     assert after in project_reading_markdown(result.markdown)
-    overview = result.markdown.split("## 全文概览（AI）")[1].split("## 精编正文")[0]
+    overview = result.markdown.split("## 全文概览")[1].split("## 正文")[0]
     assert "[^seg_000001]" in overview
     assert before == request.transcript.segments[0].text
     assert result.text_assessment.metrics.number_mismatch_count == 0
@@ -120,7 +122,7 @@ def test_grounded_terms_and_numbers_reach_body_and_preserve_raw_audit(tmp_path, 
     assert log["records"][0]["before"] == before
     assert log["records"][0]["visible_quote"] == quote
     assert compiler.compile(request, context).markdown == result.markdown
-    assert len(executor.requests) == 4
+    assert len(executor.requests) == 5
 
 
 def test_grounding_review_rejection_blocks_before_writing(tmp_path):
@@ -160,7 +162,7 @@ def test_omitted_correction_feedback_repairs_source_before_writing(tmp_path):
     assert "到这个1.5左右" in project_reading_markdown(result.markdown)
     assert [value.stage_id for value in executor.requests[:4]] == [
         "faithful-source-prepare", "faithful-source-check", "faithful-source-repair", "faithful-source-recheck"]
-    assert len(executor.requests) == 6
+    assert len(executor.requests) == 7
 
 
 @pytest.mark.parametrize("caption,selected", [
@@ -211,7 +213,7 @@ def test_truncated_before_gets_one_contract_repair_without_relaxing_validation(t
     else:
         result = compiler.compile(request, context)
         assert "到这个1.5左右" in project_reading_markdown(result.markdown)
-        assert len(executor.requests) == 5
+        assert len(executor.requests) == 6
 
 
 def test_semantic_chapters_do_not_cut_a_continuing_topic_at_150_seconds():
@@ -247,3 +249,261 @@ def test_long_dense_frame_is_near_segment_end_for_late_burned_subtitle():
     )
 
     assert plan[0].timestamp_ms == 317_021
+
+
+def test_grounding_declares_exact_frame_eligibility_without_relaxing_time_window():
+    segment = TranscriptSegment("seg_000095", 241_200, 244_100, "先行牛骑3或4次向下推动")
+    frames = (
+        VisualFrame("seg_000083", 220_300, FRAME.payload),
+        VisualFrame("seg_000094", 231_200, FRAME.payload),
+        VisualFrame("seg_000096", 254_100, FRAME.payload),
+        VisualFrame("seg_000097", 254_101, FRAME.payload),
+    )
+    payload = grounding_payload((segment,), frames, (), ())
+    assert payload["allowed_correction_frames"] == {
+        segment.segment_id: ["seg_000094", "seg_000096"],
+    }
+
+
+@pytest.mark.parametrize(("timestamp", "allowed"), [(220_300, False), (231_199, False),
+                                                   (231_200, True), (254_100, True), (254_101, False)])
+def test_declared_frame_window_matches_parser_enforcement(timestamp, allowed):
+    segment = TranscriptSegment("seg_000095", 241_200, 244_100, "Disable the switch")
+    frame = VisualFrame("seg_000083", timestamp, FRAME.payload)
+    data = {"corrections": [{"segment_id": segment.segment_id, "before": segment.text,
+        "after": "Enable the switch", "frame_segment_id": frame.segment_id,
+        "visible_quote": "Enable the switch", "reason": "Matching subtitle"}],
+        "chapter_start_ids": [], "illustration_ids": []}
+    if allowed:
+        assert parse_grounding(json.dumps(data), (segment,), (frame,), max_response_bytes=16000).corrections
+    else:
+        with pytest.raises(DomainError, match="faithful_source_grounding_invalid"):
+            parse_grounding(json.dumps(data), (segment,), (frame,), max_response_bytes=16000)
+
+
+@pytest.mark.parametrize(("before", "after", "quote"), [
+    ("后面什么时候开始做空", "后面什么时候开始做多", "后面什么时候开始做多"),
+    ("80根K线", "10根K线", "10 bar bull Micro channel"),
+    ("Disable the switch", "Enable the switch", "Enable the switch"),
+])
+def test_review_and_repair_get_raw_source_and_unselected_correction_frame(tmp_path, before, after, quote):
+    segment = replace(SEGMENT, text=before)
+
+    class Executor(_FaithfulExecutor):
+        reviews = 0
+
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            payload = json.loads(request.user_content)
+            if request.stage_id == "faithful-source-prepare":
+                data = _proposal()
+                data["corrections"][0].update(before=before, after=after, visible_quote=quote)
+                data["illustration_ids"] = []
+                return replace(result, text=json.dumps(data))
+            if request.stage_id == "faithful-review":
+                self.reviews += 1
+                assert payload["transcript"][0]["text"] == before
+                assert payload["corrected_transcript"][0]["text"] == after
+                assert payload["source_corrections"][0]["visible_quote"] == quote
+                assert request.image_webp == (FRAME.payload,)
+                if self.reviews == 1:
+                    data = json.loads(result.text)
+                    data.update(auxiliary_pass=False, auxiliary_issues=["seg_000001: auxiliary changed meaning"])
+                    return replace(result, text=json.dumps(data))
+            if request.stage_id == "faithful-semantic-repair":
+                assert payload["original_transcript"][0]["text"] == before
+                assert payload["section"]["segments"][0]["text"] == after
+                assert payload["source_corrections"][0]["visible_quote"] == quote
+                assert request.image_webp == (FRAME.payload,)
+            return result
+
+    executor = Executor()
+    compiler, context = _compiler_context(tmp_path, executor)
+    request = replace(_request(transcript=TranscriptDocument("zh", (segment,))),
+        visual_frames=(FRAME,), section_input_byte_budget=8192,
+        model_binding=replace(_binding(), provider_type="codex-app-server"))
+    result = compiler.compile(request, context)
+    assert executor.reviews == 2
+    assert after in project_reading_markdown(result.markdown)
+    assert request.transcript.segments[0].text == before
+
+
+def test_neighbor_frame_corrects_owned_segment_without_transferring_ownership(tmp_path):
+    # A subtitle straddles the 16-segment processing boundary.
+    segments = tuple(TranscriptSegment(f"seg_{index + 1:06d}", index * 1000, (index + 1) * 1000,
+                                      "Disable the switch" if index == 15 else "The explanation continues.")
+                     for index in range(17))
+    frame = VisualFrame("seg_000017", 16_500, FRAME.payload)
+
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            payload = json.loads(request.user_content)
+            if request.stage_id == "faithful-source-prepare":
+                value = json.loads(result.text)
+                value["illustration_ids"] = []
+                if payload["segments"][0]["segment_id"] == "seg_000001":
+                    assert payload["context_after"][0]["segment_id"] == frame.segment_id
+                    assert payload["allowed_correction_frames"]["seg_000016"] == [frame.segment_id]
+                    assert request.image_webp == (frame.payload,)
+                    value["corrections"] = [{"segment_id": "seg_000016", "before": segments[15].text,
+                        "after": "Enable the switch", "frame_segment_id": frame.segment_id,
+                        "visible_quote": "Enable the switch", "reason": "Matching subtitle spans boundary"}]
+                return replace(result, text=json.dumps(value))
+            return result
+
+    compiler, context = _compiler_context(tmp_path, Executor())
+    request = replace(_request(transcript=TranscriptDocument("en", segments)),
+        visual_frames=(frame,), model_binding=replace(_binding(), provider_type="codex-app-server"))
+    grounded, _, _ = compiler._ground_source(request, context)
+    assert grounded.source_corrections[0].segment_id == "seg_000016"
+    assert grounded.visual_frames == (frame,)
+    assert request.transcript.segments[15].text == "Disable the switch"
+
+
+def test_review_evidence_is_section_owned_with_read_only_context_and_no_image_truncation():
+    from app.core.application.faithful_edition_compiler import FaithfulEditionCompiler
+    from app.core.recipes.video.faithful_edition.contracts import GroundedCorrection
+
+    segments = tuple(TranscriptSegment(f"seg_{i + 1:06d}", i * 1000, (i + 1) * 1000, "text")
+                     for i in range(30))
+    frames = tuple(VisualFrame(segment.segment_id, segment.start_ms + 500, FRAME.payload) for segment in segments)
+    request = replace(_request(transcript=TranscriptDocument("en", segments)),
+        section_input_byte_budget=8192, visual_frames=frames, chapter_start_ids=("seg_000001", "seg_000003"),
+        source_corrections=(GroundedCorrection("seg_000002", "text", "corrected", "seg_000003", "corrected", "subtitle"),))
+    plan = plan_faithful_edition(request)
+    payload, selected = FaithfulEditionCompiler._section_evidence(request, plan.sections[0], segments[:2])
+    assert [value["segment_id"] for value in payload["original_transcript"]] == ["seg_000001", "seg_000002"]
+    assert [value["segment_id"] for value in payload["context_after"]] == [f"seg_{i:06d}" for i in range(3, 7)]
+    assert [frame.segment_id for frame in selected] == ["seg_000001", "seg_000002", "seg_000003"]
+    with pytest.raises(DomainError, match="model_request_budget_exceeded"):
+        FaithfulEditionCompiler._section_evidence(replace(request, max_request_images=24), plan.sections[1], segments[2:])
+
+
+@pytest.mark.parametrize("fault", ["missing", "wrong_source", "wrong_ordinal", "empty_facts", "mismatch_with_pass"])
+def test_review_requires_complete_fact_checks_and_cannot_override_mismatch_with_pass(tmp_path, fault):
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-review":
+                value = json.loads(result.text)
+                if fault == "missing":
+                    value["claim_checks"] = []
+                elif fault == "wrong_source":
+                    value["claim_checks"][0]["source_segment_ids"] = ["seg_999999"]
+                elif fault == "wrong_ordinal":
+                    value["claim_checks"][0]["paragraph_ordinal"] = 1
+                elif fault == "empty_facts":
+                    value["claim_checks"][0]["source_facts"] = ""
+                else:
+                    value["claim_checks"][0].update(matches_source=False,
+                        source_facts="Mode A: fast, high memory; Mode B: slow, low memory",
+                        candidate_facts="Mode A: slow, low memory; Mode B: fast, high memory")
+                    assert value["pass"] is True
+                return replace(result, text=json.dumps(value))
+            return result
+
+    compiler, context = _compiler_context(tmp_path, Executor())
+    error = "faithful_review_failed" if fault == "mismatch_with_pass" else "faithful_review_invalid"
+    with pytest.raises(DomainError, match=error):
+        compiler.compile(_request(transcript=TranscriptDocument("en", (
+            TranscriptSegment("seg_000001", 0, 1000, "Mode A is faster."),))), context)
+
+
+def test_independent_source_facts_are_blind_and_reused_after_candidate_repair(tmp_path):
+    class Executor(_FaithfulExecutor):
+        reviews = 0
+
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            payload = json.loads(request.user_content)
+            if request.stage_id == "faithful-facts":
+                assert not ({"candidate", "previous_section", "review_feedback", "independent_source_facts"} & payload.keys())
+                assert set(payload["section"]) == {"section_ordinal", "segments"}
+                assert payload["original_transcript"][0]["text"] == "Mode A is faster."
+                return replace(result, text=json.dumps({"facts": "Source-only record: Mode A is faster.", "unresolved_segment_ids": []}))
+            if request.stage_id in {"faithful-edit", "faithful-review", "faithful-semantic-repair"}:
+                assert payload["independent_source_facts"] == "Source-only record: Mode A is faster."
+            if request.stage_id == "faithful-review":
+                self.reviews += 1
+                if self.reviews == 1:
+                    value = json.loads(result.text)
+                    value.update(auxiliary_pass=False, auxiliary_issues=["seg_000001: fix auxiliary"])
+                    return replace(result, text=json.dumps(value))
+            return result
+
+    executor = Executor()
+    compiler, context = _compiler_context(tmp_path, executor)
+    result = compiler.compile(_request(transcript=TranscriptDocument("en", (
+        TranscriptSegment("seg_000001", 0, 1000, "Mode A is faster."),))), context)
+    stages = [request.stage_id for request in executor.requests]
+    assert stages == ["faithful-facts", "faithful-edit", "faithful-review", "faithful-semantic-repair", "faithful-review"]
+    assert result.execution_summary.model_operation_count == len(stages)
+    assert "Source-only record" not in result.markdown
+
+
+@pytest.mark.parametrize("response", ['{}', '{"facts":""}', '{"facts":42}', '{"facts":"a","facts":"b"}'])
+def test_invalid_blind_source_facts_block_before_editing(tmp_path, response):
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            return replace(result, text=response) if request.stage_id == "faithful-facts" else result
+
+    executor = Executor()
+    compiler, context = _compiler_context(tmp_path, executor)
+    with pytest.raises(DomainError, match="faithful_source_facts_invalid"):
+        compiler.compile(_request(transcript=TranscriptDocument("en", (
+            TranscriptSegment("seg_000001", 0, 1000, "Mode A is faster."),))), context)
+    assert [request.stage_id for request in executor.requests] == ["faithful-facts"]
+
+
+@pytest.mark.parametrize("always_invent", [False, True])
+def test_unresolved_source_cannot_be_resolved_even_if_reviewer_would_pass(tmp_path, always_invent):
+    segments = (
+        TranscriptSegment("seg_000001", 0, 1000, "Later validation costs more."),
+        TranscriptSegment("seg_000002", 1000, 2000, "Here the cost is lower."),
+        TranscriptSegment("seg_000003", 2000, 3000, "Here the cost is higher."),
+    )
+
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-facts":
+                return replace(result, text=json.dumps({"facts": "Later costs more. The two 'here' references are unresolved.",
+                    "unresolved_segment_ids": ["seg_000002", "seg_000003"]}))
+            if request.stage_id == "faithful-edit" or (always_invent and request.stage_id == "faithful-repair"):
+                value = json.loads(result.text)
+                value["paragraphs"][0]["text"] = "Later validation costs more. Early validation costs more; later validation costs less."
+                return replace(result, text=json.dumps(value))
+            return result
+
+    executor = Executor()
+    compiler, context = _compiler_context(tmp_path, executor)
+    request = replace(_request(transcript=TranscriptDocument("en", segments)), section_input_byte_budget=8192)
+    result = compiler.compile(request, context)
+    assert "Here the cost is lower." in result.markdown
+    assert "Early validation costs more" not in result.markdown
+    assert "faithful_unresolved_paragraph_restored" in result.warnings
+    assert [value.stage_id for value in executor.requests] == [
+        "faithful-facts", "faithful-edit", "faithful-review"]
+
+
+def test_unresolved_claims_are_not_invented_in_optional_summaries(tmp_path):
+    class Executor(_FaithfulExecutor):
+        def complete(self, request, token):
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-facts":
+                return replace(result, text=json.dumps({"facts": "The referent of 'here' is unresolved.",
+                                                       "unresolved_segment_ids": ["seg_000001"]}))
+            if request.stage_id == "faithful-edit":
+                value = json.loads(result.text)
+                value["summary"]["text"] = "Invented association"
+                value["key_points"][0]["text"] = "Invented association"
+                return replace(result, text=json.dumps(value))
+            return result
+
+    compiler, context = _compiler_context(tmp_path, Executor())
+    result = compiler.compile(_request(transcript=TranscriptDocument("en", (
+        TranscriptSegment("seg_000001", 0, 1000, "Here the cost is lower."),))), context)
+    assert "Here the cost is lower." in result.markdown
+    assert "Invented association" not in result.markdown

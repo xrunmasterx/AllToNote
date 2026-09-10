@@ -105,6 +105,42 @@ def test_adapter_invokes_only_frozen_pack_worker(tmp_path: Path) -> None:
     assert adapter.identity.endswith(f"@{MODEL_REVISION}")
 
 
+def test_transcript_cache_matches_content_and_pack_options_not_filename(tmp_path):
+    from dataclasses import replace
+    resolved = _resolved(tmp_path)
+    media = tmp_path / "first.mp3"
+    media.write_bytes(b"same audio")
+    renamed = tmp_path / "renamed.mp3"
+    renamed.write_bytes(media.read_bytes())
+    calls = []
+    def runner(*args, **kwargs):
+        calls.append(args)
+        return _result()
+    def adapter(**changes):
+        return PackedCpuTranscriber(resolved, runner=runner, cache_root=tmp_path / "cache", **changes)
+    expected = adapter().transcribe(MediaInput(media_path=media), _Token())
+    assert adapter().transcribe(MediaInput(media_path=renamed), _Token()) == expected
+    assert len(calls) == 1
+    renamed.write_bytes(b"different audio")
+    adapter().transcribe(MediaInput(media_path=renamed), _Token())
+    assert len(calls) == 2
+    adapter(cpu_threads=4).transcribe(MediaInput(media_path=renamed), _Token())
+    assert len(calls) == 3
+    resolved = replace(resolved, manifest_sha256="sha256:" + "b" * 64)
+    adapter().transcribe(MediaInput(media_path=renamed), _Token())
+    assert len(calls) == 4
+
+
+def test_invalid_transcript_is_not_cached(tmp_path):
+    resolved = _resolved(tmp_path)
+    media = tmp_path / "audio.mp3"
+    media.write_bytes(b"audio")
+    adapter = PackedCpuTranscriber(resolved, runner=lambda *args, **kwargs: {}, cache_root=tmp_path / "cache")
+    with pytest.raises(DomainError):
+        adapter.transcribe(MediaInput(media_path=media), _Token())
+    assert not list((tmp_path / "cache").glob("*.json"))
+
+
 def test_adapter_rejects_worker_identity_drift(tmp_path: Path) -> None:
     resolved = _resolved(tmp_path)
     media = tmp_path / "audio.mp3"

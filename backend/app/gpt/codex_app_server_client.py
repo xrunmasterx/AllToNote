@@ -157,6 +157,9 @@ class CodexAppServerClient:
 
     @contextmanager
     def _connection(self, cwd: str, deadline: float, check_cancelled: Callable[[], None] | None):
+        started = time.monotonic()
+        timings = {}
+        self._turn_local.timings = timings
         ticket = object()
         connection = None
         reserved = False
@@ -182,13 +185,19 @@ class CodexAppServerClient:
                         self._condition.wait(timeout=min(remaining, _CANCELLATION_POLL_SECONDS))
             gate = (model_call_slot(self._machine_slot_root, deadline=deadline, check_cancelled=check_cancelled)
                     if self._machine_slot_root is not None else nullcontext())
+            locally_admitted = time.monotonic()
+            timings["local_wait_seconds"] = locally_admitted - started
             with gate:
+                admitted = time.monotonic()
+                timings["machine_wait_seconds"] = admitted - locally_admitted
                 if connection is not None and (connection.cwd != cwd or connection.process.poll() is not None
                                                 or not connection.readers[0].is_alive()):
                     self._close_connection(connection)
                     connection = None
                 if connection is None:
                     connection = self._start_connection(cwd)
+                ready = time.monotonic()
+                timings["process_start_seconds"] = ready - admitted
                 connection.reusable = False
                 if connection.initialized:
                     connection.stderr.clear()
@@ -198,6 +207,7 @@ class CodexAppServerClient:
                             raise CodexAppServerError("Codex client is closed", outcome_known=True)
                     yield connection
                 finally:
+                    timings["protocol_seconds"] = time.monotonic() - ready
                     if not connection.reusable or not self._pool_size:
                         self._close_connection(connection)
                     self._turn_local.stderr_logs = tuple(connection.stderr)
@@ -212,6 +222,11 @@ class CodexAppServerClient:
                 if connection is not None and connection in self._connections and not self._closed:
                     self._idle.append(connection)
                 self._condition.notify_all()
+
+    @property
+    def timings(self) -> dict[str, float]:
+        """Transport timing, not an estimate of provider-side inference time."""
+        return dict(getattr(self._turn_local, "timings", {}))
 
     @property
     def stderr_logs(self) -> list[str]:

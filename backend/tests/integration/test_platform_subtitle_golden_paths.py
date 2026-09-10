@@ -187,7 +187,7 @@ class _V2Completion:
         self._calls = calls
         self._failure = failure
 
-    def complete_once(self, prompt: str, *, check_cancelled=None) -> LegacyModelResponse:
+    def complete_once(self, prompt: str, *, check_cancelled=None, stage_id=None) -> LegacyModelResponse:
         if check_cancelled is not None:
             check_cancelled()
         self._calls.model_prompts.append(prompt)
@@ -196,15 +196,17 @@ class _V2Completion:
         )[0]
         payload = json.loads(user_content)
         self._calls.model += 1
-        self._calls.model_stages.append(
-            "faithful-review" if "frames" in payload
-            else "faithful-edit" if "section" in payload else "global-compose"
-        )
+        stage_id = stage_id or ("faithful-edit" if "section" in payload else "global-compose")
+        self._calls.model_stages.append(stage_id)
         if self._failure == "unknown":
             raise TimeoutError("provider response was lost")
-        if "frames" in payload:
+        if stage_id == "faithful-review":
             return LegacyModelResponse(
-                markdown=json.dumps({"pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "frames": [], "uncertainties": []}),
+                markdown=json.dumps({"pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "frames": [], "uncertainties": [],
+                                     "claim_checks": [{"paragraph_ordinal": p["paragraph_ordinal"],
+                                                       "source_segment_ids": p["source_segment_ids"],
+                                                       "source_facts": p["text"], "candidate_facts": p["text"],
+                                                       "matches_source": True} for p in payload["section"]["paragraphs"]]}),
                 provider_request_id=f"fixture-review-{self._calls.model}",
                 input_tokens=40, output_tokens=20, actual_model="fixture/model-v2",
             )
@@ -274,7 +276,21 @@ class _V2Completion:
             check_cancelled()
         assert request.max_output_tokens > 0
         assert request.timeout_seconds > 0
-        return self.complete_once(prompt)
+        if request.stage_id in ("faithful-context-plan", "faithful-facts", "faithful-overview-select"):
+            payload = json.loads(request.user_content)
+            self._calls.model += 1
+            self._calls.model_stages.append(request.stage_id)
+            self._calls.model_prompts.append(prompt)
+            if request.stage_id == "faithful-context-plan":
+                response = {"chapters": [{"start_segment_id": payload["segments"][0][0],
+                                          "title": "Chronological source", "topic": "Lesson"}], "terminology": []}
+            elif request.stage_id == "faithful-facts":
+                response = {"facts": "Preserve the supplied source instructions.", "unresolved_segment_ids": []}
+            else:
+                response = {"section_ordinals": [payload["candidates"][0]["ordinal"]]}
+            return LegacyModelResponse(markdown=json.dumps(response), actual_model="fixture/model-v2",
+                                       input_tokens=40, output_tokens=20, provider_request_id=request.stage_id)
+        return self.complete_once(prompt, stage_id=request.stage_id)
 
 
 def _v2_model_binding() -> ModelExecutionBinding:
@@ -630,7 +646,8 @@ def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
         and document.publish_eligible
         for document in result.documents
     )
-    assert calls.model_stages == ["global-compose", "faithful-edit", "faithful-review"]
+    assert calls.model_stages == ["global-compose", "faithful-context-plan", "faithful-facts",
+                                 "faithful-edit", "faithful-review", "faithful-overview-select"]
 
     bundle = workspace_root / result.workspace_relative_bundle_path
     manifest = json.loads((bundle / "bundle.json").read_bytes())
@@ -716,7 +733,7 @@ def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
             quality_path.read_bytes()
         )
         assert receipt_output["model_binding"]["sha256"].startswith("sha256:")
-        expected_calls = 2 if document.document_kind is VideoDocumentKind.FAITHFUL_EDITION else 1
+        expected_calls = 5 if document.document_kind is VideoDocumentKind.FAITHFUL_EDITION else 1
         assert receipt_output["execution"]["model_calls"] == expected_calls
         assert "legacy_finish_reason_unavailable" in receipt_output["warnings"]
         assert receipt_output["quality"]["check_count"] == len(
@@ -744,8 +761,9 @@ def test_platform_runtime_v2_dual_outputs_commit_atomically_and_recover(
     assert recovered.job_id == submitted.job_id
     assert recovered.result is not None
     assert recovered.result.bundle_id == result.bundle_id
-    assert calls.model == 3
-    assert calls.model_stages == ["global-compose", "faithful-edit", "faithful-review"]
+    assert calls.model == 6
+    assert calls.model_stages == ["global-compose", "faithful-context-plan", "faithful-facts",
+                                 "faithful-edit", "faithful-review", "faithful-overview-select"]
 
 
 def test_platform_runtime_v2_unknown_model_outcome_is_not_resent(
@@ -813,8 +831,8 @@ def test_platform_runtime_v2_produces_single_faithful_edition(
         completed.result.documents[0].document_kind
         is VideoDocumentKind.FAITHFUL_EDITION
     )
-    assert calls.model == 2
-    assert "Keep the edited body in the source language en." in calls.model_prompts[0]
+    assert calls.model == 5
+    assert "Keep the edited body in the source language en." in calls.model_prompts[calls.model_stages.index("faithful-edit")]
 
 
 def test_platform_runtime_passes_explicit_faithful_translation_target(
@@ -844,10 +862,10 @@ def test_platform_runtime_passes_explicit_faithful_translation_target(
     completed = runtime.wait_job(runtime.submit_video(request).job_id)
 
     assert completed.state is JobState.SUCCEEDED
-    assert calls.model == 2
+    assert calls.model == 5
     assert (
         "Translate conservatively from en to zh-CN;"
-        in calls.model_prompts[0]
+        in calls.model_prompts[calls.model_stages.index("faithful-edit")]
     )
 
 

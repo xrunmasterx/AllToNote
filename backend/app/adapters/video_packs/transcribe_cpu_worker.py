@@ -6,6 +6,8 @@ import math
 import os
 import stat
 import sys
+import time
+from functools import lru_cache
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -167,6 +169,8 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--persistent"]:
+        return persistent_main()
     try:
         payload = sys.stdin.buffer.read(_MAXIMUM_REQUEST_BYTES + 1)
         if len(payload) > _MAXIMUM_REQUEST_BYTES:
@@ -192,6 +196,44 @@ def main() -> int:
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
     return 0
+
+
+def persistent_main(*, input_stream=None, output_stream=None,
+                    model_factory=_default_model_factory, versions=None) -> int:
+    source = input_stream if input_stream is not None else sys.stdin.buffer
+    target = output_stream if output_stream is not None else sys.stdout.buffer
+    load_seconds = [0.0]
+
+    @lru_cache(maxsize=1)
+    def cached_factory(*args, **kwargs):
+        started = time.monotonic()
+        model = model_factory(*args, **kwargs)
+        load_seconds[0] = time.monotonic() - started
+        return model
+    while True:
+        payload = source.readline(_MAXIMUM_REQUEST_BYTES + 1)
+        if not payload:
+            return 0
+        try:
+            if len(payload) > _MAXIMUM_REQUEST_BYTES or not payload.endswith(b"\n"):
+                raise ValueError("worker request is too large or incomplete")
+            request = json.loads(payload, object_pairs_hook=_unique_object,
+                                 parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+            load_seconds[0] = 0.0
+            started = time.monotonic()
+            result = transcribe_request(request, model_factory=cached_factory, versions=versions)
+            response = {"result": result, "timings": {
+                "model_load_seconds": load_seconds[0],
+                "transcribe_seconds": time.monotonic() - started - load_seconds[0],
+            }}
+            encoded = json.dumps(response, ensure_ascii=False, allow_nan=False,
+                                 separators=(",", ":")).encode("utf-8") + b"\n"
+            if len(encoded) > _MAXIMUM_RESULT_BYTES:
+                raise ValueError("worker result is too large")
+            target.write(encoded)
+            target.flush()
+        except Exception:
+            return 1
 
 
 if __name__ == "__main__":

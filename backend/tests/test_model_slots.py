@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from app.gpt.model_slots import MODEL_CALL_CAPACITY, model_call_slot
+from app.gpt.model_slots import MODEL_CALL_CAPACITY, model_call_slot, resource_slot
 
 
 def _try_slot(root, output):
@@ -81,3 +81,15 @@ def test_cancelled_wait_does_not_take_capacity(tmp_path):
     with ExitStack() as stack:
         for _ in range(MODEL_CALL_CAPACITY):
             stack.enter_context(model_call_slot(tmp_path, deadline=time.monotonic() + 1))
+
+
+def test_cpu_capacity_does_not_block_other_stages(tmp_path):
+    with resource_slot(tmp_path, resource="transcribe", capacity=1, deadline=time.monotonic() + 1):
+        with pytest.raises(TimeoutError):
+            with resource_slot(tmp_path, resource="transcribe", capacity=1, deadline=time.monotonic() + 0.05):
+                pytest.fail("CPU capacity exceeded")
+        with ExitStack() as stack:
+            for resource, capacity in (("download", 2), ("ffmpeg", 2), ("model-call", 8)):
+                for _ in range(capacity):
+                    stack.enter_context(resource_slot(tmp_path, resource=resource, capacity=capacity,
+                                                      deadline=time.monotonic() + 1))

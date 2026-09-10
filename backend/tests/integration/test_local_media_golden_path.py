@@ -968,15 +968,26 @@ class _FaithfulScreenshotCompletion:
         if check_cancelled:
             check_cancelled()
         payload = json.loads(request.user_content)
-        if request.stage_id == "faithful-source-prepare":
+        if request.stage_id == "faithful-context-plan":
+            response = {"chapters": [{"start_segment_id": payload["segments"][0][0],
+                                      "title": "Source lesson", "topic": "Lesson"}], "terminology": []}
+        elif request.stage_id == "faithful-overview-select":
+            response = {"section_ordinals": [payload["candidates"][0]["ordinal"]]}
+        elif request.stage_id == "faithful-facts":
+            response = {"facts": "The source explains the lesson shown in the frame.", "unresolved_segment_ids": []}
+        elif request.stage_id == "faithful-source-prepare":
             response = {"corrections": [], "chapter_start_ids": [],
                         "illustration_ids": [payload["frames"][0]["segment_id"]]}
         elif request.stage_id == "faithful-source-check":
-            response = {"pass": True, "issues": []}
+            response = {"pass": True, "issues": [], "numeric_checks": []}
         elif request.stage_id == "faithful-review":
             assert len(request.image_webp) == 1
             assert request.image_webp[0][:4] == b"RIFF"
             response = {"pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "uncertainties": [],
+                        "claim_checks": [{"paragraph_ordinal": p["paragraph_ordinal"],
+                                          "source_segment_ids": p["source_segment_ids"],
+                                          "source_facts": p["text"], "candidate_facts": p["text"],
+                                          "matches_source": True} for p in payload["section"]["paragraphs"]],
                         "frames": [{"segment_id": payload["frames"][0]["segment_id"],
                                     "use": True, "caption": "Visible lesson frame."}]}
         else:

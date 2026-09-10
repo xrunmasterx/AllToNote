@@ -287,7 +287,7 @@ def _inline_faithful_summaries(markdown: str) -> str:
     visible = markdown_visible_mask(markdown)
     headings = [match for match in re.finditer(r"(?m)^(#{2,3}) (.+)$", markdown)
                 if visible[match.start()]]
-    body = [match for match in headings if match.group(0) == "## 精编正文"]
+    body = [match for match in headings if match.group(0) in {"## 正文", "## 精编正文"}]
     auxiliary = [match for match in headings
                  if match.group(0) == "## AI 辅助摘要（不属于原文）"]
     if len(body) != 1 or len(auxiliary) != 1 or body[0].start() >= auxiliary[0].start():
@@ -315,15 +315,15 @@ def _inline_faithful_summaries(markdown: str) -> str:
         output.append(chapter.group(0))
         summary = by_chapter.get(chapter.group(2))
         if summary:
-            # Older audit drafts used headings for these reader-facing labels.
+            # Reader-facing disclosure already names the content; inner labels are redundant.
             summary_visible = markdown_visible_mask(summary)
             summary = re.sub(
-                r"(?m)^#### (AI 章节摘要|AI 关键点)[ \t]*\r?$",
-                lambda match: f"**{match.group(1)}**"
-                if summary_visible[match.start()] else match.group(0),
+                r"(?m)^(?:#### (?:AI 章节摘要|AI 关键点)|\*\*(?:AI 章节摘要|AI 关键点)\*\*)"
+                r"[ \t]*\r?\n(?:[ \t]*\r?\n)?",
+                lambda match: "" if summary_visible[match.start()] else match.group(0),
                 summary,
-            )
-            output.append("<details open>\n<summary>AI 摘要与关键点（不属于原文）</summary>\n\n"
+            ).strip()
+            output.append("<details open>\n<summary>摘要</summary>\n\n"
                           + summary + "\n\n</details>")
         output.append(markdown[chapter.end():end].strip())
     return "\n\n".join(output) + "\n"

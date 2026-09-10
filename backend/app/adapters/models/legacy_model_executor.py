@@ -9,6 +9,7 @@ from app.adapters.models.legacy_gpt import (
     LegacyReturnedInvalidResponse,
 )
 from app.core.errors import DomainError, ErrorCategory
+from app.core.portable.final_json import final_json_object
 from app.core.ports.model_executor import (
     ModelExecutionBinding,
     ModelExecutionRequest,
@@ -119,7 +120,7 @@ class LegacyModelExecutor:
             )
 
         actual_model = response.actual_model or self._binding.model_identity
-        if actual_model != self._binding.model_identity:
+        if not self._binding.accepts_model(actual_model):
             raise DomainError(
                 "model_identity_mismatch",
                 ErrorCategory.RECIPE_FAILED,
@@ -132,8 +133,14 @@ class LegacyModelExecutor:
         if response.input_tokens is None or response.output_tokens is None:
             warnings.append("legacy_model_usage_unavailable")
 
+        text = response.markdown
+        if request.stage_id.startswith("faithful-") and request.output_mode is ModelOutputMode.JSON_SCHEMA:
+            text, recovered = final_json_object(text, request.response_schema_json)
+            if recovered:
+                warnings.append("faithful_final_json_recovered")
+
         return ModelExecutionResult(
-            text=response.markdown,
+            text=text,
             actual_model_identity=actual_model,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,

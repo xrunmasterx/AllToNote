@@ -142,6 +142,19 @@ def test_missing_legacy_metadata_is_explicit_not_fabricated() -> None:
     )
 
 
+@pytest.mark.parametrize("stage,expected_recovery", [("faithful-review", True), ("knowledge-map", False)])
+def test_faithful_final_json_recovery_preserves_negative_verdict(stage, expected_recovery):
+    final = '{"pass":false,"issues":["wrong object"]}'
+    raw = 'incomplete draft\n' + final
+    bridge = _Bridge(lambda _prompt: LegacyModelResponse(raw))
+    result = LegacyModelExecutor(binding=_binding(), bridge=bridge).complete(
+        _request(stage_id=stage, response_schema_json='{"type":"object","properties":{"pass":{},"issues":{}}}'),
+        _Token(),
+    )
+    assert result.text == (final if expected_recovery else raw)
+    assert ("faithful_final_json_recovered" in result.warnings) is expected_recovery
+
+
 def test_model_identity_mismatch_fails_after_exactly_one_request() -> None:
     bridge = _Bridge(
         lambda _prompt: LegacyModelResponse(

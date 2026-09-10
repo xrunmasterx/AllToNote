@@ -171,7 +171,7 @@ def plan_faithful_edition(
         target_language=request.target_language,
         model_binding_sha256=_binding_sha256(request),
         stage_version=4,
-        prompt_version=6,
+        prompt_version=8,
         sections=tuple(sections),
         excluded_segment_ids=tuple(excluded),
         max_concurrency=min(request.model_binding.max_concurrency, len(sections)),

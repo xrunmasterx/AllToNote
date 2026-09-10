@@ -3,19 +3,24 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
+import json
+import logging
+
+from app.adapters.verified_json_cache import VerifiedJsonCache
 
 from app.adapters.transcription.legacy_transcriber import (
     normalize_legacy_transcript,
 )
 from app.adapters.video_packs.official_pack_process import (
     minimal_worker_environment,
-    run_json_worker,
 )
 from app.adapters.video_packs.official_video_pack import TRANSCRIBE_CPU
 from app.adapters.video_packs.official_video_pack_resolver import (
     ResolvedOfficialVideoPack,
 )
 from app.adapters.video_packs.transcribe_cpu_worker import MODEL_REVISION
+from app.adapters.video_packs.persistent_transcribe_process import run_persistent_transcriber
 from app.core.domain.video import TranscriptDocument
 from app.core.errors import DomainError, ErrorCategory
 from app.core.ports.source import CancellationTokenPort
@@ -39,6 +44,7 @@ _SEGMENT_KEYS = frozenset({"start", "end", "text"})
 _MAXIMUM_OUTPUT_BYTES = 32 * 1024 * 1024
 
 WorkerRunner = Callable[..., dict[str, object]]
+logger = logging.getLogger(__name__)
 
 
 def _result_invalid() -> DomainError:
@@ -56,8 +62,9 @@ class PackedCpuTranscriber:
         *,
         cpu_threads: int = 8,
         timeout_seconds: int = 1800,
-        runner: WorkerRunner = run_json_worker,
+        runner: WorkerRunner = run_persistent_transcriber,
         backend_root: Path | None = None,
+        cache_root: Path | None = None,
     ) -> None:
         if (
             not isinstance(pack, ResolvedOfficialVideoPack)
@@ -84,6 +91,7 @@ class PackedCpuTranscriber:
         self._timeout_seconds = timeout_seconds
         self._runner = runner
         self._backend_root = root
+        self._cache = VerifiedJsonCache(cache_root) if cache_root is not None else None
 
     @property
     def identity(self) -> str:
@@ -112,6 +120,27 @@ class PackedCpuTranscriber:
                 ErrorCategory.WORKSPACE_INCOMPATIBLE,
                 "The frozen media or transcribe-cpu model is unavailable",
             ) from error
+        cache_key = None
+        if self._cache is not None:
+            digest = hashlib.sha256(json.dumps({
+                "protocol": 1, "pack": self._pack.manifest_sha256,
+                "identity": _EXPECTED_IDENTITY, "cpu_threads": self._cpu_threads, "beam_size": 5,
+            }, sort_keys=True).encode())
+            with resolved_media.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    token.raise_if_cancelled()
+                    digest.update(chunk)
+            cache_key = "sha256:" + digest.hexdigest()
+            cached = self._cache.load(cache_key)
+            if cached is not None:
+                try:
+                    transcript = self._decode_result(cached, token)
+                except DomainError as error:
+                    if error.category is ErrorCategory.CANCELLED:
+                        raise
+                else:
+                    logger.info('video_performance {"stage":"transcribe","cache_hit":true}')
+                    return transcript
         result = self._runner(
             (
                 str(self._python),
@@ -138,7 +167,10 @@ class PackedCpuTranscriber:
             maximum_output_bytes=_MAXIMUM_OUTPUT_BYTES,
             check_cancelled=token.raise_if_cancelled,
         )
-        return self._decode_result(result, token)
+        transcript = self._decode_result(result, token)
+        if self._cache is not None and cache_key is not None:
+            self._cache.save(cache_key, result)
+        return transcript
 
     @staticmethod
     def _decode_result(

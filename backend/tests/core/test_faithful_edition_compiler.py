@@ -94,6 +94,12 @@ class _FaithfulExecutor:
             ordinal = len(self.requests)
         if self._provider_error is not None:
             raise self._provider_error
+        if request.stage_id == "faithful-facts":
+            return ModelExecutionResult(
+                text=json.dumps({"facts": " ".join(segment["text"] for segment in payload["section"]["segments"]),
+                                 "unresolved_segment_ids": []}),
+                actual_model_identity="fixture/model-v1", input_tokens=100, output_tokens=50,
+                finish_reason=ModelFinishReason.STOP, provider_request_id=f"req_{ordinal}")
         if request.stage_id.startswith("faithful-source-"):
             data = ({"corrections": [], "chapter_start_ids": [],
                      "illustration_ids": [frame["segment_id"] for frame in payload["frames"][:2]]}
@@ -103,7 +109,12 @@ class _FaithfulExecutor:
                 provider_request_id=f"req_{ordinal}")
         if request.stage_id == "faithful-review":
             return ModelExecutionResult(
-                text=json.dumps({"pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "uncertainties": [],
+                text=json.dumps({"claim_checks": [
+                    {"paragraph_ordinal": paragraph["paragraph_ordinal"],
+                     "source_segment_ids": paragraph["source_segment_ids"],
+                     "source_facts": "Fixture source fact", "candidate_facts": "Fixture source fact",
+                     "matches_source": True} for paragraph in payload["section"]["paragraphs"]
+                ], "pass": True, "issues": [], "auxiliary_pass": True, "auxiliary_issues": [], "uncertainties": [],
                                  "frames": [{"segment_id": frame["segment_id"], "use": True,
                                              "caption": "A visible chart."} for frame in payload["frames"]]}),
                 actual_model_identity="fixture/model-v1", input_tokens=100, output_tokens=50,
@@ -266,6 +277,7 @@ def _request(
 def _compiler_context(
     tmp_path: Path,
     executor: _FaithfulExecutor,
+    *, reviewed_cache=None,
 ) -> tuple[FaithfulEditionCompiler, VideoCompilationContext]:
     repository = SqliteJobRepository.open(tmp_path / "machine", clock=lambda: 1_000)
     job = repository.create_job(
@@ -298,6 +310,8 @@ def _compiler_context(
         operation_store=repository,
         result_store=ModelOperationResultStore(tmp_path / "results"),
         executor=executor,
+        reviewed_cache=reviewed_cache,
+        cache_namespace=lambda _execution: "fixture-principal-policy",
     )
     return (
         FaithfulEditionCompiler(coordinator),
@@ -306,6 +320,22 @@ def _compiler_context(
             cancellation_token=CancellationToken(repository, job.job_id),
         ),
     )
+
+
+def test_reviewed_sections_reused_in_new_job_without_changing_document(tmp_path):
+    from app.adapters.models.reviewed_call_cache import ReviewedCallCache
+    cache = ReviewedCallCache(tmp_path / "cache")
+    first_executor = _FaithfulExecutor()
+    compiler, context = _compiler_context(tmp_path / "first", first_executor, reviewed_cache=cache)
+    first = compiler.compile(_request(), context)
+    second_executor = _FaithfulExecutor()
+    compiler, context = _compiler_context(tmp_path / "retry", second_executor, reviewed_cache=cache)
+    second = compiler.compile(_request(), context)
+    assert first_executor.requests
+    assert second_executor.requests == []
+    assert second.markdown == first.markdown
+    assert second.text_assessment == first.text_assessment
+    assert second.usage.input_tokens == second.usage.output_tokens == 0
 
 
 def test_fast_section_review_overlaps_slow_section_generation(tmp_path):
@@ -327,6 +357,32 @@ def test_fast_section_review_overlaps_slow_section_generation(tmp_path):
     assert reviewed_first.is_set()
     assert result.text_assessment.metrics.body_segment_reference_coverage_ratio == 1.0
     assert len([r for r in executor.requests if r.stage_id == "faithful-review"]) == len(result.plan.sections)
+
+
+def test_failed_job_preserves_other_independently_approved_sections(tmp_path):
+    from app.adapters.models.reviewed_call_cache import ReviewedCallCache
+    cache = ReviewedCallCache(tmp_path / "cache")
+    reviewed = threading.Event()
+    class PartiallyFailing(_FaithfulExecutor):
+        def complete(self, request, token):
+            section = json.loads(request.user_content)["section"]
+            if request.stage_id == "faithful-edit" and section["section_ordinal"] == 1:
+                assert reviewed.wait(3)
+                raise DomainError("fixture_failure", ErrorCategory.RECIPE_FAILED, "failed second section")
+            result = super().complete(request, token)
+            if request.stage_id == "faithful-review" and section["ordinal"] == 0:
+                reviewed.set()
+            return result
+    compiler, context = _compiler_context(tmp_path / "first", PartiallyFailing(), reviewed_cache=cache)
+    with pytest.raises(DomainError, match="fixture_failure"):
+        compiler.compile(_request(), context)
+    executor = _FaithfulExecutor()
+    compiler, context = _compiler_context(tmp_path / "retry", executor, reviewed_cache=cache)
+    result = compiler.compile(_request(), context)
+    edits = [json.loads(r.user_content)["section"]["section_ordinal"] for r in executor.requests
+             if r.stage_id == "faithful-edit"]
+    assert edits == [1]
+    assert result.text_assessment.metrics.body_segment_reference_coverage_ratio == 1.0
 
 
 def test_streaming_preserves_serial_output_and_full_quality_gates(tmp_path):
@@ -590,10 +646,11 @@ def test_compiler_preserves_order_separates_regions_and_never_requests_screensho
         segment.segment_id for segment in _transcript().segments
     )
     assert result.screenshot_requests == ()
-    assert "## 精编正文" in result.markdown
-    assert "## 全文概览（AI）" in result.markdown
+    assert "## 正文" in result.markdown
+    assert "## 全文概览" in result.markdown
+    assert "## 全文概览（AI）" not in result.markdown
     assert "**AI 章节摘要**" not in result.markdown
-    assert "**AI 关键点**" in result.markdown
+    assert "**AI 关键点**" not in result.markdown
     assert "#### AI" not in result.markdown
     assert "### 待复核项" in result.markdown
     assert "fidelity score" not in result.markdown.casefold()
@@ -675,7 +732,7 @@ def test_compiler_repairs_initial_section_response_contract_once(
         repair_request.system_instruction
     )
     assert result.execution_summary.repair_operation_count == 1
-    assert result.execution_summary.sequential_model_waves == 3
+    assert result.execution_summary.sequential_model_waves == 4
     assert result.text_assessment.overall.value == "pass"
 
 
@@ -727,7 +784,7 @@ def test_compiler_does_not_repair_response_contract_when_budget_is_zero(
 
     # Other valid sections may already be reviewed by the streaming pipeline;
     # the failed section still cannot consume a repair when its budget is zero.
-    assert all(value.stage_id in {"faithful-edit", "faithful-review"} for value in executor.requests)
+    assert all(value.stage_id in {"faithful-facts", "faithful-edit", "faithful-review"} for value in executor.requests)
     assert all(json.loads(value.user_content)["section"]["ordinal"] != 0
                for value in executor.requests if value.stage_id == "faithful-review")
 
@@ -758,7 +815,7 @@ def test_compiler_propagates_non_response_errors_without_repair(
         )
 
     assert len(executor.requests) == 1
-    assert executor.requests[0].stage_id == "faithful-edit"
+    assert executor.requests[0].stage_id == "faithful-facts"
 
 
 def test_compiler_never_performs_a_second_repair_wave(tmp_path: Path) -> None:
@@ -770,7 +827,7 @@ def test_compiler_never_performs_a_second_repair_wave(tmp_path: Path) -> None:
         value for value in executor.requests if value.stage_id == "faithful-repair"
     ]
     assert len(repair_requests) == 1
-    assert result.execution_summary.sequential_model_waves == 2
+    assert result.execution_summary.sequential_model_waves == 3
     assert result.text_assessment.overall.value == "fail"
 
 
@@ -788,7 +845,8 @@ def _visual_request() -> FaithfulEditionRequestV1:
     return replace(
         _request(), section_input_byte_budget=8192,
         model_binding=replace(_binding(), provider_type="codex-app-server"),
-        visual_frames=(VisualFrame("seg_000001", 0, b"RIFF\x04\x00\x00\x00WEBP"),),
+        visual_frames=(VisualFrame("seg_000001", 0, bytes.fromhex(
+            "524946461a000000574542505650384c0d0000002f00000000071011118888fe0700")),),
     )
 
 
@@ -797,20 +855,20 @@ def test_faithful_review_receives_images_binds_local_paragraph_and_recovers(tmp_
     compiler, context = _compiler_context(tmp_path, executor)
     request = _visual_request()
     result = compiler.compile(request, context)
-    assert [call.stage_id for call in executor.requests] == ["faithful-source-prepare", "faithful-source-check", "faithful-edit", "faithful-review"]
+    assert [call.stage_id for call in executor.requests] == ["faithful-source-prepare", "faithful-source-check", "faithful-facts", "faithful-edit", "faithful-review"]
     assert all(call.image_webp == (request.visual_frames[0].payload,) for call in executor.requests)
-    assert "corrected spelling need NOT already appear verbatim" in executor.requests[3].system_instruction
-    assert "'always' becoming 'usually'" in executor.requests[3].system_instruction
-    assert "'always' must not become 'usually'" in executor.requests[2].system_instruction
+    assert "corrected spelling need NOT already appear verbatim" in executor.requests[4].system_instruction
+    assert "'always' becoming 'usually'" in executor.requests[4].system_instruction
+    assert "'always' must not become 'usually'" in executor.requests[3].system_instruction
     assert [value.segment_id for value in result.screenshot_requests] == ["seg_000001"]
     assert result.markdown.index("42 items") < result.markdown.index("[SCREENSHOT:")
     assert result.markdown.index("[SCREENSHOT:") < result.markdown.index("## AI 辅助摘要")
-    assert result.execution_summary.model_operation_count == 4
-    assert result.execution_summary.sequential_model_waves == 4
+    assert result.execution_summary.model_operation_count == 5
+    assert result.execution_summary.sequential_model_waves == 5
     assert any(check.method.value == "model" for check in result.text_assessment.checks)
     recovered = compiler.compile(request, context)
     assert recovered.markdown == result.markdown
-    assert len(executor.requests) == 4
+    assert len(executor.requests) == 5
 
 
 def test_faithful_images_reject_unsupported_provider_before_edit(tmp_path: Path) -> None:
@@ -845,7 +903,7 @@ def test_faithful_review_failures_remain_blocked_after_bounded_repair(tmp_path: 
     compiler, context = _compiler_context(tmp_path, executor)
     with pytest.raises(DomainError, match=error):
         compiler.compile(_visual_request(), context)
-    assert len(executor.requests) == (6 if mode == "fail" else 4)
+    assert len(executor.requests) == (7 if mode == "fail" else 5)
 
 
 def test_faithful_review_can_skip_frames_and_mark_local_ambiguity(tmp_path: Path) -> None:
@@ -867,14 +925,17 @@ def test_faithful_review_can_skip_frames_and_mark_local_ambiguity(tmp_path: Path
 
 @pytest.mark.parametrize("contract_repair_first", [False, True])
 @pytest.mark.parametrize("body_failure", [False, True])
+@pytest.mark.parametrize("source_repair_first", [False, True])
 def test_review_feedback_repair_is_visual_bounded_rechecked_and_recoverable(
-    tmp_path: Path, body_failure: bool, contract_repair_first: bool,
+    tmp_path: Path, body_failure: bool, contract_repair_first: bool, source_repair_first: bool,
 ) -> None:
     class Executor(_FaithfulExecutor):
         reviews = 0
 
         def complete(self, request, token):
             result = super().complete(request, token)
+            if request.stage_id == "faithful-source-check" and source_repair_first:
+                return replace(result, text=json.dumps({"pass": False, "issues": ["Source proposal needs correction"]}))
             if request.stage_id == "faithful-review":
                 self.reviews += 1
                 payload = json.loads(result.text)
@@ -898,7 +959,10 @@ def test_review_feedback_repair_is_visual_bounded_rechecked_and_recoverable(
     executor = Executor(invalid_contract_once=contract_repair_first)
     compiler, context = _compiler_context(tmp_path, executor)
     result = compiler.compile(_visual_request(), context)
-    expected = ["faithful-source-prepare", "faithful-source-check", "faithful-edit"] + (["faithful-repair"] if contract_repair_first else [])
+    expected = ["faithful-source-prepare", "faithful-source-check"]
+    if source_repair_first:
+        expected += ["faithful-source-repair", "faithful-source-recheck"]
+    expected += ["faithful-facts", "faithful-edit"] + (["faithful-repair"] if contract_repair_first else [])
     expected += ["faithful-review", "faithful-semantic-repair", "faithful-review"]
     assert [call.stage_id for call in executor.requests] == expected
     assert result.execution_summary.sequential_model_waves == len(expected)
@@ -924,7 +988,7 @@ def test_semantic_repair_cannot_bypass_numeric_checks(tmp_path: Path) -> None:
     compiler, context = _compiler_context(tmp_path, executor)
     with pytest.raises(DomainError, match="faithful_semantic_repair_failed"):
         compiler.compile(_visual_request(), context)
-    assert [call.stage_id for call in executor.requests] == ["faithful-source-prepare", "faithful-source-check", "faithful-edit", "faithful-review", "faithful-semantic-repair"]
+    assert [call.stage_id for call in executor.requests] == ["faithful-source-prepare", "faithful-source-check", "faithful-facts", "faithful-edit", "faithful-review", "faithful-semantic-repair"]
 
 
 def test_semantic_repair_only_rechecks_the_failed_section(tmp_path: Path) -> None:
@@ -995,7 +1059,8 @@ def test_faithful_edit_log_is_exact_and_hidden_only_in_reading(tmp_path: Path) -
     reading = project_reading_markdown(result.markdown)
     assert "alltonote-edit-log" not in reading
     assert "42 items" in reading
-    assert "<summary>AI 摘要与关键点（不属于原文）</summary>" in reading
+    assert "<summary>摘要</summary>" in reading
+    assert "AI 关键点" not in reading
     assert project_reading_markdown(reading) == reading
 
 
@@ -1047,7 +1112,8 @@ def test_optional_overview_and_chapter_points_render_independently(tmp_path, ove
     compiler, context = _compiler_context(tmp_path, Executor())
     result = compiler.compile(replace(_request(), section_input_byte_budget=8192), context)
     reading = project_reading_markdown(result.markdown)
-    assert ("## 全文概览（AI）" in reading) == overview
+    assert ("## 全文概览" in reading) == overview
+    assert "## 全文概览（AI）" not in reading
     assert ("<details open>" in reading) == points
     assert reading.count("Section summary") == int(overview)
     assert "AI 章节摘要" not in reading

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 from app.adapters.video_packs.transcribe_cpu_worker import (
     MODEL_REVISION,
     transcribe_request,
+    persistent_main,
 )
 
 
@@ -37,6 +39,35 @@ class _Model:
             ),
             _Info("zh"),
         )
+
+
+def test_persistent_worker_reuses_model_and_preserves_transcript(tmp_path):
+    media = tmp_path / "audio.mp3"
+    media.write_bytes(b"audio")
+    model = tmp_path / "model"
+    model.mkdir()
+    request = {"schema_version": 1, "media_path": str(media), "model_path": str(model), "cpu_threads": 8}
+    versions = {"faster-whisper": "1.1.1", "ctranslate2": "4.6.0", "av": "14.2.0", "tokenizers": "0.21.1"}
+    loads = []
+    def factory(*args, **kwargs):
+        loads.append((args, kwargs))
+        return _Model()
+    output = io.BytesIO()
+    assert persistent_main(input_stream=io.BytesIO((json.dumps(request).encode() + b"\n") * 2),
+                           output_stream=output, model_factory=factory, versions=versions) == 0
+    responses = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(loads) == 1
+    assert responses[0]["result"] == responses[1]["result"]
+    assert responses[1]["timings"]["model_load_seconds"] == 0
+    assert responses[0]["result"] == transcribe_request(request, model_factory=factory, versions=versions)
+
+
+@pytest.mark.parametrize("payload", [b'{"schema_version":1}\n', b"x" * 65537, b'{}', b'{"a":1,"a":2}\n'],
+                         ids=["schema", "oversize", "incomplete", "duplicate"])
+def test_persistent_worker_fails_closed_on_bad_request(payload):
+    output = io.BytesIO()
+    assert persistent_main(input_stream=io.BytesIO(payload), output_stream=output) == 1
+    assert output.getvalue() == b""
 
 
 def test_worker_forces_frozen_cpu_int8_model(

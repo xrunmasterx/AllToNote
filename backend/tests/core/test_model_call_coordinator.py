@@ -7,6 +7,7 @@ import pytest
 
 from app.adapters.jobs.sqlite_repository import SqliteJobRepository
 from app.adapters.models.model_result_store import ModelOperationResultStore
+from app.adapters.models.reviewed_call_cache import ReviewedCallCache
 from app.core.application.model_call_coordinator import (
     ModelCallCoordinator,
     ModelCallExecution,
@@ -28,6 +29,19 @@ from app.core.ports.model_executor import (
 class _NeverCancelled:
     def raise_if_cancelled(self) -> None:
         return None
+
+
+def test_explicit_fallback_identity_is_saved_recovered_and_hash_isolated(tmp_path):
+    repo, execution, token = _running_execution(tmp_path)
+    binding = _binding(fallback_model_identity="provider/luna")
+    executor = _SequenceExecutor(_result(actual_model_identity="provider/luna"))
+    coordinator = ModelCallCoordinator(operation_store=repo, result_store=ModelOperationResultStore(tmp_path / "results"),
+                                       executor=executor)
+    first = coordinator.execute(binding, _request(), execution, "chunk-1", token)
+    recovered = coordinator.execute(binding, _request(), execution, "chunk-1", token)
+    assert first == recovered and recovered.actual_model_identity == "provider/luna"
+    assert executor.calls == 1
+    assert coordinator.request_hash(binding, _request(), "chunk-1") != coordinator.request_hash(_binding(), _request(), "chunk-1")
 
 
 class _SequenceExecutor:
@@ -147,6 +161,52 @@ def _operation_rows(repo: SqliteJobRepository) -> list[tuple[str, str]]:
                 "SELECT operation_id, outcome FROM external_operations ORDER BY rowid"
             ).fetchall()
         ]
+
+
+@pytest.mark.parametrize("approved,namespace,changed_prompt,expected_calls", [
+    (True, "same-user-policy", False, 0),
+    (False, "same-user-policy", False, 1),
+    (True, "different-user-policy", False, 1),
+    (True, "same-user-policy", True, 1),
+])
+def test_reviewed_group_reuse_across_jobs_is_scoped_and_opt_in(
+    tmp_path, approved, namespace, changed_prompt, expected_calls,
+):
+    cache = ReviewedCallCache(tmp_path / "reviewed")
+    for index in range(2):
+        repo, execution, token = _running_execution(tmp_path / str(index))
+        executor = _SequenceExecutor(_result())
+        coordinator = ModelCallCoordinator(
+            operation_store=repo, result_store=ModelOperationResultStore(tmp_path / str(index) / "results"),
+            executor=executor, reviewed_cache=cache,
+            cache_namespace=lambda _execution: "same-user-policy" if index == 0 else namespace,
+        )
+        request = _request(prompt_version=4 if index and changed_prompt else 3)
+        result = coordinator.run_reviewed("group", execution,
+            lambda: coordinator.execute(_binding(), request, execution, "chunk-0", token),
+            lambda _result: approved)
+        assert executor.calls == (1 if index == 0 else expected_calls)
+        assert result.text == _result().text
+        if index and expected_calls == 0:
+            assert result.input_tokens == result.output_tokens == 0
+            assert "reviewed_call_cache_hit" in result.warnings
+        assert len(_operation_rows(repo)) == 1
+        assert _operation_rows(repo)[0][1] == ExternalOutcome.SUCCEEDED.value
+
+
+def test_failed_group_does_not_publish_partial_success(tmp_path):
+    repo, execution, token = _running_execution(tmp_path)
+    cache = ReviewedCallCache(tmp_path / "reviewed")
+    coordinator = ModelCallCoordinator(
+        operation_store=repo, result_store=ModelOperationResultStore(tmp_path / "results"),
+        executor=_SequenceExecutor(_result()), reviewed_cache=cache, cache_namespace=lambda _: "user",
+    )
+    def fail_after_call():
+        coordinator.execute(_binding(), _request(), execution, "chunk-0", token)
+        raise ValueError("review failed")
+    with pytest.raises(ValueError, match="review failed"):
+        coordinator.run_reviewed("group", execution, fail_after_call, lambda _: True)
+    assert not list((tmp_path / "reviewed").glob("*.json"))
 
 
 def test_request_hash_is_semantic_and_ignores_timeout_only_changes() -> None:

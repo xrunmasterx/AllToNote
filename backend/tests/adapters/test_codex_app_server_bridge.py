@@ -178,7 +178,11 @@ def test_complete_request_maps_frozen_timeout_and_json_schema() -> None:
     (
         ("knowledge-map", "medium"),
         ("knowledge-consolidate", "medium"),
-        ("faithful-edit", "medium"),
+        ("faithful-edit", "high"),
+        ("faithful-context-plan", "high"),
+        ("faithful-source-prepare", "high"),
+        ("faithful-facts", "high"),
+        ("faithful-review", "high"),
         ("global-compose", "high"),
         ("knowledge-text-repair", "high"),
         ("faithful-repair", "high"),
@@ -214,8 +218,8 @@ def test_complete_request_uses_stage_specific_reasoning_effort(
 
 def test_execution_policy_identity_freezes_stage_effort_mapping() -> None:
     assert CodexAppServerCompletionBridge.execution_policy_identity() == (
-        "codex-app-server-stage-effort-v1/"
-        "knowledge-map,knowledge-consolidate,faithful-edit:medium/default:high"
+        "codex-app-server-stage-effort-v2/"
+        "knowledge-map,knowledge-consolidate:medium/default:high"
     )
 
 
